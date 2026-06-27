@@ -1,6 +1,9 @@
-// Slide-in drawer. Phase 1 shows the category list + a "settings coming
-// soon" placeholder. Phase 2 fills in source management, notifications,
-// preference vector viewer, etc.
+// Slide-in drawer. Lists the category columns. Settings (source
+// management, followed categories, source weights) is still a future
+// phase — for now it lists categories and a brief source registry.
+
+import { useEffect, useState } from 'react'
+import { api, type Source } from '../api'
 
 type Props = {
   open: boolean
@@ -9,6 +12,13 @@ type Props = {
 }
 
 export function Drawer({ open, onClose, categories }: Props) {
+  const [sources, setSources] = useState<Source[]>([])
+
+  useEffect(() => {
+    if (!open) return
+    api.sources().then(setSources).catch(() => setSources([]))
+  }, [open])
+
   return (
     <>
       {/* backdrop */}
@@ -39,7 +49,19 @@ export function Drawer({ open, onClose, categories }: Props) {
             </ul>
           </div>
           <div className="pt-4 border-t border-slate-800">
-            <p className="text-xs text-slate-500 italic">Settings coming in phase 2</p>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Sources</h3>
+            {sources.length === 0 ? (
+              <p className="text-xs text-slate-500 italic">loading…</p>
+            ) : (
+              <ul className="space-y-1">
+                {sources.map((s) => (
+                  <li key={s.id} className="rounded px-2 py-1 text-sm text-slate-200 hover:bg-slate-800 flex items-center justify-between">
+                    <span>{s.name}</span>
+                    <span className="text-xs text-slate-500">{s.category}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         </nav>
       </aside>

@@ -120,7 +120,7 @@ cookies (8 h, `HttpOnly`, `SameSite=Lax`, `Secure` when `PUBLIC_URL` is https).
 
 **What's gated.** Reads (`/api/entries`, `/api/sources`, `/api/health`) stay
 public so embed/preview use cases work without login. Mutations
-(`POST /api/ingest/{name}` today, interactions and watchlist in phase 2)
+(`/api/ingest/{name}` today, interactions and watchlist in a later phase)
 require a session.
 
 ### Local fallback user

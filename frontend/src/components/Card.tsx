@@ -1,7 +1,6 @@
 // One card: headline link, source name, relative time, score badge.
-// Score band is a coarse color signal — phase 1's score is just age in
-// hours, so the band math is approximate. Phase 2 will swap in real
-// composite scores.
+// The score badge is the entry's composite_score (phase 2+: weighted
+// blend of recency × source weight × personal vector).
 
 import type { Entry } from '../api'
 
