@@ -8,6 +8,7 @@ import { api, type CurrentUser, type Entry, type Health, type Source } from './a
 import { Card } from './components/Card'
 import { Column } from './components/Column'
 import { Drawer } from './components/Drawer'
+import { ForYou } from './components/ForYou'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
 import { UserBadge } from './components/UserBadge'
@@ -16,6 +17,7 @@ const REFRESH_INTERVAL_MS = 60_000
 
 export function App() {
   const [entries, setEntries] = useState<Entry[]>([])
+  const [forYou, setForYou] = useState<Entry[]>([])
   const [sources, setSources] = useState<Source[]>([])
   const [health, setHealth] = useState<Health | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -50,10 +52,19 @@ export function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [e, s, h] = await Promise.all([api.entries({ limit: 200 }), api.sources(), api.health()])
+      // forYou may 401 when OIDC is on and the user isn't logged in —
+      // we already routed them to LoginPage in that case, so this only
+      // runs for signed-in users. Tolerate 401 anyway for safety.
+      const [e, s, h, fy] = await Promise.all([
+        api.entries({ limit: 200 }),
+        api.sources(),
+        api.health(),
+        api.forYou({ limit: 25 }).catch(() => [] as Entry[]),
+      ])
       setEntries(e)
       setSources(s)
       setHealth(h)
+      setForYou(fy)
       setError(null)
     } catch (err) {
       setError((err as Error).message)
@@ -142,6 +153,8 @@ export function App() {
           {error}
         </div>
       )}
+
+      <ForYou entries={forYou} sourcesById={sourcesById} />
 
       {/* Desktop: grid */}
       <main className="hidden md:grid md:grid-cols-3 lg:grid-cols-4 gap-4 p-4 flex-1 overflow-hidden">

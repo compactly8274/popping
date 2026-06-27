@@ -1,8 +1,10 @@
 """FastAPI application entrypoint.
 
 Lifespan:
-  - Up: configure logging, start scheduler (which also runs one immediate
-    fetch per plugin), nothing else needed.
+  - Up: configure logging, load embedder (lazy + async so startup
+    isn't blocked on model import), start scheduler (which also runs
+    one immediate fetch per plugin). Embedding backfill is scheduled
+    by the scheduler itself.
   - Down: stop scheduler, dispose engine.
 
 Alembic is run by the Dockerfile's CMD (`alembic upgrade head && uvicorn`),
@@ -18,7 +20,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.embeddings import embedder
 from app.routes import entries as entries_routes
+from app.routes import foryou as foryou_routes
 from app.routes import health as health_routes
 from app.routes import ingest as ingest_routes
 from app.routes import sources as sources_routes
@@ -35,6 +39,10 @@ logger = logging.getLogger("popping")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("popping starting")
+    # Load embedder first — the scheduler's ingest path will call
+    # embed() on every entry, and we want the model warm before the
+    # first fetch lands. If embedding is disabled, this is a no-op.
+    await embedder().load()
     await start_scheduler()
     try:
         yield
@@ -65,6 +73,7 @@ app.add_middleware(
 app.include_router(health_routes.router, prefix="/api")
 app.include_router(sources_routes.router, prefix="/api")
 app.include_router(entries_routes.router, prefix="/api")
+app.include_router(foryou_routes.router, prefix="/api")
 app.include_router(ingest_routes.router, prefix="/api")
 
 # Auth router is only mounted when OIDC is enabled — keeps single-user

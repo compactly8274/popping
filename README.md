@@ -83,6 +83,7 @@ POPPING_PULL_POLICY=always       # force a fresh pull
 | `GET  /api/sources`               | Registered sources + last-fetch state  | public    |
 | `GET  /api/sources/{id}`          | One source                             | public    |
 | `GET  /api/entries`               | List entries (`?category=&source=&limit=`) | public |
+| `GET  /api/foryou`                | Personal top-N feed (with convergence boost) | login |
 | `POST /api/ingest/{source_name}`  | Force a fetch now (instead of waiting) | login     |
 | `GET  /auth/login`                | Kick off the OIDC flow (302 to IdP)    | n/a       |
 | `GET  /auth/callback`             | OIDC redirect URI                      | n/a       |
@@ -224,6 +225,72 @@ Google Cloud Console with redirect URI `https://popping.example.com/auth/callbac
 
 3. Restart the backend container. The scheduler picks up the new plugin on next boot; the sources row is auto-upserted on first fetch.
 
+## Phase 2 — scoring, embeddings, For You
+
+Phase 1's `composite_score` was just recency. Phase 2 makes the feed
+actually intelligent:
+
+- **Composite scoring** blends recency, source weight, and personal
+  preference (vector cosine + followed/muted categories). The blend
+  weights are env-tunable (`SCORING_WEIGHT_*`).
+- **Embedding pipeline** fills `entries.embedding` with 384-dim
+  sentence-transformers vectors at ingest time. One-shot backfill
+  on startup handles entries from before the column was wired in.
+- **LLM provider abstraction** (Ollama / Anthropic / OpenAI / Groq) is
+  in place but currently unused — phase 4's Brief generator will be
+  the first call site.
+- **For You** (`GET /api/foryou`) is a personal top-N feed with a
+  convergence boost: items sharing a normalized title across multiple
+  sources within 24h get a small multiplicative bump.
+
+### Scoring math
+
+```
+composite = w_recency * recency(published_at, category)
+          + w_personal * personal(entry, source, profile)
+          + w_source   * (raw_score * source_weight)
+
+personal = vector_score * category_multiplier(followed, muted)
+```
+
+`recency` is exponential decay with per-category half-life (news/vulns:
+6 h, deals: 48 h, sports: 3 h, default: 12 h). `vector_score` is cosine
+similarity to the user's `preference_vector`, rescaled from `[-1, 1]` to
+`[0, 100]`. NULL vectors return a neutral 50 (cold-start midpoint).
+
+### Convergence boost
+
+Computed at query time, not at ingest, so clusters pick up the boost
+the moment they form. One SQL `GROUP BY title_slug` over the last
+`CONVERGENCE_WINDOW_HOURS`, then a Python pass applies the multiplier:
+
+- 1 source → ×1.0 (no boost)
+- 2 sources → ×`CONVERGENCE_BOOST_2` (default 1.10)
+- 3+ sources → ×`CONVERGENCE_BOOST_3PLUS` (default 1.20)
+
+### Embedding backfill
+
+On startup the scheduler queues a one-shot job (and re-runs it every
+5 minutes as a safety net) that embeds any entry with a NULL embedding.
+Batches of `EMBEDDING_BATCH_SIZE` (default 64). Failures are logged and
+skipped — the entry stays in the table with NULL embedding, and
+`personal.score` treats that as a neutral 50 cosine.
+
+### Provider selection
+
+The LLM router picks the first configured provider in this order:
+Anthropic → OpenAI → Groq → Ollama. If nothing is configured,
+`provider_for(task)` returns `None` and callers log-and-skip. Phase 2
+has no call sites yet, so a no-key install is fully supported.
+
+### Memory note
+
+`sentence-transformers` pulls in torch (~200 MB CPU-only, ~600 MB
+CUDA). The Dockerfile installs CPU-only torch explicitly to keep the
+image slim. Set `EMBEDDING_ENABLED=false` to skip the whole pipeline
+on a memory-constrained host; the rest of the scoring still works,
+just without the vector signal.
+
 ## Layout
 
 ```
@@ -254,8 +321,10 @@ Google Cloud Console with redirect URI `https://popping.example.com/auth/callbac
 │       │   └── local.py       #   POST /auth/local (bcrypt fallback user)
 │       ├── models.py          # SQLAlchemy ORM (sources/entries/interactions/...)
 │       ├── schemas.py         # Pydantic response shapes
-│       ├── scheduler.py       # APScheduler + ingest pipeline
-│       ├── scoring/recency.py # phase 1 placeholder scorer
+│       ├── scheduler.py       # APScheduler + ingest pipeline (incl. embed backfill)
+│       ├── embeddings.py      # sentence-transformers singleton
+│       ├── llm/               # provider abstraction (Anthropic / OpenAI / Groq / Ollama)
+│       ├── scoring/           # recency (per-category) + source + personal + composite
 │       ├── sources/
 │       │   ├── base.py        # SourcePlugin ABC
 │       │   ├── rss.py         # BBC News (the only built-in)
@@ -264,6 +333,7 @@ Google Cloud Console with redirect URI `https://popping.example.com/auth/callbac
 │           ├── health.py
 │           ├── sources.py
 │           ├── entries.py
+│           ├── foryou.py      # /api/foryou — personal top-N
 │           └── ingest.py
 └── frontend/
     ├── Dockerfile
@@ -285,9 +355,14 @@ Google Cloud Console with redirect URI `https://popping.example.com/auth/callbac
 ## Phase roadmap
 
 - **Phase 1** (this commit): scaffold, schema, one RSS source, minimal UI. ✅
-- **Phase 2**: scoring engine (recency + source weight + personal vector), LLM provider abstraction (Ollama/Groq/Claude/OpenAI), embedding pipeline, For You feed.
-- **Phase 3**: more source plugins — RedFlagDeals, NVD, CISA KEV, ESPN, YouTube RSS, Podcast Index, Keepa, GitHub releases, Wikipedia On This Day, HN, Mastodon.
-- **Phase 4**: notifications (Pushover/Apprise), The Brief generator, settings drawer, dead-feed detection, dedup, converging-story detection.
+- **Phase 2**: composite scoring engine, sentence-transformers embeddings,
+  LLM provider abstraction, For You feed with convergence boost. ✅
+- **Phase 3**: more source plugins — RedFlagDeals, NVD, CISA KEV, ESPN,
+  YouTube RSS, Podcast Index, Keepa, GitHub releases, Wikipedia On This
+  Day, HN, Mastodon. Interaction-recording UI, source-weight tuner.
+- **Phase 4**: notifications (Pushover/Apprise), The Brief generator,
+  settings drawer, dead-feed detection, dedup, converging-story
+  detection.
 
 ## Environment variables
 

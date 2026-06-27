@@ -99,6 +99,32 @@ class Settings(BaseSettings):
     # How often to delete expired rows from the sessions table.
     session_purge_interval_seconds: int = 3600
 
+    # --- Phase 2: embeddings ------------------------------------------------
+    # sentence-transformers model used to embed entry text at ingest time.
+    # 384-dim output, matches the Vector(384) column on entries. Override
+    # with a smaller model on memory-constrained hosts.
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_batch_size: int = 64
+    # Set to false to skip the embedding pipeline entirely (e.g. on a
+    # memory-constrained host). Entries get NULL embedding; personal
+    # scoring degenerates to recency + source weight.
+    embedding_enabled: bool = True
+
+    # --- Phase 2: composite scoring weights ---------------------------------
+    # final = w_recency * recency + w_personal * personal + w_source * source_weighted
+    # Weights don't have to sum to 1 — the values are weights, not
+    # probabilities — but the defaults do sum to 1.
+    scoring_weight_recency: float = 0.4
+    scoring_weight_personal: float = 0.4
+    scoring_weight_source: float = 0.2
+
+    # --- Phase 2: convergence boost ----------------------------------------
+    # Cross-source story clusters (same normalized title in 24h) get a
+    # multiplicative boost. Tweak to taste.
+    convergence_window_hours: int = 24
+    convergence_boost_2: float = 1.10
+    convergence_boost_3plus: float = 1.20
+
     @property
     def database_url(self) -> str:
         return (

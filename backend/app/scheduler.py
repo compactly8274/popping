@@ -8,12 +8,16 @@ phase 2 needs to scale fetches across workers, swap in `RedisJobStore`
 The scheduler owns:
     - One repeating job per registered source plugin
     - Upsert into the entries table (by url — natural primary key for feeds)
+    - Embedding the entry text at ingest (phase 2)
+    - Composite scoring at ingest (phase 2)
+    - One-shot embedding backfill for entries with NULL embedding (phase 2)
     - Source-row bookkeeping (last_fetch_at, last_error, error_count)
     - Periodic purge of expired sessions (DB-backed auth)
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 from typing import Any
@@ -26,7 +30,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Entry, Source
+from app.embeddings import embedder
+from app.models import Entry, Source, UserProfile
+from app.scoring import composite as composite_scorer
 from app.scoring import recency
 from app.sources import list_sources
 
@@ -55,6 +61,34 @@ async def _upsert_source(session: AsyncSession, plugin_cls: Any) -> Source:
     return row
 
 
+async def _load_profile(session: AsyncSession) -> UserProfile | None:
+    """The single-row user profile. Created on demand so a fresh DB
+    doesn't crash ingest."""
+    profile = await session.scalar(select(UserProfile).where(UserProfile.id == 1))
+    if profile is None:
+        profile = UserProfile(id=1)
+        session.add(profile)
+        await session.commit()
+        await session.refresh(profile)
+    return profile
+
+
+async def _embed_text(norm: dict) -> list[float] | None:
+    """Build the embed text from a normalized item. Empty → zero vector."""
+    title = (norm.get("title") or "").strip()
+    summary = (norm.get("summary") or "").strip()
+    if not title and not summary:
+        return [0.0] * embedder().dim
+    text = title
+    if summary:
+        text = f"{title} — {summary}"
+    try:
+        return await embedder().embed(text)
+    except Exception as exc:
+        logger.warning("embedding failed for '%s…': %s", title[:40], exc)
+        return None
+
+
 async def _ingest(plugin_cls: Any) -> dict:
     """Fetch from a plugin, write entries to DB, update source bookkeeping.
 
@@ -67,6 +101,7 @@ async def _ingest(plugin_cls: Any) -> dict:
     try:
         async with SessionLocal() as session:
             source = await _upsert_source(session, plugin_cls)
+            profile = await _load_profile(session)
             raw_items = await plugin.fetch()
             summary["fetched"] = len(raw_items)
             for raw in raw_items:
@@ -75,7 +110,15 @@ async def _ingest(plugin_cls: Any) -> dict:
                 except ValueError as exc:
                     logger.warning("%s: skipping bad item: %s", plugin_cls.name, exc)
                     continue
-                score = recency.score(norm["published_at"])
+                # raw_score is the recency-at-ingest — stays interpretable
+                # as "how fresh was this when it arrived".
+                raw_score = recency.score(norm["published_at"], source.category)
+                embedding = await _embed_text(norm)
+                composite = composite_scorer.score(
+                    _stub_entry(norm, raw_score, embedding),
+                    source,
+                    profile,
+                )
                 stmt = (
                     pg_insert(Entry)
                     .values(
@@ -83,9 +126,10 @@ async def _ingest(plugin_cls: Any) -> dict:
                         title=norm["title"],
                         url=norm["url"],
                         published_at=norm["published_at"],
-                        raw_score=score,
+                        raw_score=raw_score,
                         personal_score=0.0,
-                        composite_score=score,
+                        composite_score=composite,
+                        embedding=embedding,
                         meta=norm.get("meta"),
                     )
                     .on_conflict_do_nothing(index_elements=["url"])
@@ -116,6 +160,67 @@ async def _ingest(plugin_cls: Any) -> dict:
     return summary
 
 
+def _stub_entry(norm: dict, raw_score: float, embedding: list[float] | None) -> Entry:
+    """Build a transient Entry with only the fields composite_score touches.
+
+    Saves us round-tripping to the DB between insert and composite.
+    composite_score is later overwritten anyway.
+    """
+    e = Entry()
+    e.title = norm.get("title") or ""
+    e.url = norm.get("url") or ""
+    e.published_at = norm.get("published_at")
+    e.raw_score = raw_score
+    e.personal_score = 0.0
+    e.embedding = embedding
+    return e
+
+
+async def _backfill_embeddings(batch_size: int | None = None) -> None:
+    """One-shot at startup: embed any existing entries with NULL embedding.
+
+    Runs in batches so we don't OOM the embedder. Logs progress; never
+    raises — a failure here is logged and swallowed so the rest of the
+    app can start.
+    """
+    if not embedder().loaded:
+        logger.info("embedding backfill: skipping (embedder not loaded)")
+        return
+    bs = batch_size or settings.embedding_batch_size
+    try:
+        async with SessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(Entry.id, Entry.title, Entry.body_text).where(Entry.embedding.is_(None))
+                )
+            ).all()
+        if not rows:
+            logger.info("embedding backfill: nothing to do")
+            return
+        logger.info("embedding backfill: %d entries queued (batch=%d)", len(rows), bs)
+        for start in range(0, len(rows), bs):
+            chunk = rows[start:start + bs]
+            texts = [
+                ((t or "").strip() + (" — " + (bt or "").strip() if bt else "")).strip()
+                or " "
+                for _, t, bt in chunk
+            ]
+            vecs = await embedder().embed_many(texts)
+            async with SessionLocal() as session:
+                for (entry_id, _t, _bt), vec in zip(chunk, vecs):
+                    if vec is None:
+                        continue
+                    await session.execute(
+                        Entry.__table__.update()
+                        .where(Entry.id == entry_id)
+                        .values(embedding=vec)
+                    )
+                await session.commit()
+            logger.info("embedding backfill: %d / %d", min(start + bs, len(rows)), len(rows))
+    except Exception:
+        logger.exception("embedding backfill failed (will retry on next startup)")
+
+
 async def _purge_sessions() -> None:
     """Delete expired session rows. Best-effort; logs on failure."""
     # Imported lazily so module load order is independent of auth availability.
@@ -134,7 +239,8 @@ async def start_scheduler() -> AsyncIOScheduler:
     """Discover plugins, register one interval job per source, start scheduler.
 
     Also runs an immediate fetch per source so the dashboard isn't empty
-    on a cold start.
+    on a cold start. Schedules the embedding backfill as a fire-and-forget
+    task so startup isn't blocked.
     """
     global _scheduler
     if _scheduler is not None:
@@ -169,6 +275,21 @@ async def start_scheduler() -> AsyncIOScheduler:
         coalesce=True,
     )
 
+    # Phase 2: fire-and-forget embedding backfill. Runs once shortly after
+    # startup so we don't race the model load. If embeddings are disabled
+    # or the model failed to load, the backfill is a no-op.
+    if settings.embedding_enabled and embedder().loaded:
+        _scheduler.add_job(
+            _backfill_embeddings,
+            trigger=IntervalTrigger(minutes=5),  # re-run periodically to catch missed rows
+            id="embed:backfill",
+            name="Embedding backfill",
+            replace_existing=True,
+            next_run_time=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30),
+            max_instances=1,
+            coalesce=True,
+        )
+
     _scheduler.start()
     logger.info("scheduler: started")
     return _scheduler
@@ -188,3 +309,9 @@ async def trigger_now(plugin_name: str) -> dict:
     if plugin_name not in plugins:
         return {"source": plugin_name, "error": "unknown source", "fetched": 0, "inserted": 0, "duplicates": 0}
     return await _ingest(plugins[plugin_name])
+
+
+async def backfill_now() -> dict:
+    """Run the embedding backfill once on demand (e.g. from a debug endpoint)."""
+    await _backfill_embeddings()
+    return {"ok": True}

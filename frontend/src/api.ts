@@ -67,6 +67,15 @@ export const api = {
     return jsonFetch<Entry[]>(`/api/entries${q ? `?${q}` : ''}`)
   },
   sources: () => jsonFetch<Source[]>('/api/sources'),
+  /** Personal top-N feed. Requires auth when OIDC is enabled; loopback
+   * bypass users always pass through. */
+  forYou: (opts?: { limit?: number; category?: string }) => {
+    const params = new URLSearchParams()
+    if (opts?.limit) params.set('limit', String(opts.limit))
+    if (opts?.category) params.set('category', opts.category)
+    const q = params.toString()
+    return jsonFetch<Entry[]>(`/api/foryou${q ? `?${q}` : ''}`)
+  },
   ingest: (sourceName: string) =>
     jsonFetch<{ source: string; fetched: number; inserted: number; duplicates: number; error: string | null }>(
       `/api/ingest/${encodeURIComponent(sourceName)}`,

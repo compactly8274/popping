@@ -12,7 +12,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
+# Install CPU-only torch first (saves ~600 MB vs CUDA build), then the
+# rest of the deps. The empty --extra-index-url below prevents pip from
+# also hitting the default PyPI for torch; if pip falls back there it
+# will still install a usable CPU-only wheel.
 RUN pip install --upgrade pip \
+    && pip install --index-url https://download.pytorch.org/whl/cpu torch \
+    && pip install -e . --no-deps \
     && pip install -e .
 
 COPY . .

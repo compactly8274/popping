@@ -49,6 +49,9 @@ class Source(Base):
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_count: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Multiplier on the source's contribution to composite score (phase 2).
+    # Default 1.0; the UI for tuning this lands in phase 3.
+    source_weight: Mapped[float] = mapped_column(Float, default=1.0)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
@@ -147,6 +150,9 @@ class UserProfile(Base):
     followed_teams: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     tracked_repos: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     running_stack: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # Phase 2: category-based boost/mute (multiplicative on personal_score).
+    followed_categories: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    muted_categories: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     quiet_hours_start: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # hour 0-23
     quiet_hours_end: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(

@@ -21,6 +21,9 @@ dependencies = [
     "itsdangerous>=2.2",
     # Local fallback user (optional; only loaded when LOCAL_AUTH_ENABLED=true)
     "bcrypt>=4.1",
+    # Phase 2 — embeddings + LLM provider abstraction
+    "sentence-transformers>=2.7",
+    "numpy>=1.26",
 ]
 
 [build-system]
