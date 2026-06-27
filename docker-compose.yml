@@ -4,6 +4,18 @@ name: popping
 # Tag is controlled by POPPING_IMAGE_TAG (default: latest).
 # Registry owner is controlled by POPPING_IMAGE_OWNER (default: compactly8274).
 #
+# Port surface:
+#   - frontend:   the only published port. LAN-reachable by default on
+#                 0.0.0.0:5173. Front this with a reverse proxy for TLS.
+#   - backend:    not published. Reachable only via the frontend's
+#                 internal /api proxy (Vite dev server) on the docker
+#                 network.
+#   - postgres:   not published. Internal-only.
+#   - redis:      not published. Internal-only.
+#
+# To expose on the LAN, override POPPING_FRONTEND_HOST (0.0.0.0 is the
+# default) and put a reverse proxy in front for TLS + auth.
+#
 # For local dev with hot-reload, drop a docker-compose.override.yml next
 # to this file. The override is auto-loaded by `docker compose up` and
 # switches both services to `build: ./...` with bind mounts. See
@@ -24,14 +36,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    ports:
-      - "127.0.0.1:5432:5432"
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -41,15 +49,15 @@ services:
   backend:
     image: ghcr.io/${POPPING_IMAGE_OWNER:-compactly8274}/popping-backend:${POPPING_IMAGE_TAG:-latest}
     restart: unless-stopped
-    pull_policy: ${POPPING_PULL_POLICY:-missing}   # 'always' to force refresh
+    pull_policy: ${POPPING_PULL_POLICY:-missing}
     env_file: .env
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "${POPPING_BACKEND_HOST:-127.0.0.1}:${POPPING_BACKEND_PORT:-8000}:8000"
+    # No published port — backend is only reachable from the frontend
+    # via the docker network.
 
   frontend:
     image: ghcr.io/${POPPING_IMAGE_OWNER:-compactly8274}/popping-frontend:${POPPING_IMAGE_TAG:-latest}
@@ -60,7 +68,7 @@ services:
     environment:
       VITE_BACKEND_URL: http://backend:8000
     ports:
-      - "${POPPING_FRONTEND_HOST:-127.0.0.1}:${POPPING_FRONTEND_PORT:-5173}:5173"
+      - "${POPPING_FRONTEND_HOST:-0.0.0.0}:${POPPING_FRONTEND_PORT:-5173}:5173"
 
 volumes:
   pgdata:

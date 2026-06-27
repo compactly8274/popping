@@ -36,13 +36,6 @@ class Settings(BaseSettings):
     # --- Redis --------------------------------------------------------------
     redis_url: str = "redis://redis:6379/0"
 
-    # --- Backend bind -------------------------------------------------------
-    backend_host: str = "127.0.0.1"
-    backend_port: int = 8000
-
-    # --- Frontend (for CORS) ------------------------------------------------
-    frontend_origin: str = "http://127.0.0.1:5173"
-
     # --- LLM (phase 2+, listed here so the env file has one home) ----------
     ollama_base_url: str = "http://host.docker.internal:11434"
     ollama_model_scoring: str = "llama3.1:8b"
