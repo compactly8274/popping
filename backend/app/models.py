@@ -14,7 +14,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
-    DateTime(timezone=True),
+    DateTime,
     Float,
     ForeignKey,
     Index,
