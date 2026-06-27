@@ -11,11 +11,14 @@ Personal AI-ranked intelligence dashboard. Aggregates deals, vulnerabilities, ne
 ```bash
 cp .env.example .env             # defaults work out of the box
 docker compose up -d             # pulls ghcr.io/compactly8274/popping-{backend,frontend}:latest
-open http://127.0.0.1:5173       # frontend (the only published port)
+open http://127.0.0.1:4789       # frontend (the only published port)
 ```
 
-Only the frontend publishes a port. The backend is reachable from the frontend over the
-internal docker network (`http://backend:8000`); postgres and redis are entirely
+The frontend publishes on `4789` by default — chosen to stay out of the
+common 3000/5173/8000/8080 range. Override with `POPPING_FRONTEND_PORT=<port>`
+in `.env` (the container still listens on 5173; only the host-side mapping
+changes). The backend is reachable from the frontend over the internal
+docker network (`http://backend:8000`); postgres and redis are entirely
 internal — front the frontend with a reverse proxy for TLS if exposing on a LAN.
 
 The first boot runs `alembic upgrade head` against a fresh postgres volume, so the schema is created automatically. The scheduler then fires one immediate fetch per plugin and re-fetches every `refresh_interval_seconds`.
