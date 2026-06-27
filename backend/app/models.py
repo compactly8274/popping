@@ -14,7 +14,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
-    DateTime,
+    DateTime(timezone=True),
     Float,
     ForeignKey,
     Index,
@@ -45,7 +45,7 @@ class Source(Base):
     category: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     url: Mapped[str] = mapped_column(Text, nullable=False)
     refresh_interval_seconds: Mapped[int] = mapped_column(Integer, default=3600)
-    last_fetch_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+    last_fetch_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_count: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -53,7 +53,7 @@ class Source(Base):
     # Default 1.0; the UI for tuning this lands in phase 3.
     source_weight: Mapped[float] = mapped_column(Float, default=1.0)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     entries: Mapped[list["Entry"]] = relationship(back_populates="source")
@@ -73,7 +73,7 @@ class Entry(Base):
     )
     title: Mapped[str] = mapped_column(Text, nullable=False)
     url: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
-    published_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    published_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     raw_score: Mapped[float] = mapped_column(Float, default=0.0)
     personal_score: Mapped[float] = mapped_column(Float, default=0.0)
@@ -84,9 +84,9 @@ class Entry(Base):
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(384), nullable=True)
     meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
-    expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     fetched_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     source: Mapped[Source] = relationship(back_populates="entries")
@@ -109,7 +109,7 @@ class Interaction(Base):
     type: Mapped[str] = mapped_column(String(20), nullable=False)  # click/hover/dwell/thumb_*/bookmark/share/never
     value: Mapped[float] = mapped_column(Float, default=1.0)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False, index=True
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
 
     entry: Mapped[Entry] = relationship(back_populates="interactions")
@@ -129,10 +129,10 @@ class WatchlistItem(Base):
     kind: Mapped[str] = mapped_column(String(40), nullable=False)  # amazon/product/cve/repo
     target: Mapped[str] = mapped_column(Text, nullable=False)
     threshold: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    last_checked_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
-    last_notified_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+    last_checked_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_notified_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 
@@ -156,7 +156,7 @@ class UserProfile(Base):
     quiet_hours_start: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # hour 0-23
     quiet_hours_end: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
     __table_args__ = (
@@ -180,13 +180,13 @@ class Session(Base):
     name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     auth_method: Mapped[str] = mapped_column(String(20), nullable=False)  # oidc | local | loopback
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     last_used_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False, index=True
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     expires_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, nullable=False, index=True
+        DateTime(timezone=True), nullable=False, index=True
     )
 
 
@@ -200,8 +200,8 @@ class Brief(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     generated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     tone: Mapped[str] = mapped_column(String(20), default="terse")  # terse / narrative
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    delivered_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+    delivered_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
