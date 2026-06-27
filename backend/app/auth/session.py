@@ -1,74 +1,126 @@
-"""Signed-cookie sessions.
+"""DB-backed sessions.
 
-``itsdangerous`` URLSafeTimedSerializer with the configured session secret.
-Holds the OIDC user payload and an expiry timestamp. No DB lookup on every
-request — the cookie is self-validating.
+The session cookie carries only an opaque random ID (``sid``). User data
+and expiry live in the ``sessions`` table. The cookie value has ~190 bits
+of entropy (32 random bytes, url-safe base64) — brute-force is
+infeasible, and a stolen cookie is "you" until expiry (same security
+model as JWT bearer tokens).
 
-Cookie attributes set by the routes:
-  HttpOnly   — JS can't read it (defense against XSS exfiltration)
-  Secure     — when public_url is https (set automatically by routes.py)
-  SameSite   — Lax; covers the OIDC callback being a state-changing GET
-  Path=/     — sent to /api/* and /auth/*
-  Max-Age    — ttl
+Why DB-backed rather than a signed blob:
+  - Survives backend restart (no mass logout).
+  - Allows server-side revocation (logout = ``DELETE``).
+  - Allows a sliding TTL with a real ``last_used_at`` timestamp.
+  - Easier to audit (rows you can ``SELECT`` from).
+
+Cookie attributes are set by the routes that call ``create()``:
+  HttpOnly, SameSite=Lax, Path=/, Max-Age=ttl, Secure when public_url is https.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import secrets
 from typing import Optional
 
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from sqlalchemy import delete, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.settings import OIDCConfig
+from app.models import Session as SessionRow
 
 
 class SessionError(Exception):
-    """Raised when a session cookie can't be decoded / is expired / tampered."""
+    """Raised when a session can't be decoded / is expired / not found."""
 
 
-def _serializer(cfg: OIDCConfig) -> URLSafeTimedSerializer:
-    return URLSafeTimedSerializer(
-        secret_key=cfg.session_secret,
-        salt="popping-session-v1",
-    )
+def _new_sid() -> str:
+    """32 bytes of randomness, url-safe base64 (no padding)."""
+    return secrets.token_urlsafe(32)
 
 
-def encode(cfg: OIDCConfig, payload: dict) -> str:
-    """Sign and return the cookie value (string). Caller sets the cookie."""
-    ser = _serializer(cfg)
-    return ser.dumps(payload)
-
-
-def decode(cfg: OIDCConfig, cookie_value: str) -> dict:
-    """Return the session payload or raise SessionError."""
-    ser = _serializer(cfg)
-    try:
-        return ser.loads(cookie_value, max_age=cfg.session_ttl_seconds)
-    except SignatureExpired as e:
-        raise SessionError("session expired") from e
-    except BadSignature as e:
-        raise SessionError("invalid session") from e
-
-
-def new_payload(
+async def create(
+    db: AsyncSession,
+    cfg: OIDCConfig,
+    *,
     sub: str,
-    email: Optional[str] = None,
-    name: Optional[str] = None,
+    email: Optional[str],
+    name: Optional[str],
+    auth_method: str,  # 'oidc' | 'local' | 'loopback'
+) -> str:
+    """Insert a session row and return the cookie value (the new sid).
+
+    The TTL is computed here (now + cfg.session_ttl_seconds) and stored in
+    ``expires_at`` so cleanup is straightforward.
+    """
+    sid = _new_sid()
+    now = dt.datetime.now(dt.timezone.utc)
+    row = SessionRow(
+        id=sid,
+        sub=sub,
+        email=email,
+        name=name,
+        auth_method=auth_method,
+        created_at=now,
+        last_used_at=now,
+        expires_at=now + dt.timedelta(seconds=cfg.session_ttl_seconds),
+    )
+    db.add(row)
+    await db.commit()
+    return sid
+
+
+async def decode(
+    db: AsyncSession,
+    sid: str,
 ) -> dict:
-    """Build a fresh session payload (expiry set to now+ttl by the caller
-    when encoding, since the serializer enforces max_age on decode)."""
+    """Return the user payload for ``sid``, or raise SessionError.
+
+    Touches ``last_used_at`` to implement the sliding TTL. The update is
+    fire-and-forget — if it fails the session still works this request.
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    row = await db.get(SessionRow, sid)
+    if row is None:
+        raise SessionError("session not found")
+    if row.expires_at <= now:
+        # Best-effort cleanup of the expired row so it doesn't accumulate.
+        await db.delete(row)
+        await db.commit()
+        raise SessionError("session expired")
+    # Sliding refresh: bump last_used_at and extend expires_at.
+    await db.execute(
+        update(SessionRow)
+        .where(SessionRow.id == sid)
+        .values(
+            last_used_at=now,
+            expires_at=now + dt.timedelta(seconds=_row_ttl(row)),
+        )
+    )
+    await db.commit()
     return {
-        "sub": sub,
-        "email": email or "",
-        "name": name or "",
-        "iat": int(dt.datetime.now(dt.timezone.utc).timestamp()),
+        "sub": row.sub,
+        "email": row.email or "",
+        "name": row.name or "",
+        "auth_method": row.auth_method,
     }
 
 
-def is_expired(payload: dict, ttl_seconds: int) -> bool:
-    """Optional client-side check; the serializer enforces on decode too."""
-    iat = payload.get("iat")
-    if not isinstance(iat, (int, float)):
-        return True
-    now = dt.datetime.now(dt.timezone.utc).timestamp()
-    return (now - iat) > ttl_seconds
+def _row_ttl(row: SessionRow) -> int:
+    """How much longer the session has. Falls back to a sane default if
+    the row was written by an older release without a stored ttl."""
+    remaining = (row.expires_at - dt.datetime.now(dt.timezone.utc)).total_seconds()
+    return max(int(remaining), 60)
+
+
+async def destroy(db: AsyncSession, sid: str) -> None:
+    """Delete the session row. Idempotent."""
+    await db.execute(delete(SessionRow).where(SessionRow.id == sid))
+    await db.commit()
+
+
+async def purge_expired(db: AsyncSession) -> int:
+    """Delete all expired rows. Returns the count for logging."""
+    now = dt.datetime.now(dt.timezone.utc)
+    result = await db.execute(delete(SessionRow).where(SessionRow.expires_at <= now))
+    await db.commit()
+    return result.rowcount or 0

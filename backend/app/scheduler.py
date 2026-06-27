@@ -9,6 +9,7 @@ The scheduler owns:
     - One repeating job per registered source plugin
     - Upsert into the entries table (by url — natural primary key for feeds)
     - Source-row bookkeeping (last_fetch_at, last_error, error_count)
+    - Periodic purge of expired sessions (DB-backed auth)
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import Entry, Source
 from app.scoring import recency
@@ -114,6 +116,20 @@ async def _ingest(plugin_cls: Any) -> dict:
     return summary
 
 
+async def _purge_sessions() -> None:
+    """Delete expired session rows. Best-effort; logs on failure."""
+    # Imported lazily so module load order is independent of auth availability.
+    from app.auth.session import purge_expired
+
+    try:
+        async with SessionLocal() as session:
+            count = await purge_expired(session)
+            if count:
+                logger.info("session purge: deleted %d expired row(s)", count)
+    except Exception:
+        logger.exception("session purge failed")
+
+
 async def start_scheduler() -> AsyncIOScheduler:
     """Discover plugins, register one interval job per source, start scheduler.
 
@@ -140,6 +156,18 @@ async def start_scheduler() -> AsyncIOScheduler:
             max_instances=1,
             coalesce=True,
         )
+
+    # Periodic session purge. Runs whenever the scheduler is up; cheap when
+    # there's nothing to delete (a single DELETE … WHERE expires_at <= now()).
+    _scheduler.add_job(
+        _purge_sessions,
+        trigger=IntervalTrigger(seconds=settings.session_purge_interval_seconds),
+        id="auth:purge_sessions",
+        name="Purge expired sessions",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     _scheduler.start()
     logger.info("scheduler: started")

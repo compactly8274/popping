@@ -19,6 +19,8 @@ dependencies = [
     # OIDC (optional; only loaded when OIDC_ENABLED=true)
     "authlib>=1.3",
     "itsdangerous>=2.2",
+    # Local fallback user (optional; only loaded when LOCAL_AUTH_ENABLED=true)
+    "bcrypt>=4.1",
 ]
 
 [build-system]

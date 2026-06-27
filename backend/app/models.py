@@ -159,6 +159,32 @@ class UserProfile(Base):
 
 
 # ---------------------------------------------------------------------------
+# Session: DB-backed session row, looked up on every authenticated request.
+# The cookie holds only the opaque ``id``; user data lives here so a
+# container restart doesn't log everyone out.
+# ---------------------------------------------------------------------------
+
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    sub: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    auth_method: Mapped[str] = mapped_column(String(20), nullable=False)  # oidc | local | loopback
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    last_used_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, index=True
+    )
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, nullable=False, index=True
+    )
+
+
+# ---------------------------------------------------------------------------
 # Brief: AI-generated digest snapshots.
 # ---------------------------------------------------------------------------
 

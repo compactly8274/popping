@@ -53,6 +53,7 @@ export interface CurrentUser {
   sub: string
   email: string
   name: string
+  auth_method?: 'oidc' | 'local' | 'loopback'
 }
 
 export const api = {
@@ -86,4 +87,16 @@ export const api = {
   logout: () => fetch('/auth/logout', { method: 'POST', credentials: 'include' }),
   /** Build the OIDC login URL with a return path. Caller navigates. */
   loginUrl: (returnTo: string = '/') => `/auth/login?return_to=${encodeURIComponent(returnTo)}`,
+
+  /** Whether the local fallback user is configured. Used to render the
+   * password form in LoginPage. */
+  localAuthAvailable: () => jsonFetch<{ enabled: boolean }>('/auth/local/availability'),
+  /** POST /auth/local — exchanges username/password for a session cookie. */
+  loginLocal: (username: string, password: string) =>
+    jsonFetch<CurrentUser>('/auth/local', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    }),
 }

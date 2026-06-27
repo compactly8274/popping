@@ -86,7 +86,9 @@ POPPING_PULL_POLICY=always       # force a fresh pull
 | `POST /api/ingest/{source_name}`  | Force a fetch now (instead of waiting) | login     |
 | `GET  /auth/login`                | Kick off the OIDC flow (302 to IdP)    | n/a       |
 | `GET  /auth/callback`             | OIDC redirect URI                      | n/a       |
-| `POST /auth/logout`               | Clear the session cookie               | n/a       |
+| `POST /auth/local`                | Local-user login (form on login page)  | n/a       |
+| `GET  /auth/local/availability`   | `{"enabled": bool}` — does the login page show the local form? | n/a |
+| `POST /auth/logout`               | Clear the session cookie + delete row  | n/a       |
 | `GET  /auth/me`                   | Current user payload or 401            | n/a       |
 
 Interactive docs at `http://<server-ip>:14789/api/docs`.
@@ -119,6 +121,58 @@ cookies (8 h, `HttpOnly`, `SameSite=Lax`, `Secure` when `PUBLIC_URL` is https).
 public so embed/preview use cases work without login. Mutations
 (`POST /api/ingest/{name}` today, interactions and watchlist in phase 2)
 require a session.
+
+### Local fallback user
+
+When the IdP is down (or you're testing without one), a hardcoded local
+account can log in via `POST /auth/local` — the form on the login page
+exposes it automatically. Configure:
+
+```bash
+LOCAL_AUTH_ENABLED=true
+LOCAL_USER_NAME=alice
+LOCAL_USER_PASSWORD_HASH=<bcrypt hash>
+LOCAL_USER_EMAIL=alice@lan.local       # optional, display only
+```
+
+Generate the hash:
+```bash
+python -c "import bcrypt; print(bcrypt.hashpw(b'YOUR_PASSWORD', bcrypt.gensalt()).decode())"
+```
+
+The endpoint runs `bcrypt.checkpw` regardless of which field is wrong, so
+the response time is constant (no username enumeration via timing).
+
+### Loopback bypass
+
+For "I'm at the server's keyboard and don't want to round-trip through
+the IdP" — flip on loopback bypass:
+
+```bash
+LOCAL_AUTH_BYPASS=true
+```
+
+Any request from `127.0.0.0/8` or `::1` is treated as authenticated with
+a synthetic `local-loopback` user. Honors `X-Forwarded-For` (leftmost IP)
+when behind a reverse proxy, so it only fires for genuinely local traffic
+as long as your proxy is trusted to strip client-supplied headers.
+
+Off by default; only enable when you trust the network between the
+reverse proxy and the backend.
+
+### Persistent sessions
+
+Sessions are stored in the `sessions` table, not in the cookie. The
+cookie carries only an opaque random ID; the row holds user data + TTL.
+This means:
+
+- **Restart-safe**: the backend can restart without logging anyone out.
+- **Server-side revocation**: `POST /auth/logout` deletes the row.
+- **Sliding TTL**: every authenticated request extends the expiry.
+- **Audit-friendly**: `SELECT * FROM sessions` shows who's logged in.
+
+A periodic purge (every hour by default; `SESSION_PURGE_INTERVAL_SECONDS`)
+deletes expired rows.
 
 ### Authentik
 
@@ -182,19 +236,22 @@ Google Cloud Console with redirect URI `https://popping.example.com/auth/callbac
 │   ├── alembic.ini
 │   ├── alembic/
 │   │   ├── env.py
-│   │   └── versions/0001_initial.py
+│   │   └── versions/
+│   │       ├── 0001_initial.py
+│   │       └── 0002_auth.py   # sessions table
 │   └── app/
 │       ├── main.py            # FastAPI app + lifespan
 │       ├── config.py          # pydantic-settings
 │       ├── db.py              # async SQLAlchemy engine
 │       ├── redis.py           # async Redis client
 │       ├── deps.py
-│       ├── auth/              # OIDC (only mounted when OIDC_ENABLED=true)
+│       ├── auth/              # OIDC + local auth (mounted when OIDC_ENABLED=true)
 │       │   ├── settings.py    #   OIDCConfig loader
-│       │   ├── session.py     #   signed-cookie sessions
+│       │   ├── session.py     #   DB-backed sessions
 │       │   ├── oidc.py        #   authlib PKCE flow
-│       │   ├── deps.py        #   current_user / require_user
-│       │   └── routes.py      #   /auth/login /auth/callback /auth/logout /auth/me
+│       │   ├── deps.py        #   current_user / require_user (incl. loopback bypass)
+│       │   ├── routes.py      #   /auth/login /auth/callback /auth/logout /auth/me
+│       │   └── local.py       #   POST /auth/local (bcrypt fallback user)
 │       ├── models.py          # SQLAlchemy ORM (sources/entries/interactions/...)
 │       ├── schemas.py         # Pydantic response shapes
 │       ├── scheduler.py       # APScheduler + ingest pipeline
@@ -217,11 +274,12 @@ Google Cloud Console with redirect URI `https://popping.example.com/auth/callbac
         ├── App.tsx            # desktop grid + mobile swipe
         ├── api.ts
         └── components/
-            ├── AuthChip.tsx   # login / sign-out chip in the header
             ├── Card.tsx
             ├── Column.tsx
             ├── Drawer.tsx
-            └── Hamburger.tsx
+            ├── Hamburger.tsx
+            ├── LoginPage.tsx   # shown when OIDC is on and user is logged out
+            └── UserBadge.tsx   # name + sign-out chip in the header
 ```
 
 ## Phase roadmap

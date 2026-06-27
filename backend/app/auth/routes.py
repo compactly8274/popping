@@ -4,10 +4,10 @@ Mounted at the root (not under /api) because the browser hits these
 directly. When OIDC is disabled, main.py doesn't include this router,
 so /auth/* 404s — clean failure mode.
 
-Cookie shape:
-    - ``popping_oidc_state`` (short-lived, 10 min): holds state + verifier
-      + return_to across the roundtrip.
-    - ``popping_session`` (8 h, sliding): holds the actual user payload.
+The ``local`` router is mounted as a sub-router below for /auth/local and
+/auth/local/availability. Both routers use the same cookie + session
+infrastructure, so a logged-in OIDC user and a logged-in local user look
+identical downstream.
 """
 
 from __future__ import annotations
@@ -17,16 +17,24 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import local as local_auth
 from app.auth.deps import current_user
 from app.auth.oidc import OIDCError, build_authorize_url, exchange_code, unpack_state
-from app.auth.session import encode, new_payload
+from app.auth.session import create as session_create, destroy as session_destroy
 from app.auth.settings import OIDCConfig, oidc_config
 from app.config import settings
+from app.db import get_session
 
 logger = logging.getLogger("popping.auth")
 
 router = APIRouter(tags=["auth"])
+
+# Mount the local-auth routes (POST /auth/local, GET /auth/local/availability)
+# on the same auth router. The endpoints they expose are no-ops unless
+# LOCAL_AUTH_ENABLED=true, so it's safe to mount unconditionally here.
+router.include_router(local_auth.router)
 
 # State cookie name (separate from session cookie).
 _STATE_COOKIE = "popping_oidc_state"
@@ -80,8 +88,13 @@ async def login(return_to: str = "/") -> Response:
 
 
 @router.get("/auth/callback")
-async def callback(request: Request, code: str, state: str) -> Response:
-    """Exchange the code, set the session cookie, redirect to return_to."""
+async def callback(
+    request: Request,
+    code: str,
+    state: str,
+    db: AsyncSession = Depends(get_session),
+) -> Response:
+    """Exchange the code, mint a session row, set the cookie, redirect."""
     cfg = oidc_config()
 
     state_cookie = request.cookies.get(_STATE_COOKIE)
@@ -108,17 +121,26 @@ async def callback(request: Request, code: str, state: str) -> Response:
     if not sub:
         raise HTTPException(status_code=502, detail="OIDC claims missing 'sub'")
 
-    payload = new_payload(
-        sub=sub,
-        email=claims.get("email"),
-        name=claims.get("name") or claims.get("preferred_username") or claims.get("email"),
+    email = claims.get("email")
+    name = (
+        claims.get("name")
+        or claims.get("preferred_username")
+        or claims.get("email")
     )
-    session_value = encode(cfg, payload)
+
+    sid = await session_create(
+        db,
+        cfg,
+        sub=sub,
+        email=email,
+        name=name,
+        auth_method="oidc",
+    )
 
     resp = RedirectResponse(return_to, status_code=status.HTTP_302_FOUND)
     resp.set_cookie(
         cfg.cookie_name,
-        session_value,
+        sid,
         max_age=cfg.session_ttl_seconds,
         **_cookie_attrs(cfg),
     )
@@ -128,13 +150,19 @@ async def callback(request: Request, code: str, state: str) -> Response:
 
 
 # ---------------------------------------------------------------------------
-# /auth/logout — clear the session cookie
+# /auth/logout — clear the session cookie + delete the row
 # ---------------------------------------------------------------------------
 
 
 @router.post("/auth/logout")
-async def logout() -> Response:
+async def logout(
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+) -> Response:
     cfg = oidc_config()
+    sid = request.cookies.get(cfg.cookie_name)
+    if sid:
+        await session_destroy(db, sid)
     resp = Response(status_code=status.HTTP_204_NO_CONTENT)
     resp.delete_cookie(cfg.cookie_name, path="/")
     return resp
@@ -146,7 +174,9 @@ async def logout() -> Response:
 
 
 @router.get("/auth/me")
-async def me(user: dict | None = Depends(current_user)) -> dict:
+async def me(
+    user: dict | None = Depends(current_user),
+) -> dict:
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="not logged in"
@@ -155,9 +185,5 @@ async def me(user: dict | None = Depends(current_user)) -> dict:
         "sub": user.get("sub"),
         "email": user.get("email"),
         "name": user.get("name"),
+        "auth_method": user.get("auth_method"),
     }
-
-
-# /auth/me needs the cookie to flow on cross-origin dev setups (Vite
-# proxies from a different port). The fetch wrapper on the frontend sets
-# credentials: 'include', so that's covered.

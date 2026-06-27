@@ -77,6 +77,28 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 28800  # 8 h
     session_cookie_name: str = "popping_session"
 
+    # --- Local fallback auth (optional) -------------------------------------
+    # When local_auth_enabled=true, a hardcoded local account is available
+    # at /auth/local as a backup when the IdP is down. The account has no
+    # role or scope — it's the same level of access as an OIDC login.
+    local_auth_enabled: bool = False
+    local_user_name: str = ""
+    local_user_password_hash: str = ""  # bcrypt hash; generate with bcrypt.hashpw
+    local_user_email: str = ""
+
+    # --- Loopback bypass (optional) -----------------------------------------
+    # When local_auth_bypass=true, requests from 127.0.0.0/8 or ::1 are
+    # treated as authenticated with a synthetic 'local-loopback' user —
+    # useful when you're at the server's keyboard and don't want to round-
+    # trip through the IdP. Honors X-Forwarded-For from a reverse proxy.
+    # Off by default; flip on only if your reverse proxy is trusted to
+    # strip client-supplied X-Forwarded-For.
+    local_auth_bypass: bool = False
+
+    # --- Session hygiene ---------------------------------------------------
+    # How often to delete expired rows from the sessions table.
+    session_purge_interval_seconds: int = 3600
+
     @property
     def database_url(self) -> str:
         return (

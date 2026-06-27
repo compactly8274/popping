@@ -1,17 +1,16 @@
 // App: 3-4 column desktop grid, single-column mobile with swipe.
 // Top bar has the hamburger (opens Drawer) and a refresh button.
-//
-// Touch swipe is handled inline: track touchstart/touchend X delta,
-// if |delta| > 60px shift the visible mobile column index. Replace
-// with react-swipeable if gesture handling grows.
+// When OIDC is enabled and the user isn't logged in, the dashboard
+// content is replaced with a LoginPage.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type CurrentUser, type Entry, type Health, type Source } from './api'
-import { AuthChip } from './components/AuthChip'
 import { Card } from './components/Card'
 import { Column } from './components/Column'
 import { Drawer } from './components/Drawer'
 import { Hamburger } from './components/Hamburger'
+import { LoginPage } from './components/LoginPage'
+import { UserBadge } from './components/UserBadge'
 
 const REFRESH_INTERVAL_MS = 60_000
 
@@ -23,6 +22,10 @@ export function App() {
   const [mobileCol, setMobileCol] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [user, setUser] = useState<CurrentUser | null>(null)
+  // True once we've finished probing /auth/me. Until then we don't render
+  // the dashboard — avoids flashing the login page for already-logged-in
+  // users on a hard refresh.
+  const [authProbed, setAuthProbed] = useState(false)
   const [oidcDisabled, setOidcDisabled] = useState(false)
   const touchStartX = useRef<number | null>(null)
 
@@ -57,9 +60,9 @@ export function App() {
     }
   }, [])
 
-  // Probe auth state once on mount. If /auth/me 404s, OIDC is disabled
-  // and we suppress the chip entirely. If 401, OIDC is enabled but the
-  // user isn't logged in — chip shows "Sign in". If 200, we're in.
+  // Probe auth state once on mount. If /auth/me 404s, OIDC is disabled —
+  // we stay in single-user mode (no login screen). If 200 or 401, OIDC
+  // is enabled; show the dashboard or LoginPage accordingly.
   useEffect(() => {
     let cancelled = false
     api.me()
@@ -67,14 +70,15 @@ export function App() {
         if (cancelled) return
         setUser(u)
         setOidcDisabled(false)
+        setAuthProbed(true)
       })
-      .catch((err: Error) => {
+      .catch(() => {
         if (cancelled) return
-        if (err.message.includes('404')) {
-          setOidcDisabled(true)
-        } else {
-          setOidcDisabled(true) // safer default than a broken "Sign in" button
-        }
+        // 404 → no auth surface at all (OIDC off). Any other error →
+        // safest default is "no login", since that matches the
+        // single-user behavior the user has been running.
+        setOidcDisabled(true)
+        setAuthProbed(true)
       })
     return () => {
       cancelled = true
@@ -82,10 +86,14 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    // Don't start polling until auth has been resolved; the LoginPage
+    // doesn't need it, and we don't want to flood the API while the
+    // user is being redirected through the IdP.
+    if (!authProbed) return
     refresh()
     const id = setInterval(refresh, REFRESH_INTERVAL_MS)
     return () => clearInterval(id)
-  }, [refresh])
+  }, [refresh, authProbed])
 
   const onTouchStart = (e: React.TouchEvent) => { touchStartX.current = e.touches[0].clientX }
   const onTouchEnd = (e: React.TouchEvent) => {
@@ -97,6 +105,19 @@ export function App() {
     else setMobileCol((i) => Math.max(i - 1, 0))
   }
 
+  // --- Render gates -----------------------------------------------------
+
+  // 1. Auth probe in flight — render nothing (avoids login-page flash).
+  if (!authProbed) {
+    return <div className="h-full" />
+  }
+
+  // 2. OIDC enabled and not logged in — show LoginPage.
+  if (!oidcDisabled && user === null) {
+    return <LoginPage returnTo="/" onSignedIn={setUser} />
+  }
+
+  // 3. Default — the dashboard.
   return (
     <div className="h-full flex flex-col">
       <header className="flex items-center gap-3 px-4 py-3 border-b border-slate-800 bg-slate-950">
@@ -113,7 +134,7 @@ export function App() {
         >
           Refresh
         </button>
-        <AuthChip user={user} oidcDisabled={oidcDisabled} onChange={setUser} />
+        {user && <UserBadge user={user} onSignedOut={() => setUser(null)} />}
       </header>
 
       {error && (
