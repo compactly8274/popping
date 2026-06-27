@@ -11,16 +11,21 @@ Personal AI-ranked intelligence dashboard. Aggregates deals, vulnerabilities, ne
 ```bash
 cp .env.example .env             # defaults work out of the box
 docker compose up -d             # pulls ghcr.io/compactly8274/popping-{backend,frontend}:latest
-open http://127.0.0.1:14789      # frontend (the only published port)
+open http://<server-ip>:14789    # frontend (the only published port)
 ```
 
 The frontend publishes on `14789` by default — a 5-digit port in the
 14xxx range chosen to stay out of the common 3000/5173/8000/8080/8443
-range and below typical ephemeral-port territory (32768+). Override with `POPPING_FRONTEND_PORT=<port>`
-in `.env` (the container still listens on 5173; only the host-side mapping
-changes). The backend is reachable from the frontend over the internal
-docker network (`http://backend:8000`); postgres and redis are entirely
-internal — front the frontend with a reverse proxy for TLS if exposing on a LAN.
+range and below typical ephemeral-port territory (32768+). Override with
+`POPPING_FRONTEND_PORT=<port>` in `.env` (the container still listens on
+5173; only the host-side mapping changes). The backend is reachable from
+the frontend over the internal docker network (`http://backend:8000`);
+postgres and redis are entirely internal.
+
+**Headless / LAN deployments** — the frontend binds to `0.0.0.0:14789` by
+default, so any device on the network can reach it. Put a reverse proxy
+in front (Caddy / Traefik / Nginx) for TLS + (optionally) additional
+auth in front of OIDC. Enable OIDC (see below) before exposing on a LAN.
 
 The first boot runs `alembic upgrade head` against a fresh postgres volume, so the schema is created automatically. The scheduler then fires one immediate fetch per plugin and re-fetches every `refresh_interval_seconds`.
 
@@ -72,15 +77,69 @@ POPPING_PULL_POLICY=always       # force a fresh pull
 
 ## API
 
-| Endpoint                          | Purpose                                |
-| --------------------------------- | -------------------------------------- |
-| `GET  /api/health`                | Liveness + counts                      |
-| `GET  /api/sources`               | Registered sources + last-fetch state  |
-| `GET  /api/sources/{id}`          | One source                             |
-| `GET  /api/entries`               | List entries (`?category=&source=&limit=`) |
-| `POST /api/ingest/{source_name}`  | Force a fetch now (instead of waiting) |
+| Endpoint                          | Purpose                                | Auth      |
+| --------------------------------- | -------------------------------------- | --------- |
+| `GET  /api/health`                | Liveness + counts                      | public    |
+| `GET  /api/sources`               | Registered sources + last-fetch state  | public    |
+| `GET  /api/sources/{id}`          | One source                             | public    |
+| `GET  /api/entries`               | List entries (`?category=&source=&limit=`) | public |
+| `POST /api/ingest/{source_name}`  | Force a fetch now (instead of waiting) | login     |
+| `GET  /auth/login`                | Kick off the OIDC flow (302 to IdP)    | n/a       |
+| `GET  /auth/callback`             | OIDC redirect URI                      | n/a       |
+| `POST /auth/logout`               | Clear the session cookie               | n/a       |
+| `GET  /auth/me`                   | Current user payload or 401            | n/a       |
 
-Interactive docs at `http://127.0.0.1:8000/docs`.
+Interactive docs at `http://<server-ip>:14789/api/docs`.
+
+## OIDC / login
+
+`OIDC_ENABLED=false` (the default) keeps the dashboard as a single-user app
+with no login screen — fine for a personal loopback deployment. Set
+`OIDC_ENABLED=true` for any LAN or public exposure, then configure the
+remaining vars in `.env`:
+
+```bash
+OIDC_ENABLED=true
+OIDC_ISSUER=https://auth.example.com       # your IdP's issuer URL
+OIDC_CLIENT_ID=popping                    # public client (no secret)
+OIDC_SCOPES=openid email profile
+PUBLIC_URL=https://popping.example.com     # must match the reverse-proxy host
+SESSION_SECRET=<openssl rand -hex 32>      # required when OIDC is on
+```
+
+The backend fetches the IdP's `/.well-known/openid-configuration` on the
+first login, so the IdP doesn't need to be up at container start — it only
+needs to be reachable when someone clicks **Sign in**.
+
+Flow: browser → `GET /auth/login` (302 to IdP) → consent → `GET /auth/callback?code=...`
+(exchange, set session cookie, 302 to `/`). Sessions are stateless signed
+cookies (8 h, `HttpOnly`, `SameSite=Lax`, `Secure` when `PUBLIC_URL` is https).
+
+**What's gated.** Reads (`/api/entries`, `/api/sources`, `/api/health`) stay
+public so embed/preview use cases work without login. Mutations
+(`POST /api/ingest/{name}` today, interactions and watchlist in phase 2)
+require a session.
+
+### Authentik
+
+1. *Applications* → *Create* → *OAuth2/OpenID*: name `popping`, provider
+   *OAuth2*, client type *Public*, redirect URI
+   `https://popping.example.com/auth/callback`.
+2. *Providers* → *Create* → *OAuth2/OIDC*: authorization flow *Authorization
+   code*, scopes *openid email profile*, signing key *Self-signed*.
+3. Copy the client ID → `OIDC_CLIENT_ID`. Issuer URL → `OIDC_ISSUER`.
+
+### Pocket-ID
+
+1. *OIDC Clients* → *New*: name `popping`, redirect URI
+   `https://popping.example.com/auth/callback`, scopes
+   *openid email profile*, no client secret (PKCE only).
+2. Copy the client ID → `OIDC_CLIENT_ID`. Issuer URL → `OIDC_ISSUER`.
+
+### Google
+
+`OIDC_ISSUER=https://accounts.google.com`, create an OAuth client in
+Google Cloud Console with redirect URI `https://popping.example.com/auth/callback`.
 
 ## Adding a new source plugin
 
@@ -130,6 +189,12 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
 │       ├── db.py              # async SQLAlchemy engine
 │       ├── redis.py           # async Redis client
 │       ├── deps.py
+│       ├── auth/              # OIDC (only mounted when OIDC_ENABLED=true)
+│       │   ├── settings.py    #   OIDCConfig loader
+│       │   ├── session.py     #   signed-cookie sessions
+│       │   ├── oidc.py        #   authlib PKCE flow
+│       │   ├── deps.py        #   current_user / require_user
+│       │   └── routes.py      #   /auth/login /auth/callback /auth/logout /auth/me
 │       ├── models.py          # SQLAlchemy ORM (sources/entries/interactions/...)
 │       ├── schemas.py         # Pydantic response shapes
 │       ├── scheduler.py       # APScheduler + ingest pipeline
@@ -152,6 +217,7 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
         ├── App.tsx            # desktop grid + mobile swipe
         ├── api.ts
         └── components/
+            ├── AuthChip.tsx   # login / sign-out chip in the header
             ├── Card.tsx
             ├── Column.tsx
             ├── Drawer.tsx

@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     pushover_app_token: str = ""
     apprise_url: str = ""
 
+    # --- OIDC (single-tenant, optional) ------------------------------------
+    # When oidc_enabled=False (the default), the backend ships no auth and
+    # the /auth/* routes aren't mounted — single-user deployments don't need
+    # to think about it. Flip on for any LAN/public exposure.
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""            # e.g. https://auth.example.com
+    oidc_client_id: str = ""
+    oidc_scopes: str = "openid email profile"
+    public_url: str = ""             # e.g. https://popping.example.com
+    session_secret: str = ""         # required when oidc_enabled (openssl rand -hex 32)
+    session_ttl_seconds: int = 28800  # 8 h
+    session_cookie_name: str = "popping_session"
+
     @property
     def database_url(self) -> str:
         return (

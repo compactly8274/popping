@@ -16,6 +16,9 @@ dependencies = [
     "apscheduler>=3.10",
     "httpx>=0.27",
     "feedparser>=6.0",
+    # OIDC (optional; only loaded when OIDC_ENABLED=true)
+    "authlib>=1.3",
+    "itsdangerous>=2.2",
 ]
 
 [build-system]

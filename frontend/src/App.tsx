@@ -6,7 +6,8 @@
 // with react-swipeable if gesture handling grows.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, type Entry, type Health, type Source } from './api'
+import { api, type CurrentUser, type Entry, type Health, type Source } from './api'
+import { AuthChip } from './components/AuthChip'
 import { Card } from './components/Card'
 import { Column } from './components/Column'
 import { Drawer } from './components/Drawer'
@@ -21,6 +22,8 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [mobileCol, setMobileCol] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [user, setUser] = useState<CurrentUser | null>(null)
+  const [oidcDisabled, setOidcDisabled] = useState(false)
   const touchStartX = useRef<number | null>(null)
 
   const sourcesById = useMemo(
@@ -51,6 +54,30 @@ export function App() {
       setError(null)
     } catch (err) {
       setError((err as Error).message)
+    }
+  }, [])
+
+  // Probe auth state once on mount. If /auth/me 404s, OIDC is disabled
+  // and we suppress the chip entirely. If 401, OIDC is enabled but the
+  // user isn't logged in — chip shows "Sign in". If 200, we're in.
+  useEffect(() => {
+    let cancelled = false
+    api.me()
+      .then((u) => {
+        if (cancelled) return
+        setUser(u)
+        setOidcDisabled(false)
+      })
+      .catch((err: Error) => {
+        if (cancelled) return
+        if (err.message.includes('404')) {
+          setOidcDisabled(true)
+        } else {
+          setOidcDisabled(true) // safer default than a broken "Sign in" button
+        }
+      })
+    return () => {
+      cancelled = true
     }
   }, [])
 
@@ -86,6 +113,7 @@ export function App() {
         >
           Refresh
         </button>
+        <AuthChip user={user} oidcDisabled={oidcDisabled} onChange={setUser} />
       </header>
 
       {error && (

@@ -1,6 +1,11 @@
 // Typed fetch wrappers for the Popping API.
 // In dev, Vite proxies /api -> backend; in production the frontend is
 // served from the same origin and the proxy is unnecessary.
+//
+// All requests send credentials: 'include' so the OIDC session cookie
+// (when enabled) rides along. Endpoints that don't need it ignore the
+// cookie; endpoints that gate on it (POST /api/ingest, /api/interactions
+// in phase 2) require it to be present.
 
 export interface Entry {
   id: number
@@ -37,11 +42,17 @@ export interface Health {
 }
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(url, init)
+  const resp = await fetch(url, { credentials: 'include', ...init })
   if (!resp.ok) {
     throw new Error(`${resp.status} ${resp.statusText} for ${url}`)
   }
   return resp.json() as Promise<T>
+}
+
+export interface CurrentUser {
+  sub: string
+  email: string
+  name: string
 }
 
 export const api = {
@@ -60,4 +71,19 @@ export const api = {
       `/api/ingest/${encodeURIComponent(sourceName)}`,
       { method: 'POST' },
     ),
+
+  // ---- Auth (only meaningful when OIDC is enabled on the backend) ----
+  /** Probe the current user. Returns the user, null (logged out), or
+   * throws a 404-shaped Error if OIDC isn't enabled on the backend. */
+  me: async (): Promise<CurrentUser | null> => {
+    const resp = await fetch('/auth/me', { credentials: 'include' })
+    if (resp.status === 401) return null
+    if (resp.status === 404) throw new Error('OIDC not enabled')
+    if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} for /auth/me`)
+    return resp.json() as Promise<CurrentUser>
+  },
+  /** Wipe the session cookie. Backend returns 204; we always succeed. */
+  logout: () => fetch('/auth/logout', { method: 'POST', credentials: 'include' }),
+  /** Build the OIDC login URL with a return path. Caller navigates. */
+  loginUrl: (returnTo: string = '/') => `/auth/login?return_to=${encodeURIComponent(returnTo)}`,
 }

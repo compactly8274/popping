@@ -34,7 +34,7 @@ logger = logging.getLogger("popping")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("popping starting (backend on %s:%d)", settings.backend_host, settings.backend_port)
+    logger.info("popping starting")
     await start_scheduler()
     try:
         yield
@@ -50,9 +50,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — phase 1 is single-origin, but the dev port may differ from the
-# production one. Loosening CORS here is fine because the backend binds
-# to 127.0.0.1 by default and isn't reachable from the public internet.
+# CORS — single-origin in production (frontend served from the same host
+# via Vite's dev proxy). The dev proxy makes /api/* same-origin so cookies
+# flow naturally; with `credentials` set on the fetch wrapper, the
+# session cookie rides on every API call.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,3 +66,11 @@ app.include_router(health_routes.router, prefix="/api")
 app.include_router(sources_routes.router, prefix="/api")
 app.include_router(entries_routes.router, prefix="/api")
 app.include_router(ingest_routes.router, prefix="/api")
+
+# Auth router is only mounted when OIDC is enabled — keeps single-user
+# deployments free of /auth/* routes entirely.
+if settings.oidc_enabled:
+    from app.auth.routes import router as auth_router
+
+    app.include_router(auth_router)
+    logger.info("OIDC auth enabled (issuer=%s)", settings.oidc_issuer)
