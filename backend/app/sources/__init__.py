@@ -69,4 +69,11 @@ def get_source(name: str) -> type["SourcePlugin"]:
 # plugin means adding one line here AND dropping the file in this package.
 # (We could scan the directory with pkgutil, but explicit is cheaper to
 # debug than implicit and the list stays short.)
-from app.sources import rss  # noqa: F401, E402
+from app.sources import (
+    cisa_kev,                # noqa: F401, E402
+    github_releases,         # noqa: F401, E402
+    hn,                      # noqa: F401, E402
+    nvd,                     # noqa: F401, E402
+    rss,                     # noqa: F401, E402
+    wikipedia_on_this_day,   # noqa: F401, E402
+)

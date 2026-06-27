@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     keepa_api_key: str = ""
     podcast_index_api_key: str = ""
     podcast_index_api_secret: str = ""
+    # Optional PAT for the github_releases source. Unauthenticated = 60 req/hr;
+    # with a PAT = 5000 req/hr. Recommended if you watch many repos.
+    github_token: str = ""
 
     # --- Notifications (phase 2+) -----------------------------------------
     pushover_user_key: str = ""

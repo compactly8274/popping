@@ -196,6 +196,41 @@ deletes expired rows.
 `OIDC_ISSUER=https://accounts.google.com`, create an OAuth client in
 Google Cloud Console with redirect URI `https://popping.example.com/auth/callback`.
 
+## Phase 3 — sources
+
+Six source plugins, all anonymous (no API keys required for the core
+set), all bot-tolerant. Categories:
+
+| Source                  | Category | Refresh | Notes |
+| ----------------------- | -------- | ------- | ----- |
+| BBC News                | `news`   | 1 h     | RSS; phase 3 fixed the User-Agent and switched to https |
+| Wikipedia On This Day   | `news`   | 12 h    | REST; today's historical events + curated anniversaries |
+| Hacker News top         | `tech`   | 5 min   | Firebase API; top 30 stories, score + comment count in meta |
+| GitHub releases         | `tech`   | 30 min  | 5 repos (python/cpython, nodejs/node, kubernetes/*, rust-lang/rust); ETag-cached |
+| NVD recent CVEs         | `vulns`  | 6 h     | NIST CVE 2.0 API; 7-day rolling window of published CVEs |
+| CISA KEV                | `vulns`  | 6 h     | Known Exploited Vulnerabilities catalog; dateAdded as the published_at |
+
+The scheduler runs an immediate fetch per source on startup, so the
+dashboard populates within ~30 seconds of the first boot. Each source
+ingests independently — a GitHub rate-limit or NVD maintenance window
+won't block the others.
+
+To add a repo to the GitHub source, edit `backend/app/sources/github_releases.py`
+and add to `_DEFAULT_REPOS`. To add an authenticated token for higher
+rate limits, set `GITHUB_TOKEN` in `.env`.
+
+**BBC fix.** Phase 1's RSS fetcher sent `User-Agent: popping/0.1` over
+`http://`. Several RSS providers (BBC since 2024, Reddit, etc.) throttle
+or 403 the default `python-httpx` UA. Phase 3 ships a descriptive UA
+and an explicit `Accept: application/rss+xml, application/atom+xml, …`
+header, which is enough to get past those filters without any
+unconventional headers.
+
+Sources intentionally deferred to a later phase: RedFlagDeals (rate-limit
+sensitive), ESPN (sport-specific endpoints), YouTube RSS (channel
+resolution), Reddit / Mastodon (privacy-policy noise), Podcast Index
+and Keepa (API keys + tier-specific endpoints).
+
 ## Adding a new source plugin
 
 1. Create `backend/app/sources/<name>.py`:
@@ -326,9 +361,14 @@ just without the vector signal.
 │       ├── llm/               # provider abstraction (Anthropic / OpenAI / Groq / Ollama)
 │       ├── scoring/           # recency (per-category) + source + personal + composite
 │       ├── sources/
-│       │   ├── base.py        # SourcePlugin ABC
-│       │   ├── rss.py         # BBC News (the only built-in)
-│       │   └── __init__.py    # @register_source + plugin discovery
+│       │   ├── base.py            # SourcePlugin ABC
+│       │   ├── rss.py             # BBC News (phase 1; phase 3: UA + https fix)
+│       │   ├── hn.py              # Hacker News top stories
+│       │   ├── github_releases.py # GitHub releases (5 repos, ETag-cached)
+│       │   ├── nvd.py             # NVD recent CVEs (7-day rolling)
+│       │   ├── cisa_kev.py        # CISA Known Exploited Vulnerabilities
+│       │   ├── wikipedia_on_this_day.py  # Wikipedia On This Day events
+│       │   └── __init__.py        # @register_source + plugin discovery
 │       └── routes/
 │           ├── health.py
 │           ├── sources.py
@@ -354,15 +394,16 @@ just without the vector signal.
 
 ## Phase roadmap
 
-- **Phase 1** (this commit): scaffold, schema, one RSS source, minimal UI. ✅
+- **Phase 1**: scaffold, schema, one RSS source, minimal UI. ✅
 - **Phase 2**: composite scoring engine, sentence-transformers embeddings,
   LLM provider abstraction, For You feed with convergence boost. ✅
-- **Phase 3**: more source plugins — RedFlagDeals, NVD, CISA KEV, ESPN,
-  YouTube RSS, Podcast Index, Keepa, GitHub releases, Wikipedia On This
-  Day, HN, Mastodon. Interaction-recording UI, source-weight tuner.
+- **Phase 3**: six source plugins — BBC, Wikipedia On This Day, Hacker
+  News, GitHub releases (5 repos), NVD CVEs, CISA KEV. BBC RSS fetcher
+  fixed (proper User-Agent + https). New `tech` and `vulns` categories.
+  ✅
 - **Phase 4**: notifications (Pushover/Apprise), The Brief generator,
-  settings drawer, dead-feed detection, dedup, converging-story
-  detection.
+  settings drawer (followed categories, source weights), dead-feed
+  detection, dedup, converging-story detection.
 
 ## Environment variables
 

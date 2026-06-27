@@ -1,4 +1,4 @@
-"""RSS feed source — phase 1's single working source.
+"""RSS feed source — phase 1's first source, phase 3 widens it.
 
 Fetches any RSS / Atom feed via feedparser-over-httpx. Concrete plugins
 are instantiated at module load via the `@register_source` decorator;
@@ -6,6 +6,11 @@ the scheduler picks them up by name from `list_sources()`.
 
 BBC News is the default source: no auth, stable URL, exercises the
 ingestion path end-to-end.
+
+User-Agent note: many feeds (BBC since 2024, Reddit, etc.) throttle
+or 403 the default `python-httpx` UA. We send a descriptive UA and
+an Accept header that explicitly asks for RSS/Atom — both cheap and
+uncontroversial.
 """
 
 from __future__ import annotations
@@ -18,6 +23,16 @@ import httpx
 
 from app.sources import register_source
 from app.sources.base import SourcePlugin
+
+_USER_AGENT = "Popping/0.2 (+https://github.com/compactly8274/popping)"
+_ACCEPT = (
+    "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8"
+)
+
+_DEFAULT_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Accept": _ACCEPT,
+}
 
 
 def _parse_published(entry: Any) -> dt.datetime | None:
@@ -37,7 +52,7 @@ class _RssPlugin(SourcePlugin):
 
     async def fetch(self) -> list[dict]:
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            resp = await client.get(self.url, headers={"User-Agent": "popping/0.1"})
+            resp = await client.get(self.url, headers=_DEFAULT_HEADERS)
             resp.raise_for_status()
         feed = feedparser.parse(resp.text)
         items: list[dict] = []
@@ -56,5 +71,5 @@ class _RssPlugin(SourcePlugin):
 @register_source
 class BbcNews(_RssPlugin):
     name = "bbc_news"
-    url = "http://feeds.bbci.co.uk/news/rss.xml"
+    url = "https://feeds.bbci.co.uk/news/rss.xml"
     refresh_interval_seconds = 3600  # 1 hour

@@ -4,10 +4,11 @@ Returns a score in [0, 100]. 100 = just published; 0 = several half-lives
 old. Phase 2 uses a half-life per category so different verticals age at
 different rates:
 
-  - news/vulns      6h   (freshness matters; old news is stale)
-  - deals           48h  (deal posts are evergreen — they don't age out)
-  - sports          3h   (results have very short relevance)
-  - everything else 12h  (sensible default for repos, podcasts, etc.)
+  - news/vulns      6h    (freshness matters; old news is stale)
+  - deals           48h   (deal posts are evergreen — they don't age out)
+  - sports          3h    (results have very short relevance)
+  - tech            12h   (HN, GitHub releases — fast refresh keeps them current)
+  - everything else 12h   (sensible default)
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ _HALF_LIFE_HOURS = {
     "vulns": 6.0,
     "deals": 48.0,
     "sports": 3.0,
+    "tech": 12.0,
 }
 _DEFAULT_HALF_LIFE_HOURS = 12.0
 
