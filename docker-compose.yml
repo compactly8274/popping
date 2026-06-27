@@ -6,7 +6,7 @@ name: popping
 #
 # Port surface:
 #   - frontend:   the only published port. LAN-reachable by default on
-#                 0.0.0.0:4789 (set POPPING_FRONTEND_PORT to override;
+#                 0.0.0.0:14789 (set POPPING_FRONTEND_PORT to override;
 #                 container port stays at 5173 — Vite default).
 #                 Front this with a reverse proxy for TLS.
 #   - backend:    not published. Reachable only via the frontend's
@@ -72,7 +72,7 @@ services:
     ports:
       # Container port is fixed at 5173 (Vite default baked into the image);
       # only the host-side port is configurable via POPPING_FRONTEND_PORT.
-      - "${POPPING_FRONTEND_HOST:-0.0.0.0}:${POPPING_FRONTEND_PORT:-4789}:5173"
+      - "${POPPING_FRONTEND_HOST:-0.0.0.0}:${POPPING_FRONTEND_PORT:-14789}:5173"
 
 volumes:
   pgdata:
