@@ -62,6 +62,13 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Single platform only — keeps the published manifest a plain
+          # Docker v2 manifest, not an OCI image index. GHCR returns 404
+          # on OCI image indexes to clients that don't include the OCI
+          # index accept header (which plain `docker pull` does not),
+          # and that breaks anonymous `docker compose pull`.
+          platforms: linux/amd64
+          provenance: false
           cache-from: type=gha,scope=popping-backend
           cache-to: type=gha,mode=max,scope=popping-backend
 
@@ -101,5 +108,10 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # See backend job: single-platform + no provenance keeps the
+          # published manifest a plain Docker v2 manifest that anonymous
+          # `docker pull` can read.
+          platforms: linux/amd64
+          provenance: false
           cache-from: type=gha,scope=popping-frontend
           cache-to: type=gha,mode=max,scope=popping-frontend
