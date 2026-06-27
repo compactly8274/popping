@@ -29,6 +29,10 @@ export function App() {
   // users on a hard refresh.
   const [authProbed, setAuthProbed] = useState(false)
   const [oidcDisabled, setOidcDisabled] = useState(false)
+  // When set, the dashboard shows only entries from this source. Set
+  // by tapping a source in the Drawer; cleared by tapping the same
+  // source again or the "clear filter" pill.
+  const [sourceFilter, setSourceFilter] = useState<string | null>(null)
   const touchStartX = useRef<number | null>(null)
 
   const sourcesById = useMemo(
@@ -56,7 +60,7 @@ export function App() {
       // we already routed them to LoginPage in that case, so this only
       // runs for signed-in users. Tolerate 401 anyway for safety.
       const [e, s, h, fy] = await Promise.all([
-        api.entries({ limit: 200 }),
+        api.entries({ limit: 200, source: sourceFilter ?? undefined }),
         api.sources(),
         api.health(),
         api.forYou({ limit: 25 }).catch(() => [] as Entry[]),
@@ -69,7 +73,7 @@ export function App() {
     } catch (err) {
       setError((err as Error).message)
     }
-  }, [])
+  }, [sourceFilter])
 
   // Probe auth state once on mount. If /auth/me 404s, OIDC is disabled —
   // we stay in single-user mode (no login screen). If 200 or 401, OIDC
@@ -154,6 +158,20 @@ export function App() {
         </div>
       )}
 
+      {sourceFilter && (
+        <div className="px-4 py-2 border-b border-slate-800 bg-slate-900 flex items-center gap-2 text-sm">
+          <span className="text-slate-400">Filtering by source:</span>
+          <span className="rounded bg-slate-800 px-2 py-0.5 text-slate-200">{sourceFilter}</span>
+          <button
+            onClick={() => setSourceFilter(null)}
+            className="ml-auto rounded px-2 py-0.5 text-slate-400 hover:text-slate-100 hover:bg-slate-800"
+            aria-label="clear source filter"
+          >
+            clear ✕
+          </button>
+        </div>
+      )}
+
       <ForYou entries={forYou} sourcesById={sourcesById} />
 
       {/* Desktop: grid */}
@@ -199,7 +217,13 @@ export function App() {
         )}
       </main>
 
-      <Drawer open={drawerOpen} onClose={() => setDrawerOpen(false)} categories={categories} />
+      <Drawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        categories={categories}
+        sourceFilter={sourceFilter}
+        onSourceSelect={setSourceFilter}
+      />
     </div>
   )
 }

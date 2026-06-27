@@ -1,6 +1,6 @@
-// Slide-in drawer. Lists the category columns. Settings (source
-// management, followed categories, source weights) is still a future
-// phase — for now it lists categories and a brief source registry.
+// Slide-in drawer. Lists the category columns and the registered
+// sources. Tapping a source filters the dashboard to that source's
+// entries and closes the drawer.
 
 import { useEffect, useState } from 'react'
 import { api, type Source } from '../api'
@@ -9,9 +9,11 @@ type Props = {
   open: boolean
   onClose: () => void
   categories: string[]
+  sourceFilter: string | null
+  onSourceSelect: (name: string | null) => void
 }
 
-export function Drawer({ open, onClose, categories }: Props) {
+export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect }: Props) {
   const [sources, setSources] = useState<Source[]>([])
 
   useEffect(() => {
@@ -54,12 +56,27 @@ export function Drawer({ open, onClose, categories }: Props) {
               <p className="text-xs text-slate-500 italic">loading…</p>
             ) : (
               <ul className="space-y-1">
-                {sources.map((s) => (
-                  <li key={s.id} className="rounded px-2 py-1 text-sm text-slate-200 hover:bg-slate-800 flex items-center justify-between">
-                    <span>{s.name}</span>
-                    <span className="text-xs text-slate-500">{s.category}</span>
-                  </li>
-                ))}
+                {sources.map((s) => {
+                  const active = s.name === sourceFilter
+                  return (
+                    <li key={s.id}>
+                      <button
+                        onClick={() => {
+                          onSourceSelect(active ? null : s.name)
+                          onClose()
+                        }}
+                        className={`w-full text-left rounded px-2 py-1 text-sm flex items-center justify-between transition ${
+                          active
+                            ? 'bg-slate-700 text-white'
+                            : 'text-slate-200 hover:bg-slate-800'
+                        }`}
+                      >
+                        <span>{s.name}</span>
+                        <span className="text-xs text-slate-500">{s.category}</span>
+                      </button>
+                    </li>
+                  )
+                })}
               </ul>
             )}
           </div>
