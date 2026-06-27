@@ -72,18 +72,22 @@ class Embedder:
             logger.info("embeddings disabled (EMBEDDING_ENABLED=false); skipping load")
             self._loaded = True  # mark so we don't try again
             return
-        # Lazy import — sentence-transformers pulls in torch + transformers
-        # which are heavy; we want them loaded only when actually enabled.
-        from sentence_transformers import SentenceTransformer
-
         loop = asyncio.get_running_loop()
         # Loading is CPU + disk bound; run in the default executor.
+        # The actual sentence_transformers import lives inside _load_sync
+        # so the binding is in scope on the worker thread.
         await loop.run_in_executor(None, self._load_sync, settings.embedding_model)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
         self._loaded = True
         logger.info("embedding model loaded: %s (dim=%d)", settings.embedding_model, self._dim)
 
     def _load_sync(self, model_name: str) -> None:
+        # Import inside the worker so the binding is in scope (executors
+        # run on separate threads — a name bound in ``load()`` isn't
+        # visible here). Also keeps the heavy torch+transformers import
+        # off the import path.
+        from sentence_transformers import SentenceTransformer
+
         # ``device='cpu'`` is the explicit default but pinned here so a
         # GPU-enabled torch install doesn't try to claim VRAM we don't have.
         self._model = SentenceTransformer(model_name, device="cpu")
