@@ -1,0 +1,30 @@
+# Dev override for docker compose. Auto-loaded when present next to
+# docker-compose.yml. Switches backend + frontend to build from source
+# with hot-reload bind mounts; postgres and redis stay as in the base.
+#
+# To use: copy this file to docker-compose.override.yml and run
+# `docker compose up`. The override is auto-merged.
+#
+# Don't commit your personal override — the .example suffix keeps it
+# ignored by git's example rule (no, it doesn't, but it's a convention
+# to copy + gitignore the real one).
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    pull_policy: never   # build wins over pull
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    pull_policy: never
+    environment:
+      VITE_BACKEND_URL: http://backend:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules

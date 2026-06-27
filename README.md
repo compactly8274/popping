@@ -6,14 +6,36 @@ Personal AI-ranked intelligence dashboard. Aggregates deals, vulnerabilities, ne
 
 ## Quickstart
 
+**Prebuilt images (production, no build step):**
+
 ```bash
 cp .env.example .env             # defaults work out of the box
-docker compose up -d --build
+docker compose up -d             # pulls ghcr.io/compactly8274/popping-{backend,frontend}:latest
 open http://127.0.0.1:5173       # frontend
 curl http://127.0.0.1:8000/api/health   # backend
 ```
 
 The first boot runs `alembic upgrade head` against a fresh postgres volume, so the schema is created automatically. The scheduler then fires one immediate fetch per plugin and re-fetches every `refresh_interval_seconds`.
+
+**Local dev with hot-reload (build from source):**
+
+```bash
+cp .env.example .env
+cp docker-compose.override.yml.example docker-compose.override.yml
+docker compose up -d --build     # builds from ./backend and ./frontend, bind-mounts source
+```
+
+The override is auto-loaded by `docker compose up` and only adds `build:` + bind mounts; postgres and redis stay pulled.
+
+**Pin to a specific build:**
+
+```bash
+# In .env:
+POPPING_IMAGE_TAG=sha-50af121    # exact commit
+# or
+POPPING_IMAGE_TAG=pr-3           # test a PR
+POPPING_PULL_POLICY=always       # force a fresh pull
+```
 
 ## Architecture
 
