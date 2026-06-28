@@ -96,32 +96,52 @@ def _pick_image_url(entry: Any) -> str | None:
     return None
 
 
+async def fetch_rss(url: str) -> list[dict]:
+    """Fetch and parse any RSS/Atom feed at ``url``.
+
+    Module-level helper so the class-driven ``_RssPlugin`` and the
+    row-driven ``DynamicRssPlugin`` (see ``dynamic_rss.py``) share
+    the same parsing logic. Image picking uses the same priority as
+    the BBC plugin: media:thumbnail → media:content (image/*) →
+    enclosure (image/*) → itunes:image → first <img src> in summary.
+    No DB / scheduler awareness here — this is a pure HTTP→list[dict]
+    function that the scheduler's ``_ingest`` consumes through the
+    plugin's ``fetch()`` method.
+    """
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        resp = await client.get(url, headers=_DEFAULT_HEADERS)
+        resp.raise_for_status()
+    feed = feedparser.parse(resp.text)
+    items: list[dict] = []
+    for entry in feed.entries:
+        image_url = _pick_image_url(entry)
+        items.append(
+            {
+                "title": entry.get("title", ""),
+                "url": entry.get("link", ""),
+                "published_at": _parse_published(entry),
+                "summary": entry.get("summary", ""),
+                # Top-level so the ingest pipeline can pop it out of
+                # meta cleanly. NULL when the feed ships no image.
+                "image_url": image_url,
+            }
+        )
+    return items
+
+
 class _RssPlugin(SourcePlugin):
-    """Generic RSS/Atom fetcher. Subclasses set name/url/refresh."""
+    """Generic RSS/Atom fetcher. Subclasses set name/url/refresh.
+
+    Thin wrapper around ``fetch_rss`` so the class-driven plugins
+    (BBC today; future built-ins if any) and the row-driven
+    ``DynamicRssPlugin`` share one implementation.
+    """
 
     type = "rss"
     category = "news"
 
     async def fetch(self) -> list[dict]:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            resp = await client.get(self.url, headers=_DEFAULT_HEADERS)
-            resp.raise_for_status()
-        feed = feedparser.parse(resp.text)
-        items: list[dict] = []
-        for entry in feed.entries:
-            image_url = _pick_image_url(entry)
-            items.append(
-                {
-                    "title": entry.get("title", ""),
-                    "url": entry.get("link", ""),
-                    "published_at": _parse_published(entry),
-                    "summary": entry.get("summary", ""),
-                    # Top-level so the ingest pipeline can pop it out of
-                    # meta cleanly. NULL when the feed ships no image.
-                    "image_url": image_url,
-                }
-            )
-        return items
+        return await fetch_rss(self.url)
 
 
 @register_source

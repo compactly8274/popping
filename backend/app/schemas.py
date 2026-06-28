@@ -29,6 +29,42 @@ class SourceOut(BaseModel):
         from_attributes = True
 
 
+class SourceCreate(BaseModel):
+    """Body for ``POST /api/sources``. All fields required except
+    ``refresh_interval_seconds`` (defaults to 1h).
+
+    The route layer validates ``name`` against ``^[a-z0-9_]{1,120}$``
+    and ``url`` against an http/https URL parse — clients get a 422
+    with a clear field-level error before any DB write.
+    """
+    name: str
+    type: str = "rss"
+    category: str
+    url: str
+    refresh_interval_seconds: int = 3600
+
+
+class SourceUpdate(BaseModel):
+    """Body for ``PATCH /api/sources/{id}``. All fields optional —
+    missing fields are left untouched. ``url`` and ``name`` are
+    deliberately not exposed: changing them invalidates the cached
+    favicon and thumbnail and would require a "re-cache" hook. The
+    user-facing path is delete + recreate."""
+    refresh_interval_seconds: Optional[int] = None
+    active: Optional[bool] = None
+    category: Optional[str] = None
+
+
+class FeedRecommendation(BaseModel):
+    """One row of ``GET /api/feed-recommendations``. The frontend
+    renders the ``name`` + ``blurb`` and shows the ``url`` only on
+    demand (e.g. long-press / copy-link)."""
+    name: str
+    category: str
+    url: str
+    blurb: str
+
+
 class EntryOut(BaseModel):
     id: int
     source_id: int

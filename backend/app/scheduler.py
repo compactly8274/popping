@@ -43,6 +43,7 @@ from app.notify import Notifier
 from app.scoring import composite as composite_scorer
 from app.scoring import recency
 from app.sources import list_sources
+from app.sources.dynamic_rss import DynamicRssPlugin
 
 logger = logging.getLogger("popping.scheduler")
 
@@ -519,6 +520,16 @@ async def start_scheduler(notifier: Optional[Notifier] = None) -> AsyncIOSchedul
             coalesce=True,
         )
 
+    # Phase 5: register scheduler jobs for ``Source`` rows that don't
+    # have a backing plugin class. Today the only such shape is
+    # ``type="rss"`` (served by ``DynamicRssPlugin``); future phases
+    # will add ``podcast`` and ``youtube_channel`` and the dispatcher
+    # below will pick the right plugin class per row.
+    try:
+        await _register_dynamic_source_jobs(_scheduler, plugins)
+    except Exception:
+        logger.exception("scheduler: dynamic-source walk failed — continuing with class-driven sources only")
+
     # Periodic session purge. Runs whenever the scheduler is up; cheap when
     # there's nothing to delete (a single DELETE … WHERE expires_at <= now()).
     _scheduler.add_job(
@@ -600,3 +611,246 @@ async def backfill_now() -> dict:
     """Run the embedding backfill once on demand (e.g. from a debug endpoint)."""
     await _backfill_embeddings()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: dynamic source rows
+# ---------------------------------------------------------------------------
+#
+# ``Source`` rows whose ``name`` is not in the registered plugin
+# registry are "dynamic" — they have no class backing them and need a
+# runtime-constructed plugin to be fetched. Today this only covers
+# ``type="rss"`` (served by ``DynamicRssPlugin``); Phase 6 will add
+# ``type="podcast"``, Phase 7 ``type="youtube_channel"``. Both will
+# land as their own ``_plugin_for(row)`` branch below.
+#
+# Each dynamic row gets its own scheduler job keyed by
+# ``ingest:dynamic:{row.id}``. This id is what the routes use to
+# reschedule / remove the job on PATCH / DELETE.
+
+# Stable id prefix so callers don't have to know the format. Mirrors
+# ``ingest:<name>`` used for class-driven sources — different prefix
+# (``dynamic:``) so a ``name`` collision with a registered plugin
+# name can't mask the class-driven job, and so ``reschedule_job`` /
+# ``remove_job`` know they're talking about a row, not a class.
+_DYNAMIC_JOB_PREFIX = "ingest:dynamic:"
+
+
+def _dynamic_job_id(row_id: int) -> str:
+    return f"{_DYNAMIC_JOB_PREFIX}{row_id}"
+
+
+def _plugin_for(row: Source) -> SourcePlugin | None:
+    """Dispatch a ``Source`` row to the right plugin instance.
+
+    Returns ``None`` for ``type`` values we don't handle yet (a
+    no-op skip; the row stays in the DB but doesn't fetch). Logs a
+    debug message so misconfigurations are visible without being
+    noisy.
+    """
+    if row.type == "rss":
+        return DynamicRssPlugin(row)
+    # Phase 6/7 will add ``podcast`` and ``youtube_channel`` here.
+    logger.debug(
+        "scheduler: no plugin for source %s (id=%d, type=%s) — skipping",
+        row.name, row.id, row.type,
+    )
+    return None
+
+
+def _add_or_replace_dynamic_job(scheduler: Any, row: Source) -> bool:
+    """Register (or replace) the scheduler job for a dynamic row.
+
+    Returns True if a job was registered, False if the row's type
+    has no plugin yet. ``replace_existing=True`` so PATCH refresh-
+    interval changes take effect without first removing the job.
+    """
+    plugin = _plugin_for(row)
+    if plugin is None:
+        return False
+    scheduler.add_job(
+        _ingest,
+        trigger=IntervalTrigger(seconds=row.refresh_interval_seconds),
+        args=[plugin],
+        id=_dynamic_job_id(row.id),
+        name=f"Ingest {row.name} (dynamic)",
+        replace_existing=True,
+        next_run_time=dt.datetime.now(dt.timezone.utc),
+        max_instances=1,
+        coalesce=True,
+    )
+    logger.info(
+        "scheduler: registered dynamic source id=%d name=%s interval=%ds",
+        row.id, row.name, row.refresh_interval_seconds,
+    )
+    return True
+
+
+async def _register_dynamic_source_jobs(scheduler: Any, plugins: dict[str, Any]) -> None:
+    """Startup walk: register a job for every ``Source`` row whose
+    ``name`` is not in the registered plugin registry and whose
+    ``active`` is True. Idempotent — APScheduler's
+    ``replace_existing=True`` makes a second startup a no-op for
+    jobs already registered.
+
+    Disabled rows (``active=False``) are skipped; their job doesn't
+    exist and the scheduler won't fetch from them. Re-enabling via
+    PATCH goes through ``update_source`` which adds the job back.
+    """
+    registered_names = set(plugins.keys())
+    async with SessionLocal() as session:
+        rows = (
+            await session.scalars(
+                select(Source).where(Source.active == True)  # noqa: E712
+            )
+        ).all()
+    dynamic = [r for r in rows if r.name not in registered_names]
+    if not dynamic:
+        logger.info("scheduler: no dynamic source rows to register")
+        return
+    registered_count = 0
+    for row in dynamic:
+        if _add_or_replace_dynamic_job(scheduler, row):
+            registered_count += 1
+    logger.info(
+        "scheduler: registered %d dynamic source(s) out of %d candidate row(s)",
+        registered_count, len(dynamic),
+    )
+
+
+async def add_source(
+    session: AsyncSession,
+    *,
+    name: str,
+    type_: str,
+    category: str,
+    url: str,
+    refresh: int,
+) -> Source:
+    """Create a Source row and register its scheduler job.
+
+    Idempotent on ``name``: if a row with the same name already
+    exists, returns it without modification. This matches the
+    class-driven upsert in ``_upsert_source`` and lets the POST
+    endpoint safely retry without raising 409.
+
+    The scheduler is a module-level singleton; if it isn't running
+    (e.g. during tests) the row is still created and will be picked
+    up on the next ``start_scheduler`` walk.
+    """
+    existing = await session.scalar(select(Source).where(Source.name == name))
+    if existing is not None:
+        return existing
+    row = Source(
+        name=name,
+        type=type_,
+        category=category,
+        url=url,
+        refresh_interval_seconds=refresh,
+        active=True,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    if _scheduler is not None:
+        _add_or_replace_dynamic_job(_scheduler, row)
+    return row
+
+
+async def update_source(
+    session: AsyncSession,
+    source_id: int,
+    *,
+    refresh: int | None = None,
+    active: bool | None = None,
+    category: str | None = None,
+) -> Source | None:
+    """Apply a partial update to a Source row and reschedule if needed.
+
+    Returns the updated row, or None if no row exists with that id.
+
+    Only fields the Phase 5 UI exposes are accepted. ``name`` /
+    ``url`` changes would invalidate the favicon cache and aren't
+    supported — the UI points users to delete + recreate.
+
+    Scheduler effects:
+      - ``active`` False → remove the dynamic job. A class-driven
+        source (``name in list_sources()``) is left alone; the
+        class-driven job continues independently of the row.
+      - ``active`` True or ``refresh`` change → re-add the dynamic
+        job with the new trigger (``replace_existing=True`` handles
+        idempotency).
+    """
+    row = await session.get(Source, source_id)
+    if row is None:
+        return None
+    refresh_changed = (
+        refresh is not None and refresh != row.refresh_interval_seconds
+    )
+    active_changed = active is not None and active != row.active
+    category_changed = category is not None and category != row.category
+    if not (refresh_changed or active_changed or category_changed):
+        return row
+    if refresh is not None:
+        row.refresh_interval_seconds = refresh
+    if active is not None:
+        row.active = active
+    if category is not None:
+        row.category = category
+    await session.commit()
+    await session.refresh(row)
+
+    if _scheduler is None:
+        return row
+
+    # Class-driven sources (BBC, etc.) own their scheduler job via the
+    # plugin registry — touching it here would be wrong. Only manage
+    # dynamic jobs. ``list_sources()`` is module-level; safe to call
+    # without awaiting.
+    registered_names = set(list_sources().keys())
+    if row.name in registered_names:
+        return row
+
+    if active is False:
+        # Disabled — remove the job if it exists. ``remove_job``
+        # raises if the id doesn't exist; catch so the caller still
+        # gets a successful row update.
+        try:
+            _scheduler.remove_job(_dynamic_job_id(row.id))
+            logger.info("scheduler: removed dynamic job for %s (id=%d)", row.name, row.id)
+        except Exception:
+            pass
+        return row
+
+    # Re-add (covers: enabled, refresh changed, or both).
+    _add_or_replace_dynamic_job(_scheduler, row)
+    return row
+
+
+async def delete_source(session: AsyncSession, source_id: int) -> bool:
+    """Drop a Source row and its scheduler job. Returns True if a
+    row was deleted.
+
+    Class-driven sources (BBC etc.) should not reach here — the
+    route layer rejects DELETE for those with a 400 before calling.
+    We double-check the registry so a future caller that bypasses
+    the route can't accidentally nuke a built-in row.
+    """
+    row = await session.get(Source, source_id)
+    if row is None:
+        return False
+    name = row.name
+    registered_names = set(list_sources().keys())
+    if name in registered_names:
+        # Defensive: refuse here too. The route's 400 is the
+        # user-facing check; this guard catches programmatic callers.
+        raise ValueError(f"refusing to delete built-in source {name!r}")
+    await session.delete(row)
+    await session.commit()
+    if _scheduler is not None:
+        try:
+            _scheduler.remove_job(_dynamic_job_id(source_id))
+            logger.info("scheduler: removed dynamic job for %s (id=%d)", name, source_id)
+        except Exception:
+            pass
+    return True

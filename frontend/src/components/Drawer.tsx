@@ -24,6 +24,7 @@ import {
   type SettingsOut,
   type Source,
 } from '../api'
+import { FeedManager } from './FeedManager'
 
 type Props = {
   open: boolean
@@ -40,6 +41,9 @@ type Props = {
   // brief now" stays in sync with the BriefCard pills.
   briefTone: 'terse' | 'narrative' | 'alert'
   onBriefToneChange: (next: 'terse' | 'narrative' | 'alert') => void
+  // Phase 5: FeedManager errors flow up to App's red banner for
+  // a single, consistent error surface.
+  onError: (msg: string) => void
 }
 
 // Whitelist mirrors backend ``_VALID_PROVIDERS``. Includes a sentinel
@@ -72,6 +76,7 @@ export function Drawer({
   onCategoryJump,
   briefTone,
   onBriefToneChange,
+  onError,
 }: Props) {
   const [sources, setSources] = useState<Source[]>([])
   const [sourcesError, setSourcesError] = useState<string | null>(null)
@@ -84,9 +89,9 @@ export function Drawer({
 
   // Each fetch function is its own retry-able handler. Storing them
   // as ``useCallback`` so the chip can call them directly on tap.
-  const refetchSources = () => {
+  const refetchSources = (): Promise<void> => {
     setSourcesError(null)
-    api.sources().then(setSources).catch((err) => {
+    return api.sources().then(setSources).catch((err) => {
       setSources([])
       setSourcesError((err as Error).message)
     })
@@ -245,7 +250,17 @@ export function Drawer({
             </ul>
           </div>
           <div className="pt-4 border-t border-slate-800">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Sources</h3>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Feeds</h3>
+            <FeedManager
+              sources={sources}
+              onRefresh={refetchSources}
+              onError={onError}
+            />
+          </div>
+          <div className="pt-4 border-t border-slate-800">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
+              Sources <span className="text-slate-600 normal-case font-normal">— tap to filter</span>
+            </h3>
             {sourcesError ? (
               <button
                 onClick={refetchSources}

@@ -721,6 +721,7 @@ export function App() {
         onCategoryJump={jumpToCategory}
         briefTone={briefTone}
         onBriefToneChange={setBriefTone}
+        onError={setError}
       />
 
       <ToastHost />

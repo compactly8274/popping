@@ -158,6 +158,53 @@ export const api = {
     return jsonFetch<Entry[]>(`/api/entries${q ? `?${q}` : ''}`)
   },
   sources: () => jsonFetch<Source[]>('/api/sources'),
+
+  // ---- Phase 5: feed onboarding + recommendations ----
+  /** Create a dynamic source row. Backend validates name regex +
+   * url parse + refresh clamp + accepts type='rss' only. The
+   * scheduler registers an ingest job for the new row immediately. */
+  createSource: (body: {
+    name: string
+    type?: string
+    category: string
+    url: string
+    refresh_interval_seconds?: number
+  }) =>
+    jsonFetch<Source>('/api/sources', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  /** Partial update of a source. All fields optional. URL/name
+   * changes are intentionally not exposed — delete + recreate. */
+  updateSource: (
+    id: number,
+    body: { refresh_interval_seconds?: number; active?: boolean; category?: string },
+  ) =>
+    jsonFetch<Source>(`/api/sources/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  /** Drop a dynamic source row + its scheduler job. 400 if the row
+   * is a built-in (BBC, HN, etc.). */
+  deleteSource: (id: number) =>
+    fetch(`/api/sources/${id}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    }).then((resp) => {
+      if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} for /api/sources/${id}`)
+    }),
+  /** Curated list of feeds the user might want to add, minus any
+   * they already have. Phase 5 is static; Phase 8 re-ranks by
+   * co-engagement. */
+  feedRecommendations: () => jsonFetch<Array<{
+    name: string
+    category: string
+    url: string
+    blurb: string
+  }>>('/api/feed-recommendations'),
+
   /** Personal top-N feed. Requires auth when OIDC is enabled; local
    * bypass users always pass through. */
   forYou: (opts?: { limit?: number; category?: string }) => {
