@@ -24,6 +24,31 @@ type Props = {
 // other UI keys; no schema version because it's a bare boolean.
 const COLLAPSED_KEY = 'brief.collapsed'
 
+// Strip a small set of markdown emphasis chars (``*``, ``_``, ``#``,
+// backtick) from the start and end of a line so the parser still
+// recognises section headers when the LLM bolds or otherwise marks
+// them up. We deliberately don't pull in a markdown library — the
+// brief format is fixed and we only need to tolerate a handful of
+// mistakes that the backend prompt asks the model not to make.
+const EMPHASIS_CHARS_RE = /^[\s*_`#]+|[\s*_`#]+$/g
+function stripEmphasis(line: string): string {
+  return line.replace(EMPHASIS_CHARS_RE, '')
+}
+
+// Strip inline markdown emphasis from a list item body. Handles
+// ``**bold**``, ``__bold__``, ``*italic*``, ``_italic_``, and lone
+// ```` ` `` `` (backtick). Code spans (``code``) are dropped entirely
+// rather than rendered with stray backticks.
+const INLINE_EMPHASIS_RE = /(\*\*|__)(.*?)\1/g
+const INLINE_ITALIC_RE = /(\*|_)(.*?)\1/g
+const INLINE_CODE_RE = /`([^`]*)`/g
+function stripInlineEmphasis(text: string): string {
+  return text
+    .replace(INLINE_EMPHASIS_RE, '$2')
+    .replace(INLINE_ITALIC_RE, '$2')
+    .replace(INLINE_CODE_RE, '$1')
+}
+
 type Parsed = {
   oneSentence: string
   highlights: string[]
@@ -40,7 +65,13 @@ function parse(content: string): Parsed {
   }
   let bucket: 'none' | 'one' | 'high' | 'watch' | 'rest' = 'none'
   for (const raw of content.split(/\r?\n/)) {
-    const line = raw.trim()
+    // Strip leading/trailing markdown emphasis chars so ``**TODAY IN
+    // ONE SENTENCE**`` and ``# TODAY IN ONE SENTENCE`` still match the
+    // header regexes below. The bucket transitions happen on the
+    // stripped form, but the line content we accumulate is the
+    // stripped version too — otherwise ``**headline** — why`` would
+    // render with literal asterisks in the dashboard.
+    const line = stripEmphasis(raw.trim())
     if (/^TODAY IN ONE SENTENCE/i.test(line)) {
       bucket = 'one'
       continue
@@ -61,14 +92,14 @@ function parse(content: string): Parsed {
       out.oneSentence = (out.oneSentence ? out.oneSentence + ' ' : '') + line
       bucket = 'rest'
     } else if (bucket === 'high' && line.startsWith('-')) {
-      out.highlights.push(line.slice(1).trim())
+      out.highlights.push(stripInlineEmphasis(line.slice(1).trim()))
     } else if (bucket === 'watch' && line.startsWith('-')) {
-      out.watch.push(line.slice(1).trim())
+      out.watch.push(stripInlineEmphasis(line.slice(1).trim()))
     } else if (bucket === 'high' || bucket === 'watch') {
       // Section header detected but no dash — keep accumulating into the
       // first matching list.
-      if (bucket === 'high') out.highlights.push(line)
-      else out.watch.push(line)
+      if (bucket === 'high') out.highlights.push(stripInlineEmphasis(line))
+      else out.watch.push(stripInlineEmphasis(line))
     } else {
       out.remainder = out.remainder ? out.remainder + '\n' + line : line
     }

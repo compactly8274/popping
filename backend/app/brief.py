@@ -42,6 +42,18 @@ _DIGEST_LIMIT = 25
 # of English so this is comfortable.
 _BRIEF_MAX_TOKENS = 900
 
+# Source slug that's categorically historical and never belongs in a
+# "this present day" brief. The source itself stays enabled — its
+# entries still surface in the dashboard's browse view (sorted by
+# ``published_at``) — but we filter it out of the brief's candidate
+# set so the LLM doesn't pick a 1950 Korea story as today's lead.
+#
+# Excluding by source slug (not by category) because the category is
+# ``news``, shared with real news sources. A new custom source named
+# ``my_history_feed`` would still flow into the brief — the slug
+# match is a deliberate, narrow opt-out, not a category filter.
+_HISTORICAL_SOURCE_SLUGS: frozenset[str] = frozenset({"wikipedia_on_this_day"})
+
 
 class BriefGenerator:
     """Stateless wrapper around the LLM call. The factory builds one
@@ -140,7 +152,8 @@ class BriefGenerator:
             f"(seen across {source_count} sources, ingested in the last {window_hours}h):\n\n"
             + self._format_entries(entries)
             + "\n\nWrite ONE sentence (max 30 words) capturing the event and why it matters. "
-            "Lead with the fact, not 'this story'. No bullet points, no preamble."
+            "Lead with the fact, not 'this story'. No bullet points, no preamble, "
+            "no markdown, no bold, no headers, no analysis. Output only the sentence."
         )
         try:
             content = await provider.complete(prompt, max_tokens=120)
@@ -206,14 +219,19 @@ class BriefGenerator:
         are ingested today — using ``fetched_at`` keeps the brief focused
         on actual recent content. The dashboard's browse view still
         sorts by ``published_at`` so historical entries stay visible.
-        Joined to Source so the prompt can show category + source name.
-        """
+
+        Historical-content sources (currently just
+        ``wikipedia_on_this_day``) are excluded by slug. Their entries
+        still surface in the dashboard's browse view; only the brief
+        skips them. Joined to Source so the prompt can show category +
+        source name."""
         window_hours = await BriefGenerator._resolve_window_hours()
         since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
         stmt = (
             select(Entry, Source)
             .join(Source, Entry.source_id == Source.id)
             .where(Entry.fetched_at >= since)
+            .where(Source.name.notin_(_HISTORICAL_SOURCE_SLUGS))
             .order_by(desc(Entry.composite_score))
             .limit(limit)
         )
@@ -226,7 +244,8 @@ class BriefGenerator:
     ) -> list[tuple[Entry, Source]]:
         """Recent entries whose normalized title matches ``slug``. Used by
         the alert path to feed the LLM just the cluster, not the full
-        feed. Same ``fetched_at`` filter as ``_select_entries``."""
+        feed. Same ``fetched_at`` filter as ``_select_entries`` plus the
+        historical-source exclusion."""
         from app.scoring import composite as composite_scorer
 
         window_hours = await BriefGenerator._resolve_window_hours()
@@ -235,6 +254,7 @@ class BriefGenerator:
             select(Entry, Source)
             .join(Source, Entry.source_id == Source.id)
             .where(Entry.fetched_at >= since)
+            .where(Source.name.notin_(_HISTORICAL_SOURCE_SLUGS))
             .order_by(desc(Entry.composite_score))
             .limit(limit * 5)  # over-fetch; filter post-hoc by slug
         )
@@ -291,9 +311,59 @@ class BriefGenerator:
             ),
         }.get(tone, "")
 
+        # The format-compliance block below is deliberately redundant.
+        # Three layers:
+        #   1. Direct instruction ("output ONLY the brief").
+        #   2. Anti-example (concrete wrong vs concrete right).
+        #   3. Domain scope (every entry is current news; never pick
+        #      historical events even if the year prefix suggests so).
+        # Without one or more of these, thinking-style models dump their
+        # chain-of-thought as the output and non-thinking models bold
+        # the section labels — both produce text that looks plausible
+        # but fails the frontend parser and reads as noise.
+        format_directive = (
+            "Output ONLY the brief — no analysis, no reasoning, no preamble, "
+            "no markdown formatting (no **bold**, no *italic*, no # headers, "
+            "no backticks). Do not explain your choices. Do not include a "
+            "'note to the editor' or 'here is the brief' or any other wrapper. "
+            "Start your reply with the literal line 'TODAY IN ONE SENTENCE'."
+        )
+        format_example = (
+            "BAD:\n"
+            "  **Analyze the request:**\n"
+            "  1. **Role:** Editor...\n"
+            "  2. **Select the most important fact:**\n"
+            "  \n"
+            "  # Brief\n"
+            "  \n"
+            "  **TODAY IN ONE SENTENCE**\n"
+            "  <sentence>\n"
+            "\n"
+            "GOOD:\n"
+            "  TODAY IN ONE SENTENCE\n"
+            "  <one sentence>\n"
+            "  \n"
+            "  HIGHLIGHTS\n"
+            "  - <headline> — <why it matters>\n"
+            "  - ...\n"
+            "  \n"
+            "  WATCH\n"
+            "  - <item>\n"
+            "  - ..."
+        )
+        scope_clause = (
+            f"Every entry below happened in the last {window_hours}h and is "
+            "current news. Some titles carry a year prefix (e.g. '1950: ...') "
+            "because the source is a curated history feed — IGNORE those, "
+            "they are not candidates. Pick only from real, recent stories."
+        )
+
         return (
             f"You are the editor of a personal intelligence brief. "
             f"Tone: {tone}. {tone_blurb}\n\n"
+            f"{format_directive}\n\n"
+            f"{format_example}\n\n"
+            f"{scope_clause}\n\n"
             f"Format your output exactly like this — no extra prose, no markdown:\n\n"
             f"  TODAY IN ONE SENTENCE\n"
             f"  <one sentence capturing the single most important development>\n\n"

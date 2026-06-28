@@ -14,6 +14,7 @@ import httpx
 
 from app.config import settings
 from app.llm.base import Provider, ProviderError
+from app.llm.tags import _THINKING_MODELS
 
 logger = logging.getLogger("popping.llm.ollama")
 
@@ -45,7 +46,10 @@ class OllamaProvider(Provider):
         data = resp.json()
         text = data.get("response", "")
         thinking = data.get("thinking", "")
-        if not text and thinking:
+        # Only substitute the thinking field for models we know put
+        # their answer there. See the matching comment in
+        # ``ollama_cloud.py`` and ``_THINKING_MODELS`` in tags.py.
+        if not text and thinking and self._model in _THINKING_MODELS:
             # Thinking-style model: the final answer is empty and the
             # chain-of-thought / actual content is in ``thinking``. We
             # use the thinking text as the completion rather than

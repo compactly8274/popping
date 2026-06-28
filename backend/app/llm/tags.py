@@ -142,6 +142,24 @@ _RECOMMENDED_NOTES: dict[str, str] = {
     "deepseek-r1:14b": "thinking",
 }
 
+# Set of model names whose chain-of-thought lives in the ``thinking``
+# response field rather than ``response``. Both Ollama providers use
+# this to gate the thinking-field fallback: we ONLY substitute
+# ``thinking`` for ``response`` when the model is on this list.
+#
+# Why gate it: a generic fallback (any model with empty ``response``
+# and non-empty ``thinking`` gets the CoT blob) caused a real bug —
+# non-reasoning models that hit context overflow or finish with an
+# empty completion would have their raw reasoning dumped into the
+# Brief as the "answer." That's worse than failing loudly, because
+# the resulting text *looks* like output and the user has no reason
+# to suspect it's the model's chain-of-thought. Restricted to the
+# documented thinking-style models here, the fallback only fires for
+# users who deliberately picked one of these.
+_THINKING_MODELS: frozenset[str] = frozenset(
+    name for name, note in _RECOMMENDED_NOTES.items() if note == "thinking"
+)
+
 
 def _annotate_recommended(
     models: list[dict[str, Any]], task: str

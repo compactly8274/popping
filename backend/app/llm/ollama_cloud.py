@@ -23,6 +23,7 @@ import httpx
 
 from app.config import settings
 from app.llm.base import Provider, ProviderError
+from app.llm.tags import _THINKING_MODELS
 
 logger = logging.getLogger("popping.llm.ollama_cloud")
 
@@ -62,7 +63,12 @@ class OllamaCloudProvider(Provider):
         data = resp.json()
         text = data.get("response", "")
         thinking = data.get("thinking", "")
-        if not text and thinking:
+        # Only substitute the thinking field for models we know put
+        # their answer there. Otherwise an empty ``response`` is a real
+        # error (context overflow, model misbehavior, malformed prompt)
+        # and substituting the CoT blob would dump raw reasoning into
+        # the user's brief. See ``_THINKING_MODELS`` in tags.py.
+        if not text and thinking and self._model in _THINKING_MODELS:
             # Thinking-style model: the final answer is empty and the
             # chain-of-thought / actual content is in ``thinking``. We
             # use the thinking text as the completion rather than
