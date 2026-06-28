@@ -1,0 +1,66 @@
+"""Ollama Cloud provider.
+
+Same HTTP shape as the local ``app.llm.ollama`` provider (``POST
+/api/generate``), just with a different base URL and a Bearer token.
+The Cloud API is OpenAI-compatible for ``/api/chat`` but uses the
+native Ollama schema for ``/api/generate``, so we can reuse the
+request/response parsing logic byte-for-byte.
+
+Base URL is fixed at ``https://ollama.com`` per Ollama's docs — the
+API key selects the account. We don't read this from settings so a
+typo can't point it at a private host.
+
+Auth: ``Authorization: Bearer $OLLAMA_CLOUD_API_KEY``. Key is opaque
+(the same way ``ANTHROPIC_API_KEY`` is opaque) — never logged.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+
+from app.config import settings
+from app.llm.base import Provider, ProviderError
+
+logger = logging.getLogger("popping.llm.ollama_cloud")
+
+
+class OllamaCloudProvider(Provider):
+    name = "ollama_cloud"
+    _BASE_URL = "https://ollama.com"
+
+    def __init__(self, model: str, api_key: str) -> None:
+        self._base = self._BASE_URL
+        self._model = model
+        self._api_key = api_key
+
+    async def complete(self, prompt: str, *, max_tokens: int = 512) -> str:
+        url = f"{self._base}/api/generate"
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_predict": max_tokens},
+        }
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"ollama cloud transport error: {exc}") from exc
+        if resp.status_code != 200:
+            # Don't echo the body back into logs — Ollama's auth-failure
+            # body can be verbose. The status code is enough to act on.
+            raise ProviderError(
+                f"ollama cloud returned {resp.status_code}: {resp.text[:200]}"
+            )
+        data = resp.json()
+        text = data.get("response", "")
+        if not text:
+            raise ProviderError("ollama cloud returned empty response")
+        return text

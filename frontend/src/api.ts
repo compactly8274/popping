@@ -63,6 +63,12 @@ export interface NotificationStatus {
   scheme: string | null
 }
 
+export interface LLMStatus {
+  configured: boolean
+  backend: string | null
+  model: string | null
+}
+
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, { credentials: 'include', ...init })
   if (!resp.ok) {
@@ -118,6 +124,7 @@ export const api = {
       { method: 'POST' },
     ),
   notificationStatus: () => jsonFetch<NotificationStatus>('/api/notifications/status'),
+  llmStatus: () => jsonFetch<LLMStatus>('/api/llm/status'),
 
   // ---- Auth (only meaningful when OIDC is enabled on the backend) ----
   /** Probe the current user. Returns the user, null (logged out), or

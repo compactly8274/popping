@@ -21,10 +21,11 @@ from app.auth.deps import require_user
 from app.brief import BriefGenerator
 from app.config import settings
 from app.db import SessionLocal, get_session
+from app.llm import router as llm_router
 from app.models import Brief
 from app.notify import notifier_status
 from app.request_state import current_notifier
-from app.schemas import BriefOut, NotificationStatus
+from app.schemas import BriefOut, LLMStatus, NotificationStatus
 
 logger = logging.getLogger("popping.routes.brief")
 
@@ -97,3 +98,11 @@ async def brief_generate(
 async def notifications_status() -> NotificationStatus:
     """Drawer chip — does the backend have a working notifier? No secrets."""
     return NotificationStatus(**notifier_status())
+
+
+@router.get("/llm/status", response_model=LLMStatus)
+async def llm_status() -> LLMStatus:
+    """Drawer chip — does the backend have a configured LLM? No secrets.
+    Used by the Brief panel + the manual Generate button so the user can
+    see which provider / model will be called before clicking."""
+    return LLMStatus(**llm_router.status(task="brief"))

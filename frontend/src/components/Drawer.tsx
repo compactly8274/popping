@@ -1,11 +1,11 @@
 // Slide-in drawer. Lists the category columns and the registered
 // sources. Tapping a source filters the dashboard to that source's
 // entries and closes the drawer. Also surfaces the notifications
-// backend status (Apprise / Pushover / none) — useful confirmation
-// that the user's env vars are wired up.
+// backend status (Apprise / Pushover / none) and the LLM provider
+// status — useful confirmation that the user's env vars are wired up.
 
 import { useEffect, useState } from 'react'
-import { api, type NotificationStatus, type Source } from '../api'
+import { api, type LLMStatus, type NotificationStatus, type Source } from '../api'
 
 type Props = {
   open: boolean
@@ -18,6 +18,7 @@ type Props = {
 export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect }: Props) {
   const [sources, setSources] = useState<Source[]>([])
   const [notif, setNotif] = useState<NotificationStatus | null>(null)
+  const [llm, setLlm] = useState<LLMStatus | null>(null)
   const [generating, setGenerating] = useState(false)
   const [genError, setGenError] = useState<string | null>(null)
 
@@ -28,6 +29,10 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
       .notificationStatus()
       .then(setNotif)
       .catch(() => setNotif({ configured: false, backend: null, scheme: null }))
+    api
+      .llmStatus()
+      .then(setLlm)
+      .catch(() => setLlm({ configured: false, backend: null, model: null }))
   }, [open])
 
   return (
@@ -68,6 +73,24 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
                 </span>
               )}
             </div>
+          </div>
+          <div>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
+              LLM
+            </h3>
+            <div className="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs">
+              {llm === null ? (
+                <span className="text-slate-500">checking…</span>
+              ) : llm.configured ? (
+                <span className="text-emerald-400">
+                  ✓ {llm.backend} · {llm.model}
+                </span>
+              ) : (
+                <span className="text-amber-400">
+                  no LLM provider configured
+                </span>
+              )}
+            </div>
             <button
               onClick={async () => {
                 setGenError(null)
@@ -81,7 +104,7 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
                   setGenerating(false)
                 }
               }}
-              disabled={generating}
+              disabled={generating || (llm !== null && !llm.configured)}
               className="mt-2 w-full rounded bg-blue-800 hover:bg-blue-700 disabled:opacity-50 text-blue-100 px-3 py-1.5 text-xs"
             >
               {generating ? 'Generating brief…' : 'Generate brief now'}

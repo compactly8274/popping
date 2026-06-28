@@ -86,6 +86,15 @@ class Settings(BaseSettings):
     ollama_model_brief: str = "llama3.1:8b"
     ollama_model_embedding: str = "all-minilm"
 
+    # Ollama Cloud (https://ollama.com) — paid SaaS that fronts the same
+    # /api/generate endpoint as local Ollama. Select via OLLAMA_CLOUD_API_KEY;
+    # model name is read from OLLAMA_CLOUD_MODEL_SCORING / _BRIEF (defaults
+    # to the local Ollama model name since the same tags are typically
+    # available — e.g. llama3.1:8b, gpt-oss:120b).
+    ollama_cloud_api_key: str = ""
+    ollama_cloud_model_scoring: str = ""
+    ollama_cloud_model_brief: str = ""
+
     anthropic_api_key: str = ""
     claude_model_scoring: str = "claude-haiku-4-5"
     claude_model_brief: str = "claude-sonnet-4-6"

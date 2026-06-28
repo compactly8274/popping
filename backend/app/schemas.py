@@ -75,6 +75,14 @@ class NotificationStatus(BaseModel):
     scheme: Optional[str] = None
 
 
+class LLMStatus(BaseModel):
+    """Same shape as NotificationStatus, for the LLM. Used by the
+    Drawer chip + the Brief endpoint to surface provider / model."""
+    configured: bool
+    backend: Optional[str] = None    # anthropic / openai / groq / ollama_cloud / ollama
+    model: Optional[str] = None
+
+
 class HealthOut(BaseModel):
     status: str
     sources: int
