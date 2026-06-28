@@ -24,6 +24,9 @@ dependencies = [
     # Phase 2 — embeddings + LLM provider abstraction
     "sentence-transformers>=2.7",
     "numpy>=1.26",
+    # Phase 4 — notifications (preferred backend; Pushover uses httpx
+    # directly, no extra dep needed)
+    "apprise>=1.8",
 ]
 
 [build-system]

@@ -52,6 +52,12 @@ class Source(Base):
     # Multiplier on the source's contribution to composite score (phase 2).
     # Default 1.0; the UI for tuning this lands in phase 3.
     source_weight: Mapped[float] = mapped_column(Float, default=1.0)
+    # Remote URL of the source's favicon (typically origin's /favicon.ico).
+    # NULL until the first ingest downloads it. The local cache path is
+    # in ``favicon_path`` (extension varies — .ico, .png, .svg); the
+    # frontend renders <img src=/assets/{favicon_path}>.
+    favicon_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    favicon_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -83,6 +89,12 @@ class Entry(Base):
     body_text_compressed: Mapped[bool] = mapped_column(Boolean, default=False)
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(384), nullable=True)
     meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # Remote URL of the entry's thumbnail (parsed from the feed by the
+    # RSS plugin; NULL for sources that don't ship images). The local
+    # cache lives at /app/assets/thumbnails/<id>.<ext>; the frontend
+    # renders <img src=/assets/{image_path}>.
+    image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    image_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     fetched_at: Mapped[dt.datetime] = mapped_column(
@@ -178,7 +190,7 @@ class Session(Base):
     sub: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    auth_method: Mapped[str] = mapped_column(String(20), nullable=False)  # oidc | local | loopback
+    auth_method: Mapped[str] = mapped_column(String(20), nullable=False)  # oidc | local | bypass
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -202,6 +214,11 @@ class Brief(Base):
     generated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    tone: Mapped[str] = mapped_column(String(20), default="terse")  # terse / narrative
+    tone: Mapped[str] = mapped_column(String(20), default="terse")  # terse / narrative / alert
     content: Mapped[str] = mapped_column(Text, nullable=False)
     delivered_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Free-form bag used for dedup:
+    #   {"notified_urls": [...]} — CVEs / high-severity alerts already pushed
+    #   {"alert_slugs": [...]}   — convergence clusters already alerted on
+    # GIN-indexed so ``meta @> '{"notified_urls": [<url>]}'::jsonb`` is cheap.
+    meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)

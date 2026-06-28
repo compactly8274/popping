@@ -196,6 +196,77 @@ deletes expired rows.
 `OIDC_ISSUER=https://accounts.google.com`, create an OAuth client in
 Google Cloud Console with redirect URI `https://popping.example.com/auth/callback`.
 
+## Phase 4 — The Brief + notifications
+
+Phase 4 lights up the LLM router that phase 2 shipped and adds push
+notifications. Three new endpoints; one new dashboard card; no
+breaking changes to the schema beyond a new JSON column on
+`briefs.meta` (used for dedup).
+
+### The Brief
+
+A daily AI-generated digest of the top 25 entries from the last 24h,
+rendered as a card on the dashboard above For You. One LLM call per
+Brief; no streaming. Tone defaults to `terse` (one line + 3-5
+highlights + 1-3 watch items); `narrative` is also available.
+
+**Triggers** — all three converge on `BriefGenerator.generate()`:
+
+| Trigger | How | When |
+| --- | --- | --- |
+| Daily scheduled | APScheduler `CronTrigger(hour=BRIEF_SCHEDULE_HOUR)` | `BRIEF_SCHEDULE_HOUR` UTC (default 08:00). Set `-1` to disable. |
+| Manual | `POST /api/brief/generate?tone=terse` | Header "Brief" button or Drawer button. Login-gated when OIDC is on. |
+| Convergence | `BriefGenerator.generate_alert()` from the periodic convergence-check job | When a slug appears in `CONVERGENCE_NOTIFY_THRESHOLD` (default 2) sources within `CONVERGENCE_WINDOW_HOURS`. |
+
+The LLM is picked via `app.llm.router.provider_for("brief")` — same
+Anthropic → OpenAI → Groq → Ollama order as scoring. If nothing is
+configured, the manual endpoint returns 503 ("no LLM provider") and
+the scheduler logs and skips. The dashboard keeps working with the
+existing Brief row.
+
+### Notifications
+
+Two backends, picked at startup. The Drawer shows which one is wired
+up:
+
+| Backend | Env vars | Notes |
+| --- | --- | --- |
+| Apprise (preferred) | `APPRISE_URL` | Opaque URL — `pover://…`, `tgram://…`, `discord://…`, `mailto://…`, `ntfy://…`. One library, 100+ services. |
+| Pushover (fallback) | `PUSHOVER_USER_KEY` + `PUSHOVER_APP_TOKEN` | Plain `httpx` POST to `api.pushover.net/1/messages.json`. Used when `APPRISE_URL` is unset. |
+
+**Three notification triggers:**
+
+1. **Brief delivery** — every successful Brief generation pushes the
+   full content via the configured backend.
+2. **High-CVSS CVEs** — post-ingest hook in `_ingest` checks
+   `meta.cvss_score` on newly-inserted rows. Sends a single batched
+   alert per ingest when at least one entry exceeds
+   `CVE_NOTIFY_MIN_CVSS` (default 7.0). Deduped via
+   `Brief.meta.notified_urls` (GIN-indexed JSON containment).
+3. **Convergence alerts** — periodic job (every
+   `CONVERGENCE_CHECK_INTERVAL_MINUTES`, default 15) scans for
+   unalerted clusters, fires `generate_alert()` (one-sentence
+   `tone="alert"` Brief), and pushes that.
+
+`Notifier.send()` is best-effort — transport failures are logged but
+never raise. A broken notifier can't break ingest.
+
+### Settings / Drawer
+
+The Drawer now shows a "Notifications" chip at the top with the
+configured backend (e.g. `configured (apprise · pover)`) plus a
+"Generate brief now" button. The full settings drawer (followed
+categories, source weight tuning) is still a follow-up — the model
+columns exist but the UI isn't built yet.
+
+### API additions
+
+| Endpoint | Purpose | Auth |
+| --- | --- | --- |
+| `GET  /api/brief/latest?tone=&limit=` | Most recent Brief(s). Latest of each tone when `tone` is omitted. | public |
+| `POST /api/brief/generate?tone=terse\|narrative` | Synchronously generate a new Brief. | login when OIDC on |
+| `GET  /api/notifications/status` | `{configured, backend, scheme}` — Drawer chip. | public |
+
 ## Phase 3 — sources
 
 Six source plugins, all anonymous (no API keys required for the core
@@ -401,9 +472,9 @@ just without the vector signal.
   News, GitHub releases (5 repos), NVD CVEs, CISA KEV. BBC RSS fetcher
   fixed (proper User-Agent + https). New `tech` and `vulns` categories.
   ✅
-- **Phase 4**: notifications (Pushover/Apprise), The Brief generator,
-  settings drawer (followed categories, source weights), dead-feed
-  detection, dedup, converging-story detection.
+- **Phase 4**: The Brief generator (daily + manual + convergence
+  triggers), notifications via Apprise (preferred) / Pushover (fallback),
+  alert paths for high-CVSS CVEs and convergence clusters. ✅
 
 ## Environment variables
 

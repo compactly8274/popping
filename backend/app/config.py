@@ -128,6 +128,21 @@ class Settings(BaseSettings):
     convergence_boost_2: float = 1.10
     convergence_boost_3plus: float = 1.20
 
+    # --- Phase 4: The Brief + notifications -------------------------------
+    # UTC hour at which the scheduler generates the daily brief. Brief is
+    # idempotent — generating it twice on the same day just overwrites the
+    # row. Set to -1 to disable the scheduled daily brief (manual only).
+    brief_schedule_hour: int = 8
+    # CVSS threshold for the post-ingest CVE notification. Default 7.0
+    # (HIGH severity). Set to 0 to alert on every CVE ingest.
+    cve_notify_min_cvss: float = 7.0
+    # Convergence threshold for the periodic alert job — minimum number
+    # of distinct sources a slug must appear in to trigger an alert.
+    convergence_notify_threshold: int = 2
+    # How often the convergence-check job runs. Cheap (one GROUP BY),
+    # but doesn't need to be tight.
+    convergence_check_interval_minutes: int = 15
+
     @property
     def database_url(self) -> str:
         return (

@@ -47,6 +47,25 @@ class IngestResult(BaseModel):
     error: Optional[str] = None
 
 
+class BriefOut(BaseModel):
+    id: int
+    generated_at: dt.datetime
+    tone: str
+    content: str
+    delivered_at: Optional[dt.datetime] = None
+    meta: Optional[dict] = None
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationStatus(BaseModel):
+    """What the Drawer chip reads. Doesn't leak secrets."""
+    configured: bool
+    backend: Optional[str] = None
+    scheme: Optional[str] = None
+
+
 class HealthOut(BaseModel):
     status: str
     sources: int

@@ -41,6 +41,21 @@ export interface Health {
   last_fetch: string | null
 }
 
+export interface Brief {
+  id: number
+  generated_at: string
+  tone: string
+  content: string
+  delivered_at: string | null
+  meta: Record<string, unknown> | null
+}
+
+export interface NotificationStatus {
+  configured: boolean
+  backend: string | null
+  scheme: string | null
+}
+
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, { credentials: 'include', ...init })
   if (!resp.ok) {
@@ -81,6 +96,21 @@ export const api = {
       `/api/ingest/${encodeURIComponent(sourceName)}`,
       { method: 'POST' },
     ),
+
+  // ---- The Brief (phase 4) ----
+  briefLatest: (opts?: { tone?: string; limit?: number }) => {
+    const params = new URLSearchParams()
+    if (opts?.tone) params.set('tone', opts.tone)
+    if (opts?.limit) params.set('limit', String(opts.limit))
+    const q = params.toString()
+    return jsonFetch<Brief[]>(`/api/brief/latest${q ? `?${q}` : ''}`)
+  },
+  briefGenerate: (tone: string = 'terse') =>
+    jsonFetch<Brief>(
+      `/api/brief/generate${tone ? `?tone=${encodeURIComponent(tone)}` : ''}`,
+      { method: 'POST' },
+    ),
+  notificationStatus: () => jsonFetch<NotificationStatus>('/api/notifications/status'),
 
   // ---- Auth (only meaningful when OIDC is enabled on the backend) ----
   /** Probe the current user. Returns the user, null (logged out), or

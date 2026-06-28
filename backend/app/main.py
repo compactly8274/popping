@@ -21,6 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.embeddings import embedder
+from app.notify import build_notifier
+from app.request_state import set_notifier
+from app.routes import brief as brief_routes
 from app.routes import entries as entries_routes
 from app.routes import foryou as foryou_routes
 from app.routes import health as health_routes
@@ -43,7 +46,16 @@ async def lifespan(app: FastAPI):
     # embed() on every entry, and we want the model warm before the
     # first fetch lands. If embedding is disabled, this is a no-op.
     await embedder().load()
-    await start_scheduler()
+    # Build the notifier once. Both scheduler jobs and the brief
+    # endpoint read it from app.request_state. ``None`` means "no
+    # backend configured" — everything keeps working without pushes.
+    notifier = build_notifier()
+    set_notifier(notifier)
+    if notifier is not None:
+        logger.info("notifications: configured (%s)", notifier.name)
+    else:
+        logger.info("notifications: no backend configured")
+    await start_scheduler(notifier=notifier)
     try:
         yield
     finally:
@@ -75,6 +87,7 @@ app.include_router(sources_routes.router, prefix="/api")
 app.include_router(entries_routes.router, prefix="/api")
 app.include_router(foryou_routes.router, prefix="/api")
 app.include_router(ingest_routes.router, prefix="/api")
+app.include_router(brief_routes.router, prefix="/api")
 
 # Auth router is only mounted when OIDC is enabled — keeps single-user
 # deployments free of /auth/* routes entirely.

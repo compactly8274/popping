@@ -4,7 +4,8 @@
 // content is replaced with a LoginPage.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, type CurrentUser, type Entry, type Health, type Source } from './api'
+import { api, type Brief, type CurrentUser, type Entry, type Health, type Source } from './api'
+import { BriefCard } from './components/BriefCard'
 import { Card } from './components/Card'
 import { Column } from './components/Column'
 import { Drawer } from './components/Drawer'
@@ -33,6 +34,9 @@ export function App() {
   // by tapping a source in the Drawer; cleared by tapping the same
   // source again or the "clear filter" pill.
   const [sourceFilter, setSourceFilter] = useState<string | null>(null)
+  // Latest terse Brief for the dashboard card. Null until either the
+  // scheduler has run today or the user manually generates one.
+  const [brief, setBrief] = useState<Brief | null>(null)
   const touchStartX = useRef<number | null>(null)
 
   const sourcesById = useMemo(
@@ -149,6 +153,20 @@ export function App() {
         >
           Refresh
         </button>
+        <button
+          onClick={async () => {
+            try {
+              const next = await api.briefGenerate('terse')
+              setBrief(next)
+            } catch (err) {
+              setError((err as Error).message)
+            }
+          }}
+          className="rounded px-3 py-1 text-sm bg-blue-800 hover:bg-blue-700 text-blue-100"
+          title="Generate today's brief now"
+        >
+          Brief
+        </button>
         {user && <UserBadge user={user} onSignedOut={() => setUser(null)} />}
       </header>
 
@@ -173,6 +191,8 @@ export function App() {
       )}
 
       <ForYou entries={forYou} sourcesById={sourcesById} />
+
+      <BriefCard brief={brief} onBriefChange={setBrief} />
 
       {/* Desktop: grid */}
       <main className="hidden md:grid md:grid-cols-3 lg:grid-cols-4 gap-4 p-4 flex-1 overflow-hidden">
