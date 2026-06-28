@@ -7,9 +7,11 @@ permissions in Docker), skip it rather than crashing on startup.
 
 import logging
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,12 +21,54 @@ _readable_env_file: Path | None = (
 )
 
 
+# Values that look like ".env template placeholders" — common patterns
+# users copy/paste from .env.example without filling in. Treat them as
+# "not configured" so the LLM router doesn't try to call a provider
+# with a literal "redacted" / "changeme" key.
+#
+# Match (case-insensitive, anchored): "redacted", "changeme", "your-*-here",
+# "replace-me", "todo", "xxx+", "<...>", "{...}", "[...]", "sk-...", all
+# whitespace, or a single dash. Pydantic settings reads these as strings;
+# any truthy non-empty string would otherwise make the LLM router think
+# the provider is configured and try to call it.
+_PLACEHOLDER_RE = re.compile(
+    r"^\s*("
+    r"redacted|changeme|change-?me|your[-_][a-z0-9_-]+-here|"
+    r"replace[-_]?me|todo|xxx+|sk-xxx+|example|dummy|"
+    r"<[^>]+>|\[[^\]]+\]|\{[^}]+\}|---+|\s*"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder(value: str) -> bool:
+    """True if ``value`` looks like an unfilled .env template placeholder.
+
+    Empty strings and whitespace-only strings are NOT placeholders —
+    those are the canonical "not configured" form. Placeholders are the
+    sneaky middle case: a non-empty string that's still semantically
+    unset. See ``_PLACEHOLDER_RE``.
+    """
+    return bool(_PLACEHOLDER_RE.match(value))
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_readable_env_file,
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _strip_placeholders(cls, value):
+        """Normalise obvious .env placeholders to empty strings so the
+        LLM router's truthy-key check doesn't pick them up. Real keys
+        (Anthropic ``sk-ant-…``, OpenAI ``sk-…``, Groq ``gsk_…``) are
+        opaque enough that they won't match ``_PLACEHOLDER_RE``."""
+        if isinstance(value, str) and _is_placeholder(value):
+            return ""
+        return value
 
     # --- Database -----------------------------------------------------------
     postgres_user: str = "popping"
