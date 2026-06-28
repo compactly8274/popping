@@ -89,13 +89,18 @@ class Settings(BaseSettings):
     local_user_password_hash: str = ""  # bcrypt hash; generate with bcrypt.hashpw
     local_user_email: str = ""
 
-    # --- Loopback bypass (optional) -----------------------------------------
-    # When local_auth_bypass=true, requests from 127.0.0.0/8 or ::1 are
-    # treated as authenticated with a synthetic 'local-loopback' user —
-    # useful when you're at the server's keyboard and don't want to round-
-    # trip through the IdP. Honors X-Forwarded-For from a reverse proxy.
-    # Off by default; flip on only if your reverse proxy is trusted to
-    # strip client-supplied X-Forwarded-For.
+    # --- Local bypass (loopback OR LAN) ----------------------------------
+    # When local_auth_bypass=true, requests from a private network
+    # address (loopback, RFC1918, link-local, IPv6 ULA) are treated as
+    # authenticated with a synthetic 'local-bypass' user. Useful for
+    # headless LAN deployments without a full OIDC stack.
+    #
+    # SECURITY: the IP is taken from the TCP peer only. X-Forwarded-For
+    # is ignored — it can be spoofed by any client and would let a LAN
+    # attacker claim a loopback identity. If you need to run behind a
+    # reverse proxy, terminate TLS at the proxy and have it speak to
+    # the backend on a private interface, or add explicit proxy-trust
+    # support (out of scope for the local bypass).
     local_auth_bypass: bool = False
 
     # --- Session hygiene ---------------------------------------------------

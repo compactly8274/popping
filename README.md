@@ -144,22 +144,30 @@ python -c "import bcrypt; print(bcrypt.hashpw(b'YOUR_PASSWORD', bcrypt.gensalt()
 The endpoint runs `bcrypt.checkpw` regardless of which field is wrong, so
 the response time is constant (no username enumeration via timing).
 
-### Loopback bypass
+### Local bypass
 
-For "I'm at the server's keyboard and don't want to round-trip through
-the IdP" — flip on loopback bypass:
+For "I'm at the server's keyboard (or on the same LAN) and don't want to
+round-trip through the IdP" — flip on local bypass:
 
 ```bash
 LOCAL_AUTH_BYPASS=true
 ```
 
-Any request from `127.0.0.0/8` or `::1` is treated as authenticated with
-a synthetic `local-loopback` user. Honors `X-Forwarded-For` (leftmost IP)
-when behind a reverse proxy, so it only fires for genuinely local traffic
-as long as your proxy is trusted to strip client-supplied headers.
+Any request from a private network address (loopback `127.0.0.0/8` /
+`::1`, RFC1918 `10/8` `172.16/12` `192.168/16`, IPv6 ULA `fc00::/7`, or
+link-local `169.254/16` / `fe80::/10`) is treated as authenticated with a
+synthetic `local-bypass` user. Every grant is logged at INFO
+(`local-auth-bypass grant: ip=…`) so you can audit who came in.
 
-Off by default; only enable when you trust the network between the
-reverse proxy and the backend.
+**Security note.** The IP is taken from the TCP peer only —
+`X-Forwarded-For` is deliberately ignored. A client can set that header
+to anything it wants, and trusting it would let any LAN attacker claim
+a loopback identity. If you run behind a reverse proxy, terminate TLS at
+the proxy and have it speak to the backend on a private interface, or
+add explicit proxy-trust support (out of scope here).
+
+Off by default; only enable when you trust the network between clients
+and the backend.
 
 ### Persistent sessions
 
@@ -422,7 +430,7 @@ just without the vector signal.
 │       │   ├── settings.py    #   OIDCConfig loader
 │       │   ├── session.py     #   DB-backed sessions
 │       │   ├── oidc.py        #   authlib PKCE flow
-│       │   ├── deps.py        #   current_user / require_user (incl. loopback bypass)
+│       │   ├── deps.py        #   current_user / require_user (incl. local bypass)
 │       │   ├── routes.py      #   /auth/login /auth/callback /auth/logout /auth/me
 │       │   └── local.py       #   POST /auth/local (bcrypt fallback user)
 │       ├── models.py          # SQLAlchemy ORM (sources/entries/interactions/...)

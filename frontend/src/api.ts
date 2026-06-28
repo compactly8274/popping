@@ -68,7 +68,7 @@ export interface CurrentUser {
   sub: string
   email: string
   name: string
-  auth_method?: 'oidc' | 'local' | 'loopback'
+  auth_method?: 'oidc' | 'local' | 'bypass'
 }
 
 export const api = {
@@ -82,7 +82,7 @@ export const api = {
     return jsonFetch<Entry[]>(`/api/entries${q ? `?${q}` : ''}`)
   },
   sources: () => jsonFetch<Source[]>('/api/sources'),
-  /** Personal top-N feed. Requires auth when OIDC is enabled; loopback
+  /** Personal top-N feed. Requires auth when OIDC is enabled; local
    * bypass users always pass through. */
   forYou: (opts?: { limit?: number; category?: string }) => {
     const params = new URLSearchParams()

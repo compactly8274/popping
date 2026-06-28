@@ -45,7 +45,7 @@ async def create(
     sub: str,
     email: Optional[str],
     name: Optional[str],
-    auth_method: str,  # 'oidc' | 'local' | 'loopback'
+    auth_method: str,  # 'oidc' | 'local' | 'bypass'
 ) -> str:
     """Insert a session row and return the cookie value (the new sid).
 

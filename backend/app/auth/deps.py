@@ -2,15 +2,21 @@
 
 ``current_user`` returns the decoded session payload or None. It:
   1. Reads the session cookie and looks up the DB row (DB-backed session).
-  2. If the cookie is absent AND the request came from loopback AND
-     ``local_auth_bypass`` is on, returns a synthetic 'local-loopback'
+  2. If the cookie is absent AND the request came from a private
+     network address (loopback, RFC1918, link-local, IPv6 ULA) AND
+     ``local_auth_bypass`` is on, returns a synthetic 'local-bypass'
      user. (Bypass is checked AFTER the cookie so an authenticated
-     loopback user still gets their real identity.)
+     LAN user still gets their real identity.)
 
 ``require_user`` 401s when ``current_user`` returns None.
 
 Routes opt in by adding ``user: dict = Depends(require_user)`` to their
 signature.
+
+SECURITY: the bypass IP is taken from the TCP peer only (``request.
+client.host``). X-Forwarded-For is intentionally ignored — a client
+can set that header to anything it wants, and trusting it would let
+a LAN attacker claim a loopback identity.
 """
 
 from __future__ import annotations
@@ -31,47 +37,86 @@ logger = logging.getLogger("popping.auth")
 
 
 # ---------------------------------------------------------------------------
-# Loopback detection
+# Local bypass detection
 # ---------------------------------------------------------------------------
 
-_LOOPBACK_SYNTHETIC = {
-    "sub": "local-loopback",
+# Synthetic user for cookie-less requests from a private address when
+# ``local_auth_bypass=true``. We use ``sub="local-bypass"`` (rather
+# than the old "local-loopback") so the UserBadge can render "Bypass"
+# instead of "Loopback" for non-loopback callers.
+_BYPASS_SYNTHETIC = {
+    "sub": "local-bypass",
     "email": "",
     "name": "Local",
-    "auth_method": "loopback",
+    "auth_method": "bypass",
 }
 
+# Networks considered "local" for the bypass. Composed at import time
+# so the membership check is just a flat ``in`` against a small list.
+# IPv4 first:
+#   127.0.0.0/8        — loopback
+#   10.0.0.0/8         — RFC1918
+#   172.16.0.0/12      — RFC1918
+#   192.168.0.0/16     — RFC1918
+#   169.254.0.0/16     — link-local
+# IPv6:
+#   ::1/128            — loopback
+#   fe80::/10          — link-local
+#   fc00::/7           — ULA (covers fc00::/8 and fd00::/8)
+_PRIVATE_NETS: tuple = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "::1/128",
+        "fe80::/10",
+        "fc00::/7",
+    )
+)
 
-def _resolve_client_ip(request: Request) -> Optional[str]:
-    """Read X-Forwarded-For (leftmost) when behind a trusted proxy, else
-    fall back to the TCP peer. Returns None if neither is parseable."""
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        first = xff.split(",", 1)[0].strip()
-        if first:
-            return first
+
+def _client_ip(request: Request) -> Optional[str]:
+    """Return the TCP peer address.
+
+    We deliberately do NOT read ``X-Forwarded-For``: a client can set
+    that header to any value it wants, and trusting it would let a LAN
+    attacker claim a loopback identity under the bypass. If you ever
+    need real-client-IP from a reverse proxy, add explicit proxy
+    trust — see config.py ``local_auth_bypass`` for the warning.
+    """
     if request.client and request.client.host:
         return request.client.host
     return None
 
 
-def _is_loopback(ip_str: str) -> bool:
+def _is_private_address(ip_str: str) -> bool:
+    """True if the address is loopback, RFC1918, link-local, or IPv6 ULA."""
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    return ip.is_loopback  # covers 127.0.0.0/8 and ::1
+    return any(ip in net for net in _PRIVATE_NETS)
 
 
-def _maybe_loopback_user(request: Request) -> Optional[dict]:
-    """Return the synthetic loopback user when the bypass is enabled and
-    the request came from a loopback IP. None otherwise."""
+def _maybe_bypass_user(request: Request) -> Optional[dict]:
+    """Return the synthetic bypass user when the bypass is enabled and
+    the request came from a private address. None otherwise. Every
+    successful grant is logged at INFO for an audit trail."""
     if not settings.local_auth_bypass:
         return None
-    ip = _resolve_client_ip(request)
-    if ip is None or not _is_loopback(ip):
+    ip = _client_ip(request)
+    if ip is None or not _is_private_address(ip):
         return None
-    return dict(_LOOPBACK_SYNTHETIC)
+    logger.info(
+        "local-auth-bypass grant: ip=%s method=%s path=%s",
+        ip,
+        request.method,
+        request.url.path,
+    )
+    return dict(_BYPASS_SYNTHETIC)
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +130,8 @@ async def current_user(
 ) -> dict | None:
     """Return the session payload for this request, or None if not logged in.
 
-    Cookie lookup is attempted first; loopback bypass is the fallback for
-    cookie-less requests when ``local_auth_bypass`` is on.
+    Cookie lookup is attempted first; the local bypass is the fallback
+    for cookie-less requests when ``local_auth_bypass`` is on.
     """
     cfg = oidc_config()
     raw = request.cookies.get(cfg.cookie_name)
@@ -94,15 +139,15 @@ async def current_user(
         try:
             return await decode(db, raw)
         except SessionError:
-            pass  # fall through to loopback check
-    return _maybe_loopback_user(request)
+            pass  # fall through to bypass check
+    return _maybe_bypass_user(request)
 
 
 async def require_user(
     request: Request,
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    """FastAPI dependency: 401 when no valid session or loopback bypass."""
+    """FastAPI dependency: 401 when no valid session or local bypass."""
     user = await current_user(request, db)
     if user is None:
         raise HTTPException(
