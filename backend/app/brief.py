@@ -37,10 +37,41 @@ logger = logging.getLogger("popping.brief")
 # How many top entries the digest covers. Large enough to give the LLM
 # real choice; small enough that the prompt stays under a few KB.
 _DIGEST_LIMIT = 25
-# Brief output budget. 900 tokens is plenty for a 5-bullet digest + a
-# one-sentence summary. Pushover's body limit is ~4 KB which is ~1k tokens
-# of English so this is comfortable.
-_BRIEF_MAX_TOKENS = 900
+# Brief output budget. 400 tokens is enough for the headline sentence
+# (~40) + 5 highlights (~50 each = 250) + 3 watch items (~30 each = 90)
+# = ~380, with a small buffer. The previous 900-budget left room for
+# the model to leak chain-of-thought into the output before
+# hitting the limit; tightening the cap physically prevents that.
+# Pushover's body limit is ~4 KB (~1k tokens of English), so 400 is
+# comfortably within the notification budget too.
+_BRIEF_MAX_TOKENS = 400
+
+# Stop sequences for the brief. Each entry is a string the model is
+# told to halt on — the moment any of these appears, generation stops
+# and the partial response is returned. The brief format is fixed:
+# TODAY IN ONE SENTENCE → headline → HIGHLIGHTS → - bullets → WATCH
+# → - bullets. Anything else is noise we want to cut at the source.
+#
+# The list targets the specific leak patterns we've observed:
+#   - ``\n\n1. `` / ``\n\n2. `` — numbered analysis headings ("1. Role",
+#     "2. Evaluate Source Entries"). The model was treating the
+#     prompt's constraints as a task outline and numbering its work.
+#   - ``**`` — markdown bold. The model was bolding section labels.
+#   - "Source Material:" — the exact phrase the model leaked as a
+#     header above the entries dump.
+#   - "# Brief" — markdown H1 header the model sometimes prepends.
+#
+# Anthropic caps ``stop_sequences`` at 4. We list 4 here so every
+# provider gets the full set. If you're on Ollama and want more
+# (e.g. "Note to the editor", "Constraint"), add them at the end
+# and update the Anthropic provider to slice ``[:4]`` if needed —
+# but the 4 below catch every leak we've actually seen in the wild.
+_BRIEF_STOP_SEQUENCES: list[str] = [
+    "\n\n1. ",
+    "\n**",
+    "Source Material",
+    "# Brief",
+]
 
 # Source slug that's categorically historical and never belongs in a
 # "this present day" brief. The source itself stays enabled — its
@@ -95,7 +126,11 @@ class BriefGenerator:
         window_hours = await self._resolve_window_hours()
         prompt = self._build_prompt(entries, tone, window_hours)
         try:
-            content = await provider.complete(prompt, max_tokens=_BRIEF_MAX_TOKENS)
+            content = await provider.complete(
+                prompt,
+                max_tokens=_BRIEF_MAX_TOKENS,
+                stop=_BRIEF_STOP_SEQUENCES,
+            )
         except ProviderError as exc:
             logger.warning("brief: LLM call failed: %s", exc)
             return None
@@ -156,7 +191,15 @@ class BriefGenerator:
             "no markdown, no bold, no headers, no analysis. Output only the sentence."
         )
         try:
-            content = await provider.complete(prompt, max_tokens=120)
+            # Same stop sequences as the digest. The alert prompt is
+            # already tight ("write ONE sentence… output only the
+            # sentence"), but the same model tendencies apply — the
+            # model might still leak if asked to analyze a cluster.
+            content = await provider.complete(
+                prompt,
+                max_tokens=120,
+                stop=_BRIEF_STOP_SEQUENCES,
+            )
         except ProviderError as exc:
             logger.warning("brief: alert LLM call failed: %s", exc)
             return None
@@ -311,69 +354,76 @@ class BriefGenerator:
             ),
         }.get(tone, "")
 
-        # The format-compliance block below is deliberately redundant.
-        # Three layers:
-        #   1. Direct instruction ("output ONLY the brief").
-        #   2. Anti-example (concrete wrong vs concrete right).
-        #   3. Domain scope (every entry is current news; never pick
-        #      historical events even if the year prefix suggests so).
-        # Without one or more of these, thinking-style models dump their
-        # chain-of-thought as the output and non-thinking models bold
-        # the section labels — both produce text that looks plausible
-        # but fails the frontend parser and reads as noise.
+        # Prompt design notes (after the previous BAD-vs-GOOD example
+        # turned out to backfire — verbose models copied the BAD
+        # example's "1. **Role:** / 2. **Select:**" structure into the
+        # output, producing exactly the analysis we were trying to
+        # prevent):
+        #
+        #   1. Don't show the model what NOT to do. Telling it "don't
+        #      produce analysis" while giving an analysis-shaped BAD
+        #      example still primes the analysis shape. The example
+        #      block now only shows the GOOD format, with no annotations.
+        #   2. Don't label the entries as "Source Material:" or number
+        #      the constraints. The previous "1. Constraint / 2. Format"
+        #      header structure was being mirrored by the model.
+        #   3. Don't show the model any markdown emphasis characters
+        #      in the prompt. ``**bold**``, ``*italic*``, ``# header``
+        #      all taught it to bold the section labels.
+        #   4. The example uses placeholder names like "topic A"
+        #      rather than real-world examples that the model might
+        #      echo verbatim (the previous ``<one sentence capturing
+        #      the single most important development>`` placeholder
+        #      was being copied straight into the output).
+        #
+        # The accompanying Ollama-side mitigation (stop sequences +
+        # reduced max_tokens) lives in the ollama providers; the prompt
+        # alone wouldn't be enough against the more verbose models.
         format_directive = (
-            "Output ONLY the brief — no analysis, no reasoning, no preamble, "
-            "no markdown formatting (no **bold**, no *italic*, no # headers, "
-            "no backticks). Do not explain your choices. Do not include a "
-            "'note to the editor' or 'here is the brief' or any other wrapper. "
-            "Start your reply with the literal line 'TODAY IN ONE SENTENCE'."
-        )
-        format_example = (
-            "BAD:\n"
-            "  **Analyze the request:**\n"
-            "  1. **Role:** Editor...\n"
-            "  2. **Select the most important fact:**\n"
-            "  \n"
-            "  # Brief\n"
-            "  \n"
-            "  **TODAY IN ONE SENTENCE**\n"
-            "  <sentence>\n"
-            "\n"
-            "GOOD:\n"
-            "  TODAY IN ONE SENTENCE\n"
-            "  <one sentence>\n"
-            "  \n"
-            "  HIGHLIGHTS\n"
-            "  - <headline> — <why it matters>\n"
-            "  - ...\n"
-            "  \n"
-            "  WATCH\n"
-            "  - <item>\n"
-            "  - ..."
-        )
-        scope_clause = (
-            f"Every entry below happened in the last {window_hours}h and is "
-            "current news. Some titles carry a year prefix (e.g. '1950: ...') "
-            "because the source is a curated history feed — IGNORE those, "
-            "they are not candidates. Pick only from real, recent stories."
+            "Reply with the brief only. No preamble. No analysis, no reasoning, "
+            "no explanations, no labels, no headers, no bold, no italic, no "
+            "markdown of any kind. Begin your reply with the literal line "
+            "TODAY IN ONE SENTENCE on its own line, then a single sentence, "
+            "then a blank line, then HIGHLIGHTS on its own line, then 3 to 5 "
+            "bulleted lines each starting with a hyphen, then a blank line, "
+            "then WATCH on its own line, then 1 to 3 bulleted lines starting "
+            "with a hyphen. No other text."
         )
 
+        # The example deliberately uses generic, non-echoable language
+        # ("topic A", "a recent event") so the model doesn't have
+        # specific phrases to copy. ``-`` is the only special character
+        # and it's just bullet syntax.
+        format_example = (
+            "TODAY IN ONE SENTENCE\n"
+            "A one-sentence statement of the single most important development.\n"
+            "\n"
+            "HIGHLIGHTS\n"
+            "- topic A — why it matters in one sentence\n"
+            "- topic B — why it matters in one sentence\n"
+            "- topic C — why it matters in one sentence\n"
+            "\n"
+            "WATCH\n"
+            "- a lower-priority item to keep an eye on"
+        )
+
+        scope_clause = (
+            f"All entries below are real news ingested in the last {window_hours} "
+            "hours. Some titles carry a year prefix because the source is a "
+            "curated history feed; ignore those entries entirely — they are "
+            "not candidates for the brief."
+        )
+
+        # No numbered headers, no role label, no markdown, no example
+        # of what NOT to do. Just the constraints and the entries.
         return (
-            f"You are the editor of a personal intelligence brief. "
-            f"Tone: {tone}. {tone_blurb}\n\n"
+            f"You are the editor of a personal intelligence brief. Tone: {tone}. "
+            f"{tone_blurb}\n\n"
             f"{format_directive}\n\n"
+            f"Example of the exact shape to produce:\n"
             f"{format_example}\n\n"
             f"{scope_clause}\n\n"
-            f"Format your output exactly like this — no extra prose, no markdown:\n\n"
-            f"  TODAY IN ONE SENTENCE\n"
-            f"  <one sentence capturing the single most important development>\n\n"
-            f"  HIGHLIGHTS\n"
-            f"  - <headline> — <one sentence why it matters>\n"
-            f"  - ... (3-5 items)\n\n"
-            f"  WATCH\n"
-            f"  - <item worth keeping an eye on, lower priority>\n"
-            f"  - ... (1-3 items)\n\n"
-            f"Top {len(entries)} entries ingested in the last {window_hours}h:\n\n"
+            f"Candidate entries:\n\n"
             f"{BriefGenerator._format_entries(entries)}\n"
         )
 

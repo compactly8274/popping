@@ -2,6 +2,9 @@
 
 Uses ``anthropic-version: 2023-06-01`` and a single-user message.
 ``max_tokens`` is required by the API, so we always set it.
+
+``stop`` sequences are passed as ``stop_sequences`` (Anthropic
+caps this at 4; we cap defensively to avoid an API error).
 """
 
 from __future__ import annotations
@@ -16,6 +19,9 @@ from app.llm.base import Provider, ProviderError
 
 logger = logging.getLogger("popping.llm.anthropic")
 
+# Anthropic's ``stop_sequences`` parameter caps at 4 entries.
+_MAX_STOP_SEQUENCES = 4
+
 
 class AnthropicProvider(Provider):
     name = "anthropic"
@@ -24,7 +30,13 @@ class AnthropicProvider(Provider):
         self._model = model
         self._api_key = api_key
 
-    async def complete(self, prompt: str, *, max_tokens: int = 512) -> str:
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        stop: list[str] | None = None,
+    ) -> str:
         url = "https://api.anthropic.com/v1/messages"
         headers = {
             "x-api-key": self._api_key,
@@ -36,6 +48,8 @@ class AnthropicProvider(Provider):
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
+        if stop:
+            payload["stop_sequences"] = stop[:_MAX_STOP_SEQUENCES]
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
                 resp = await client.post(url, headers=headers, json=payload)

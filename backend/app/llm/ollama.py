@@ -26,7 +26,13 @@ class OllamaProvider(Provider):
         self._base = settings.ollama_base_url.rstrip("/")
         self._model = model
 
-    async def complete(self, prompt: str, *, max_tokens: int = 512) -> str:
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        stop: list[str] | None = None,
+    ) -> str:
         url = f"{self._base}/api/generate"
         payload: dict[str, Any] = {
             "model": self._model,
@@ -34,6 +40,10 @@ class OllamaProvider(Provider):
             "stream": False,
             "options": {"num_predict": max_tokens},
         }
+        if stop:
+            # Ollama's native ``stop`` field. Halts generation the
+            # moment any of these strings appear in the output.
+            payload["stop"] = stop
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
                 resp = await client.post(url, json=payload)

@@ -20,9 +20,20 @@ class Provider(ABC):
     name: str
 
     @abstractmethod
-    async def complete(self, prompt: str, *, max_tokens: int = 512) -> str:
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        stop: list[str] | None = None,
+    ) -> str:
         """Generate a completion for ``prompt``. Implementations should
-        return the assistant's text (no chat preamble)."""
+        return the assistant's text (no chat preamble).
+
+        ``stop`` is an optional list of strings; if the model produces
+        any of them, generation halts. Useful for capping the response
+        to a known structure (e.g. a brief that should never contain
+        markdown headers or numbered analysis)."""
         raise NotImplementedError
 
 

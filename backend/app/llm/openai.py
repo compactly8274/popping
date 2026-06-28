@@ -24,7 +24,13 @@ class OpenAIProvider(Provider):
         self._model = model
         self._api_key = api_key
 
-    async def complete(self, prompt: str, *, max_tokens: int = 512) -> str:
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        stop: list[str] | None = None,
+    ) -> str:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {
             "authorization": f"Bearer {self._api_key}",
@@ -35,6 +41,8 @@ class OpenAIProvider(Provider):
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
+        if stop:
+            payload["stop"] = stop
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
                 resp = await client.post(url, headers=headers, json=payload)

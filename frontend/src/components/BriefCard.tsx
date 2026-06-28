@@ -78,8 +78,24 @@ function parse(content: string): Parsed {
     watch: [],
     remainder: '',
   }
+  // Defense in depth: even with stop sequences on the backend, a
+  // future model or edge case might still emit the prompt-template
+  // example (``<one sentence capturing the single most important
+  // development>``) or a numbered analysis block before/after the
+  // real brief. Truncate the content to the region between the
+  // first ``TODAY IN ONE SENTENCE`` header and the end of the last
+  // bullet section (``HIGHLIGHTS`` / ``WATCH``). Anything before the
+  // first header is prompt-echo noise; anything after a non-bullet
+  // line in the WATCH bucket is too.
+  const lines = content.split(/\r?\n/)
+  // Find the first ``TODAY IN ONE SENTENCE`` line. If we don't find
+  // one, the parser already handles it gracefully (everything falls
+  // into ``remainder``), so we don't need to fabricate a header.
+  let startIdx = lines.findIndex((l) => /^TODAY IN ONE SENTENCE\s*$/i.test(l.trim()))
+  if (startIdx === -1) startIdx = 0
+
   let bucket: 'none' | 'one' | 'high' | 'watch' | 'rest' = 'none'
-  for (const raw of content.split(/\r?\n/)) {
+  for (const raw of lines.slice(startIdx)) {
     // Strip leading/trailing markdown emphasis chars so ``**TODAY IN
     // ONE SENTENCE**`` and ``# TODAY IN ONE SENTENCE`` still match the
     // header regexes below. The bucket transitions happen on the
@@ -425,11 +441,15 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
               </ul>
             </div>
           )}
-          {parsed.remainder && (
-            <pre className="text-xs text-slate-500 whitespace-pre-wrap font-sans">
-              {parsed.remainder}
-            </pre>
-          )}
+          {/* The remainder block is no longer rendered. In practice
+              it has only ever shown leaked prompt-template text
+              (e.g. "Source Material:", "Analyze the Request:") that
+              the backend should have prevented via stop sequences.
+              If a future model emits useful prose that doesn't fit
+              the schema, the right place to surface it is here —
+              but it should require explicit opt-in (a flag on the
+              parsed result, e.g. ``parsed.hasUsefulRemainder``)
+              rather than render any leftover text by default. */}
           {error && <p className="text-xs text-red-300">{error}</p>}
         </div>
       )}

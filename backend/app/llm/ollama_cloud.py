@@ -37,7 +37,13 @@ class OllamaCloudProvider(Provider):
         self._model = model
         self._api_key = api_key
 
-    async def complete(self, prompt: str, *, max_tokens: int = 512) -> str:
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        stop: list[str] | None = None,
+    ) -> str:
         url = f"{self._base}/api/generate"
         payload: dict[str, Any] = {
             "model": self._model,
@@ -45,6 +51,8 @@ class OllamaCloudProvider(Provider):
             "stream": False,
             "options": {"num_predict": max_tokens},
         }
+        if stop:
+            payload["stop"] = stop
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
