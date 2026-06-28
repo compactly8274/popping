@@ -34,6 +34,10 @@ type Props = {
   // Active source filter (multi-select). Empty set = no filter.
   activeSources: Set<string>
   onSourceToggle: (name: string) => void
+  // Wipe the active filter set in one call. Wired to the "Filtering:
+  // …" header's clear-all button so the user doesn't have to untick
+  // each row individually.
+  onClearAllFilters?: () => void
   // "Scroll to column" support. The Drawer's category list calls
   // back with the category name; App owns the column refs and
   // scrolls the right one into view.
@@ -74,6 +78,7 @@ export function Drawer({
   categories,
   activeSources,
   onSourceToggle,
+  onClearAllFilters,
   onCategoryJump,
   briefTone,
   onBriefToneChange,
@@ -272,9 +277,33 @@ export function Drawer({
             />
           </div>
           <div className="pt-4 border-t border-slate-800">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
-              Sources <span className="text-slate-600 normal-case font-normal">— tap to filter</span>
-            </h3>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                Sources <span className="text-slate-600 normal-case font-normal">— tap to filter</span>
+              </h3>
+            </div>
+            {/* Filtering summary — surfaces the active set at the top
+                of the Sources section so the user can confirm what's
+                applied without scrolling back to the chip-bar in the
+                header. Hidden when the set is empty; the "clear all"
+                button is the only purpose this header serves while
+                a filter is active. */}
+            {activeSources.size > 0 && (
+              <div className="mb-2 rounded border border-blue-900/60 bg-blue-950/40 px-2 py-1.5 text-xs flex items-center gap-2">
+                <span className="text-blue-200 truncate min-w-0">
+                  filtering: {Array.from(activeSources).join(', ')}
+                </span>
+                {onClearAllFilters && (
+                  <button
+                    onClick={onClearAllFilters}
+                    className="shrink-0 ml-auto text-[10px] text-blue-300 hover:text-blue-100 underline decoration-dotted"
+                    aria-label="clear all source filters"
+                  >
+                    clear
+                  </button>
+                )}
+              </div>
+            )}
             {sourcesError ? (
               <button
                 onClick={refetchSources}
@@ -286,37 +315,45 @@ export function Drawer({
             ) : sources.length === 0 ? (
               <p className="text-xs text-slate-500 italic">loading…</p>
             ) : (
+              // The Sources list is now a checkbox list, not a button
+              // list. Visually honest: each row is a checkbox + label,
+              // so the multi-select semantics match what the chip-bar
+              // in the header does. ``<label>`` makes the entire row
+              // clickable, which matches the previous tap-target size.
+              // App's ``toggleSourceAndMaybeClose`` closes the drawer
+              // on the first selection so the user can see the
+              // filtered dashboard immediately — subsequent taps don't
+              // close, so they can keep picking without the panel
+              // ping-ponging shut.
               <ul className="space-y-1">
                 {sources.map((s) => {
-                  // Multi-select: a source is "active" when its name
-                  // is in the activeSources set. Tap toggles. No
-                  // longer auto-closes the drawer — the user might
-                  // want to pick two or three. They can close the
-                  // drawer manually when they're done.
                   const active = activeSources.has(s.name)
                   return (
                     <li key={s.id}>
-                      <button
-                        onClick={() => onSourceToggle(s.name)}
-                        className={`w-full text-left rounded px-2 py-1 text-sm flex items-center justify-between gap-2 transition ${
+                      <label
+                        className={`w-full rounded px-2 py-1 text-sm flex items-center gap-2 cursor-pointer transition ${
                           active
                             ? 'bg-slate-700 text-white'
                             : 'text-slate-200 hover:bg-slate-800'
                         }`}
-                        aria-pressed={active}
                       >
-                        <span className="flex items-center gap-2 min-w-0">
-                          {/* SourceIcon. Falls back to a colored
-                              letter when the favicon hasn't been
-                              fetched yet — so the row is visually
-                              present even on a freshly-added dynamic
-                              source. ``console.warn`` surfaces
-                              failures in DevTools. */}
-                          <SourceIcon src={s.favicon_path} name={s.name} size={14} />
-                          <span className="truncate">{s.name}</span>
-                        </span>
-                        <span className="text-xs text-slate-500 shrink-0">{s.category}</span>
-                      </button>
+                        <input
+                          type="checkbox"
+                          checked={active}
+                          onChange={() => onSourceToggle(s.name)}
+                          // Visually hidden but kept in the DOM so
+                          // screen readers announce state correctly.
+                          // ``accent-blue-500`` colors the native check
+                          // mark to match the rest of the UI.
+                          className="shrink-0 h-3.5 w-3.5 accent-blue-500"
+                          aria-label={`filter by ${s.name}`}
+                        />
+                        {/* SourceIcon. Falls back to a colored letter
+                            when the favicon hasn't been fetched yet. */}
+                        <SourceIcon src={s.favicon_path} name={s.name} size={14} />
+                        <span className="truncate">{s.name}</span>
+                        <span className="text-xs text-slate-500 shrink-0 ml-auto">{s.category}</span>
+                      </label>
                     </li>
                   )
                 })}

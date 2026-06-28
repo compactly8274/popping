@@ -43,6 +43,7 @@ from app.notify import Notifier
 from app.scoring import composite as composite_scorer
 from app.scoring import recency
 from app.sources import list_sources
+from app.sources.base import SourcePlugin
 from app.sources.dynamic_rss import DynamicRssPlugin
 
 logger = logging.getLogger("popping.scheduler")
@@ -126,7 +127,15 @@ async def _ingest(plugin_cls: Any) -> dict:
     the scheduler down.
     """
     summary = {"source": plugin_cls.name, "fetched": 0, "inserted": 0, "duplicates": 0, "error": None}
-    plugin = plugin_cls()
+    # A class-driven plugin arrives as a class — instantiate a fresh one
+    # per run so plugin-local state doesn't leak between ingests. A
+    # dynamic plugin arrives as an already-constructed
+    # ``DynamicRssPlugin`` instance (the scheduler creates one per row
+    # and passes that instance to ``add_job``); calling an instance
+    # would raise ``TypeError: 'DynamicRssPlugin' object is not callable``
+    # which the broad ``except Exception`` below would swallow, leaving
+    # the row with a stale ``last_error`` and no entries landing.
+    plugin = plugin_cls() if not isinstance(plugin_cls, SourcePlugin) else plugin_cls
     newly_inserted: list[tuple[Entry, Source]] = []
     # Track entries that need a thumbnail pass. Collected here so we
     # can do the network fetches outside the DB session (each
@@ -174,6 +183,18 @@ async def _ingest(plugin_cls: Any) -> dict:
             source = await session.get(Source, source_id) if source_id else None
             if source is None:
                 # Source was deleted between sessions — nothing to do.
+                return summary
+            # Paused (built-in or dynamic): skip the fetch entirely.
+            # APScheduler doesn't know about the DB row's active flag,
+            # so we have to check here. For dynamic rows, ``update_source``
+            # already removes the job on pause, but a class-driven
+            # built-in's job is owned by the plugin registry and never
+            # goes away — this is the only place the pause can be
+            # honored end-to-end. Skipping on every tick (instead of
+            # removing the job) keeps the resume path O(1): flip the
+            # flag back and the next tick lands entries again.
+            if not source.active:
+                logger.debug("ingest: %s paused — skipping", source.name)
                 return summary
             profile = await _load_profile(session)
             raw_items = await plugin.fetch()

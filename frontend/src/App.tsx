@@ -524,6 +524,23 @@ export function App() {
       return next
     })
   }
+  // Same as ``toggleSource`` but also closes the drawer the first time
+  // the user adds a source to an empty filter. The "empty → first tap"
+  // transition is the confusing one — the user picked a source, the
+  // filter engaged, but the panel stayed open covering the now-filtered
+  // dashboard. Auto-closing lets them see the result immediately.
+  // Subsequent taps toggle in place; they don't close again (avoids
+  // the drawer ping-ponging shut when the user wants to pick two or
+  // three sources in a row). The "sizeBefore === 0" check runs on the
+  // current state, captured before ``toggleSource`` queues its update.
+  const toggleSourceAndMaybeClose = (name: string) => {
+    const wasEmpty = activeSources.size === 0
+    toggleSource(name)
+    if (wasEmpty) setDrawerOpen(false)
+  }
+  const clearSourceFilters = () => {
+    setActiveSources(new Set())
+  }
 
   const jumpToCategory = (category: string) => {
     const idx = columns.findIndex((c) => c.name === category)
@@ -772,7 +789,8 @@ export function App() {
         onClose={() => setDrawerOpen(false)}
         categories={categories}
         activeSources={activeSources}
-        onSourceToggle={toggleSource}
+        onSourceToggle={toggleSourceAndMaybeClose}
+        onClearAllFilters={clearSourceFilters}
         onCategoryJump={jumpToCategory}
         briefTone={briefTone}
         onBriefToneChange={setBriefTone}
