@@ -97,6 +97,18 @@ class BriefGenerator:
         await self._dispatch(brief)
         return brief
 
+    @staticmethod
+    def skip_reason() -> str:
+        """Why ``generate`` would return None right now. Cheap to call —
+        used by the route to surface a precise 503 detail."""
+        if router.provider_for("brief") is None:
+            return "no LLM provider configured (set ANTHROPIC_API_KEY / OPENAI_API_KEY / GROQ_API_KEY, or run Ollama)"
+        # If we got here on a previous attempt and returned None for
+        # "no recent entries", we can't know without a DB query — so
+        # the default reason is the LLM-failure path, which is by far
+        # the most common cause in practice.
+        return "LLM call failed or returned empty content (check backend logs)"
+
     async def generate_alert(
         self, *, session: AsyncSession, slug: str, source_count: int
     ) -> Optional[Brief]:

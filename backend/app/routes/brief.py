@@ -86,7 +86,7 @@ async def brief_generate(
         if brief is None:
             raise HTTPException(
                 status_code=503,
-                detail="no LLM provider configured or no recent entries to digest",
+                detail=BriefGenerator.skip_reason(),
             )
         await session.commit()
         await session.refresh(brief)
