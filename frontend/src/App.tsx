@@ -9,7 +9,6 @@ import { BriefCard } from './components/BriefCard'
 import { Card } from './components/Card'
 import { Column } from './components/Column'
 import { Drawer } from './components/Drawer'
-import { ForYou } from './components/ForYou'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
 import { UserBadge } from './components/UserBadge'
@@ -63,6 +62,22 @@ export function App() {
   }, [entries, sources])
 
   const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
+
+  // Unified column list. ``For You`` leads when populated; real
+  // categories follow in their alphabetical sort order. Skipping
+  // ForYou when empty avoids a "nothing yet" header in a 1-row
+  // column — the user can read the empty state once, in the empty
+  // dashboard placeholder, not on every refresh. Memoized because
+  // ``columns`` is referenced from multiple render paths (desktop
+  // grid, mobile swipe, dot indicator).
+  const columns = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
+    const out: Array<{ name: string; entries: Entry[] }> = []
+    if (forYou.length > 0) out.push({ name: 'For You', entries: forYou })
+    for (const cat of categories) {
+      out.push({ name: cat, entries: byCategory.get(cat) ?? [] })
+    }
+    return out
+  }, [forYou, categories, byCategory])
 
   const refresh = useCallback(async () => {
     try {
@@ -120,13 +135,22 @@ export function App() {
     return () => clearInterval(id)
   }, [refresh, authProbed])
 
+  // Keep ``mobileCol`` in bounds. After a refresh the column count
+  // can shrink (a source failed to ingest, ForYou turned empty) and
+  // we'd otherwise point at an out-of-range index. Reset silently —
+  // the user just lands on the last available column.
+  useEffect(() => {
+    if (columns.length === 0) return
+    if (mobileCol >= columns.length) setMobileCol(columns.length - 1)
+  }, [columns.length, mobileCol])
+
   const onTouchStart = (e: React.TouchEvent) => { touchStartX.current = e.touches[0].clientX }
   const onTouchEnd = (e: React.TouchEvent) => {
     if (touchStartX.current == null) return
     const delta = e.changedTouches[0].clientX - touchStartX.current
     touchStartX.current = null
     if (Math.abs(delta) < 60) return
-    if (delta < 0) setMobileCol((i) => Math.min(i + 1, Math.max(categories.length - 1, 0)))
+    if (delta < 0) setMobileCol((i) => Math.min(i + 1, Math.max(columns.length - 1, 0)))
     else setMobileCol((i) => Math.max(i - 1, 0))
   }
 
@@ -216,52 +240,63 @@ export function App() {
         </div>
       )}
 
-      <ForYou entries={forYou} sourcesById={sourcesById} />
-
       <BriefCard brief={brief} onBriefChange={setBrief} />
 
-      {/* Desktop: grid */}
-      <main className="hidden md:grid md:grid-cols-3 lg:grid-cols-4 gap-4 p-4 flex-1 overflow-hidden">
-        {categories.map((cat) => (
-          <Column key={cat} name={cat} entries={byCategory.get(cat) ?? []} sourcesById={sourcesById} />
-        ))}
-        {categories.length === 0 && (
-          <div className="col-span-full flex items-center justify-center text-slate-500">
-            no entries yet — the scheduler will fetch the first batch shortly, or hit Refresh
-          </div>
-        )}
-      </main>
+      {/* Unified column list. ``For You`` is the user's personal feed
+          (computed server-side via convergence-boosted composite_score
+          over the last ingest window). When it has entries we lead
+          with it — it's what the user should read first — and append
+          the regular category columns after. Same Column component,
+          same swipe pattern on mobile. When ForYou is empty we
+          silently skip it: a "nothing yet" header in a 1-row column
+          is noise. */}
+      {columns.length === 0 && (
+        <div className="flex-1 flex items-center justify-center text-slate-500 px-4 text-center">
+          no entries yet — the scheduler will fetch the first batch shortly, or hit Refresh
+        </div>
+      )}
 
-      {/* Mobile: one column + swipe */}
-      <main
-        className="md:hidden flex-1 overflow-hidden p-3"
-        onTouchStart={onTouchStart}
-        onTouchEnd={onTouchEnd}
-      >
-        {categories.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-slate-500 text-sm">
-            no entries yet
-          </div>
-        ) : (
-          <>
+      {columns.length > 0 && (
+        <>
+          {/* Desktop: auto-fit grid. ``auto-fit,minmax(280px,1fr)``
+              fills the viewport with as many 280+px columns as fit
+              and lets the rest wrap to a new row. ``overflow-y-auto``
+              on main means the extra row scrolls instead of clipping
+              — the old fixed ``md:grid-cols-3 lg:grid-cols-4`` clipped
+              the 5th+ column on lg viewports. */}
+          <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
+            {columns.map((col) => (
+              <Column key={col.name} name={col.name} entries={col.entries} sourcesById={sourcesById} />
+            ))}
+          </main>
+
+          {/* Mobile: one column + swipe, with ForYou as the first
+              swipe target if it has entries. The dot indicator
+              reflects the full column count so the user knows how
+              many swipes are available. */}
+          <main
+            className="md:hidden flex-1 overflow-hidden p-3"
+            onTouchStart={onTouchStart}
+            onTouchEnd={onTouchEnd}
+          >
             <Column
-              name={categories[mobileCol] ?? ''}
-              entries={byCategory.get(categories[mobileCol] ?? '') ?? []}
+              name={columns[mobileCol]?.name ?? ''}
+              entries={columns[mobileCol]?.entries ?? []}
               sourcesById={sourcesById}
             />
-            {categories.length > 1 && (
+            {columns.length > 1 && (
               <div className="flex justify-center gap-1 mt-2">
-                {categories.map((c, i) => (
+                {columns.map((c, i) => (
                   <span
-                    key={c}
+                    key={c.name}
                     className={`h-1.5 w-1.5 rounded-full ${i === mobileCol ? 'bg-slate-300' : 'bg-slate-700'}`}
                   />
                 ))}
               </div>
             )}
-          </>
-        )}
-      </main>
+          </main>
+        </>
+      )}
 
       <Drawer
         open={drawerOpen}
