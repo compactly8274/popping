@@ -83,6 +83,44 @@ class LLMStatus(BaseModel):
     model: Optional[str] = None
 
 
+class LLMTag(BaseModel):
+    """One model entry in the Ollama-style ``/api/tags`` response.
+    Slimmed-down subset of Ollama's full record — we don't expose
+    ``digest`` or ``modified_at`` to the picker (they're long and the
+    user doesn't act on them)."""
+    name: str
+    size: Optional[int] = None
+    family: Optional[str] = None
+    parameter_size: Optional[str] = None
+    quantization_level: Optional[str] = None
+
+
+class LLMTagsResponse(BaseModel):
+    """Response from ``GET /api/llm/tags``. ``stale`` is set when the
+    live fetch failed and we served a previously-cached value — the
+    picker shows a banner so the user knows the list may be outdated."""
+    models: list[LLMTag]
+    cached_at: Optional[dt.datetime] = None
+    ttl_seconds: int
+    stale: Optional[bool] = None
+
+
+class SettingsOut(BaseModel):
+    """What ``GET /api/settings`` returns. All fields nullable — first
+    boot with no env seeds has everything blank."""
+    llm_provider: Optional[str] = None       # runtime_settings value of "llm.provider"
+    llm_model_brief: Optional[str] = None   # runtime_settings value of "llm.model_brief"
+    llm_model_scoring: Optional[str] = None  # runtime_settings value of "llm.model_scoring"
+
+
+class LLMSettingsUpdate(BaseModel):
+    """Body for ``PUT /api/settings/llm``. Each field is optional —
+    missing fields are left untouched (PUT but partial update)."""
+    provider: Optional[str] = None           # ollama_cloud / ollama / anthropic / openai / groq / None
+    model_brief: Optional[str] = None
+    model_scoring: Optional[str] = None
+
+
 class HealthOut(BaseModel):
     status: str
     sources: int

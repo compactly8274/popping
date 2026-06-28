@@ -69,6 +69,39 @@ export interface LLMStatus {
   model: string | null
 }
 
+// /api/settings — runtime-overridable settings the user has saved
+// (from the Drawer picker). All fields nullable: first boot or
+// "use env default" leaves the value unset.
+export interface SettingsOut {
+  llm_provider: string | null
+  llm_model_brief: string | null
+  llm_model_scoring: string | null
+}
+
+// PUT /api/settings/llm — all fields optional; missing = unchanged.
+export interface LLMSettingsUpdate {
+  provider?: string | null
+  model_brief?: string | null
+  model_scoring?: string | null
+}
+
+// One row from /api/llm/tags — Ollama-style model record. Slim subset
+// of what Ollama returns; details (digest, modified_at) trimmed.
+export interface LLMTag {
+  name: string
+  size: number | null
+  family: string | null
+  parameter_size: string | null
+  quantization_level: string | null
+}
+
+export interface LLMTagsResponse {
+  models: LLMTag[]
+  cached_at: string | null
+  ttl_seconds: number
+  stale?: boolean
+}
+
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, { credentials: 'include', ...init })
   if (!resp.ok) {
@@ -125,6 +158,24 @@ export const api = {
     ),
   notificationStatus: () => jsonFetch<NotificationStatus>('/api/notifications/status'),
   llmStatus: () => jsonFetch<LLMStatus>('/api/llm/status'),
+
+  // ---- Runtime settings (LLM picker) ----
+  /** Current runtime overrides for LLM knobs. All fields nullable. */
+  settings: () => jsonFetch<SettingsOut>('/api/settings'),
+  /** Persist one or more LLM knobs. Empty string = reset to env. */
+  updateLLMSettings: (update: LLMSettingsUpdate) =>
+    jsonFetch<SettingsOut>('/api/settings/llm', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(update),
+    }),
+  /** Fetch the model list for ``provider`` (Ollama-shaped only). */
+  llmTags: (provider: string = 'ollama_cloud', refresh: boolean = false) => {
+    const params = new URLSearchParams()
+    params.set('provider', provider)
+    if (refresh) params.set('refresh', 'true')
+    return jsonFetch<LLMTagsResponse>(`/api/llm/tags?${params.toString()}`)
+  },
 
   // ---- Auth (only meaningful when OIDC is enabled on the backend) ----
   /** Probe the current user. Returns the user, null (logged out), or

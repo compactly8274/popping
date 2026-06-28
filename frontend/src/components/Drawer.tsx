@@ -4,8 +4,15 @@
 // backend status (Apprise / Pushover / none) and the LLM provider
 // status — useful confirmation that the user's env vars are wired up.
 
-import { useEffect, useState } from 'react'
-import { api, type LLMStatus, type NotificationStatus, type Source } from '../api'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  api,
+  type LLMTagsResponse,
+  type LLMStatus,
+  type NotificationStatus,
+  type SettingsOut,
+  type Source,
+} from '../api'
 
 type Props = {
   open: boolean
@@ -14,6 +21,18 @@ type Props = {
   sourceFilter: string | null
   onSourceSelect: (name: string | null) => void
 }
+
+// Whitelist mirrors backend ``_VALID_PROVIDERS``. Includes a sentinel
+// empty value so the user can pick "use env default" (which is what
+// happens when no runtime override is set).
+const PROVIDER_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '', label: '— env default —' },
+  { value: 'ollama_cloud', label: 'Ollama Cloud' },
+  { value: 'ollama', label: 'Ollama (local)' },
+  { value: 'anthropic', label: 'Anthropic' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'groq', label: 'Groq' },
+]
 
 export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect }: Props) {
   const [sources, setSources] = useState<Source[]>([])
@@ -78,19 +97,7 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
               LLM
             </h3>
-            <div className="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs">
-              {llm === null ? (
-                <span className="text-slate-500">checking…</span>
-              ) : llm.configured ? (
-                <span className="text-emerald-400">
-                  ✓ {llm.backend} · {llm.model}
-                </span>
-              ) : (
-                <span className="text-amber-400">
-                  no LLM provider configured
-                </span>
-              )}
-            </div>
+            <LLMSection llm={llm} onChange={setLlm} />
             <button
               onClick={async () => {
                 setGenError(null)
@@ -168,6 +175,281 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
           </div>
         </nav>
       </aside>
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// LLM section: chip + inline picker
+// ---------------------------------------------------------------------------
+
+function LLMSection({
+  llm,
+  onChange,
+}: {
+  llm: LLMStatus | null
+  onChange: (next: LLMStatus) => void
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [tags, setTags] = useState<LLMTagsResponse | null>(null)
+  const [provider, setProvider] = useState<string>('')
+  const [modelBrief, setModelBrief] = useState<string>('')
+  const [modelScoring, setModelScoring] = useState<string>('')
+  const [freeTextBrief, setFreeTextBrief] = useState<string>('')
+  const [useFreeText, setUseFreeText] = useState<boolean>(false)
+  const [tagsError, setTagsError] = useState<string | null>(null)
+  const [tagsLoading, setTagsLoading] = useState<boolean>(false)
+  const [saving, setSaving] = useState<boolean>(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  // Fetch settings + tags when the picker is opened. We re-fetch on
+  // open rather than on drawer-open because settings can change mid-
+  // drawer-open (e.g. user saves, then opens picker again to verify).
+  const openPicker = async () => {
+    setPickerOpen(true)
+    setSaveError(null)
+    setTagsError(null)
+    setTagsLoading(true)
+    try {
+      // Fetch settings first so we can derive which provider's tag
+      // list to pull (Ollama-shaped only — Anthropic/OpenAI/Groq don't
+      // expose a /api/tags). If the user has pinned a non-Ollama
+      // provider, skip the tags fetch entirely and show free-text.
+      const s = await api.settings()
+      const prov = providerForTagsFetch(s)
+      const t = prov
+        ? await api.llmTags(prov)
+        : null
+      setTags(t)
+      applySettingsToForm(s, t)
+    } catch (err) {
+      setTagsError((err as Error).message)
+    } finally {
+      setTagsLoading(false)
+    }
+  }
+
+  // The chip's backend may not be one we've exposed in the picker
+  // (e.g. user pinned "anthropic"). Only Ollama-shaped providers
+  // expose /api/tags today — return null for the others so the picker
+  // skips the fetch and shows a free-text input.
+  const providerForTagsFetch = (s: SettingsOut | null): string | null => {
+    const pinned = s?.llm_provider || ''
+    if (pinned === 'ollama_cloud' || pinned === '') return 'ollama_cloud'
+    if (pinned === 'ollama') return 'ollama'
+    return null
+  }
+
+  const applySettingsToForm = (s: SettingsOut, t: LLMTagsResponse | null) => {
+    setProvider(s.llm_provider || '')
+    setModelBrief(s.llm_model_brief || '')
+    setModelScoring(s.llm_model_scoring || '')
+    // If the saved model isn't in the tags list (e.g. user typed it
+    // freehand last time), keep it as free text so they can edit.
+    const tagNames = t?.models?.map((m) => m.name) ?? []
+    const isFreeText =
+      Boolean(s.llm_model_brief) && tagNames.length > 0 && !tagNames.includes(s.llm_model_brief || '')
+    setUseFreeText(isFreeText)
+    setFreeTextBrief(isFreeText ? s.llm_model_brief || '' : '')
+  }
+
+  const refreshTags = async () => {
+    setTagsLoading(true)
+    setTagsError(null)
+    try {
+      const prov = providerForTagsFetch({
+        llm_provider: provider || null,
+        llm_model_brief: modelBrief || null,
+        llm_model_scoring: modelScoring || null,
+      })
+      if (!prov) {
+        // Pinned to a non-Ollama provider; no /api/tags to fetch.
+        setTags(null)
+        return
+      }
+      const t = await api.llmTags(prov, true)
+      setTags(t)
+      // Re-evaluate free-text mode now that we have a fresh list. If
+      // the model the user has in the form isn't in the freshly-
+      // fetched list, switch to free-text so they can edit it.
+      if (!useFreeText && modelBrief && !t.models.some((m) => m.name === modelBrief)) {
+        setUseFreeText(true)
+        setFreeTextBrief(modelBrief)
+      }
+    } catch (err) {
+      setTagsError((err as Error).message)
+    } finally {
+      setTagsLoading(false)
+    }
+  }
+
+  const save = async () => {
+    setSaving(true)
+    setSaveError(null)
+    try {
+      // Always send all three fields. Empty string = reset to env
+      // (backend deletes the row); any other value = upsert. See the
+      // docstring on ``PUT /api/settings/llm``.
+      const next = await api.updateLLMSettings({
+        provider: provider,
+        model_brief: useFreeText ? freeTextBrief : modelBrief,
+        model_scoring: modelScoring,
+      })
+      // ``next`` is the persisted settings row from the response. We
+      // don't read it directly because the chip is rebuilt from a
+      // fresh ``/api/llm/status`` call — that one is the source of
+      // truth for what the backend will actually use on the next Brief.
+      void next
+      const status = await api.llmStatus()
+      onChange(status)
+      setPickerOpen(false)
+    } catch (err) {
+      setSaveError((err as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // Tag-name list for the dropdown. Empty array triggers free-text mode.
+  const tagNames = useMemo(() => tags?.models?.map((m) => m.name) ?? [], [tags])
+
+  return (
+    <>
+      <div className="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs flex items-center justify-between gap-2">
+        {llm === null ? (
+          <span className="text-slate-500">checking…</span>
+        ) : llm.configured ? (
+          <span className="text-emerald-400 truncate">
+            ✓ {llm.backend} · {llm.model}
+          </span>
+        ) : (
+          <span className="text-amber-400">no LLM provider configured</span>
+        )}
+        <button
+          onClick={openPicker}
+          className="shrink-0 rounded px-2 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+          aria-label="edit LLM settings"
+        >
+          {pickerOpen ? 'close' : 'change'}
+        </button>
+      </div>
+
+      {pickerOpen && (
+        <div className="mt-2 rounded border border-slate-800 bg-slate-950 p-3 space-y-2 text-xs">
+          <div>
+            <label className="block text-slate-400 mb-1">Provider</label>
+            <select
+              value={provider}
+              onChange={(e) => setProvider(e.target.value)}
+              className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
+            >
+              {PROVIDER_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-slate-400">Model (brief)</label>
+              <button
+                onClick={refreshTags}
+                disabled={tagsLoading}
+                className="text-[10px] text-slate-400 hover:text-slate-100 disabled:opacity-50"
+              >
+                {tagsLoading ? 'refreshing…' : 'refresh list'}
+              </button>
+            </div>
+            {tagsError ? (
+              <p className="text-[10px] text-amber-400 break-words mb-1">
+                couldn’t load model list: {tagsError}
+              </p>
+            ) : null}
+            {tags?.stale ? (
+              <p className="text-[10px] text-amber-400 mb-1">
+                showing cached list (live fetch failed)
+              </p>
+            ) : null}
+            {tagNames.length === 0 || useFreeText ? (
+              <input
+                type="text"
+                value={useFreeText ? freeTextBrief : modelBrief}
+                onChange={(e) => {
+                  setUseFreeText(true)
+                  setFreeTextBrief(e.target.value)
+                  setModelBrief(e.target.value)
+                }}
+                placeholder="model name, e.g. gpt-oss:120b"
+                className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 placeholder:text-slate-600"
+              />
+            ) : (
+              <select
+                value={modelBrief}
+                onChange={(e) => setModelBrief(e.target.value)}
+                className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
+              >
+                <option value="">— pick a model —</option>
+                {tagNames.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            )}
+            {tagNames.length > 0 && (
+              <button
+                onClick={() => {
+                  if (useFreeText) {
+                    // Switching back to dropdown — keep current value if it’s in the list
+                    setUseFreeText(false)
+                    if (!tagNames.includes(modelBrief)) {
+                      setModelBrief('')
+                    }
+                  } else {
+                    setUseFreeText(true)
+                    setFreeTextBrief(modelBrief)
+                  }
+                }}
+                className="mt-1 text-[10px] text-slate-400 hover:text-slate-100"
+              >
+                {useFreeText ? '← back to list' : 'type a name instead'}
+              </button>
+            )}
+          </div>
+          <div>
+            <label className="block text-slate-400 mb-1">Model (scoring)</label>
+            <input
+              type="text"
+              value={modelScoring}
+              onChange={(e) => setModelScoring(e.target.value)}
+              placeholder="same as brief if blank"
+              className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 placeholder:text-slate-600"
+            />
+          </div>
+          {saveError && <p className="text-[10px] text-red-300 break-words">{saveError}</p>}
+          <div className="flex gap-2 pt-1">
+            <button
+              onClick={save}
+              disabled={saving}
+              className="flex-1 rounded bg-blue-800 hover:bg-blue-700 disabled:opacity-50 text-blue-100 px-2 py-1"
+            >
+              {saving ? 'saving…' : 'save'}
+            </button>
+            <button
+              onClick={() => setPickerOpen(false)}
+              disabled={saving}
+              className="flex-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 px-2 py-1"
+            >
+              cancel
+            </button>
+          </div>
+          <p className="text-[10px] text-slate-500 leading-snug">
+            Changes apply immediately — no restart needed. An empty
+            value resets to the env default.
+          </p>
+        </div>
+      )}
     </>
   )
 }

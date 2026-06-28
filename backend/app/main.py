@@ -25,11 +25,13 @@ from app.config import settings
 from app.embeddings import embedder
 from app.notify import build_notifier
 from app.request_state import set_notifier
+from app import runtime_settings
 from app.routes import brief as brief_routes
 from app.routes import entries as entries_routes
 from app.routes import foryou as foryou_routes
 from app.routes import health as health_routes
 from app.routes import ingest as ingest_routes
+from app.routes import settings as settings_routes
 from app.routes import sources as sources_routes
 from app.scheduler import start_scheduler, stop_scheduler
 
@@ -79,6 +81,19 @@ async def lifespan(app: FastAPI):
         logger.info("notifications: configured (%s)", notifier.name)
     else:
         logger.info("notifications: no backend configured")
+    # Seed the runtime_settings table from env on first boot only —
+    # ``seed_from_env`` is a no-op when the table already has rows, so
+    # subsequent restarts don't clobber the user's UI choices. Wrapped
+    # so a DB hiccup doesn't block the rest of startup; the picker
+    # then falls through to env values, which is the safe default.
+    try:
+        await runtime_settings.seed_from_env()
+    except Exception:
+        logger.exception("runtime_settings: seed failed — falling back to env")
+    # Warm the in-process cache from existing DB rows so the Router
+    # serves saved choices on the very first request after restart.
+    # Idempotent with seed_from_env (no-op if the table is empty).
+    await runtime_settings.warm_cache()
     await start_scheduler(notifier=notifier)
     try:
         yield
@@ -112,6 +127,7 @@ app.include_router(entries_routes.router, prefix="/api")
 app.include_router(foryou_routes.router, prefix="/api")
 app.include_router(ingest_routes.router, prefix="/api")
 app.include_router(brief_routes.router, prefix="/api")
+app.include_router(settings_routes.router, prefix="/api")
 
 # Auth router is only mounted when OIDC is enabled — keeps single-user
 # deployments free of /auth/* routes entirely.

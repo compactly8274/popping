@@ -201,6 +201,13 @@ class Settings(BaseSettings):
     # but doesn't need to be tight.
     convergence_check_interval_minutes: int = 15
 
+    # --- Runtime settings (LLM picker) -----------------------------------
+    # TTL for the /api/llm/tags response cache. The picker fetches this
+    # on drawer-open; 1 h is plenty because the user's available models
+    # change rarely (account-level quotas, not per-call). Override with
+    # POPPING_LLM_TAGS_CACHE_TTL_SECONDS if you need tighter refresh.
+    llm_tags_cache_ttl_seconds: int = 3600
+
     # --- Asset cache (favicons + thumbnails) ------------------------------
     # Where the ingest pipeline writes downloaded images. Must be
     # readable by the StaticFiles mount at /assets and writable by the

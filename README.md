@@ -227,10 +227,12 @@ highlights + 1-3 watch items); `narrative` is also available.
 | Convergence | `BriefGenerator.generate_alert()` from the periodic convergence-check job | When a slug appears in `CONVERGENCE_NOTIFY_THRESHOLD` (default 2) sources within `CONVERGENCE_WINDOW_HOURS`. |
 
 The LLM is picked via `app.llm.router.provider_for("brief")` — same
-Anthropic → OpenAI → Groq → Ollama order as scoring. If nothing is
-configured, the manual endpoint returns 503 ("no LLM provider") and
-the scheduler logs and skips. The dashboard keeps working with the
-existing Brief row.
+Anthropic → OpenAI → Groq → Ollama Cloud → Ollama local order as scoring.
+If nothing is configured, the manual endpoint returns 503 ("no LLM
+provider") and the scheduler logs and skips. The dashboard keeps working
+with the existing Brief row. The provider / model can be overridden at
+runtime via the Settings UI (Drawer → LLM chip → "change"); see
+**Runtime settings** below.
 
 ### Notifications
 
@@ -274,8 +276,37 @@ columns exist but the UI isn't built yet.
 | `GET  /api/brief/latest?tone=&limit=` | Most recent Brief(s). Latest of each tone when `tone` is omitted. | public |
 | `POST /api/brief/generate?tone=terse\|narrative` | Synchronously generate a new Brief. | login when OIDC on |
 | `GET  /api/notifications/status` | `{configured, backend, scheme}` — Drawer chip. | public |
+| `GET  /api/settings` | Runtime-overridable settings (`llm.provider`, `llm.model_brief`, `llm.model_scoring`). All fields nullable. | login when OIDC on |
+| `PUT  /api/settings/llm` | Persist one or more LLM knobs. Empty string clears the override. | login when OIDC on |
+| `GET  /api/llm/tags?provider=&refresh=` | Ollama-style model list (1 h TTL cache). The Drawer picker uses this to populate the model dropdown without making you type tag names blind. | login when OIDC on |
 
-## Phase 3 — sources
+### Runtime settings
+
+Some knobs (currently just the LLM provider / model name) are stored in
+a DB-backed `app_settings` table rather than only in env vars. This
+lets the operator change them from the UI without restarting the
+container:
+
+1. Open the Drawer → click "change" under the LLM chip.
+2. Pick a provider, then a model. The model dropdown is populated from
+   `/api/llm/tags?provider=ollama_cloud` (or `ollama` for local) — the
+   actual models your account has access to, not a guess.
+3. Hit Save. The chip flips to the new model immediately and the next
+   Brief uses it.
+
+**Read precedence** (per lookup):
+
+1. The `app_settings` row (if present and non-empty).
+2. The env-var default (`OLLAMA_CLOUD_MODEL_BRIEF`, etc.).
+3. The hardcoded fallback.
+
+**Env vs DB.** On first boot, `seed_from_env` copies the relevant env
+values into the table — but only if the table is empty for that key.
+After that, the table is authoritative: an `.env` edit does NOT
+silently override the choice you made in the UI. To reset a value to
+"use env," set it to the empty string in the picker.
+
+### Phase 3 — sources
 
 Six source plugins, all anonymous (no API keys required for the core
 set), all bot-tolerant. Categories:

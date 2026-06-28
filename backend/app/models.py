@@ -223,3 +223,27 @@ class Brief(Base):
     #   {"alert_slugs": [...]}   — convergence clusters already alerted on
     # GIN-indexed so ``meta @> '{"notified_urls": [<url>]}'::jsonb`` is cheap.
     meta: Mapped[Optional[dict]] = mapped_column(postgresql.JSONB, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# AppSetting: key/value store for runtime-overridable configuration.
+# ---------------------------------------------------------------------------
+# Lets the operator change settings (currently: LLM provider + model
+# name) from the UI without restarting the container. Persisted to the
+# DB so the choice survives restarts; env vars seed the table on first
+# boot only — after that the table is authoritative.
+#
+# Free-form ``value`` (TEXT) so we can add more keys without a
+# migration; the schema-level validation lives in the route handler
+# that accepts PUTs.
+# ---------------------------------------------------------------------------
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
