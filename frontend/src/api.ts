@@ -13,6 +13,10 @@ export interface Entry {
   title: string
   url: string
   published_at: string | null
+  // ISO timestamp of when the row landed in our DB (server `fetched_at`).
+  // Distinct from `published_at` (source article publish time). The
+  // frontend uses this for "new since last refresh" + read/unread.
+  fetched_at: string | null
   composite_score: number
   personal_score: number
   raw_score: number
@@ -125,10 +129,30 @@ export interface CurrentUser {
 
 export const api = {
   health: () => jsonFetch<Health>('/api/health'),
-  entries: (opts?: { category?: string; source?: string; limit?: number }) => {
+  entries: (
+    opts?: {
+      category?: string
+      // Multi-source: pass an array; the backend turns this into
+      // ``?source=a&source=b`` via ``Query(default=None, ...)``. An
+      // empty array means "no filter" (we don't even send the param).
+      source?: string[] | string
+      // Case-insensitive substring match on title and meta.summary.
+      // Backend caps results at 50 regardless of `limit`.
+      q?: string
+      limit?: number
+    },
+  ) => {
     const params = new URLSearchParams()
     if (opts?.category) params.set('category', opts.category)
-    if (opts?.source) params.set('source', opts.source)
+    if (opts?.source) {
+      // Accept either an array or a single string so callers don't
+      // have to construct an array for the common single-source case.
+      const sources = Array.isArray(opts.source) ? opts.source : [opts.source]
+      for (const s of sources) {
+        if (s) params.append('source', s)
+      }
+    }
+    if (opts?.q) params.set('q', opts.q)
     if (opts?.limit) params.set('limit', String(opts.limit))
     const q = params.toString()
     return jsonFetch<Entry[]>(`/api/entries${q ? `?${q}` : ''}`)

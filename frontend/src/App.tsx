@@ -1,19 +1,96 @@
 // App: 3-4 column desktop grid, single-column mobile with swipe.
-// Top bar has the hamburger (opens Drawer) and a refresh button.
+// Top bar has the hamburger (opens Drawer), search input, and refresh.
 // When OIDC is enabled and the user isn't logged in, the dashboard
 // content is replaced with a LoginPage.
+//
+// Layered UX features (each documented at the call site):
+//   - Active source filter chips (multi-select via Drawer)
+//   - Per-column sort/filter popover (the ⋯ button)
+//   - Per-column read/unread state in localStorage
+//   - New-entry chip in column headers (union of refresh-delta +
+//     last-viewed-delta)
+//   - Search (debounced, replaces columns when query is set)
+//   - Keyboard navigation on desktop (←/→/↑/↓/Enter)
+//   - Tab-visibility-aware polling (pauses when tab is hidden,
+//     force-refresh + reset seen-set when it returns)
+//   - Brief tone picker (terse / narrative / alert)
+//   - Source filter chips in the header
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type Brief, type CurrentUser, type Entry, type Health, type Source } from './api'
 import { BriefCard } from './components/BriefCard'
-import { Card } from './components/Card'
-import { Column } from './components/Column'
+import { Column, DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
 import { Drawer } from './components/Drawer'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
+import { SearchResults } from './components/SearchResults'
+import { ToastHost } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 
 const REFRESH_INTERVAL_MS = 60_000
+// Hidden longer than this → treat return as "fresh start"; the new-
+// entry indicator resets and all entries surface as unread. Without
+// this, returning from a long absence shows nothing flagged (because
+// the seen-set still has the old ids).
+const HIDDEN_RESET_MS = 2 * 60 * 1000
+
+// localStorage keys. Dotted namespace matches BriefCard's existing
+// ``brief.collapsed`` convention — each feature owns its own subtree.
+const LS_LAST_VIEWED = 'col.lastViewed'
+const LS_COLUMN_PREFS = 'col.prefs'
+const LS_MOBILE_COL = 'mobileCol.last'
+
+function loadLastViewed(): Record<string, string> {
+  if (typeof window === 'undefined') return {}
+  try {
+    const raw = window.localStorage?.getItem(LS_LAST_VIEWED)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, string>) : {}
+  } catch {
+    return {}
+  }
+}
+
+function loadColumnPrefs(): Record<string, ColumnPrefs> {
+  if (typeof window === 'undefined') return {}
+  try {
+    const raw = window.localStorage?.getItem(LS_COLUMN_PREFS)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return {}
+    const out: Record<string, ColumnPrefs> = {}
+    for (const [k, v] of Object.entries(parsed)) {
+      if (v && typeof v === 'object' && 'sort' in v) {
+        out[k] = { ...DEFAULT_PREFS, ...(v as Partial<ColumnPrefs>) }
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function loadMobileCol(): number {
+  if (typeof window === 'undefined') return 0
+  try {
+    const raw = window.localStorage?.getItem(LS_MOBILE_COL)
+    if (!raw) return 0
+    const n = Number(raw)
+    return Number.isInteger(n) && n >= 0 ? n : 0
+  } catch {
+    return 0
+  }
+}
+
+function safeSetItem(key: string, value: string) {
+  try {
+    window.localStorage?.setItem(key, value)
+  } catch {
+    // Quota / private-mode — the in-memory state is the source of
+    // truth for the current session.
+  }
+}
 
 export function App() {
   const [entries, setEntries] = useState<Entry[]>([])
@@ -21,29 +98,59 @@ export function App() {
   const [sources, setSources] = useState<Source[]>([])
   const [health, setHealth] = useState<Health | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const [mobileCol, setMobileCol] = useState(0)
+  const [mobileCol, setMobileCol] = useState<number>(loadMobileCol)
   const [error, setError] = useState<string | null>(null)
   const [user, setUser] = useState<CurrentUser | null>(null)
-  // True once we've finished probing /auth/me. Until then we don't render
-  // the dashboard — avoids flashing the login page for already-logged-in
-  // users on a hard refresh.
   const [authProbed, setAuthProbed] = useState(false)
   const [oidcDisabled, setOidcDisabled] = useState(false)
-  // When set, the dashboard shows only entries from this source. Set
-  // by tapping a source in the Drawer; cleared by tapping the same
-  // source again or the "clear filter" pill.
-  const [sourceFilter, setSourceFilter] = useState<string | null>(null)
-  // Latest terse Brief for the dashboard card. Null until either the
-  // scheduler has run today or the user manually generates one.
+  // Multi-source filter (empty set = no filter).
+  const [activeSources, setActiveSources] = useState<Set<string>>(() => new Set())
   const [brief, setBrief] = useState<Brief | null>(null)
-  // Tracks in-flight brief generation requests from the header
-  // button so a second tap doesn't fire a parallel LLM roundtrip.
-  // The BriefCard and Drawer manage their own generating state for
-  // their own buttons; this is just for the header button which
-  // lives up here in App.
   const [generatingBrief, setGeneratingBrief] = useState(false)
-  const touchStartX = useRef<number | null>(null)
+  // Brief tone — lifted from BriefCard so the header Brief button,
+  // the Drawer "Generate brief now" button, and the BriefCard pills
+  // all stay in sync.
+  const [briefTone, setBriefTone] = useState<'terse' | 'narrative' | 'alert'>('terse')
+  // Refresh in-flight state — drives the Refresh button's disabled
+  // state so a second tap doesn't fire a parallel fetch.
+  const [refreshing, setRefreshing] = useState(false)
+  // Per-column last-viewed timestamps.
+  const [lastViewed, setLastViewed] = useState<Record<string, string>>(loadLastViewed)
+  // Per-column sort/filter preferences.
+  const [columnPrefs, setColumnPrefs] = useState<Record<string, ColumnPrefs>>(loadColumnPrefs)
+  // Search state. ``searchInput`` is the controlled input value;
+  // ``searchQuery`` is the debounced value used for the fetch.
+  const [searchInput, setSearchInput] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<Entry[]>([])
+  const [searching, setSearching] = useState(false)
+  // Keyboard selection.
+  const [selectedColumnIndex, setSelectedColumnIndex] = useState(0)
+  const [selectedCardId, setSelectedCardId] = useState<number | null>(null)
 
+  const touchStartX = useRef<number | null>(null)
+  // Set of entry ids observed on the previous successful refresh.
+  // Used to compute "new since last refresh" — entries whose id is
+  // not in this set are flagged. ``null`` means "haven't completed a
+  // refresh yet" — the new-entry indicator stays hidden until the
+  // first refresh lands so the initial dashboard load doesn't flag
+  // every entry as new.
+  const seenEntryIdsRef = useRef<Set<number> | null>(null)
+  // When the tab was last hidden. ``null`` while visible.
+  const hiddenAtRef = useRef<number | null>(null)
+  // Shared ref Maps for column and card DOM nodes. Keyboard nav and
+  // jump-to-category both read from these — using a single shared
+  // Map per axis (rather than per-component refs) means we can find
+  // any card/column regardless of which is currently mounted.
+  const columnRefs = useRef<Map<string, HTMLElement | null>>(new Map())
+  const cardRefs = useRef<Map<number, HTMLElement | null>>(new Map())
+
+  // sourcesByName: Map<source_name, Source>. Lets us resolve an
+  // entry's category in O(1) instead of the previous O(N) ``sources.find``.
+  const sourcesByName = useMemo(
+    () => new Map(sources.map((s) => [s.name, s])),
+    [sources],
+  )
   const sourcesById = useMemo(
     () => new Map(sources.map((s) => [s.id, s.name])),
     [sources],
@@ -52,25 +159,19 @@ export function App() {
   const byCategory = useMemo(() => {
     const grouped = new Map<string, Entry[]>()
     for (const e of entries) {
-      const src = sources.find((s) => s.id === e.source_id)
+      const sourceName = sourcesById.get(e.source_id)
+      const src = sourceName != null ? sourcesByName.get(sourceName) : undefined
       const cat = src?.category ?? 'other'
       const arr = grouped.get(cat) ?? []
       arr.push(e)
       grouped.set(cat, arr)
     }
     return grouped
-  }, [entries, sources])
+  }, [entries, sourcesByName, sourcesById])
 
   const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
 
-  // Unified column list. ``For You`` leads when populated; real
-  // categories follow in their alphabetical sort order. Skipping
-  // ForYou when empty avoids a "nothing yet" header in a 1-row
-  // column — the user can read the empty state once, in the empty
-  // dashboard placeholder, not on every refresh. Memoized because
-  // ``columns`` is referenced from multiple render paths (desktop
-  // grid, mobile swipe, dot indicator).
-  const columns = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
+  const baseColumns = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
     const out: Array<{ name: string; entries: Entry[] }> = []
     if (forYou.length > 0) out.push({ name: 'For You', entries: forYou })
     for (const cat of categories) {
@@ -79,17 +180,102 @@ export function App() {
     return out
   }, [forYou, categories, byCategory])
 
+  // Apply per-column prefs. For You skips the sort filter (backend
+  // pre-sorts by composite_score) but still respects min-score +
+  // max-age.
+  const columns = useMemo<Array<{ name: string; entries: Entry[]; totalCount: number }>>(() => {
+    const now = Date.now()
+    return baseColumns.map((col) => {
+      const prefs = columnPrefs[col.name] ?? DEFAULT_PREFS
+      let filtered = col.entries
+      if (prefs.minScore > 0) {
+        filtered = filtered.filter((e) => e.composite_score >= prefs.minScore)
+      }
+      if (prefs.maxAgeHours != null) {
+        const cutoff = now - prefs.maxAgeHours * 60 * 60 * 1000
+        filtered = filtered.filter((e) => {
+          if (!e.fetched_at) return true
+          return new Date(e.fetched_at).getTime() >= cutoff
+        })
+      }
+      if (col.name !== 'For You' && prefs.sort !== 'top') {
+        filtered = [...filtered].sort((a, b) => {
+          const ta = a.published_at ? new Date(a.published_at).getTime() : 0
+          const tb = b.published_at ? new Date(b.published_at).getTime() : 0
+          return prefs.sort === 'newest' ? tb - ta : ta - tb
+        })
+      }
+      return { name: col.name, entries: filtered, totalCount: col.entries.length }
+    })
+  }, [baseColumns, columnPrefs])
+
+  // New-entry per column. An entry is "new" when its id isn't in the
+  // seen-set from the previous refresh AND/OR it's newer than the
+  // user's last visit to this column. Union of both — anything
+  // unacknowledged surfaces.
+  const newCountByColumn = useMemo(() => {
+    const out = new Map<string, number>()
+    const seen = seenEntryIdsRef.current
+    for (const col of columns) {
+      const last = lastViewed[col.name]
+      const lastMs = last ? new Date(last).getTime() : 0
+      let n = 0
+      for (const e of col.entries) {
+        const isNewSinceRefresh = seen != null && !seen.has(e.id)
+        const isNewSinceVisit =
+          lastMs > 0 && e.fetched_at != null && new Date(e.fetched_at).getTime() > lastMs
+        if (isNewSinceRefresh || isNewSinceVisit) n++
+      }
+      if (n > 0) out.set(col.name, n)
+    }
+    return out
+  }, [columns, lastViewed])
+
+  // Unread entry ids per column — used to dim read cards.
+  const unreadIdsByColumn = useMemo(() => {
+    const out = new Map<string, Set<number>>()
+    for (const col of columns) {
+      const last = lastViewed[col.name]
+      if (!last) continue
+      const lastMs = new Date(last).getTime()
+      const ids = new Set<number>()
+      for (const e of col.entries) {
+        if (e.fetched_at && new Date(e.fetched_at).getTime() > lastMs) {
+          ids.add(e.id)
+        }
+      }
+      if (ids.size > 0) out.set(col.name, ids)
+    }
+    return out
+  }, [columns, lastViewed])
+
   const refresh = useCallback(async () => {
+    setRefreshing(true)
     try {
-      // forYou may 401 when OIDC is on and the user isn't logged in —
-      // we already routed them to LoginPage in that case, so this only
-      // runs for signed-in users. Tolerate 401 anyway for safety.
+      const sourceArg = activeSources.size > 0 ? Array.from(activeSources) : undefined
       const [e, s, h, fy] = await Promise.all([
-        api.entries({ limit: 200, source: sourceFilter ?? undefined }),
+        api.entries({ limit: 200, source: sourceArg }),
         api.sources(),
         api.health(),
         api.forYou({ limit: 25 }).catch(() => [] as Entry[]),
       ])
+      const prevSeen = seenEntryIdsRef.current
+      const newSeen = new Set(e.map((x) => x.id))
+      if (
+        hiddenAtRef.current != null &&
+        Date.now() - hiddenAtRef.current > HIDDEN_RESET_MS
+      ) {
+        // Long absence → reset so everything surfaces as new.
+        seenEntryIdsRef.current = new Set()
+      } else if (prevSeen == null) {
+        // First refresh — don't flag every entry.
+        seenEntryIdsRef.current = newSeen
+      } else {
+        const merged = new Set(prevSeen)
+        for (const id of newSeen) merged.add(id)
+        seenEntryIdsRef.current = merged
+      }
+      hiddenAtRef.current = null
       setEntries(e)
       setSources(s)
       setHealth(h)
@@ -97,12 +283,12 @@ export function App() {
       setError(null)
     } catch (err) {
       setError((err as Error).message)
+    } finally {
+      setRefreshing(false)
     }
-  }, [sourceFilter])
+  }, [activeSources])
 
-  // Probe auth state once on mount. If /auth/me 404s, OIDC is disabled —
-  // we stay in single-user mode (no login screen). If 200 or 401, OIDC
-  // is enabled; show the dashboard or LoginPage accordingly.
+  // Probe auth state once on mount.
   useEffect(() => {
     let cancelled = false
     api.me()
@@ -114,9 +300,6 @@ export function App() {
       })
       .catch(() => {
         if (cancelled) return
-        // 404 → no auth surface at all (OIDC off). Any other error →
-        // safest default is "no login", since that matches the
-        // single-user behavior the user has been running.
         setOidcDisabled(true)
         setAuthProbed(true)
       })
@@ -125,26 +308,180 @@ export function App() {
     }
   }, [])
 
+  // Visibility-aware polling. The interval only runs while the tab
+  // is visible; on return we force a refresh so the user sees fresh
+  // data immediately. The interval cleanup runs on unmount.
   useEffect(() => {
-    // Don't start polling until auth has been resolved; the LoginPage
-    // doesn't need it, and we don't want to flood the API while the
-    // user is being redirected through the IdP.
     if (!authProbed) return
-    refresh()
-    const id = setInterval(refresh, REFRESH_INTERVAL_MS)
-    return () => clearInterval(id)
+
+    let intervalId: number | null = null
+
+    const startPolling = () => {
+      if (intervalId != null) return
+      intervalId = window.setInterval(() => {
+        void refresh()
+      }, REFRESH_INTERVAL_MS)
+    }
+    const stopPolling = () => {
+      if (intervalId != null) {
+        window.clearInterval(intervalId)
+        intervalId = null
+      }
+    }
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenAtRef.current = Date.now()
+        stopPolling()
+      } else {
+        void refresh()
+        startPolling()
+      }
+    }
+
+    document.addEventListener('visibilitychange', onVisibility)
+    void refresh()
+    if (document.visibilityState === 'visible') startPolling()
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      stopPolling()
+    }
   }, [refresh, authProbed])
 
-  // Keep ``mobileCol`` in bounds. After a refresh the column count
-  // can shrink (a source failed to ingest, ForYou turned empty) and
-  // we'd otherwise point at an out-of-range index. Reset silently —
-  // the user just lands on the last available column.
+  // Keep ``mobileCol`` in bounds.
   useEffect(() => {
     if (columns.length === 0) return
-    if (mobileCol >= columns.length) setMobileCol(columns.length - 1)
+    if (mobileCol >= columns.length) {
+      const next = columns.length - 1
+      setMobileCol(next)
+      safeSetItem(LS_MOBILE_COL, String(next))
+    }
   }, [columns.length, mobileCol])
 
-  const onTouchStart = (e: React.TouchEvent) => { touchStartX.current = e.touches[0].clientX }
+  useEffect(() => {
+    safeSetItem(LS_MOBILE_COL, String(mobileCol))
+  }, [mobileCol])
+
+  useEffect(() => {
+    safeSetItem(LS_LAST_VIEWED, JSON.stringify(lastViewed))
+  }, [lastViewed])
+
+  useEffect(() => {
+    safeSetItem(LS_COLUMN_PREFS, JSON.stringify(columnPrefs))
+  }, [columnPrefs])
+
+  // Debounced search. 300ms — standard "feels live but doesn't fire
+  // on every keystroke". The mirror into ``searchQuery`` happens
+  // inside the timeout so the actual fetch effect only re-runs on
+  // the settled value.
+  useEffect(() => {
+    const trimmed = searchInput.trim()
+    if (!trimmed) {
+      setSearchQuery('')
+      setSearchResults([])
+      setSearching(false)
+      return
+    }
+    setSearching(true)
+    const id = window.setTimeout(() => {
+      setSearchQuery(trimmed)
+    }, 300)
+    return () => window.clearTimeout(id)
+  }, [searchInput])
+
+  useEffect(() => {
+    if (!searchQuery) return
+    let cancelled = false
+    api
+      .entries({ q: searchQuery, limit: 50 })
+      .then((rows) => {
+        if (cancelled) return
+        setSearchResults(rows)
+      })
+      .catch(() => {
+        if (cancelled) return
+        setSearchResults([])
+      })
+      .finally(() => {
+        if (!cancelled) setSearching(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [searchQuery])
+
+  // Keyboard navigation. Skips when an input/textarea/select has
+  // focus so the LLM picker's free-text fields stay typeable. ``/``
+  // focuses search; Esc clears it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const ae = document.activeElement
+      if (
+        ae instanceof HTMLInputElement ||
+        ae instanceof HTMLTextAreaElement ||
+        ae instanceof HTMLSelectElement ||
+        (ae && (ae as HTMLElement).isContentEditable)
+      ) {
+        if (ae instanceof HTMLInputElement && ae.type === 'search' && e.key === 'Escape') {
+          ae.blur()
+          setSearchInput('')
+        }
+        return
+      }
+
+      if (e.key === '/' && columns.length > 0) {
+        e.preventDefault()
+        document.getElementById('app-search')?.focus()
+        return
+      }
+
+      if (e.key === 'Escape' && searchQuery) {
+        setSearchInput('')
+        return
+      }
+
+      if (columns.length === 0) return
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault()
+        setSelectedColumnIndex((i) => Math.max(0, i - 1))
+        setSelectedCardId(null)
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault()
+        setSelectedColumnIndex((i) => Math.min(columns.length - 1, i + 1))
+        setSelectedCardId(null)
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault()
+        const col = columns[selectedColumnIndex]
+        if (!col || col.entries.length === 0) return
+        const idx = col.entries.findIndex((e2) => e2.id === selectedCardId)
+        const next =
+          e.key === 'ArrowDown'
+            ? Math.min(col.entries.length - 1, idx + 1)
+            : Math.max(0, idx - 1)
+        setSelectedCardId(col.entries[next]?.id ?? null)
+      } else if (e.key === 'Enter' && selectedCardId != null) {
+        e.preventDefault()
+        const card = cardRefs.current.get(selectedCardId)
+        const link = card?.querySelector('a')
+        link?.click()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [columns, selectedColumnIndex, selectedCardId, searchQuery])
+
+  // Scroll the keyboard-selected card into view.
+  useEffect(() => {
+    if (selectedCardId == null) return
+    const el = cardRefs.current.get(selectedCardId)
+    if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, [selectedCardId])
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    touchStartX.current = e.touches[0].clientX
+  }
   const onTouchEnd = (e: React.TouchEvent) => {
     if (touchStartX.current == null) return
     const delta = e.changedTouches[0].clientX - touchStartX.current
@@ -154,56 +491,92 @@ export function App() {
     else setMobileCol((i) => Math.max(i - 1, 0))
   }
 
+  const markColumnRead = (columnName: string) => {
+    const col = columns.find((c) => c.name === columnName)
+    setLastViewed((prev) => ({ ...prev, [columnName]: new Date().toISOString() }))
+    if (col && seenEntryIdsRef.current != null) {
+      const merged = new Set(seenEntryIdsRef.current)
+      for (const e of col.entries) merged.add(e.id)
+      seenEntryIdsRef.current = merged
+    }
+  }
+
+  const toggleSource = (name: string) => {
+    setActiveSources((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
+
+  const jumpToCategory = (category: string) => {
+    const idx = columns.findIndex((c) => c.name === category)
+    if (idx >= 0) {
+      setSelectedColumnIndex(idx)
+      setSelectedCardId(null)
+      const el = columnRefs.current.get(category)
+      if (el) el.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    }
+  }
+
+  const setPrefsFor = (columnName: string, prefs: ColumnPrefs) => {
+    setColumnPrefs((prev) => ({ ...prev, [columnName]: prefs }))
+  }
+
+  // The outer div lets us register a per-column ref on a wrapper
+  // without breaking the grid layout — the wrapper uses
+  // ``display: contents`` so its child (Column) participates in
+  // the grid as if it weren't wrapped.
+  const setColumnRef = (name: string) => (el: HTMLElement | null) => {
+    if (el) columnRefs.current.set(name, el)
+    else columnRefs.current.delete(name)
+  }
+
   // --- Render gates -----------------------------------------------------
 
-  // 1. Auth probe in flight — render nothing (avoids login-page flash).
   if (!authProbed) {
     return <div className="h-full" />
   }
 
-  // 2. OIDC enabled and not logged in — show LoginPage.
   if (!oidcDisabled && user === null) {
     return <LoginPage returnTo="/" onSignedIn={setUser} />
   }
 
-  // 3. Default — the dashboard.
+  const showSearchView = searchQuery.trim().length > 0
+
   return (
     <div className="h-full flex flex-col">
       <header className="flex items-center gap-2 sm:gap-3 px-4 py-1.5 sm:py-3 border-b border-slate-800 bg-slate-950">
         <Hamburger onClick={() => setDrawerOpen(true)} />
-        {/* Title: text-base on mobile saves a couple px of line-height
-            vs text-lg without losing legibility. sm: bumps back to
-            the desktop look. */}
         <h1 className="text-base sm:text-lg font-bold">Popping</h1>
-        {/* The "X entries · Y sources" chip is duplicative with the
-            Drawer sources list and squashes the action buttons on
-            narrow phones. Hide below sm; the Drawer covers the
-            curious case where someone wants the counts. */}
+        <input
+          id="app-search"
+          type="search"
+          inputMode="search"
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+          placeholder="search… (press /)"
+          className="hidden sm:block w-40 lg:w-56 rounded bg-slate-900 border border-slate-800 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-slate-600"
+        />
         <span className="ml-auto hidden sm:inline text-xs text-slate-400">
           {health
             ? `${health.entries} entries · ${health.sources} sources · ${health.status}`
             : 'connecting…'}
         </span>
-        {/* min-h-[36px] on mobile / [44px] on sm+: keeps the row
-            slim on phones while staying above the iOS 44px guidance
-            on tablets/desktops. The icon-equivalent text labels
-            mean a thumb can still land the button accurately. */}
         <button
-          onClick={refresh}
-          className="min-h-[36px] sm:min-h-[44px] rounded px-3 py-1 text-sm bg-slate-800 active:bg-slate-700 text-slate-200 [@media(hover:hover)]:hover:bg-slate-700"
+          onClick={() => void refresh()}
+          disabled={refreshing}
+          className="min-h-[36px] sm:min-h-[44px] rounded px-3 py-1 text-sm bg-slate-800 active:bg-slate-700 disabled:opacity-50 text-slate-200 [@media(hover:hover)]:hover:bg-slate-700"
         >
-          Refresh
+          {refreshing ? '…' : 'Refresh'}
         </button>
-        {/* Header-level Brief button: hides on mobile because the
-            BriefCard itself surfaces a Generate / Regenerate button.
-            Two CTAs on the same action is noise, and on a 320px
-            viewport there's no room for both. */}
         <button
           onClick={async () => {
             if (generatingBrief) return
             setGeneratingBrief(true)
             try {
-              const next = await api.briefGenerate('terse')
+              const next = await api.briefGenerate(briefTone)
               setBrief(next)
             } catch (err) {
               setError((err as Error).message)
@@ -220,60 +593,78 @@ export function App() {
         {user && <UserBadge user={user} onSignedOut={() => setUser(null)} />}
       </header>
 
+      {activeSources.size > 0 && (
+        <div className="px-4 py-2 border-b border-slate-800 bg-slate-900 flex items-center gap-2 text-sm overflow-x-auto whitespace-nowrap">
+          <span className="text-slate-400 shrink-0">filtering by:</span>
+          {Array.from(activeSources).map((src) => (
+            <button
+              key={src}
+              onClick={() => toggleSource(src)}
+              className="shrink-0 rounded-full bg-blue-900/50 border border-blue-700 px-2.5 py-0.5 text-blue-100 text-xs hover:bg-blue-800/60"
+              aria-label={`remove ${src} from filter`}
+            >
+              {src} ✕
+            </button>
+          ))}
+          <button
+            onClick={() => setActiveSources(new Set())}
+            className="shrink-0 ml-auto text-xs text-slate-400 hover:text-slate-100"
+          >
+            clear all
+          </button>
+        </div>
+      )}
+
       {error && (
         <div className="px-4 py-2 bg-red-900/40 border-b border-red-800 text-sm text-red-200">
           {error}
         </div>
       )}
 
-      {sourceFilter && (
-        <div className="px-4 py-2 border-b border-slate-800 bg-slate-900 flex items-center gap-2 text-sm">
-          <span className="text-slate-400">Filtering by source:</span>
-          <span className="rounded bg-slate-800 px-2 py-0.5 text-slate-200">{sourceFilter}</span>
-          <button
-            onClick={() => setSourceFilter(null)}
-            className="ml-auto min-h-[36px] sm:min-h-[44px] rounded px-3 py-1 text-slate-400 active:bg-slate-800 [@media(hover:hover)]:hover:text-slate-100 [@media(hover:hover)]:hover:bg-slate-800"
-            aria-label="clear source filter"
-          >
-            clear ✕
-          </button>
-        </div>
-      )}
+      <BriefCard
+        brief={brief}
+        onBriefChange={setBrief}
+        tone={briefTone}
+        onToneChange={setBriefTone}
+      />
 
-      <BriefCard brief={brief} onBriefChange={setBrief} />
-
-      {/* Unified column list. ``For You`` is the user's personal feed
-          (computed server-side via convergence-boosted composite_score
-          over the last ingest window). When it has entries we lead
-          with it — it's what the user should read first — and append
-          the regular category columns after. Same Column component,
-          same swipe pattern on mobile. When ForYou is empty we
-          silently skip it: a "nothing yet" header in a 1-row column
-          is noise. */}
-      {columns.length === 0 && (
+      {showSearchView ? (
+        <main className="flex-1 overflow-y-auto p-3 sm:p-4">
+          <SearchResults
+            query={searchQuery}
+            entries={searchResults}
+            sourcesById={sourcesById}
+          />
+          {searching && (
+            <p className="mt-2 text-xs text-slate-500 px-1">searching…</p>
+          )}
+        </main>
+      ) : columns.length === 0 ? (
         <div className="flex-1 flex items-center justify-center text-slate-500 px-4 text-center">
           no entries yet — the scheduler will fetch the first batch shortly, or hit Refresh
         </div>
-      )}
-
-      {columns.length > 0 && (
+      ) : (
         <>
-          {/* Desktop: auto-fit grid. ``auto-fit,minmax(280px,1fr)``
-              fills the viewport with as many 280+px columns as fit
-              and lets the rest wrap to a new row. ``overflow-y-auto``
-              on main means the extra row scrolls instead of clipping
-              — the old fixed ``md:grid-cols-3 lg:grid-cols-4`` clipped
-              the 5th+ column on lg viewports. */}
           <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
-            {columns.map((col) => (
-              <Column key={col.name} name={col.name} entries={col.entries} sourcesById={sourcesById} />
+            {columns.map((col, ci) => (
+              <div key={col.name} ref={setColumnRef(col.name)} className="contents">
+                <Column
+                  name={col.name}
+                  entries={col.entries}
+                  sourcesById={sourcesById}
+                  newCount={newCountByColumn.get(col.name)}
+                  unreadIds={unreadIdsByColumn.get(col.name)}
+                  selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
+                  cardRefs={cardRefs}
+                  onMarkRead={() => markColumnRead(col.name)}
+                  prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
+                  onPrefsChange={(next) => setPrefsFor(col.name, next)}
+                  totalCount={col.totalCount}
+                />
+              </div>
             ))}
           </main>
 
-          {/* Mobile: one column + swipe, with ForYou as the first
-              swipe target if it has entries. The dot indicator
-              reflects the full column count so the user knows how
-              many swipes are available. */}
           <main
             className="md:hidden flex-1 overflow-hidden p-3"
             onTouchStart={onTouchStart}
@@ -283,13 +674,36 @@ export function App() {
               name={columns[mobileCol]?.name ?? ''}
               entries={columns[mobileCol]?.entries ?? []}
               sourcesById={sourcesById}
+              newCount={newCountByColumn.get(columns[mobileCol]?.name ?? '')}
+              unreadIds={unreadIdsByColumn.get(columns[mobileCol]?.name ?? '')}
+              selectedId={
+                mobileCol === selectedColumnIndex ? selectedCardId ?? undefined : undefined
+              }
+              cardRefs={cardRefs}
+              onMarkRead={() => markColumnRead(columns[mobileCol]?.name ?? '')}
+              prefs={
+                columns[mobileCol]
+                  ? columnPrefs[columns[mobileCol].name] ?? DEFAULT_PREFS
+                  : DEFAULT_PREFS
+              }
+              onPrefsChange={(next) =>
+                columns[mobileCol] && setPrefsFor(columns[mobileCol].name, next)
+              }
+              totalCount={columns[mobileCol]?.totalCount}
             />
             {columns.length > 1 && (
               <div className="flex justify-center gap-1 mt-2">
                 {columns.map((c, i) => (
-                  <span
+                  <button
                     key={c.name}
-                    className={`h-1.5 w-1.5 rounded-full ${i === mobileCol ? 'bg-slate-300' : 'bg-slate-700'}`}
+                    onClick={() => {
+                      setMobileCol(i)
+                      markColumnRead(c.name)
+                    }}
+                    aria-label={`go to column ${c.name}`}
+                    className={`h-2 w-2 rounded-full transition ${
+                      i === mobileCol ? 'bg-slate-300 w-4' : 'bg-slate-700'
+                    }`}
                   />
                 ))}
               </div>
@@ -302,9 +716,14 @@ export function App() {
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         categories={categories}
-        sourceFilter={sourceFilter}
-        onSourceSelect={setSourceFilter}
+        activeSources={activeSources}
+        onSourceToggle={toggleSource}
+        onCategoryJump={jumpToCategory}
+        briefTone={briefTone}
+        onBriefToneChange={setBriefTone}
       />
+
+      <ToastHost />
     </div>
   )
 }

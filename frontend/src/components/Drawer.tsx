@@ -1,8 +1,19 @@
 // Slide-in drawer. Lists the category columns and the registered
-// sources. Tapping a source filters the dashboard to that source's
-// entries and closes the drawer. Also surfaces the notifications
-// backend status (Apprise / Pushover / none) and the LLM provider
-// status — useful confirmation that the user's env vars are wired up.
+// sources. Tapping a source toggles it in the active-source set
+// (multi-select — empty set = no filter). Also surfaces the
+// notifications backend status (Apprise / Pushover / none) and the
+// LLM provider status — useful confirmation that the user's env vars
+// are wired up.
+//
+// The Drawer surfaces three categories of "failed to load" state:
+//   - sources list (rendered with a retry button)
+//   - notifications status chip (renders red, tap to retry)
+//   - LLM status chip (renders red, tap to retry)
+//
+// The old code silently coerced all fetch failures into
+// "{ configured: false }" which made a 401 look the same as a
+// missing env var. Now each failure shows the actual error message
+// and offers to retry.
 
 import { useEffect, useMemo, useState } from 'react'
 import {
@@ -18,8 +29,17 @@ type Props = {
   open: boolean
   onClose: () => void
   categories: string[]
-  sourceFilter: string | null
-  onSourceSelect: (name: string | null) => void
+  // Active source filter (multi-select). Empty set = no filter.
+  activeSources: Set<string>
+  onSourceToggle: (name: string) => void
+  // "Scroll to column" support. The Drawer's category list calls
+  // back with the category name; App owns the column refs and
+  // scrolls the right one into view.
+  onCategoryJump?: (category: string) => void
+  // Active brief tone, lifted from App so the Drawer's "Generate
+  // brief now" stays in sync with the BriefCard pills.
+  briefTone: 'terse' | 'narrative' | 'alert'
+  onBriefToneChange: (next: 'terse' | 'narrative' | 'alert') => void
 }
 
 // Whitelist mirrors backend ``_VALID_PROVIDERS``. Includes a sentinel
@@ -34,25 +54,70 @@ const PROVIDER_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'groq', label: 'Groq' },
 ]
 
-export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect }: Props) {
+// Same tone set as BriefCard. Kept in sync via duplication rather
+// than a shared module — two constants, ~6 lines, no point in a new
+// file.
+const TONES: Array<{ value: 'terse' | 'narrative' | 'alert'; label: string }> = [
+  { value: 'terse',     label: 'terse' },
+  { value: 'narrative', label: 'narrative' },
+  { value: 'alert',     label: 'alert' },
+]
+
+export function Drawer({
+  open,
+  onClose,
+  categories,
+  activeSources,
+  onSourceToggle,
+  onCategoryJump,
+  briefTone,
+  onBriefToneChange,
+}: Props) {
   const [sources, setSources] = useState<Source[]>([])
+  const [sourcesError, setSourcesError] = useState<string | null>(null)
   const [notif, setNotif] = useState<NotificationStatus | null>(null)
+  const [notifError, setNotifError] = useState<string | null>(null)
   const [llm, setLlm] = useState<LLMStatus | null>(null)
+  const [llmError, setLlmError] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
   const [genError, setGenError] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (!open) return
-    api.sources().then(setSources).catch(() => setSources([]))
+  // Each fetch function is its own retry-able handler. Storing them
+  // as ``useCallback`` so the chip can call them directly on tap.
+  const refetchSources = () => {
+    setSourcesError(null)
+    api.sources().then(setSources).catch((err) => {
+      setSources([])
+      setSourcesError((err as Error).message)
+    })
+  }
+  const refetchNotif = () => {
+    setNotifError(null)
     api
       .notificationStatus()
       .then(setNotif)
-      .catch(() => setNotif({ configured: false, backend: null, scheme: null }))
+      .catch((err) => {
+        // Don't set a default ``notif`` — leaving it null and the
+        // chip renders the retry path.
+        setNotifError((err as Error).message)
+      })
+  }
+  const refetchLlm = () => {
+    setLlmError(null)
     api
       .llmStatus()
       .then(setLlm)
-      .catch(() => setLlm({ configured: false, backend: null, model: null }))
-  }, [open])
+      .catch((err) => {
+        setLlmError((err as Error).message)
+      })
+  }
+
+  useEffect(() => {
+    if (!open) return
+    refetchSources()
+    refetchNotif()
+    refetchLlm()
+  }, [open]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <>
@@ -80,7 +145,19 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
               Notifications
             </h3>
             <div className="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs">
-              {notif === null ? (
+              {notifError ? (
+                // Failed to fetch — show the actual error and offer
+                // a retry. Previously this silently rendered
+                // "not configured", which conflated a misconfigured
+                // backend with a transient network blip.
+                <button
+                  onClick={refetchNotif}
+                  className="text-red-300 underline decoration-dotted"
+                  title={`Error: ${notifError}`}
+                >
+                  couldn't check — tap to retry
+                </button>
+              ) : notif === null ? (
                 <span className="text-slate-500">checking…</span>
               ) : notif.configured ? (
                 <span className="text-emerald-400">
@@ -97,13 +174,37 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
               LLM
             </h3>
-            <LLMSection llm={llm} onChange={setLlm} />
+            <LLMSection llm={llm} llmError={llmError} onChange={setLlm} onRetry={refetchLlm} />
+            {/* Brief tone picker — lifted state. Same UX as
+                BriefCard's pills but rendered inline in the Drawer
+                so the user can pre-pick a tone before clicking
+                "Generate brief now". */}
+            <div className="mt-2 flex items-center gap-1" role="group" aria-label="brief tone">
+              {TONES.map((t) => {
+                const active = t.value === briefTone
+                return (
+                  <button
+                    key={t.value}
+                    type="button"
+                    onClick={() => onBriefToneChange(t.value)}
+                    className={`flex-1 rounded px-2 py-1 text-[10px] uppercase tracking-wide transition ${
+                      active
+                        ? 'bg-blue-700 text-white'
+                        : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                    }`}
+                    aria-pressed={active}
+                  >
+                    {t.label}
+                  </button>
+                )
+              })}
+            </div>
             <button
               onClick={async () => {
                 setGenError(null)
                 setGenerating(true)
                 try {
-                  await api.briefGenerate('terse')
+                  await api.briefGenerate(briefTone)
                   onClose()
                 } catch (err) {
                   setGenError((err as Error).message)
@@ -124,30 +225,56 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Categories</h3>
             <ul className="space-y-1">
               {categories.map((c) => (
-                <li key={c} className="rounded px-2 py-1 text-sm text-slate-200 hover:bg-slate-800">{c}</li>
+                // Each category is now a real button. Tap → close
+                // drawer and scroll the desktop grid to that column.
+                // On mobile the column-swipe is the primary nav, so
+                // this is best-effort: App's handler can be a no-op
+                // on mobile.
+                <li key={c}>
+                  <button
+                    onClick={() => {
+                      onCategoryJump?.(c)
+                      onClose()
+                    }}
+                    className="w-full text-left rounded px-2 py-1 text-sm text-slate-200 hover:bg-slate-800"
+                  >
+                    {c}
+                  </button>
+                </li>
               ))}
             </ul>
           </div>
           <div className="pt-4 border-t border-slate-800">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Sources</h3>
-            {sources.length === 0 ? (
+            {sourcesError ? (
+              <button
+                onClick={refetchSources}
+                className="text-xs text-red-300 underline decoration-dotted"
+                title={`Error: ${sourcesError}`}
+              >
+                couldn't load sources — tap to retry
+              </button>
+            ) : sources.length === 0 ? (
               <p className="text-xs text-slate-500 italic">loading…</p>
             ) : (
               <ul className="space-y-1">
                 {sources.map((s) => {
-                  const active = s.name === sourceFilter
+                  // Multi-select: a source is "active" when its name
+                  // is in the activeSources set. Tap toggles. No
+                  // longer auto-closes the drawer — the user might
+                  // want to pick two or three. They can close the
+                  // drawer manually when they're done.
+                  const active = activeSources.has(s.name)
                   return (
                     <li key={s.id}>
                       <button
-                        onClick={() => {
-                          onSourceSelect(active ? null : s.name)
-                          onClose()
-                        }}
+                        onClick={() => onSourceToggle(s.name)}
                         className={`w-full text-left rounded px-2 py-1 text-sm flex items-center justify-between gap-2 transition ${
                           active
                             ? 'bg-slate-700 text-white'
                             : 'text-slate-200 hover:bg-slate-800'
                         }`}
+                        aria-pressed={active}
                       >
                         <span className="flex items-center gap-2 min-w-0">
                           {s.favicon_path && (
@@ -185,10 +312,14 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
 
 function LLMSection({
   llm,
+  llmError,
   onChange,
+  onRetry,
 }: {
   llm: LLMStatus | null
+  llmError: string | null
   onChange: (next: LLMStatus) => void
+  onRetry: () => void
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
   // Two parallel tag lists: one annotated for brief, one for scoring.
@@ -367,7 +498,17 @@ function LLMSection({
   return (
     <>
       <div className="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs flex items-center justify-between gap-2">
-        {llm === null ? (
+        {llmError ? (
+          // Same shape as the notifications chip — error path with
+          // a tap-to-retry affordance.
+          <button
+            onClick={onRetry}
+            className="text-red-300 underline decoration-dotted truncate text-left"
+            title={`Error: ${llmError}`}
+          >
+            couldn't check — tap to retry
+          </button>
+        ) : llm === null ? (
           <span className="text-slate-500">checking…</span>
         ) : llm.configured ? (
           <span className="text-emerald-400 truncate">

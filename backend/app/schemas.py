@@ -35,6 +35,13 @@ class EntryOut(BaseModel):
     title: str
     url: str
     published_at: Optional[dt.datetime]
+    # When the row landed in our DB. Distinct from ``published_at``
+    # (when the source article was published) — Wikipedia OTD entries
+    # carry a very old ``published_at`` but a fresh ``fetched_at``.
+    # The frontend uses this to compute "new since last visit" /
+    # read/unread state. Optional for forward-compat with rows written
+    # before the column existed; in practice every row has a value.
+    fetched_at: Optional[dt.datetime] = None
     composite_score: float
     personal_score: float
     raw_score: float
