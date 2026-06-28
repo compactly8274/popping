@@ -20,6 +20,7 @@
 
 import { useEffect, useState } from 'react'
 import { api, type Source } from '../api'
+import { SourceIcon } from './SourceIcon'
 
 type Props = {
   sources: Source[]
@@ -270,19 +271,10 @@ function SourceRow({
   return (
     <div className={`rounded border border-slate-800 bg-slate-950 px-2 py-1.5 text-xs ${busy ? 'opacity-60' : ''}`}>
       <div className="flex items-center gap-2 min-w-0">
-        {source.favicon_path && (
-          <img
-            src={`/assets/${source.favicon_path}`}
-            alt=""
-            width={14}
-            height={14}
-            loading="lazy"
-            className="shrink-0 w-3.5 h-3.5 rounded-sm bg-slate-800"
-            onError={(e) => {
-              ;(e.currentTarget as HTMLImageElement).style.display = 'none'
-            }}
-          />
-        )}
+        {/* SourceIcon — colored-letter fallback when the favicon
+            hasn't landed yet. ``size={14}`` matches the original
+            w-3.5 h-3.5 img (14px). */}
+        <SourceIcon src={source.favicon_path} name={source.name} size={14} />
         <span className={`truncate font-medium ${source.active ? 'text-slate-100' : 'text-slate-500 line-through'}`}>
           {source.name}
         </span>

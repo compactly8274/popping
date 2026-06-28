@@ -286,7 +286,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
 
   if (!brief) {
     return (
-      <section className="border-b border-slate-800 bg-gradient-to-r from-slate-900/60 to-slate-900/30">
+      <section className="border-b border-slate-800 bg-gradient-to-r from-slate-900/80 via-slate-900/60 to-slate-900/30">
         <div
           role="button"
           tabIndex={0}
@@ -353,7 +353,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
   const parsed = parse(brief.content)
 
   return (
-    <section className="border-b border-slate-800 bg-gradient-to-r from-slate-900/60 to-slate-900/30">
+    <section className="border-b border-slate-800 bg-gradient-to-r from-slate-900/80 via-slate-900/60 to-slate-900/30">
       {/* Header row. The whole element is the toggle target — chevron,
           title, tone badge, timestamp — but Regenerate is a child
           marked ``data-brief-action`` so it bypasses the toggle. */}
@@ -383,6 +383,20 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
           <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
             The Brief
           </h2>
+          {/* "TODAY'S BRIEF" pill. Anchors the brief as a
+              recognizable recurring surface — same idea as a
+              newsletter masthead — without committing to a date
+              string (which would need to update daily). The pill
+              sits inline next to the title; on mobile it wraps
+              naturally. */}
+          <span
+            data-brief-action="today-pill"
+            className="inline-flex items-center gap-1 rounded-full bg-accent-soft border border-blue-800/40 px-2 py-0.5 text-[10px] uppercase tracking-wide text-blue-300"
+            title="the most recent brief"
+          >
+            <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-blue-400" />
+            today's
+          </span>
           {/* Tone picker replaces the static tone badge — the badge
               was informational, the picker is the same surface turned
               interactive. */}
@@ -411,16 +425,26 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
       </header>
       {!collapsed && (
         <div id={bodyId} className="px-4 pb-3 space-y-2">
+          {/* One-sentence hero. Larger than the original body text
+              so the brief's "headline" lands with weight — this is
+              what the user reads first, and it's the line the model
+              was asked to write most carefully. */}
           {parsed.oneSentence && (
-            <p className="text-base font-medium text-slate-100 leading-snug">
+            <p className="text-lg sm:text-xl font-semibold leading-snug text-white">
               {parsed.oneSentence}
             </p>
           )}
           {parsed.highlights.length > 0 && (
-            <ul className="space-y-1 text-sm text-slate-200 list-none">
+            <ul className="space-y-1.5 text-sm text-slate-200 list-none">
               {parsed.highlights.map((h, i) => (
-                <li key={i} className="flex gap-2">
-                  <span className="text-slate-500 select-none">•</span>
+                // Accent dot replaces the text bullet. ``items-start``
+                // so the dot sits aligned to the first line of the
+                // text even when the highlight wraps to two lines.
+                <li key={i} className="flex items-start gap-2">
+                  <span
+                    aria-hidden="true"
+                    className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-blue-400"
+                  />
                   <span>{h}</span>
                 </li>
               ))}
@@ -428,13 +452,16 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
           )}
           {parsed.watch.length > 0 && (
             <div className="pt-1">
-              <h3 className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+              <h3 className="text-[10px] font-semibold uppercase tracking-wide text-slate-400 mb-1">
                 Watch
               </h3>
               <ul className="space-y-0.5 text-xs text-slate-400 list-none">
                 {parsed.watch.map((w, i) => (
-                  <li key={i} className="flex gap-2">
-                    <span className="text-slate-600 select-none">›</span>
+                  <li key={i} className="flex items-start gap-2">
+                    <span
+                      aria-hidden="true"
+                      className="mt-1 h-1 w-1 shrink-0 rounded-full bg-slate-500"
+                    />
                     <span>{w}</span>
                   </li>
                 ))}

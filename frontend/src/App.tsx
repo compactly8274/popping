@@ -16,7 +16,7 @@
 //   - Brief tone picker (terse / narrative / alert)
 //   - Source filter chips in the header
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { api, type Brief, type CurrentUser, type Entry, type Health, type Source } from './api'
 import { BriefCard } from './components/BriefCard'
 import { Column, DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
@@ -129,6 +129,12 @@ export function App() {
   const [selectedCardId, setSelectedCardId] = useState<number | null>(null)
 
   const touchStartX = useRef<number | null>(null)
+  // Stable id for the logo SVG gradient. ``useId`` is React's
+  // SSR-safe id generator — without it, two App mounts (or a
+  // future extracted header component rendered twice) would emit
+  // duplicate ``id="logo-grad"`` and the second ``fill="url(#logo-grad)"``
+  // would resolve to the wrong gradient.
+  const logoGradId = useId()
   // Set of entry ids observed on the previous successful refresh.
   // Used to compute "new since last refresh" — entries whose id is
   // not in this set are flagged. ``null`` means "haven't completed a
@@ -153,6 +159,15 @@ export function App() {
   )
   const sourcesById = useMemo(
     () => new Map(sources.map((s) => [s.id, s.name])),
+    [sources],
+  )
+  // Same key as ``sourcesById`` but the value is the source's
+  // category. Passed down to Column → Card so each card can render
+  // its category-colored left stripe. Optional because older source
+  // rows (pre-Phase-5) have no category in the DB until they're
+  // touched — we just skip the stripe for those.
+  const categoriesBySourceId = useMemo(
+    () => new Map(sources.map((s) => [s.id, s.category])),
     [sources],
   )
 
@@ -547,9 +562,40 @@ export function App() {
 
   return (
     <div className="h-full flex flex-col">
-      <header className="flex items-center gap-2 sm:gap-3 px-4 py-1.5 sm:py-3 border-b border-slate-800 bg-slate-950">
+      {/* Sticky top bar. ``backdrop-blur`` + ``supports-[backdrop-filter]:bg-slate-950/80``
+          gives a frosted look on capable browsers (Chrome, Safari,
+          Firefox 103+) and falls back to a solid ``bg-slate-950``
+          elsewhere. The hairline shadow underneath reads as a
+          separator when the user scrolls a long column under the
+          bar. ``z-20`` keeps the bar above column content but below
+          the Drawer (z-30+). */}
+      <header className="sticky top-0 z-20 flex items-center gap-2 sm:gap-3 px-4 py-1.5 sm:py-3 border-b border-slate-800 bg-slate-950 supports-[backdrop-filter]:backdrop-blur supports-[backdrop-filter]:bg-slate-950/80 shadow-[0_1px_0_0_rgba(255,255,255,0.04)]">
         <Hamburger onClick={() => setDrawerOpen(true)} />
-        <h1 className="text-base sm:text-lg font-bold">Popping</h1>
+        {/* Logo + wordmark. The SVG is a tiny "P" — outer ring + inner
+            dot — sized at 20px so it sits next to the title without
+            crowding it. ``aria-hidden`` on the SVG because the
+            adjacent text is the actual wordmark. The gradient on the
+            outer ring reuses the same blue→violet stop as the
+            accent + filter-chip palette for visual continuity. */}
+        <span className="flex items-center gap-2">
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 20 20"
+            aria-hidden="true"
+            className="shrink-0"
+          >
+            <defs>
+              <linearGradient id={logoGradId} x1="0" y1="0" x2="20" y2="20" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stopColor="#3b82f6" />
+                <stop offset="100%" stopColor="#8b5cf6" />
+              </linearGradient>
+            </defs>
+            <circle cx="10" cy="10" r="9" fill={`url(#${logoGradId})`} />
+            <circle cx="10" cy="10" r="3" fill="#020617" />
+          </svg>
+          <h1 className="text-base sm:text-lg font-bold tracking-tight">Popping</h1>
+        </span>
         <input
           id="app-search"
           type="search"
@@ -597,10 +643,17 @@ export function App() {
         <div className="px-4 py-2 border-b border-slate-800 bg-slate-900 flex items-center gap-2 text-sm overflow-x-auto whitespace-nowrap">
           <span className="text-slate-400 shrink-0">filtering by:</span>
           {Array.from(activeSources).map((src) => (
+            // ``animate-fade-in`` fires on every mount (the animation
+            // restarts when the chip re-mounts after a re-render).
+            // 180ms is short enough that it doesn't lag the tap but
+            // long enough that the eye notices the chip land when
+            // several arrive in quick succession. ``motion-safe:``
+            // keeps it off for users who've asked the OS to reduce
+            // motion.
             <button
               key={src}
               onClick={() => toggleSource(src)}
-              className="shrink-0 rounded-full bg-blue-900/50 border border-blue-700 px-2.5 py-0.5 text-blue-100 text-xs hover:bg-blue-800/60"
+              className="shrink-0 rounded-full bg-blue-900/50 border border-blue-700 px-2.5 py-0.5 text-blue-100 text-xs hover:border-blue-500/60 hover:bg-blue-800/60 transition-colors duration-200 motion-safe:animate-fade-in"
               aria-label={`remove ${src} from filter`}
             >
               {src} ✕
@@ -608,7 +661,7 @@ export function App() {
           ))}
           <button
             onClick={() => setActiveSources(new Set())}
-            className="shrink-0 ml-auto text-xs text-slate-400 hover:text-slate-100"
+            className="shrink-0 ml-auto text-xs text-slate-400 hover:text-slate-100 transition-colors duration-200"
           >
             clear all
           </button>
@@ -660,6 +713,7 @@ export function App() {
                   prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
                   onPrefsChange={(next) => setPrefsFor(col.name, next)}
                   totalCount={col.totalCount}
+                  categoriesBySourceId={categoriesBySourceId}
                 />
               </div>
             ))}
@@ -690,6 +744,7 @@ export function App() {
                 columns[mobileCol] && setPrefsFor(columns[mobileCol].name, next)
               }
               totalCount={columns[mobileCol]?.totalCount}
+              categoriesBySourceId={categoriesBySourceId}
             />
             {columns.length > 1 && (
               <div className="flex justify-center gap-1 mt-2">

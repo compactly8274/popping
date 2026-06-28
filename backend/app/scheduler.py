@@ -99,6 +99,25 @@ async def _embed_text(norm: dict) -> list[float] | None:
         return None
 
 
+# Favicon retry gate: at most one attempt per source per hour. Catches
+# the cold-start-with-unmounted-volume case (asset_dir became writable
+# after the first ingest) without hammering a permanently-broken host
+# (a 403 stays a 403, no amount of retrying helps). One hour is long
+# enough to recover from transient infra issues and short enough that
+# the user notices the favicon land within a typical work session.
+_FAVICON_RETRY_INTERVAL = dt.timedelta(hours=1)
+
+
+def _should_retry_favicon(last_fetch_at: dt.datetime | None) -> bool:
+    if last_fetch_at is None:
+        return True
+    # ``last_fetch_at`` is timezone-aware UTC in practice, but tolerate
+    # a naive value coming from a pre-upgrade DB row.
+    if last_fetch_at.tzinfo is None:
+        last_fetch_at = last_fetch_at.replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - last_fetch_at) >= _FAVICON_RETRY_INTERVAL
+
+
 async def _ingest(plugin_cls: Any) -> dict:
     """Fetch from a plugin, write entries to DB, update source bookkeeping.
 
@@ -109,22 +128,53 @@ async def _ingest(plugin_cls: Any) -> dict:
     summary = {"source": plugin_cls.name, "fetched": 0, "inserted": 0, "duplicates": 0, "error": None}
     plugin = plugin_cls()
     newly_inserted: list[tuple[Entry, Source]] = []
+    # Track entries that need a thumbnail pass. Collected here so we
+    # can do the network fetches outside the DB session (each
+    # ``fetch_thumbnail`` can take up to 20s with the new retry
+    # logic — holding a DB transaction for 50 entries × 20s is a
+    # pool starvation waiting to happen). The pass runs after the
+    # entries commit and writes back via a single bulk UPDATE.
+    thumbnail_jobs: list[tuple[int, str]] = []
     try:
+        # Decide whether to fetch the favicon BEFORE opening the long
+        # ingest transaction. ``fetch_favicon`` makes two network
+        # round-trips (HTML probe + icon download, each up to 10s) —
+        # running them inside the session would hold an idle DB
+        # transaction for ~20s per source on every retry, starving the
+        # pool. We snapshot the upserted source's id/url/state, close
+        # the session, run the network work, and re-open the session
+        # only to persist the result.
+        source_id: int | None = None
+        source_url: str | None = None
+        needs_favicon = False
         async with SessionLocal() as session:
             source = await _upsert_source(session, plugin_cls)
-            # Lazy favicon fetch: only on first ingest per source. A
-            # failed fetch leaves favicon_url NULL and retries next
-            # ingest. Runs inside the same transaction so the URL lands
-            # in the DB atomically with the source row.
-            if source.favicon_url is None:
-                try:
-                    remote, local = await assets.fetch_favicon(source.url, source.id)
-                    if remote and local:
-                        source.favicon_url = remote
-                        source.favicon_path = local
-                        logger.info("favicon cached for %s → %s", source.name, local)
-                except Exception:
-                    logger.debug("favicon fetch failed for %s", source.name, exc_info=True)
+            source_id = source.id
+            source_url = source.url
+            needs_favicon = (
+                source.favicon_url is None
+                and _should_retry_favicon(source.last_fetch_at)
+            )
+
+        if needs_favicon and source_id is not None and source_url:
+            try:
+                remote, local = await assets.fetch_favicon(source_url, source_id)
+                if remote and local:
+                    async with SessionLocal() as session:
+                        row = await session.get(Source, source_id)
+                        if row is not None:
+                            row.favicon_url = remote
+                            row.favicon_path = local
+                            await session.commit()
+                            logger.info("favicon cached for %s → %s", plugin_cls.name, local)
+            except Exception:
+                logger.debug("favicon fetch failed for %s", plugin_cls.name, exc_info=True)
+
+        async with SessionLocal() as session:
+            source = await session.get(Source, source_id) if source_id else None
+            if source is None:
+                # Source was deleted between sessions — nothing to do.
+                return summary
             profile = await _load_profile(session)
             raw_items = await plugin.fetch()
             summary["fetched"] = len(raw_items)
@@ -170,39 +220,26 @@ async def _ingest(plugin_cls: Any) -> dict:
                 result = await session.execute(stmt)
                 if result.rowcount == 1:
                     summary["inserted"] += 1
-                    # Re-read the persisted row so the post-hook has a
-                    # fully-hydrated Entry (id + meta). Cheap — we just
-                    # wrote it.
                     inserted_id = result.scalar_one_or_none()
-                    if inserted_id is not None:
-                        row = await session.get(Entry, inserted_id)
-                        if row is not None:
-                            newly_inserted.append((row, source))
-                            # Fetch the thumbnail now that we have the
-                            # row's id. Set image_path/image_url on the
-                            # ORM object — SQLAlchemy emits an UPDATE at
-                            # the next flush (the commit below). Never
-                            # raises: a failed fetch leaves the row
-                            # with image_url set but image_path NULL.
-                            if remote_image_url:
-                                try:
-                                    local_path = await assets.fetch_thumbnail(
-                                        remote_image_url, inserted_id
-                                    )
-                                    if local_path:
-                                        row.image_path = local_path
-                                        row.image_url = remote_image_url
-                                except Exception:
-                                    logger.debug(
-                                        "thumbnail fetch failed for entry %d",
-                                        inserted_id, exc_info=True,
-                                    )
+                    if inserted_id is not None and remote_image_url:
+                        # Defer the network fetch to a single pass
+                        # after the commit (see below).
+                        thumbnail_jobs.append((inserted_id, remote_image_url))
                 else:
                     summary["duplicates"] += 1
             source.last_fetch_at = dt.datetime.now(dt.timezone.utc)
             source.last_error = None
             source.error_count = 0
             await session.commit()
+            # Re-fetch inserted rows for the post-hook (notification
+            # path) after the commit so they have stable ids.
+            if thumbnail_jobs:
+                ids = [jid for jid, _ in thumbnail_jobs]
+                rows = (
+                    await session.scalars(select(Entry).where(Entry.id.in_(ids)))
+                ).all()
+                for row in rows:
+                    newly_inserted.append((row, source))
     except Exception as exc:
         logger.exception("ingest failed for %s", plugin_cls.name)
         summary["error"] = f"{type(exc).__name__}: {exc}"
@@ -218,6 +255,48 @@ async def _ingest(plugin_cls: Any) -> dict:
         except Exception:
             logger.exception("could not record error for %s", plugin_cls.name)
         return summary
+
+    # Thumbnail pass. Runs OUTSIDE the ingest session — each
+    # ``fetch_thumbnail`` can take up to 20s with the new retry
+    # logic, and a typical ingest inserts dozens of entries. Doing
+    # the fetches here (post-commit) keeps the DB transaction short
+    # and lets us run them concurrently via ``asyncio.gather`` since
+    # they're independent of each other. The bulk UPDATE at the end
+    # persists all results in one round-trip.
+    if thumbnail_jobs:
+        results = await asyncio.gather(
+            *(assets.fetch_thumbnail(url, eid) for eid, url in thumbnail_jobs),
+            return_exceptions=True,
+        )
+        path_by_id: dict[int, str] = {}
+        for (eid, _url), result in zip(thumbnail_jobs, results):
+            if isinstance(result, BaseException):
+                logger.debug("thumbnail fetch failed for entry %d", eid, exc_info=result)
+                continue
+            if result is not None:
+                path_by_id[eid] = result
+        if path_by_id:
+            try:
+                async with SessionLocal() as session:
+                    # One bulk UPDATE per source — N entries become a
+                    # single round-trip instead of N. ``CASE WHEN``
+                    # picks the right path for each id.
+                    from sqlalchemy import case
+                    whens = {eid: path for eid, path in path_by_id.items()}
+                    ids = list(whens.keys())
+                    path_expr = case(whens, value=Entry.id)
+                    await session.execute(
+                        Entry.__table__.update()
+                        .where(Entry.id.in_(ids))
+                        .values(image_path=path_expr)
+                    )
+                    await session.commit()
+                    logger.info(
+                        "thumbnails cached for %s: %d / %d",
+                        plugin_cls.name, len(path_by_id), len(thumbnail_jobs),
+                    )
+            except Exception:
+                logger.exception("thumbnail bulk update failed for %s", plugin_cls.name)
 
     # Post-ingest hook: high-CVSS CVE notifications. Only fires when
     # the scheduler actually inserted something (not on every duplicate

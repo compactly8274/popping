@@ -25,6 +25,7 @@ import {
   type Source,
 } from '../api'
 import { FeedManager } from './FeedManager'
+import { SourceIcon } from './SourceIcon'
 
 type Props = {
   open: boolean
@@ -126,13 +127,22 @@ export function Drawer({
 
   return (
     <>
-      {/* backdrop */}
+      {/* backdrop. ``backdrop-blur-sm`` softens the dashboard behind
+          the drawer; ``bg-black/50`` is a touch darker than the
+          previous ``/40`` because the blur reduces the perceived
+          contrast. Transition stays the same — the drawer slides in
+          without a flash. */}
       <div
         onClick={onClose}
-        className={`fixed inset-0 bg-black/40 z-30 transition-opacity ${open ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+        className={`fixed inset-0 bg-black/50 backdrop-blur-sm z-30 transition-opacity ${open ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
       />
       <aside
-        className={`fixed top-0 left-0 z-40 h-full w-72 bg-slate-900 border-r border-slate-800 shadow-xl transform transition-transform ${open ? 'translate-x-0' : '-translate-x-full'}`}
+        // ``bg-bg-app/95`` matches the app shell (slate-950) at 95%
+        // opacity so the blur underneath is visible at the panel
+        // edges. ``shadow-2xl`` casts a deeper shadow than the old
+        // ``shadow-xl`` because the panel is wider and the blur
+        // invites more attention to the panel's edge.
+        className={`fixed top-0 left-0 z-40 h-full w-72 bg-bg-app/95 border-r border-slate-800 backdrop-blur-md shadow-2xl transform transition-transform ${open ? 'translate-x-0' : '-translate-x-full'}`}
       >
         <div className="flex items-center justify-between p-4 border-b border-slate-800">
           <h2 className="text-lg font-semibold">Popping</h2>
@@ -292,19 +302,13 @@ export function Drawer({
                         aria-pressed={active}
                       >
                         <span className="flex items-center gap-2 min-w-0">
-                          {s.favicon_path && (
-                            <img
-                              src={`/assets/${s.favicon_path}`}
-                              alt=""
-                              width={16}
-                              height={16}
-                              loading="lazy"
-                              className="shrink-0 w-4 h-4 rounded-sm bg-slate-800"
-                              onError={(e) => {
-                                ;(e.currentTarget as HTMLImageElement).style.display = 'none'
-                              }}
-                            />
-                          )}
+                          {/* SourceIcon. Falls back to a colored
+                              letter when the favicon hasn't been
+                              fetched yet — so the row is visually
+                              present even on a freshly-added dynamic
+                              source. ``console.warn`` surfaces
+                              failures in DevTools. */}
+                          <SourceIcon src={s.favicon_path} name={s.name} size={14} />
                           <span className="truncate">{s.name}</span>
                         </span>
                         <span className="text-xs text-slate-500 shrink-0">{s.category}</span>

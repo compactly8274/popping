@@ -28,6 +28,29 @@ type Props = {
   // Optional — most cards never need it.
   cardRef?: (el: HTMLElement | null) => void
   onActivate?: () => void
+  // Source category — drives the colored left stripe. Optional; when
+  // absent the card just renders without a stripe. The Column passes
+  // it through from ``sourcesByMeta``.
+  category?: string
+}
+
+// Map a category name to a Tailwind background class for the left
+// stripe. Kept inline (no new module) because the call site is the
+// only consumer and we want it obvious from Card.tsx which colors
+// map to which categories. ``other`` falls through to a neutral
+// slate so unrecognized categories don't render without a stripe.
+function categoryStripeClass(category: string | undefined): string {
+  switch (category) {
+    case 'news':     return 'bg-blue-500/70'
+    case 'tech':     return 'bg-violet-500/70'
+    case 'vulns':    return 'bg-red-500/70'
+    case 'science':  return 'bg-emerald-500/70'
+    case 'finance':  return 'bg-amber-500/70'
+    case 'policy':   return 'bg-cyan-500/70'
+    case 'longform': return 'bg-rose-500/70'
+    case 'deals':    return 'bg-lime-500/70'
+    default:         return 'bg-slate-600/70'
+  }
 }
 
 function timeAgo(iso: string | null): string {
@@ -42,11 +65,15 @@ function timeAgo(iso: string | null): string {
   return `${days}d ago`
 }
 
+// Score bands. Each tier is a gradient now — the flat bg-score-*
+// colors in the previous config were serviceable but felt like
+// badges stuck on a sticker. Gradients give a tiny bit of depth
+// without crossing into skeuomorphism.
 function scoreBand(score: number): { color: string; label: string } {
-  if (score >= 75) return { color: 'bg-score-hot',   label: 'hot' }
-  if (score >= 50) return { color: 'bg-score-warm',  label: 'warm' }
-  if (score >= 25) return { color: 'bg-score-cool',  label: 'cool' }
-  return                { color: 'bg-score-cold',  label: 'cold' }
+  if (score >= 75) return { color: 'bg-gradient-to-br from-red-500 to-red-700',   label: 'hot' }
+  if (score >= 50) return { color: 'bg-gradient-to-br from-amber-400 to-amber-600', label: 'warm' }
+  if (score >= 25) return { color: 'bg-gradient-to-br from-blue-500 to-blue-700',   label: 'cool' }
+  return               { color: 'bg-gradient-to-br from-slate-500 to-slate-700',   label: 'cold' }
 }
 
 // Long-press threshold. ~500ms is the conventional "long enough to
@@ -55,11 +82,12 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
-export function Card({ entry, sourceName, unread, selected, cardRef, onActivate }: Props) {
+export function Card({ entry, sourceName, unread, selected, cardRef, onActivate, category }: Props) {
   const band = scoreBand(entry.composite_score)
+  const stripeClass = categoryStripeClass(category)
   // Touch tracking for long-press → copy URL.
   // Kept in refs so the values don't trigger re-renders mid-press.
-  const touchStart = useRef<{ x: number; y: number; t: number; id: number } | null>(null)
+  const touchStart = useRef<{ x: number; y: number; t: number; id: number; onInteractiveChild: boolean } | null>(null)
   const longPressTimer = useRef<number | null>(null)
 
   const clearLongPress = () => {
@@ -78,14 +106,30 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate 
       return
     }
     const t = e.touches[0]
-    touchStart.current = { x: t.clientX, y: t.clientY, t: Date.now(), id: t.identifier }
+    // Mark whether the touch originated on the thumbnail (or any
+    // other interactive child like the future score chip). The
+    // long-press path skips when this is set so we don't fire
+    // copy-URL on top of the thumbnail's own click handler.
+    const target = e.target as HTMLElement
+    const onInteractiveChild = !!target.closest('[data-card-interactive]')
+    touchStart.current = {
+      x: t.clientX,
+      y: t.clientY,
+      t: Date.now(),
+      id: t.identifier,
+      onInteractiveChild,
+    }
+    if (onInteractiveChild) {
+      // Don't arm the timer at all — saves the cleanup path too.
+      return
+    }
     clearLongPress()
     longPressTimer.current = window.setTimeout(() => {
       // Re-check the touch is still the same finger and roughly in
       // place. If the user has already started swiping the column we
       // bail so we don't fire copy mid-swipe.
       const start = touchStart.current
-      if (!start) return
+      if (!start || start.onInteractiveChild) return
       longPressTimer.current = null
       void copyUrl(entry.url)
     }, LONG_PRESS_MS)
@@ -109,11 +153,16 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate 
     // If the press held LONG_PRESS_MS the timer already fired (and we
     // showed the toast). Cancel the click that would otherwise happen
     // when the finger lifts — opening the link after a copy would be
-    // confusing. ``changedTouches`` survives after the touchend so we
-    // can compare ids; if the lifted finger matches the one we
-    // tracked and the gesture was long, suppress the default.
+    // confusing. ``longPressTimer.current === null`` is the
+    // authoritative "the timer fired" check — the timer handler
+    // nulls the ref before calling ``copyUrl``. Skipping the
+    // long-press path (because the touch started on an interactive
+    // child like the thumbnail) leaves the ref set, so the click
+    // suppression correctly doesn't fire — a long tap on the
+    // thumbnail opens the article as the user expects.
+    const timerFired = longPressTimer.current === null
     const dur = Date.now() - start.t
-    if (dur >= LONG_PRESS_MS) {
+    if (timerFired && dur >= LONG_PRESS_MS) {
       e.preventDefault()
       e.stopPropagation()
     }
@@ -160,8 +209,20 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate 
       onTouchEnd={onTouchEnd}
       onTouchCancel={onTouchCancel}
       onContextMenu={onContextMenu}
-      className={`group rounded-lg border border-slate-800 bg-slate-900/60 p-4 hover:border-slate-700 transition ${opacityClass} ${ringClass}`}
+      className={`group relative rounded-lg border border-slate-800 bg-slate-900/60 p-4 pl-5
+                  hover:border-slate-700 hover:-translate-y-px hover:shadow-glow-md
+                  transition-[transform,box-shadow,border-color] duration-200
+                  ${opacityClass} ${ringClass}`}
     >
+      {/* Category stripe. 2px wide, full height of the card. Lives
+          outside the padding flow so it doesn't shift content when
+          a category is/isn't known. ``aria-hidden`` because the
+          color is decorative — the category name (if shown) carries
+          the semantic. */}
+      <div
+        aria-hidden="true"
+        className={`absolute left-0 top-0 bottom-0 w-0.5 rounded-l-lg ${stripeClass}`}
+      />
       <div className="flex items-start justify-between gap-3 mb-2">
         <a
           href={entry.url}
@@ -184,9 +245,19 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate 
             ↗
           </span>
         </a>
-        {entry.image_path && <Thumbnail path={entry.image_path} title={entry.title} />}
+        {entry.image_path && (
+          <Thumbnail
+            path={entry.image_path}
+            title={entry.title}
+            url={entry.url}
+          />
+        )}
+        {/* Score badge. The gradient gives the badge a tiny bit of
+            depth; ``ring-1 ring-white/10`` is a faint inner highlight
+            that reads as "this is a label" rather than "this is a
+            button". Title shows the raw number for power users. */}
         <span
-          className={`shrink-0 inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold text-white ${band.color}`}
+          className={`shrink-0 inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold text-white ring-1 ring-white/10 ${band.color}`}
           title={`composite score ${entry.composite_score.toFixed(0)}`}
         >
           {entry.composite_score.toFixed(0)}
@@ -201,28 +272,68 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate 
   )
 }
 
-// 96 px square. The wrapper div reserves the box on first paint so
-// the score badge doesn't shift when the image arrives (or fails).
-// ``onError`` hides the wrapper, not the bare <img> — hiding the img
-// alone leaves an empty 96px hole in the layout, which would have
-// shifted the score badge left in the original code.
-function Thumbnail({ path, title }: { path: string; title: string }) {
+// Aspect-video thumbnail (16:9). Wider than the old 96×96 square so
+// the image fills more of the right side of the card — a real
+// thumbnail instead of a postage-stamp. ``bg-bg-elevated`` reserves
+// the box on first paint so the score badge doesn't shift when the
+// image arrives (or fails). ``min-h-[72px]`` keeps a row from
+// collapsing entirely if the image is a long 1×N transparent.
+//
+// Click handler opens the article in a new tab — gives the
+// thumbnail a second obvious affordance in addition to the title
+// link. ``e.preventDefault()`` + ``e.stopPropagation()`` keep the
+// click from bubbling into the card's long-press / context-menu
+// paths. The cursor-zoom-in style signals the clickability.
+//
+// Keyboard: ``role="button"`` + ``tabIndex={0}`` so the thumbnail
+// is reachable via Tab and activatable with Enter/Space, matching
+// the title ``<a>``. Without this, sighted keyboard users would
+// have no way to act on a card without scrolling past the title.
+//
+// ``onError`` now ``console.warn``s in addition to hiding the wrapper
+// so a developer chasing a 403 / 404 sees which thumbnail URL is
+// the offender. Hidden state is the same as before (display:none on
+// the wrapper) so the badge still lands flush right.
+function Thumbnail({ path, title, url }: { path: string; title: string; url: string }) {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
+  const open = () => {
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }
+  const onClick = (e: MouseEvent<HTMLDivElement>) => {
+    // Don't bubble up — the article-level handlers (long-press,
+    // context menu) shouldn't fire when the user just wants the
+    // thumbnail to act as a link.
+    e.preventDefault()
+    e.stopPropagation()
+    open()
+  }
+  const onKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      e.stopPropagation()
+      open()
+    }
+  }
   return (
     <div
       ref={wrapperRef}
-      className="shrink-0 w-24 h-24 rounded overflow-hidden bg-slate-800"
+      role="button"
+      tabIndex={0}
+      data-card-interactive
+      onClick={onClick}
+      onKeyDown={onKey}
+      aria-label={`open ${title} in new tab`}
       title={title}
+      className="shrink-0 w-24 sm:w-32 aspect-video rounded-md overflow-hidden bg-bg-elevated cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-blue-500/60"
     >
       <img
         src={`/assets/${path}`}
         alt=""
         loading="lazy"
         decoding="async"
-        width={96}
-        height={96}
-        className="w-24 h-24 object-cover"
+        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
         onError={() => {
+          console.warn(`Card thumbnail failed: /assets/${path}`)
           if (wrapperRef.current) wrapperRef.current.style.display = 'none'
         }}
       />

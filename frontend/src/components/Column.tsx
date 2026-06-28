@@ -50,6 +50,10 @@ type Props = {
   // content. App passes this; falls back to entries.length when
   // prefs are not in play.
   totalCount?: number
+  // Optional map sourceId → category. Passed through to each Card so
+  // it can render the colored left stripe. Without it the cards just
+  // skip the stripe.
+  categoriesBySourceId?: Map<number, string>
 }
 
 export function Column({
@@ -64,6 +68,7 @@ export function Column({
   prefs,
   onPrefsChange,
   totalCount,
+  categoriesBySourceId,
 }: Props) {
   const [popoverOpen, setPopoverOpen] = useState(false)
   const popoverRef = useRef<HTMLDivElement | null>(null)
@@ -126,6 +131,15 @@ export function Column({
         className="relative flex items-center justify-between px-1 pb-2 cursor-pointer select-none"
         title="tap to mark this column read"
       >
+        {/* Thin gradient underline. Sits below the title row and
+            gives each column a soft separator from its body without
+            a hard border. The transparent-to-transparent endpoint
+            keeps the line from "starting" — it reads as a continuous
+            gradient flow rather than a divider stuck across the top. */}
+        <div
+          aria-hidden="true"
+          className="absolute left-0 right-0 bottom-0 h-px bg-gradient-to-r from-transparent via-slate-700 to-transparent"
+        />
         <div className="flex items-center gap-2 min-w-0">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300 truncate">
             {name}
@@ -273,6 +287,7 @@ export function Column({
                 unread={unreadIds == null ? false : unreadIds.has(e.id)}
                 selected={selectedId === e.id}
                 cardRef={refCb}
+                category={categoriesBySourceId?.get(e.source_id)}
               />
             )
           })
