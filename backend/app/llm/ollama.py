@@ -44,6 +44,31 @@ class OllamaProvider(Provider):
             )
         data = resp.json()
         text = data.get("response", "")
+        thinking = data.get("thinking", "")
+        if not text and thinking:
+            # Thinking-style model: the final answer is empty and the
+            # chain-of-thought / actual content is in ``thinking``. We
+            # use the thinking text as the completion rather than
+            # failing — it's still useful output, even if it's not a
+            # "clean" answer. The user can re-prompt or switch models.
+            logger.info(
+                "ollama: response empty, falling back to thinking for model=%s thinking_len=%d",
+                self._model, len(thinking),
+            )
+            text = thinking
         if not text:
+            # Log the response shape (not the body — it's potentially
+            # large). Helps diagnose model-not-found / context-overflow
+            # cases that surface as 200 + empty response instead of 4xx.
+            logger.warning(
+                "ollama: empty response for model=%s keys=%s done=%s done_reason=%s eval_count=%s response_len=%d thinking_len=%d",
+                self._model,
+                sorted(data.keys()),
+                data.get("done"),
+                data.get("done_reason"),
+                data.get("eval_count"),
+                len(data.get("response", "") or ""),
+                len(data.get("thinking", "") or ""),
+            )
             raise ProviderError("ollama returned empty response")
         return text
