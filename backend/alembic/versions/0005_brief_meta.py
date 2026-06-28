@@ -25,10 +25,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column("briefs", sa.Column("meta", sa.JSON, nullable=True))
-    # GIN over the JSONB column — Postgres can index any key path. Cheap
-    # containment queries like ``meta @> '{"notified_urls": [...]}'
-    # ::jsonb`` use this index without a specific key being named.
+    # Use JSONB (not JSON). Bare ``json`` has no default GIN operator
+    # class — Postgres would reject ``CREATE INDEX ... USING gin (meta)``
+    # on it with "data type json has no default operator class". JSONB
+    # ships with ``jsonb_ops`` as the GIN default, so the containment
+    # queries in app/scheduler.py (``meta @> '{"notified_urls": [...]}'
+    # ::jsonb``) can use this index without naming an opclass.
+    op.add_column("briefs", sa.Column("meta", sa.dialects.postgresql.JSONB, nullable=True))
     op.create_index(
         "ix_briefs_meta",
         "briefs",

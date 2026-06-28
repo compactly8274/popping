@@ -24,6 +24,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -88,7 +89,7 @@ class Entry(Base):
     body_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     body_text_compressed: Mapped[bool] = mapped_column(Boolean, default=False)
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(384), nullable=True)
-    meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    meta: Mapped[Optional[dict]] = mapped_column(postgresql.JSONB, nullable=True)
     # Remote URL of the entry's thumbnail (parsed from the feed by the
     # RSS plugin; NULL for sources that don't ship images). The local
     # cache lives at /app/assets/thumbnails/<id>.<ext>; the frontend
@@ -221,4 +222,4 @@ class Brief(Base):
     #   {"notified_urls": [...]} — CVEs / high-severity alerts already pushed
     #   {"alert_slugs": [...]}   — convergence clusters already alerted on
     # GIN-indexed so ``meta @> '{"notified_urls": [<url>]}'::jsonb`` is cheap.
-    meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    meta: Mapped[Optional[dict]] = mapped_column(postgresql.JSONB, nullable=True)
