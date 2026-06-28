@@ -145,9 +145,12 @@ export function App() {
   // 3. Default — the dashboard.
   return (
     <div className="h-full flex flex-col">
-      <header className="flex items-center gap-3 px-4 py-3 border-b border-slate-800 bg-slate-950">
+      <header className="flex items-center gap-2 sm:gap-3 px-4 py-1.5 sm:py-3 border-b border-slate-800 bg-slate-950">
         <Hamburger onClick={() => setDrawerOpen(true)} />
-        <h1 className="text-lg font-bold">Popping</h1>
+        {/* Title: text-base on mobile saves a couple px of line-height
+            vs text-lg without losing legibility. sm: bumps back to
+            the desktop look. */}
+        <h1 className="text-base sm:text-lg font-bold">Popping</h1>
         {/* The "X entries · Y sources" chip is duplicative with the
             Drawer sources list and squashes the action buttons on
             narrow phones. Hide below sm; the Drawer covers the
@@ -157,9 +160,13 @@ export function App() {
             ? `${health.entries} entries · ${health.sources} sources · ${health.status}`
             : 'connecting…'}
         </span>
+        {/* min-h-[36px] on mobile / [44px] on sm+: keeps the row
+            slim on phones while staying above the iOS 44px guidance
+            on tablets/desktops. The icon-equivalent text labels
+            mean a thumb can still land the button accurately. */}
         <button
           onClick={refresh}
-          className="min-h-[44px] rounded px-3 py-1 text-sm bg-slate-800 active:bg-slate-700 text-slate-200 [@media(hover:hover)]:hover:bg-slate-700"
+          className="min-h-[36px] sm:min-h-[44px] rounded px-3 py-1 text-sm bg-slate-800 active:bg-slate-700 text-slate-200 [@media(hover:hover)]:hover:bg-slate-700"
         >
           Refresh
         </button>
@@ -201,7 +208,7 @@ export function App() {
           <span className="rounded bg-slate-800 px-2 py-0.5 text-slate-200">{sourceFilter}</span>
           <button
             onClick={() => setSourceFilter(null)}
-            className="ml-auto min-h-[44px] rounded px-3 py-1 text-slate-400 active:bg-slate-800 [@media(hover:hover)]:hover:text-slate-100 [@media(hover:hover)]:hover:bg-slate-800"
+            className="ml-auto min-h-[36px] sm:min-h-[44px] rounded px-3 py-1 text-slate-400 active:bg-slate-800 [@media(hover:hover)]:hover:text-slate-100 [@media(hover:hover)]:hover:bg-slate-800"
             aria-label="clear source filter"
           >
             clear ✕
