@@ -142,9 +142,9 @@ export function Drawer({
         // edges. ``shadow-2xl`` casts a deeper shadow than the old
         // ``shadow-xl`` because the panel is wider and the blur
         // invites more attention to the panel's edge.
-        className={`fixed top-0 left-0 z-40 h-full w-72 bg-bg-app/95 border-r border-slate-800 backdrop-blur-md shadow-2xl transform transition-transform ${open ? 'translate-x-0' : '-translate-x-full'}`}
+        className={`fixed top-0 left-0 z-40 h-full w-72 bg-bg-app/95 border-r border-slate-800 backdrop-blur-md shadow-2xl transform transition-transform flex flex-col ${open ? 'translate-x-0' : '-translate-x-full'}`}
       >
-        <div className="flex items-center justify-between p-4 border-b border-slate-800">
+        <div className="flex items-center justify-between p-4 border-b border-slate-800 shrink-0">
           <h2 className="text-lg font-semibold">Popping</h2>
           <button
             onClick={onClose}
@@ -154,7 +154,11 @@ export function Drawer({
             ✕
           </button>
         </div>
-        <nav className="p-4 space-y-4 overflow-y-auto">
+        {/* ``min-h-0`` lets the nav actually shrink below its content
+            height — without it, ``overflow-y-auto`` is a no-op because
+            the flex item refuses to be smaller than its contents and
+            the parent grows to fit (overflowing the viewport). */}
+        <nav className="flex-1 min-h-0 p-4 space-y-4 overflow-y-auto">
           <div>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
               Notifications
