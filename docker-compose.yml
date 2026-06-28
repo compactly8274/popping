@@ -51,7 +51,7 @@ services:
   backend:
     image: ghcr.io/${POPPING_IMAGE_OWNER:-compactly8274}/popping-backend:${POPPING_IMAGE_TAG:-latest}
     restart: unless-stopped
-    pull_policy: ${POPPING_PULL_POLICY:-missing}
+    pull_policy: ${POPPING_PULL_POLICY:-always}
     env_file: .env
     depends_on:
       postgres:
@@ -61,13 +61,23 @@ services:
     volumes:
       # Cached favicons + thumbnails written by ingest and served at /assets.
       - assets:/app/assets
+    # Map host.docker.internal to the docker host's gateway IP. The
+    # default OLLAMA_BASE_URL points at host.docker.internal:11434 so
+    # the backend can reach an Ollama instance running on the host
+    # (typical Linux setup). The gateway IP is the well-known address
+    # for this on Linux Docker; on Docker Desktop / macOS the hostname
+    # is already resolvable natively. Override OLLAMA_BASE_URL in .env
+    # if your Ollama runs somewhere else (a separate container, a
+    # different host, etc.).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # No published port — backend is only reachable from the frontend
     # via the docker network.
 
   frontend:
     image: ghcr.io/${POPPING_IMAGE_OWNER:-compactly8274}/popping-frontend:${POPPING_IMAGE_TAG:-latest}
     restart: unless-stopped
-    pull_policy: ${POPPING_PULL_POLICY:-missing}
+    pull_policy: ${POPPING_PULL_POLICY:-always}
     depends_on:
       - backend
     environment:

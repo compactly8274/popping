@@ -40,36 +40,35 @@ class Router:
     """
 
     def provider_for(self, task: str) -> Provider | None:
-        model = self._model_for(task)
-        if not model:
-            return None
+        # Pick the provider AND its model name together. Earlier
+        # versions picked the model from a single chain regardless of
+        # which provider actually wins — so when no API keys were set
+        # and Ollama was the fallback, we'd ask Ollama for a model
+        # named "claude-sonnet-4-6" (or similar), which doesn't exist
+        # locally and returned 404 from /api/generate.
         if settings.anthropic_api_key:
             from app.llm.anthropic import AnthropicProvider
 
+            model = settings.claude_model_brief if task == "brief" else settings.claude_model_scoring
+            if not model:
+                return None
             return AnthropicProvider(model, settings.anthropic_api_key)
         if settings.openai_api_key:
+            model = settings.openai_model_brief if task == "brief" else settings.openai_model_scoring
+            if not model:
+                return None
             return OpenAIProvider(model, settings.openai_api_key)
         if settings.groq_api_key:
+            model = settings.groq_model_brief if task == "brief" else settings.groq_model_scoring
+            if not model:
+                return None
             return GroqProvider(model, settings.groq_api_key)
+        # No cloud key — fall through to Ollama. Use the Ollama model
+        # name explicitly; the cloud-model chain doesn't apply here.
+        model = settings.ollama_model_brief if task == "brief" else settings.ollama_model_scoring
+        if not model:
+            return None
         return OllamaProvider(model)
-
-    @staticmethod
-    def _model_for(task: str) -> str | None:
-        if task == "scoring":
-            return (
-                settings.claude_model_scoring
-                or settings.openai_model_scoring
-                or settings.groq_model_scoring
-                or settings.ollama_model_scoring
-            )
-        if task == "brief":
-            return (
-                settings.claude_model_brief
-                or settings.openai_model_brief
-                or settings.groq_model_brief
-                or settings.ollama_model_brief
-            )
-        return None
 
 
 router = Router()
