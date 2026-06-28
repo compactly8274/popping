@@ -45,12 +45,31 @@ logger = logging.getLogger("popping")
 async def lifespan(app: FastAPI):
     logger.info("popping starting")
     # Create the asset cache dirs so the /assets mount never 404s on a
-    # fresh volume. Idempotent.
-    assets.ensure_dirs()
+    # fresh volume. Idempotent. If the assets dir isn't writable (e.g.
+    # the named volume wasn't mounted when running outside compose),
+    # log and keep going — the StaticFiles mount will serve an empty
+    # dir and favicons/thumbnails will silently stay missing.
+    try:
+        assets.ensure_dirs()
+    except OSError as exc:
+        logger.warning(
+            "assets: cannot create %s (%s) — favicons/thumbnails will be unavailable",
+            settings.assets_dir, exc,
+        )
     # Load embedder first — the scheduler's ingest path will call
     # embed() on every entry, and we want the model warm before the
-    # first fetch lands. If embedding is disabled, this is a no-op.
-    await embedder().load()
+    # first fetch lands. If the model download fails (offline cold
+    # start, HuggingFace unreachable) or embeddings are explicitly
+    # disabled, this is a no-op. Never crash startup on it — ingest
+    # degrades to recency + source weight when embeddings are absent
+    # (see app.config: embedding_enabled docstring).
+    try:
+        await embedder().load()
+    except Exception:
+        logger.exception(
+            "embeddings: failed to load model '%s' — continuing without embeddings",
+            settings.embedding_model,
+        )
     # Build the notifier once. Both scheduler jobs and the brief
     # endpoint read it from app.request_state. ``None`` means "no
     # backend configured" — everything keeps working without pushes.
