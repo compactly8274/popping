@@ -17,6 +17,13 @@ export default defineConfig({
         target: backend,
         changeOrigin: true,
       },
+      // Cached favicons/thumbnails served by the backend at /assets.
+      // Required because the backend has no published port in compose;
+      // the browser must reach it through Vite like /api does.
+      '/assets': {
+        target: backend,
+        changeOrigin: true,
+      },
     },
   },
 })

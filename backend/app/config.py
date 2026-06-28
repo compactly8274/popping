@@ -148,6 +148,13 @@ class Settings(BaseSettings):
     # but doesn't need to be tight.
     convergence_check_interval_minutes: int = 15
 
+    # --- Asset cache (favicons + thumbnails) ------------------------------
+    # Where the ingest pipeline writes downloaded images. Must be
+    # readable by the StaticFiles mount at /assets and writable by the
+    # backend. Default /app/assets matches the named volume in
+    # docker-compose.yml. Override with POPPING_ASSETS_DIR.
+    assets_dir: str = "/app/assets"
+
     @property
     def database_url(self) -> str:
         return (

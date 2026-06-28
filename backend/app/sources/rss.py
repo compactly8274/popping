@@ -16,6 +16,7 @@ uncontroversial.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Any
 
 import feedparser
@@ -44,6 +45,57 @@ def _parse_published(entry: Any) -> dt.datetime | None:
     return None
 
 
+# First <img src> in a summary blob. Lazy fallback when the feed
+# doesn't ship a structured image field — common in WordPress-style
+# HTML summaries.
+_IMG_SRC_RE = re.compile(
+    r"""<img\s[^>]*?src=["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+
+
+def _pick_image_url(entry: Any) -> str | None:
+    """Best thumbnail URL from a feedparser entry, or None.
+
+    Priority matches what real feeds actually ship:
+      1. media:thumbnail (Media RSS — most common)
+      2. media:content with image/* type
+      3. enclosure with image/* type (RSS 2.0)
+      4. itunes:image (podcast artwork)
+      5. first <img src> regex over summary (HTML summaries)
+    """
+    # 1. media:thumbnail
+    mt = entry.get("media_thumbnail")
+    if mt:
+        url = mt[0].get("url") if isinstance(mt, list) else mt.get("url")
+        if url:
+            return url
+    # 2. media:content
+    mc = entry.get("media_content")
+    if mc:
+        items = mc if isinstance(mc, list) else [mc]
+        for m in items:
+            ct = (m.get("type") or "").lower()
+            if ct.startswith("image/") and m.get("url"):
+                return m["url"]
+    # 3. enclosure
+    for enc in entry.get("enclosures") or []:
+        ct = (enc.get("type") or "").lower()
+        if ct.startswith("image/") and enc.get("href"):
+            return enc["href"]
+    # 4. itunes:image
+    ii = entry.get("image")
+    if isinstance(ii, dict) and ii.get("href"):
+        return ii["href"]
+    # 5. inline <img src> in summary
+    summary = entry.get("summary") or ""
+    if summary:
+        m = _IMG_SRC_RE.search(summary)
+        if m:
+            return m.group(1)
+    return None
+
+
 class _RssPlugin(SourcePlugin):
     """Generic RSS/Atom fetcher. Subclasses set name/url/refresh."""
 
@@ -57,12 +109,16 @@ class _RssPlugin(SourcePlugin):
         feed = feedparser.parse(resp.text)
         items: list[dict] = []
         for entry in feed.entries:
+            image_url = _pick_image_url(entry)
             items.append(
                 {
                     "title": entry.get("title", ""),
                     "url": entry.get("link", ""),
                     "published_at": _parse_published(entry),
                     "summary": entry.get("summary", ""),
+                    # Top-level so the ingest pipeline can pop it out of
+                    # meta cleanly. NULL when the feed ships no image.
+                    "image_url": image_url,
                 }
             )
         return items

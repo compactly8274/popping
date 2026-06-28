@@ -1,6 +1,7 @@
 // One card: headline link, source name, relative time, score badge.
-// The score badge is the entry's composite_score (phase 2+: weighted
-// blend of recency × source weight × personal vector).
+// When the entry has a thumbnail (parsed from the feed at ingest), a
+// 96 px square renders to the right of the title — feeds without
+// thumbnails keep the original compact layout.
 
 import type { Entry } from '../api'
 
@@ -32,15 +33,16 @@ export function Card({ entry, sourceName }: Props) {
   const band = scoreBand(entry.composite_score)
   return (
     <article className="rounded-lg border border-slate-800 bg-slate-900/60 p-4 hover:border-slate-700 transition">
-      <div className="flex items-start justify-between gap-2 mb-2">
+      <div className="flex items-start justify-between gap-3 mb-2">
         <a
           href={entry.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-base font-medium text-slate-100 hover:text-white line-clamp-2"
+          className="flex-1 min-w-0 text-base font-medium text-slate-100 hover:text-white line-clamp-2"
         >
           {entry.title}
         </a>
+        {entry.image_path && <Thumbnail path={entry.image_path} title={entry.title} />}
         <span
           className={`shrink-0 inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold text-white ${band.color}`}
           title={`composite score ${entry.composite_score.toFixed(0)}`}
@@ -54,5 +56,25 @@ export function Card({ entry, sourceName }: Props) {
         <time>{timeAgo(entry.published_at)}</time>
       </div>
     </article>
+  )
+}
+
+// 96 px square. `loading="lazy"` defers off-screen images; `onError`
+// hides the broken-image icon so a stale cache never ruins the card.
+// Intrinsic width/height attrs reserve the box from first paint, so
+// the card layout doesn't shift when the image arrives.
+function Thumbnail({ path, title }: { path: string; title: string }) {
+  return (
+    <img
+      src={`/assets/${path}`}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      width={96}
+      height={96}
+      className="shrink-0 w-24 h-24 rounded object-cover bg-slate-800"
+      onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
+      title={title}
+    />
   )
 }

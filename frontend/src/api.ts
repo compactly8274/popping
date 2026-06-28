@@ -17,6 +17,9 @@ export interface Entry {
   personal_score: number
   raw_score: number
   meta: Record<string, unknown> | null
+  // Thumbnail (if the source ships one). Path is relative to /assets.
+  image_url: string | null
+  image_path: string | null
 }
 
 export interface Source {
@@ -30,6 +33,10 @@ export interface Source {
   last_error: string | null
   error_count: number
   active: boolean
+  // Favicon URL (typically origin's /favicon.ico), populated on first ingest.
+  favicon_url: string | null
+  // Local path under /assets, e.g. "favicons/3.ico".
+  favicon_path: string | null
 }
 
 export interface Health {

@@ -33,6 +33,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import assets
 from app.brief import BriefGenerator
 from app.config import settings
 from app.db import SessionLocal
@@ -110,6 +111,19 @@ async def _ingest(plugin_cls: Any) -> dict:
     try:
         async with SessionLocal() as session:
             source = await _upsert_source(session, plugin_cls)
+            # Lazy favicon fetch: only on first ingest per source. A
+            # failed fetch leaves favicon_url NULL and retries next
+            # ingest. Runs inside the same transaction so the URL lands
+            # in the DB atomically with the source row.
+            if source.favicon_url is None:
+                try:
+                    remote, local = await assets.fetch_favicon(source.url, source.id)
+                    if remote and local:
+                        source.favicon_url = remote
+                        source.favicon_path = local
+                        logger.info("favicon cached for %s → %s", source.name, local)
+                except Exception:
+                    logger.debug("favicon fetch failed for %s", source.name, exc_info=True)
             profile = await _load_profile(session)
             raw_items = await plugin.fetch()
             summary["fetched"] = len(raw_items)
@@ -119,6 +133,12 @@ async def _ingest(plugin_cls: Any) -> dict:
                 except ValueError as exc:
                     logger.warning("%s: skipping bad item: %s", plugin_cls.name, exc)
                     continue
+                # Lift image_url out of meta (the default normalize()
+                # buckets it there) so it can land in its own column.
+                # A missing image is the common case for non-RSS sources
+                # and stays NULL.
+                meta = norm.get("meta") or {}
+                remote_image_url = meta.pop("image_url", None) or None
                 # raw_score is the recency-at-ingest — stays interpretable
                 # as "how fresh was this when it arrived".
                 raw_score = recency.score(norm["published_at"], source.category)
@@ -139,7 +159,9 @@ async def _ingest(plugin_cls: Any) -> dict:
                         personal_score=0.0,
                         composite_score=composite,
                         embedding=embedding,
-                        meta=norm.get("meta"),
+                        meta=meta or None,
+                        image_url=remote_image_url,
+                        image_path=None,
                     )
                     .on_conflict_do_nothing(index_elements=["url"])
                     .returning(Entry.id)
@@ -155,6 +177,25 @@ async def _ingest(plugin_cls: Any) -> dict:
                         row = await session.get(Entry, inserted_id)
                         if row is not None:
                             newly_inserted.append((row, source))
+                            # Fetch the thumbnail now that we have the
+                            # row's id. Set image_path/image_url on the
+                            # ORM object — SQLAlchemy emits an UPDATE at
+                            # the next flush (the commit below). Never
+                            # raises: a failed fetch leaves the row
+                            # with image_url set but image_path NULL.
+                            if remote_image_url:
+                                try:
+                                    local_path = await assets.fetch_thumbnail(
+                                        remote_image_url, inserted_id
+                                    )
+                                    if local_path:
+                                        row.image_path = local_path
+                                        row.image_url = remote_image_url
+                                except Exception:
+                                    logger.debug(
+                                        "thumbnail fetch failed for entry %d",
+                                        inserted_id, exc_info=True,
+                                    )
                 else:
                     summary["duplicates"] += 1
             source.last_fetch_at = dt.datetime.now(dt.timezone.utc)

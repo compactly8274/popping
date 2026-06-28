@@ -18,7 +18,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
+from app import assets
 from app.config import settings
 from app.embeddings import embedder
 from app.notify import build_notifier
@@ -42,6 +44,9 @@ logger = logging.getLogger("popping")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("popping starting")
+    # Create the asset cache dirs so the /assets mount never 404s on a
+    # fresh volume. Idempotent.
+    assets.ensure_dirs()
     # Load embedder first — the scheduler's ingest path will call
     # embed() on every entry, and we want the model warm before the
     # first fetch lands. If embedding is disabled, this is a no-op.
@@ -96,3 +101,8 @@ if settings.oidc_enabled:
 
     app.include_router(auth_router)
     logger.info("OIDC auth enabled (issuer=%s)", settings.oidc_issuer)
+
+# Cached asset files (favicons + thumbnails). Mounted last so the API
+# routers above always win for /api/* paths. The browser loads these
+# as same-origin <img> tags — no third-party referer leak, no CORS.
+app.mount("/assets", StaticFiles(directory=settings.assets_dir), name="assets")

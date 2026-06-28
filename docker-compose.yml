@@ -58,6 +58,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      # Cached favicons + thumbnails written by ingest and served at /assets.
+      - assets:/app/assets
     # No published port — backend is only reachable from the frontend
     # via the docker network.
 
@@ -76,3 +79,4 @@ services:
 
 volumes:
   pgdata:
+  assets:

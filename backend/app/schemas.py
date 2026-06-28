@@ -19,6 +19,11 @@ class SourceOut(BaseModel):
     last_error: Optional[str]
     error_count: int
     active: bool
+    # Remote URL of the source's favicon. NULL until first ingest
+    # downloads it (typically origin's /favicon.ico).
+    favicon_url: Optional[str] = None
+    # Local path under /assets, e.g. "favicons/3.png".
+    favicon_path: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -34,6 +39,10 @@ class EntryOut(BaseModel):
     personal_score: float
     raw_score: float
     meta: Optional[dict]
+    # Remote URL of the entry's thumbnail (parsed from the feed).
+    image_url: Optional[str] = None
+    # Local path under /assets, e.g. "thumbnails/1234.jpg".
+    image_path: Optional[str] = None
 
     class Config:
         from_attributes = True

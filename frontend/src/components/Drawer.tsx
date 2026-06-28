@@ -113,14 +113,29 @@ export function Drawer({ open, onClose, categories, sourceFilter, onSourceSelect
                           onSourceSelect(active ? null : s.name)
                           onClose()
                         }}
-                        className={`w-full text-left rounded px-2 py-1 text-sm flex items-center justify-between transition ${
+                        className={`w-full text-left rounded px-2 py-1 text-sm flex items-center justify-between gap-2 transition ${
                           active
                             ? 'bg-slate-700 text-white'
                             : 'text-slate-200 hover:bg-slate-800'
                         }`}
                       >
-                        <span>{s.name}</span>
-                        <span className="text-xs text-slate-500">{s.category}</span>
+                        <span className="flex items-center gap-2 min-w-0">
+                          {s.favicon_path && (
+                            <img
+                              src={`/assets/${s.favicon_path}`}
+                              alt=""
+                              width={16}
+                              height={16}
+                              loading="lazy"
+                              className="shrink-0 w-4 h-4 rounded-sm bg-slate-800"
+                              onError={(e) => {
+                                ;(e.currentTarget as HTMLImageElement).style.display = 'none'
+                              }}
+                            />
+                          )}
+                          <span className="truncate">{s.name}</span>
+                        </span>
+                        <span className="text-xs text-slate-500 shrink-0">{s.category}</span>
                       </button>
                     </li>
                   )
