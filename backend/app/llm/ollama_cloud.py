@@ -49,7 +49,7 @@ class OllamaCloudProvider(Provider):
             "Content-Type": "application/json",
         }
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
                 resp = await client.post(url, json=payload, headers=headers)
         except httpx.HTTPError as exc:
             raise ProviderError(f"ollama cloud transport error: {exc}") from exc
@@ -62,5 +62,16 @@ class OllamaCloudProvider(Provider):
         data = resp.json()
         text = data.get("response", "")
         if not text:
-            raise ProviderError("ollama cloud returned empty response")
+            # Log the response shape (not the body — it's potentially
+            # large). Helps diagnose model-not-found / context-overflow
+            # cases that surface as 200 + empty response instead of 4xx.
+            logger.warning(
+                "ollama cloud: empty response for model=%s keys=%s done=%s done_reason=%s eval_count=%s",
+                self._model,
+                sorted(data.keys()),
+                data.get("done"),
+                data.get("done_reason"),
+                data.get("eval_count"),
+            )
+            raise ProviderError(f"ollama cloud returned empty response (model={self._model})")
         return text
