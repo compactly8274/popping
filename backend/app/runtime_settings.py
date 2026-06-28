@@ -85,6 +85,7 @@ _SETTINGS_FIELDS: dict[str, str] = {
     "llm.provider": "",  # no env default — user picks via the chip
     "llm.model_brief": "ollama_cloud_model_brief",
     "llm.model_scoring": "ollama_cloud_model_scoring",
+    "brief.window_hours": "brief_window_hours",
 }
 
 

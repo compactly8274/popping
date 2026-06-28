@@ -297,8 +297,14 @@ container:
 **Read precedence** (per lookup):
 
 1. The `app_settings` row (if present and non-empty).
-2. The env-var default (`OLLAMA_CLOUD_MODEL_BRIEF`, etc.).
+2. The env-var default (`OLLAMA_CLOUD_MODEL_BRIEF`, `BRIEF_WINDOW_HOURS`, etc.).
 3. The hardcoded fallback.
+
+**Available runtime knobs** (full list in `.env.example`):
+
+- `llm.provider` — picked via the chip; no env default.
+- `llm.model_brief` / `llm.model_scoring` — model names for brief + scoring. Default `OLLAMA_CLOUD_MODEL_BRIEF` / `OLLAMA_CLOUD_MODEL_SCORING`.
+- `brief.window_hours` — lookback window for the brief generator. Filters on `fetched_at` (when the row landed in the DB), not `published_at`, so historical content (Wikipedia "on this day") ingested today doesn't pollute today's digest. Default 24, clamped to `[1, 168]`.
 
 **Env vs DB.** On first boot, `seed_from_env` copies the relevant env
 values into the table — but only if the table is empty for that key.

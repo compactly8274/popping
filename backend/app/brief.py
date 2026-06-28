@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.llm import ProviderError, router
 from app.models import Brief, Entry, Source
 from app.notify import Notifier
+from app import runtime_settings
 
 logger = logging.getLogger("popping.brief")
 
@@ -74,7 +75,13 @@ class BriefGenerator:
             logger.info("brief: no recent entries — skipping generation")
             return None
 
-        prompt = self._build_prompt(entries, tone)
+        # Resolve the window once and thread it into the prompt so the
+        # LLM sees the actual value the selector used (rather than a
+        # hardcoded "24h" that lies when the operator changed the knob).
+        # ``_select_entries`` re-reads the same value internally — that's
+        # a cache hit (5s TTL) so it's a no-op cost.
+        window_hours = await self._resolve_window_hours()
+        prompt = self._build_prompt(entries, tone, window_hours)
         try:
             content = await provider.complete(prompt, max_tokens=_BRIEF_MAX_TOKENS)
         except ProviderError as exc:
@@ -127,9 +134,10 @@ class BriefGenerator:
         if len(entries) < 2:
             return None
 
+        window_hours = await self._resolve_window_hours()
         prompt = (
             f"These {len(entries)} stories all appear to cover the same event "
-            f"(seen across {source_count} sources in the last 24h):\n\n"
+            f"(seen across {source_count} sources, ingested in the last {window_hours}h):\n\n"
             + self._format_entries(entries)
             + "\n\nWrite ONE sentence (max 30 words) capturing the event and why it matters. "
             "Lead with the fact, not 'this story'. No bullet points, no preamble."
@@ -158,15 +166,54 @@ class BriefGenerator:
     # Selection
     # ------------------------------------------------------------------
 
+    # Bounds on the lookback window. Negative or absurdly large values
+    # are easy to typo (or a malicious operator can set BRIEF_WINDOW_HOURS=0
+    # and silently disable the brief). Clamp to a sane range — 1h min
+    # keeps the brief responsive to "what just landed", 168h (1 week) max
+    # keeps the prompt from filling with stale content.
+    _WINDOW_MIN_HOURS = 1
+    _WINDOW_MAX_HOURS = 168
+    _WINDOW_DEFAULT_HOURS = 24
+
+    @classmethod
+    async def _resolve_window_hours(cls) -> int:
+        """Read the lookback window from runtime settings / env.
+
+        ``runtime_settings.get`` returns a string from the DB or env
+        (lines 142 / 147-151 in runtime_settings.py). We cast to int and
+        clamp to [_WINDOW_MIN_HOURS, _WINDOW_MAX_HOURS]. Bad values
+        (non-numeric, out of range) fall back to the default — a brief
+        that's slightly off is better than one that crashes the
+        scheduler."""
+        raw = await runtime_settings.get(
+            "brief.window_hours", default=cls._WINDOW_DEFAULT_HOURS
+        )
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return cls._WINDOW_DEFAULT_HOURS
+        if n < cls._WINDOW_MIN_HOURS or n > cls._WINDOW_MAX_HOURS:
+            return cls._WINDOW_DEFAULT_HOURS
+        return n
+
     @staticmethod
     async def _select_entries(session: AsyncSession, *, limit: int) -> list[tuple[Entry, Source]]:
-        """Top-N entries from the last 24h by composite_score. Joined to
-        Source so the prompt can show category + source name."""
-        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+        """Top-N entries ingested in the lookback window, by composite_score.
+
+        Filter is on ``fetched_at`` (when the row landed in our DB), not
+        ``published_at`` (when the source article was published). Wikipedia
+        "on this day" entries have very old ``published_at`` values but
+        are ingested today — using ``fetched_at`` keeps the brief focused
+        on actual recent content. The dashboard's browse view still
+        sorts by ``published_at`` so historical entries stay visible.
+        Joined to Source so the prompt can show category + source name.
+        """
+        window_hours = await BriefGenerator._resolve_window_hours()
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
         stmt = (
             select(Entry, Source)
             .join(Source, Entry.source_id == Source.id)
-            .where(Entry.published_at >= since)
+            .where(Entry.fetched_at >= since)
             .order_by(desc(Entry.composite_score))
             .limit(limit)
         )
@@ -179,14 +226,15 @@ class BriefGenerator:
     ) -> list[tuple[Entry, Source]]:
         """Recent entries whose normalized title matches ``slug``. Used by
         the alert path to feed the LLM just the cluster, not the full
-        feed."""
+        feed. Same ``fetched_at`` filter as ``_select_entries``."""
         from app.scoring import composite as composite_scorer
 
-        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+        window_hours = await BriefGenerator._resolve_window_hours()
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
         stmt = (
             select(Entry, Source)
             .join(Source, Entry.source_id == Source.id)
-            .where(Entry.published_at >= since)
+            .where(Entry.fetched_at >= since)
             .order_by(desc(Entry.composite_score))
             .limit(limit * 5)  # over-fetch; filter post-hoc by slug
         )
@@ -227,7 +275,7 @@ class BriefGenerator:
         return "\n".join(lines)
 
     @staticmethod
-    def _build_prompt(entries: list[tuple[Entry, Source]], tone: str) -> str:
+    def _build_prompt(entries: list[tuple[Entry, Source]], tone: str, window_hours: int) -> str:
         tone_blurb = {
             "terse": (
                 "Write a brief, dense digest. Skip the preamble. Lead with the "
@@ -255,7 +303,7 @@ class BriefGenerator:
             f"  WATCH\n"
             f"  - <item worth keeping an eye on, lower priority>\n"
             f"  - ... (1-3 items)\n\n"
-            f"Top {len(entries)} entries from the last 24h:\n\n"
+            f"Top {len(entries)} entries ingested in the last {window_hours}h:\n\n"
             f"{BriefGenerator._format_entries(entries)}\n"
         )
 

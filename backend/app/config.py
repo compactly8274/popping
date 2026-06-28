@@ -191,6 +191,12 @@ class Settings(BaseSettings):
     # idempotent — generating it twice on the same day just overwrites the
     # row. Set to -1 to disable the scheduled daily brief (manual only).
     brief_schedule_hour: int = 8
+    # Lookback window for the brief generator: only entries ingested within
+    # this many hours are considered. Excludes historical content (e.g.
+    # Wikipedia "on this day") that was ingested today but published long
+    # ago. Overridable at runtime via ``brief.window_hours`` in
+    # app_settings — same pattern as the LLM knobs.
+    brief_window_hours: int = 24
     # CVSS threshold for the post-ingest CVE notification. Default 7.0
     # (HIGH severity). Set to 0 to alert on every CVE ingest.
     cve_notify_min_cvss: float = 7.0
