@@ -37,6 +37,12 @@ export function App() {
   // Latest terse Brief for the dashboard card. Null until either the
   // scheduler has run today or the user manually generates one.
   const [brief, setBrief] = useState<Brief | null>(null)
+  // Tracks in-flight brief generation requests from the header
+  // button so a second tap doesn't fire a parallel LLM roundtrip.
+  // The BriefCard and Drawer manage their own generating state for
+  // their own buttons; this is just for the header button which
+  // lives up here in App.
+  const [generatingBrief, setGeneratingBrief] = useState(false)
   const touchStartX = useRef<number | null>(null)
 
   const sourcesById = useMemo(
@@ -142,30 +148,43 @@ export function App() {
       <header className="flex items-center gap-3 px-4 py-3 border-b border-slate-800 bg-slate-950">
         <Hamburger onClick={() => setDrawerOpen(true)} />
         <h1 className="text-lg font-bold">Popping</h1>
-        <span className="ml-auto text-xs text-slate-400">
+        {/* The "X entries · Y sources" chip is duplicative with the
+            Drawer sources list and squashes the action buttons on
+            narrow phones. Hide below sm; the Drawer covers the
+            curious case where someone wants the counts. */}
+        <span className="ml-auto hidden sm:inline text-xs text-slate-400">
           {health
             ? `${health.entries} entries · ${health.sources} sources · ${health.status}`
             : 'connecting…'}
         </span>
         <button
           onClick={refresh}
-          className="rounded px-3 py-1 text-sm bg-slate-800 hover:bg-slate-700 text-slate-200"
+          className="min-h-[44px] rounded px-3 py-1 text-sm bg-slate-800 active:bg-slate-700 text-slate-200 [@media(hover:hover)]:hover:bg-slate-700"
         >
           Refresh
         </button>
+        {/* Header-level Brief button: hides on mobile because the
+            BriefCard itself surfaces a Generate / Regenerate button.
+            Two CTAs on the same action is noise, and on a 320px
+            viewport there's no room for both. */}
         <button
           onClick={async () => {
+            if (generatingBrief) return
+            setGeneratingBrief(true)
             try {
               const next = await api.briefGenerate('terse')
               setBrief(next)
             } catch (err) {
               setError((err as Error).message)
+            } finally {
+              setGeneratingBrief(false)
             }
           }}
-          className="rounded px-3 py-1 text-sm bg-blue-800 hover:bg-blue-700 text-blue-100"
+          disabled={generatingBrief}
+          className="hidden sm:inline-flex min-h-[44px] rounded px-3 py-1 text-sm bg-blue-800 active:bg-blue-900 disabled:opacity-50 text-blue-100 [@media(hover:hover)]:hover:bg-blue-700"
           title="Generate today's brief now"
         >
-          Brief
+          {generatingBrief ? '…' : 'Brief'}
         </button>
         {user && <UserBadge user={user} onSignedOut={() => setUser(null)} />}
       </header>
@@ -182,7 +201,7 @@ export function App() {
           <span className="rounded bg-slate-800 px-2 py-0.5 text-slate-200">{sourceFilter}</span>
           <button
             onClick={() => setSourceFilter(null)}
-            className="ml-auto rounded px-2 py-0.5 text-slate-400 hover:text-slate-100 hover:bg-slate-800"
+            className="ml-auto min-h-[44px] rounded px-3 py-1 text-slate-400 active:bg-slate-800 [@media(hover:hover)]:hover:text-slate-100 [@media(hover:hover)]:hover:bg-slate-800"
             aria-label="clear source filter"
           >
             clear ✕
