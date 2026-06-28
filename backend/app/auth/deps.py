@@ -29,7 +29,6 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.session import SessionError, decode
-from app.auth.settings import OIDCConfig, oidc_config
 from app.config import settings
 from app.db import get_session
 
@@ -132,9 +131,15 @@ async def current_user(
 
     Cookie lookup is attempted first; the local bypass is the fallback
     for cookie-less requests when ``local_auth_bypass`` is on.
+
+    Note: the cookie name comes from ``settings.session_cookie_name``
+    directly, not from ``oidc_config()``. Calling ``oidc_config()``
+    here would raise on every request when OIDC is disabled, even
+    though we only need the cookie name (which has a default in
+    settings). The OIDC config is still consulted in the auth/OIDC
+    code paths that actually need it.
     """
-    cfg = oidc_config()
-    raw = request.cookies.get(cfg.cookie_name)
+    raw = request.cookies.get(settings.session_cookie_name)
     if raw:
         try:
             return await decode(db, raw)
