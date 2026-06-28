@@ -87,12 +87,19 @@ class LLMTag(BaseModel):
     """One model entry in the Ollama-style ``/api/tags`` response.
     Slimmed-down subset of Ollama's full record — we don't expose
     ``digest`` or ``modified_at`` to the picker (they're long and the
-    user doesn't act on them)."""
+    user doesn't act on them).
+
+    ``recommended`` and ``recommended_note`` are populated by the tags
+    endpoint based on a curated list of well-known Ollama Cloud models
+    (``app.llm.tags._RECOMMENDED``). Both default to safe values so
+    older cached payloads without the keys still parse cleanly."""
     name: str
     size: Optional[int] = None
     family: Optional[str] = None
     parameter_size: Optional[str] = None
     quantization_level: Optional[str] = None
+    recommended: bool = False
+    recommended_note: Optional[str] = None
 
 
 class LLMTagsResponse(BaseModel):

@@ -87,12 +87,18 @@ export interface LLMSettingsUpdate {
 
 // One row from /api/llm/tags — Ollama-style model record. Slim subset
 // of what Ollama returns; details (digest, modified_at) trimmed.
+// ``recommended`` is server-set based on a curated list of well-known
+// Ollama Cloud tags (``backend/app/llm/tags.py``). ``recommended_note``
+// carries an optional short suffix (e.g. ``"thinking"``) for tags whose
+// output goes through the thinking-field fallback.
 export interface LLMTag {
   name: string
   size: number | null
   family: string | null
   parameter_size: string | null
   quantization_level: string | null
+  recommended?: boolean
+  recommended_note?: string | null
 }
 
 export interface LLMTagsResponse {

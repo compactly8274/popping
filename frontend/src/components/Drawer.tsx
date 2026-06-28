@@ -310,8 +310,22 @@ function LLMSection({
     }
   }
 
-  // Tag-name list for the dropdown. Empty array triggers free-text mode.
-  const tagNames = useMemo(() => tags?.models?.map((m) => m.name) ?? [], [tags])
+  // Annotated list of model rows from the backend. The backend already
+  // stamps ``recommended`` and ``recommended_note`` and sorts recommended
+  // first — we just surface them in the dropdown with a ``★`` prefix and
+  // an optional ``(thinking)`` suffix so the user can spot the curated
+  // picks at a glance. ``tagNames`` is the bare-name view used by the
+  // free-text toggle's membership checks (see ``applySettingsToForm`` and
+  // the "type a name instead" handler below).
+  const tagOptions = useMemo(
+    () => tags?.models ?? [],
+    [tags],
+  )
+  const tagNames = useMemo(() => tagOptions.map((m) => m.name), [tagOptions])
+  const hasRecommendations = useMemo(
+    () => tagOptions.some((m) => m.recommended),
+    [tagOptions],
+  )
 
   return (
     <>
@@ -390,12 +404,27 @@ function LLMSection({
                 className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
               >
                 <option value="">— pick a model —</option>
-                {tagNames.map((n) => (
-                  <option key={n} value={n}>
-                    {n}
-                  </option>
-                ))}
+                {tagOptions.map((m) => {
+                  // Label format: "★ name (thinking)" for recommended
+                  // thinking models, "★ name" for other recommended,
+                  // plain "name" for the rest. The (thinking) suffix
+                  // tells the user the brief will include some
+                  // chain-of-thought content from the model's thinking
+                  // field rather than a clean summary.
+                  const star = m.recommended ? '★ ' : ''
+                  const note = m.recommended_note ? ` (${m.recommended_note})` : ''
+                  return (
+                    <option key={m.name} value={m.name}>
+                      {star}{m.name}{note}
+                    </option>
+                  )
+                })}
               </select>
+            )}
+            {hasRecommendations && tagOptions.length > 0 && (
+              <p className="mt-1 text-[10px] text-slate-500">
+                ★ = recommended for Ollama Cloud
+              </p>
             )}
             {tagNames.length > 0 && (
               <button

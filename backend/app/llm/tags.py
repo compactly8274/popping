@@ -65,6 +65,72 @@ def invalidate_all() -> None:
     _cache.clear()
 
 
+# ---------------------------------------------------------------------------
+# Recommendations
+# ---------------------------------------------------------------------------
+
+# Curated set of well-known Ollama Cloud tags. A model in this set gets
+# ``recommended: True`` on its API entry; the frontend sorts it to the
+# top of the picker dropdown with a ``★`` marker.
+#
+# Why a hardcoded list:
+#   - We can't query Ollama Cloud for "good" models — the API only
+#     knows about tags on the user's account.
+#   - A curated list is deterministic and auditable; new entries go in
+#     a code review with a real ``/api/tags`` response to back them up.
+#
+# Add an entry when:
+#   - It's a model you can confirm shows up in at least three users'
+#     /api/tags responses (or in Ollama Cloud's public catalog page).
+#   - It's actually good at brief-style summarisation, not just
+#     technically usable.
+#
+# Don't add model versions you're not sure exist on Cloud today —
+# the annotation only shows up on matching names, so an entry that
+# never appears in any user's response is harmless but misleading.
+_RECOMMENDED: frozenset[str] = frozenset(
+    {
+        "gpt-oss:120b",
+        "gpt-oss:20b",
+        "qwen3-coder:480b",
+        "deepseek-v3.1:671b",
+        "qwen3:480b",
+        "llama3.1:70b",
+        "mistral-large:latest",
+        "glm-5.2:cloud",
+        "deepseek-r1:671b",
+    }
+)
+
+# Per-name display suffix shown in the dropdown after the model name.
+# Currently used to flag thinking-style models whose output lives in
+# ``thinking`` rather than ``response`` (see ``OllamaCloudProvider``).
+# Empty/absent entries are treated as no suffix.
+_RECOMMENDED_NOTES: dict[str, str] = {
+    "glm-5.2:cloud": "thinking",
+    "deepseek-r1:671b": "thinking",
+}
+
+
+def _annotate_recommended(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stamp ``recommended`` / ``recommended_note`` on each model dict.
+
+    In-place so we don't double the memory hit on a long tag list.
+    Recommended-first sort happens here too — the dropdown reads in
+    display order, so a stable, curated ordering belongs in the API
+    rather than the React render."""
+    for m in models:
+        name = m.get("name") or ""
+        is_recommended = name in _RECOMMENDED
+        m["recommended"] = is_recommended
+        m["recommended_note"] = _RECOMMENDED_NOTES.get(name)
+    # Stable sort: recommended first, then alphabetical. Python's sort
+    # is stable so the in-provider alpha order from each fetcher is
+    # preserved within each bucket.
+    models.sort(key=lambda m: (not m.get("recommended", False), m.get("name") or ""))
+    return models
+
+
 def _cache_get(provider: str, base_url: str) -> tuple[float, list[dict[str, Any]]] | None:
     hit = _cache.get((provider, base_url))
     if hit is None:
@@ -124,10 +190,10 @@ async def _fetch_ollama_cloud() -> list[dict[str, Any]]:
                 "quantization_level": details.get("quantization_level"),
             }
         )
-    # Ollama doesn't guarantee sorted output; sort by name so the dropdown
-    # is stable across calls.
-    out.sort(key=lambda x: (x.get("name") or ""))
-    return out
+    # Annotate (curated-list flag + per-name suffix) and sort
+    # recommended-first, then alphabetical. Done before caching so the
+    # cached payload already carries the annotations.
+    return _annotate_recommended(out)
 
 
 async def _fetch_ollama_local() -> list[dict[str, Any]]:
