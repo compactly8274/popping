@@ -191,7 +191,11 @@ function LLMSection({
   onChange: (next: LLMStatus) => void
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
+  // Two parallel tag lists: one annotated for brief, one for scoring.
+  // The backend stamps ``recommended`` differently per task — same
+  // model can be starred in one dropdown but not the other.
   const [tags, setTags] = useState<LLMTagsResponse | null>(null)
+  const [scoringTags, setScoringTags] = useState<LLMTagsResponse | null>(null)
   const [provider, setProvider] = useState<string>('')
   const [modelBrief, setModelBrief] = useState<string>('')
   const [modelScoring, setModelScoring] = useState<string>('')
@@ -205,6 +209,8 @@ function LLMSection({
   // Fetch settings + tags when the picker is opened. We re-fetch on
   // open rather than on drawer-open because settings can change mid-
   // drawer-open (e.g. user saves, then opens picker again to verify).
+  // Brief and scoring tags are fetched in parallel since they share the
+  // same provider + base URL but different annotation overlays.
   const openPicker = async () => {
     setPickerOpen(true)
     setSaveError(null)
@@ -217,11 +223,19 @@ function LLMSection({
       // provider, skip the tags fetch entirely and show free-text.
       const s = await api.settings()
       const prov = providerForTagsFetch(s)
-      const t = prov
-        ? await api.llmTags(prov)
-        : null
-      setTags(t)
-      applySettingsToForm(s, t)
+      if (prov) {
+        const [tb, ts] = await Promise.all([
+          api.llmTags(prov, false, 'brief'),
+          api.llmTags(prov, false, 'scoring'),
+        ])
+        setTags(tb)
+        setScoringTags(ts)
+        applySettingsToForm(s, tb, ts)
+      } else {
+        setTags(null)
+        setScoringTags(null)
+        applySettingsToForm(s, null, null)
+      }
     } catch (err) {
       setTagsError((err as Error).message)
     } finally {
@@ -240,17 +254,24 @@ function LLMSection({
     return null
   }
 
-  const applySettingsToForm = (s: SettingsOut, t: LLMTagsResponse | null) => {
+  const applySettingsToForm = (
+    s: SettingsOut,
+    t: LLMTagsResponse | null,
+    ts: LLMTagsResponse | null,
+  ) => {
     setProvider(s.llm_provider || '')
     setModelBrief(s.llm_model_brief || '')
     setModelScoring(s.llm_model_scoring || '')
-    // If the saved model isn't in the tags list (e.g. user typed it
-    // freehand last time), keep it as free text so they can edit.
+    // Brief: if the saved model isn't in the tags list (e.g. user
+    // typed it freehand last time), keep it as free text so they can
+    // edit. Scoring has no free-text mode — the dropdown covers every
+    // account-available model and the sentinel ``""`` maps to env.
     const tagNames = t?.models?.map((m) => m.name) ?? []
     const isFreeText =
       Boolean(s.llm_model_brief) && tagNames.length > 0 && !tagNames.includes(s.llm_model_brief || '')
     setUseFreeText(isFreeText)
     setFreeTextBrief(isFreeText ? s.llm_model_brief || '' : '')
+    void ts // scoring form state doesn't need a free-text flip
   }
 
   const refreshTags = async () => {
@@ -265,14 +286,19 @@ function LLMSection({
       if (!prov) {
         // Pinned to a non-Ollama provider; no /api/tags to fetch.
         setTags(null)
+        setScoringTags(null)
         return
       }
-      const t = await api.llmTags(prov, true)
-      setTags(t)
+      const [tb, ts] = await Promise.all([
+        api.llmTags(prov, true, 'brief'),
+        api.llmTags(prov, true, 'scoring'),
+      ])
+      setTags(tb)
+      setScoringTags(ts)
       // Re-evaluate free-text mode now that we have a fresh list. If
       // the model the user has in the form isn't in the freshly-
       // fetched list, switch to free-text so they can edit it.
-      if (!useFreeText && modelBrief && !t.models.some((m) => m.name === modelBrief)) {
+      if (!useFreeText && modelBrief && !tb.models.some((m) => m.name === modelBrief)) {
         setUseFreeText(true)
         setFreeTextBrief(modelBrief)
       }
@@ -325,6 +351,17 @@ function LLMSection({
   const hasRecommendations = useMemo(
     () => tagOptions.some((m) => m.recommended),
     [tagOptions],
+  )
+  // Same shape for the scoring dropdown. Scoring has its own curated
+  // list (``_RECOMMENDED_FOR['scoring']`` on the backend) so the
+  // starred models here are different from the brief dropdown.
+  const scoringOptions = useMemo(
+    () => scoringTags?.models ?? [],
+    [scoringTags],
+  )
+  const hasScoringRecommendations = useMemo(
+    () => scoringOptions.some((m) => m.recommended),
+    [scoringOptions],
   )
 
   return (
@@ -448,13 +485,46 @@ function LLMSection({
           </div>
           <div>
             <label className="block text-slate-400 mb-1">Model (scoring)</label>
-            <input
-              type="text"
-              value={modelScoring}
-              onChange={(e) => setModelScoring(e.target.value)}
-              placeholder="same as brief if blank"
-              className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 placeholder:text-slate-600"
-            />
+            {scoringOptions.length === 0 ? (
+              // No tags yet (initial load before fetch lands, or fetch
+              // failed, or pinned to a non-Ollama provider). Plain text
+              // input as a fallback — still editable, just no dropdown.
+              <input
+                type="text"
+                value={modelScoring}
+                onChange={(e) => setModelScoring(e.target.value)}
+                placeholder="env default (or model name)"
+                className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 placeholder:text-slate-600"
+              />
+            ) : (
+              <select
+                value={modelScoring}
+                onChange={(e) => setModelScoring(e.target.value)}
+                className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
+              >
+                {/* Sentinel maps to ``""`` on save, which the backend
+                    treats as "delete the runtime override → fall back
+                    to env-driven scoring model". Different from the
+                    brief dropdown's "pick a model" sentinel because
+                    scoring's env default is the meaningful baseline
+                    the user came from. */}
+                <option value="">— env default —</option>
+                {scoringOptions.map((m) => {
+                  const star = m.recommended ? '★ ' : ''
+                  const note = m.recommended_note ? ` (${m.recommended_note})` : ''
+                  return (
+                    <option key={m.name} value={m.name}>
+                      {star}{m.name}{note}
+                    </option>
+                  )
+                })}
+              </select>
+            )}
+            {hasScoringRecommendations && scoringOptions.length > 0 && (
+              <p className="mt-1 text-[10px] text-slate-500">
+                ★ = recommended for scoring
+              </p>
+            )}
           </div>
           {saveError && <p className="text-[10px] text-red-300 break-words">{saveError}</p>}
           <div className="flex gap-2 pt-1">

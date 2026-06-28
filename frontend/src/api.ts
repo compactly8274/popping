@@ -175,10 +175,20 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(update),
     }),
-  /** Fetch the model list for ``provider`` (Ollama-shaped only). */
-  llmTags: (provider: string = 'ollama_cloud', refresh: boolean = false) => {
+  /** Fetch the model list for ``provider`` (Ollama-shaped only).
+   * ``task`` selects which curated recommendation list annotates the
+   * response — ``"brief"`` for the brief prose generator, ``"scoring"``
+   * for per-entry relevance scoring. The picker calls this twice
+   * (once per task) so each dropdown shows task-appropriate
+   * ``★`` markers. */
+  llmTags: (
+    provider: string = 'ollama_cloud',
+    refresh: boolean = false,
+    task: 'brief' | 'scoring' = 'brief',
+  ) => {
     const params = new URLSearchParams()
     params.set('provider', provider)
+    params.set('task', task)
     if (refresh) params.set('refresh', 'true')
     return jsonFetch<LLMTagsResponse>(`/api/llm/tags?${params.toString()}`)
   },

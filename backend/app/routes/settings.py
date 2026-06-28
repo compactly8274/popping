@@ -148,18 +148,26 @@ async def llm_tags_endpoint(
             "providers expose /api/tags today (ollama_cloud, ollama)."
         ),
     ),
+    task: str = Query(
+        default="brief",
+        description=(
+            "Which picker the tags are being fetched for — ``brief`` or "
+            "``scoring``. Selects the curated recommendation list used "
+            "to annotate the response."
+        ),
+    ),
     refresh: bool = Query(
         default=False,
         description="Bypass the TTL cache and force a fresh fetch.",
     ),
 ) -> LLMTagsResponse:
-    """Return the user's available models for ``provider``. Used by the
-    inline picker in the Drawer to populate the model dropdown without
-    making the user type tag names blind."""
+    """Return the user's available models for ``provider``, annotated
+    for ``task``. Used by both the brief and scoring dropdowns in the
+    Drawer."""
     try:
-        result = await llm_tags.fetch_tags(provider, force_refresh=refresh)
+        result = await llm_tags.fetch_tags(provider, force_refresh=refresh, task=task)
     except llm_tags.TagsError as exc:
-        logger.warning("tags: fetch failed for %s: %s", provider, exc)
+        logger.warning("tags: fetch failed for %s/%s: %s", provider, task, exc)
         raise HTTPException(
             status_code=503,
             detail=f"failed to fetch tags for {provider}: {exc}",

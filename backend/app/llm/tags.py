@@ -50,14 +50,20 @@ class TagsError(RuntimeError):
 # Cache
 # ---------------------------------------------------------------------------
 
-# value shape: (fetched_at, models_payload)
-_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+# Cache key is (provider, base_url, task) — task is "brief" or
+# "scoring" and lets the brief picker and scoring picker cache
+# independent lists (different recommended annotations).
+_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
 
 
 def invalidate(provider: str, base_url: str) -> None:
     """Drop a single cache entry. Called by the settings route on save
-    so the picker reflects the user's fresh choice."""
-    _cache.pop((provider, base_url), None)
+    so the picker reflects the user's fresh choice. Drops both tasks
+    for the (provider, base_url) since the upstream list itself hasn't
+    changed — only the annotation overlay — so a TTL hit would still
+    be valid; we wipe for simplicity."""
+    for task in ("brief", "scoring"):
+        _cache.pop((provider, base_url, task), None)
 
 
 def invalidate_all() -> None:
@@ -69,9 +75,10 @@ def invalidate_all() -> None:
 # Recommendations
 # ---------------------------------------------------------------------------
 
-# Curated set of well-known Ollama Cloud tags. A model in this set gets
-# ``recommended: True`` on its API entry; the frontend sorts it to the
-# top of the picker dropdown with a ``★`` marker.
+# Per-task curated lists of well-known Ollama Cloud tags. A model in the
+# list for ``task`` gets ``recommended: True`` on its API entry; the
+# frontend sorts it to the top of that task's dropdown with a ``★``
+# marker.
 #
 # Why a hardcoded list:
 #   - We can't query Ollama Cloud for "good" models — the API only
@@ -79,49 +86,81 @@ def invalidate_all() -> None:
 #   - A curated list is deterministic and auditable; new entries go in
 #     a code review with a real ``/api/tags`` response to back them up.
 #
+# Why per-task (not a single shared set):
+#   - Brief is prose summarisation; scoring is per-entry relevance
+#     judgment. Different work → different recommended model sizes.
+#   - Decoupling the two means the next time a new model lands we can
+#     promote it to "good for scoring" without it having to be the best
+#     choice for brief prose.
+#
 # Add an entry when:
 #   - It's a model you can confirm shows up in at least three users'
 #     /api/tags responses (or in Ollama Cloud's public catalog page).
-#   - It's actually good at brief-style summarisation, not just
-#     technically usable.
+#   - It's actually good at the task, not just technically usable.
 #
 # Don't add model versions you're not sure exist on Cloud today —
 # the annotation only shows up on matching names, so an entry that
 # never appears in any user's response is harmless but misleading.
-_RECOMMENDED: frozenset[str] = frozenset(
-    {
-        "gpt-oss:120b",
-        "gpt-oss:20b",
-        "qwen3-coder:480b",
-        "deepseek-v3.1:671b",
-        "qwen3:480b",
-        "llama3.1:70b",
-        "mistral-large:latest",
-        "glm-5.2:cloud",
-        "deepseek-r1:671b",
-    }
-)
+_RECOMMENDED_FOR: dict[str, frozenset[str]] = {
+    # Brief / prose generation — larger models, good at writing.
+    "brief": frozenset(
+        {
+            "gpt-oss:120b",
+            "gpt-oss:20b",
+            "qwen3-coder:480b",
+            "deepseek-v3.1:671b",
+            "qwen3:480b",
+            "llama3.1:70b",
+            "mistral-large:latest",
+            "glm-5.2:cloud",
+            "deepseek-r1:671b",
+        }
+    ),
+    # Scoring — small/fast models, good at short structured judgments.
+    # Scoring runs per-entry on every ingest cycle, so latency matters.
+    "scoring": frozenset(
+        {
+            "gpt-oss:20b",
+            "qwen3:30b",
+            "llama3.1:8b",
+            "mistral-small:latest",
+            "gemma3:27b",
+            "deepseek-r1:14b",
+        }
+    ),
+}
 
 # Per-name display suffix shown in the dropdown after the model name.
 # Currently used to flag thinking-style models whose output lives in
 # ``thinking`` rather than ``response`` (see ``OllamaCloudProvider``).
+# Task-agnostic — if a name is in either curated list and is a thinking
+# model, the suffix shows up regardless of which picker the user opened.
 # Empty/absent entries are treated as no suffix.
 _RECOMMENDED_NOTES: dict[str, str] = {
     "glm-5.2:cloud": "thinking",
     "deepseek-r1:671b": "thinking",
+    "deepseek-r1:14b": "thinking",
 }
 
 
-def _annotate_recommended(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _annotate_recommended(
+    models: list[dict[str, Any]], task: str
+) -> list[dict[str, Any]]:
     """Stamp ``recommended`` / ``recommended_note`` on each model dict.
 
     In-place so we don't double the memory hit on a long tag list.
     Recommended-first sort happens here too — the dropdown reads in
     display order, so a stable, curated ordering belongs in the API
-    rather than the React render."""
+    rather than the React render.
+
+    ``task`` picks which curated set to use. Unknown tasks fall back to
+    no recommendations (still annotated with ``recommended_note`` if any
+    apply). This makes the function safe to call from new code paths
+    without forcing every task to declare a list up front."""
+    rec_set = _RECOMMENDED_FOR.get(task, frozenset())
     for m in models:
         name = m.get("name") or ""
-        is_recommended = name in _RECOMMENDED
+        is_recommended = name in rec_set
         m["recommended"] = is_recommended
         m["recommended_note"] = _RECOMMENDED_NOTES.get(name)
     # Stable sort: recommended first, then alphabetical. Python's sort
@@ -131,19 +170,23 @@ def _annotate_recommended(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return models
 
 
-def _cache_get(provider: str, base_url: str) -> tuple[float, list[dict[str, Any]]] | None:
-    hit = _cache.get((provider, base_url))
+def _cache_get(
+    provider: str, base_url: str, task: str
+) -> tuple[float, list[dict[str, Any]]] | None:
+    hit = _cache.get((provider, base_url, task))
     if hit is None:
         return None
     fetched_at, payload = hit
     if (time.time() - fetched_at) > settings.llm_tags_cache_ttl_seconds:
-        _cache.pop((provider, base_url), None)
+        _cache.pop((provider, base_url, task), None)
         return None
     return hit
 
 
-def _cache_set(provider: str, base_url: str, payload: list[dict[str, Any]]) -> None:
-    _cache[(provider, base_url)] = (time.time(), payload)
+def _cache_set(
+    provider: str, base_url: str, task: str, payload: list[dict[str, Any]]
+) -> None:
+    _cache[(provider, base_url, task)] = (time.time(), payload)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +194,7 @@ def _cache_set(provider: str, base_url: str, payload: list[dict[str, Any]]) -> N
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_ollama_cloud() -> list[dict[str, Any]]:
+async def _fetch_ollama_cloud(task: str) -> list[dict[str, Any]]:
     """Pull the user's account-level model list from ollama.com.
 
     Requires ``OLLAMA_CLOUD_API_KEY``. Same auth header as the generate
@@ -163,6 +206,9 @@ async def _fetch_ollama_cloud() -> list[dict[str, Any]]:
 
     We surface ``name``, ``size``, and the four ``details`` fields —
     enough for the picker dropdown + a hover tooltip.
+
+    ``task`` is passed through to the annotator so the cached payload
+    carries the right per-task ``recommended`` flags.
     """
     if not settings.ollama_cloud_api_key:
         raise TagsError("ollama_cloud: OLLAMA_CLOUD_API_KEY not set")
@@ -193,12 +239,13 @@ async def _fetch_ollama_cloud() -> list[dict[str, Any]]:
     # Annotate (curated-list flag + per-name suffix) and sort
     # recommended-first, then alphabetical. Done before caching so the
     # cached payload already carries the annotations.
-    return _annotate_recommended(out)
+    return _annotate_recommended(out, task)
 
 
-async def _fetch_ollama_local() -> list[dict[str, Any]]:
+async def _fetch_ollama_local(task: str) -> list[dict[str, Any]]:
     """Pull the local Ollama instance's model list. No auth — same
-    response shape as the cloud variant."""
+    response shape as the cloud variant. ``task`` flows through to the
+    annotator."""
     base = settings.ollama_base_url.rstrip("/")
     url = f"{base}/api/tags"
     try:
@@ -222,8 +269,7 @@ async def _fetch_ollama_local() -> list[dict[str, Any]]:
                 "quantization_level": details.get("quantization_level"),
             }
         )
-    out.sort(key=lambda x: (x.get("name") or ""))
-    return out
+    return _annotate_recommended(out, task)
 
 
 _FETCHERS = {
@@ -237,8 +283,18 @@ _FETCHERS = {
 # ---------------------------------------------------------------------------
 
 
-async def fetch_tags(provider: str, *, force_refresh: bool = False) -> dict[str, Any]:
-    """Fetch the model list for ``provider``.
+async def fetch_tags(
+    provider: str,
+    *,
+    force_refresh: bool = False,
+    task: str = "brief",
+) -> dict[str, Any]:
+    """Fetch the model list for ``provider`` annotated for ``task``.
+
+    ``task`` selects which curated recommendation set the annotator
+    uses — ``"brief"`` (default) or ``"scoring"``. The annotation is
+    baked into the cached payload so a TTL hit returns the right
+    ``recommended`` flags for whichever task the route asked for.
 
     Returns ``{"models": [...], "cached_at": <iso>, "ttl_seconds": <int>}``.
     On Ollama HTTP error, returns the stale cached value if any — the
@@ -253,10 +309,10 @@ async def fetch_tags(provider: str, *, force_refresh: bool = False) -> dict[str,
 
     fetcher, cloud_base = _FETCHERS[provider]
     base_url = cloud_base if cloud_base else settings.ollama_base_url.rstrip("/")
-    cache_key = (provider, base_url)
+    cache_key = (provider, base_url, task)
 
     if not force_refresh:
-        hit = _cache_get(provider, base_url)
+        hit = _cache_get(provider, base_url, task)
         if hit is not None:
             fetched_at_ts, payload = hit
             return {
@@ -268,14 +324,14 @@ async def fetch_tags(provider: str, *, force_refresh: bool = False) -> dict[str,
             }
 
     try:
-        payload = await fetcher()
+        payload = await fetcher(task)
     except TagsError as exc:
         # Try to serve stale rather than fail outright.
         stale = _cache.get(cache_key)
         if stale is not None:
             logger.warning(
-                "tags: live fetch failed for %s (%s) — returning stale cache",
-                provider, exc,
+                "tags: live fetch failed for %s/%s (%s) — returning stale cache",
+                provider, task, exc,
             )
             fetched_at_ts, payload = stale
             return {
@@ -288,7 +344,7 @@ async def fetch_tags(provider: str, *, force_refresh: bool = False) -> dict[str,
             }
         raise
 
-    _cache_set(provider, base_url, payload)
+    _cache_set(provider, base_url, task, payload)
     return {
         "models": payload,
         "cached_at": dt.datetime.now(tz=dt.timezone.utc),
