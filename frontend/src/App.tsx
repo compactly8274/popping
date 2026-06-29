@@ -993,10 +993,51 @@ export function App() {
     // blank — an empty div here made the dashboard feel frozen on
     // cold loads. Spinner is the same shape as the Refresh button's
     // ``animate-spin`` so the visual language stays consistent.
+    //
+    // ``position: fixed; inset: 0`` is INLINE so this surface covers
+    // the viewport from the first frame after mount, regardless of
+    // whether the Tailwind CSS bundle has loaded yet. Without it,
+    // the ``h-full`` Tailwind class only takes effect after
+    // ``styles.css`` parses — the window between React replacing
+    // the index.html splash and the CSS landing is the visible
+    // black flicker. Background is the same pure-black as the
+    // index.html splash so the transition is a swap, not a fade.
     return (
-      <div className="h-full flex flex-col items-center justify-center gap-3 bg-bg-app">
-        <div className="w-8 h-8 rounded-full border-2 border-hairline border-t-accent animate-spin" />
-        <p className="text-ios-body text-label-secondary">Connecting…</p>
+      <div
+        style={{
+          position: 'fixed',
+          inset: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 12,
+          backgroundColor: '#000000',
+          color: '#ffffff',
+          fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", system-ui, sans-serif',
+        }}
+      >
+        <div
+          style={{
+            width: 32,
+            height: 32,
+            borderRadius: '50%',
+            border: '2px solid rgba(255,255,255,0.08)',
+            borderTopColor: '#0a84ff',
+            animation: 'popping-spin 0.9s linear infinite',
+          }}
+        />
+        <p
+          style={{
+            fontSize: 17,
+            fontWeight: 600,
+            letterSpacing: '-0.41px',
+            color: 'rgba(235, 235, 245, 0.6)',
+            margin: 0,
+          }}
+        >
+          Popping
+        </p>
       </div>
     )
   }
