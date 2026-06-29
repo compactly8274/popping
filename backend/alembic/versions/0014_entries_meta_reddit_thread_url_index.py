@@ -1,4 +1,4 @@
-"""entries_meta_reddit_thread_url_index — GIN index on entries.meta for Reddit cross-ref key
+"""entries_meta_reddit_thread_url_index — JSONB column + GIN index for Reddit cross-ref key
 
 Revision ID: 0014
 Revises: 0013
@@ -30,9 +30,32 @@ also support ``@>`` / ``<@`` if we ever need them, at the cost of
 ~2x index size. Trade goes to smaller since the existing dedup
 patterns (CVE URL containment) use their own tables, not meta.
 
-Idempotency note: a re-run on a deploy that already has the index is
-a no-op (the op.create_index IF NOT EXISTS guard skips). The
-migration is safe to re-run after a partial-failure state.
+Column type note
+----------------
+
+The model declares ``Entry.meta`` as ``JSONB`` (``app/models.py:104``),
+but the column was originally created as ``JSON`` in
+``0001_initial.py:63`` (``sa.JSON``). Runtime code has been quietly
+relying on PostgreSQL's implicit ``json`` → ``jsonb`` cast on the
+``||`` operator (``scheduler.py:705``, several routes).
+
+``jsonb_path_ops`` is a *JSONB-only* operator class — it rejects
+plain ``json`` with ``DatatypeMismatchError``. Before we can add
+the GIN index this migration first promotes the column to JSONB.
+The cast is data-loss-safe (``jsonb`` is a stricter superset of
+``json``: every well-formed ``json`` value round-trips through
+``jsonb`` byte-for-byte). Rewrite cost is one full-table scan,
+acceptable because the entries table is small relative to typical
+ingest volume and the migration runs once per deployment.
+
+After this migration, the DB matches the model: ``meta`` is JSONB,
+explicit ``'{}'::jsonb`` casts in app code are no longer implicit,
+and the GIN index is valid.
+
+Idempotency note: a re-run on a deploy that already has the column
+as JSONB and the index in place is a no-op (``USING`` and
+``IF NOT EXISTS`` guards both skip). The migration is safe to
+re-run after a partial-failure state.
 """
 
 from __future__ import annotations
@@ -49,10 +72,20 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # GIN index on the entries.meta JSONB column. ``jsonb_path_ops``
-    # is the smaller / faster operator class for key-existence
-    # queries (``?`` operator); if we later add containment queries
-    # (``@>``), drop and recreate with the default ``jsonb_ops``.
+    # 1. Promote ``entries.meta`` from JSON to JSONB so the GIN
+    #    operator class below is valid. Guarded with ``USING`` so a
+    #    no-op re-run doesn't error. The ``meta::text::jsonb``
+    #    round-trip is byte-equivalent for any well-formed JSON
+    #    value; nothing in the existing data should fail it.
+    op.execute(
+        "ALTER TABLE entries "
+        "ALTER COLUMN meta TYPE JSONB USING meta::text::jsonb"
+    )
+
+    # 2. GIN index on the entries.meta JSONB column. ``jsonb_path_ops``
+    #    is the smaller / faster operator class for key-existence
+    #    queries (``?`` operator); if we later add containment queries
+    #    (``@>``), drop and recreate with the default ``jsonb_ops``.
     op.execute(
         "CREATE INDEX IF NOT EXISTS ix_entries_meta_gin "
         "ON entries USING GIN (meta jsonb_path_ops)"
@@ -61,3 +94,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS ix_entries_meta_gin")
+    # Best-effort revert the column to JSON. If the column has data
+    # that doesn't fit JSONB's stricter encoding (none of ours
+    # should — the round-trip is a no-op for well-formed JSON) this
+    # will fail loudly, which is the right signal for an operator.
+    op.execute(
+        "ALTER TABLE entries "
+        "ALTER COLUMN meta TYPE JSON USING meta::text::json"
+    )
