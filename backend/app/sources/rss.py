@@ -108,7 +108,11 @@ async def fetch_rss(url: str) -> list[dict]:
     function that the scheduler's ``_ingest`` consumes through the
     plugin's ``fetch()`` method.
     """
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+    # 30s — feeds hosted on slow CDNs (CBC, NYT metered) routinely
+    # exceed 20s. Worth the longer wait on the cold path since every
+    # failed ingest leaves a stale ``last_error`` that makes the source
+    # look broken in the UI until the next tick.
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         resp = await client.get(url, headers=_DEFAULT_HEADERS)
         resp.raise_for_status()
     feed = feedparser.parse(resp.text)

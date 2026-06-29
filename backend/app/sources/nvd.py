@@ -1,13 +1,16 @@
 """NVD recent CVEs (NATIONAL VULNERABILITY DATABASE).
 
-Fetches a rolling 7-day window of recently published CVEs via the
+Fetches a rolling 8-day window of recently published CVEs via the
 NVD CVE 2.0 API. Output is plain JSON, no auth, no rate limit (NVD
 asks for a 6-second cadence between requests — we refresh every 6 h
 so this is comfortable).
 
-The ``pubStartDate`` parameter is RFC 3339 UTC; the response carries
-``published`` for each CVE. We map the CVE description into
-``summary`` so the embedder has real text to vector against.
+The ``pubStartDate`` and ``pubEndDate`` parameters are RFC 3339 UTC;
+the response carries ``published`` for each CVE. We map the CVE
+description into ``summary`` so the embedder has real text to vector
+against. NVD requires both endpoints of the range — sending only
+``pubStartDate`` gets a 404 with no body — and the range cannot
+exceed 120 days (we use 8).
 
 Phase 3 only reads recently-published CVEs. Modified/older CVEs would
 require a different query and aren't on the roadmap.
@@ -35,8 +38,11 @@ _DEFAULT_HEADERS = {
 
 
 def _rfc3339(dt_obj: dt.datetime) -> str:
-    # NVD expects "YYYY-MM-DDTHH:MM:SS.sss" without timezone marker (UTC assumed).
-    return dt_obj.strftime("%Y-%m-%dT%H:%M:%S.000")
+    # NVD expects extended ISO-8601 in UTC. Append ``Z`` rather than
+    # relying on the "no offset = GMT" implicit default — the explicit
+    # form matches NVD's own example URLs and rules out parser quirks
+    # if NVD ever tightens input validation.
+    return dt_obj.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def _parse_iso(s: str | None) -> dt.datetime | None:
@@ -64,13 +70,20 @@ class NvdRecent(SourcePlugin):
     refresh_interval_seconds = 21600  # 6 h
 
     async def fetch(self) -> list[dict]:
-        # Rolling 7-day window. NVD rejects very recent pubStartDate if
-        # the lastModifiedDate is too close to now (sometimes returns
-        # 404), so we use UTC 0:00 of the day 8 days ago to be safe.
-        start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=_WINDOW_DAYS + 1)
-        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Rolling 8-day window (UTC 00:00 of day-8 through end-of-yesterday).
+        # NVD requires BOTH pubStartDate and pubEndDate when a date range
+        # is given — sending only pubStartDate gets a 404 with no body —
+        # and the range cannot exceed 120 days. We stay well inside that.
+        # Using midnight..midnight (not ``now()`` on the high end) avoids
+        # the "pubStartDate too close to lastModifiedDate" 404 that NVD
+        # sometimes returns for queries straddling the current minute.
+        end = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        start = end - dt.timedelta(days=_WINDOW_DAYS)
         params = {
             "pubStartDate": _rfc3339(start),
+            "pubEndDate": _rfc3339(end),
             "resultsPerPage": 50,
         }
         try:

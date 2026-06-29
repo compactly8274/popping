@@ -29,7 +29,7 @@ from typing import Any, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -944,6 +944,16 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
     route layer rejects DELETE for those with a 400 before calling.
     We double-check the registry so a future caller that bypasses
     the route can't accidentally nuke a built-in row.
+
+    Entries belonging to this source are deleted in the SAME
+    transaction. The FK is declared ``ON DELETE CASCADE`` so the DB
+    would clean them up on its own, but the ORM-level relationship
+    doesn't include ``cascade="all, delete-orphan"`` — by default
+    SQLAlchemy disassociates children via ``UPDATE ... SET source_id
+    = NULL``, which the NOT NULL constraint rejects with a 500.
+    Issuing the DELETE explicitly matches the FK cascade semantics
+    and avoids a misleading NotNullViolationError surfacing to the
+    user as "can't delete feed."
     """
     row = await session.get(Source, source_id)
     if row is None:
@@ -954,6 +964,12 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
         # Defensive: refuse here too. The route's 400 is the
         # user-facing check; this guard catches programmatic callers.
         raise ValueError(f"refusing to delete built-in source {name!r}")
+    # Delete child rows first. ``Entry.interactions`` also has an
+    # ON DELETE CASCADE FK, so dropping entries drops their
+    # interactions transparently — no need to fan out further.
+    await session.execute(
+        delete(Entry).where(Entry.source_id == source_id)
+    )
     await session.delete(row)
     await session.commit()
     if _scheduler is not None:
