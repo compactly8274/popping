@@ -30,7 +30,7 @@
 // missing env var. Now each failure shows the actual error message
 // and offers to retry.
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
   type LLMTagsResponse,
@@ -70,6 +70,10 @@ type Props = {
   // this, the chip bar briefly loses the renamed source during the
   // gap between PATCH and the next ``refresh()`` resolving.
   onSourceRenamed?: (oldName: string, newName: string) => void
+  // Wipe namespaced localStorage keys + reload. App owns the
+  // actual reset so the source of truth (App's ``useState``
+  // mirrors) resets in lockstep.
+  onResetLocalState: () => void
 }
 
 // Whitelist mirrors backend ``_VALID_PROVIDERS``. Includes a sentinel
@@ -105,6 +109,12 @@ export function Drawer({
   onBriefToneChange,
   onError,
   onSourceRenamed,
+  // Reset hook. App wipes the namespaced localStorage keys and
+  // reloads the page so every component picks up the cleared state.
+  // Wired through a prop rather than reaching into storage
+  // directly so the Drawer doesn't grow a dependency on App's
+  // state shape.
+  onResetLocalState,
 }: Props) {
   const [sources, setSources] = useState<Source[]>([])
   const [sourcesError, setSourcesError] = useState<string | null>(null)
@@ -152,6 +162,135 @@ export function Drawer({
     refetchLlm()
   }, [open]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Esc dismisses the drawer. Mirrors the iOS sheet pattern where
+  // the swipe-down and back-tap gestural dismiss are also Esc on a
+  // keyboard. ``capture: true`` so the handler fires before any
+  // inner element's keydown (e.g. a focused input's "submit on
+  // Enter" listener). Stops the event so the App-level keyboard
+  // effect doesn't also see Esc and fire its global close logic.
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        e.preventDefault()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [open, onClose])
+
+  // Swipe-down dismiss on mobile. Mirrors the iOS sheet gesture:
+  // touch begins in the drawer's top ~60px (the grabber zone),
+  // drags downward, and releases past a 100px threshold → drawer
+  // closes. Set up via addEventListener (not JSX onTouch*) so we
+  // can pass ``{ passive: false }`` and ``preventDefault`` — JSX
+  // touch handlers default to passive on touchmove for scroll
+  // performance. Without ``preventDefault`` the page scrolls
+  // underneath the drawer mid-gesture, which feels broken.
+  const SWIPE_ARM_HEIGHT_PX = 60
+  const SWIPE_DISMISS_PX = 100
+  useEffect(() => {
+    if (!open) return
+    const drawer = drawerRef.current
+    if (!drawer) return
+
+    let startY = 0
+    let armed = false
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 1) return
+      const touch = e.touches[0]
+      const rect = drawer.getBoundingClientRect()
+      // Arm only if the touch starts within the grabber zone at
+      // the top of the drawer. Touches that begin lower are
+      // probably scroll gestures on the drawer's body content —
+      // leave them alone.
+      const touchYInDrawer = touch.clientY - rect.top
+      if (touchYInDrawer < 0 || touchYInDrawer > SWIPE_ARM_HEIGHT_PX) return
+      startY = touch.clientY
+      armed = true
+    }
+    const onTouchMove = (e: TouchEvent) => {
+      if (!armed) return
+      const dy = e.touches[0].clientY - startY
+      if (dy > 10) {
+        // First non-trivial downward motion — block the underlying
+        // page scroll from kicking in.
+        e.preventDefault()
+      }
+    }
+    const onTouchEnd = (e: TouchEvent) => {
+      if (!armed) return
+      armed = false
+      // ``changedTouches`` (not ``touches``) because the gesture
+      // ended and the finger is no longer on screen.
+      const touch = e.changedTouches[0]
+      const dy = touch.clientY - startY
+      if (dy > SWIPE_DISMISS_PX) onClose()
+    }
+    const onTouchCancel = () => {
+      armed = false
+    }
+    drawer.addEventListener('touchstart', onTouchStart, { passive: true })
+    drawer.addEventListener('touchmove', onTouchMove, { passive: false })
+    drawer.addEventListener('touchend', onTouchEnd, { passive: true })
+    drawer.addEventListener('touchcancel', onTouchCancel, { passive: true })
+    return () => {
+      drawer.removeEventListener('touchstart', onTouchStart)
+      drawer.removeEventListener('touchmove', onTouchMove)
+      drawer.removeEventListener('touchend', onTouchEnd)
+      drawer.removeEventListener('touchcancel', onTouchCancel)
+    }
+  }, [open, onClose])
+
+  // Focus trap. Move focus into the drawer on open and cycle it
+  // between the first and last tabbable elements so Tab can't
+  // escape into the dashboard behind the backdrop. Without this,
+  // a keyboard-only user can Tab past the drawer's Done button
+  // into the dashboard's hidden-but-still-tabbable columns.
+  // The trap is opt-out for screen-reader users (the dialog's
+  // aria-modal already announces modality to AT; the visual
+  // focus ring still follows their focus).
+  const drawerRef = useRef<HTMLElement | null>(null)
+  const firstFocusableRef = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    if (!open) return
+    const drawer = drawerRef.current
+    if (!drawer) return
+
+    // Defer to next frame so the slide-up animation hasn't
+    // started yet — focusing inside a 0-opacity panel reads as
+    // a no-op to assistive tech.
+    const id = window.requestAnimationFrame(() => {
+      firstFocusableRef.current?.focus()
+    })
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab') return
+      const focusables = drawer.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )
+      if (focusables.length === 0) return
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      const active = document.activeElement as HTMLElement | null
+      if (e.shiftKey && active === first) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault()
+        first.focus()
+      }
+    }
+    drawer.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.cancelAnimationFrame(id)
+      drawer.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open])
+
   return (
     <>
       {/* Backdrop. Same backdrop-blur treatment on both breakpoints;
@@ -174,6 +313,22 @@ export function Drawer({
           independent CSS classes so the swap is breakpoint-clean —
           the mobile sheet never shows on desktop and vice versa. */}
       <aside
+        ref={(el) => {
+          drawerRef.current = el
+          // First focusable child: the Done button is rendered
+          // before everything else in the header so it lands as
+          // ``focusables[0]`` above. We capture it explicitly
+          // because ``querySelectorAll`` runs against the live
+          // tree which is fine for the Tab cycle but the
+          // initial focus wants the explicit Done button —
+          // not a child that may not exist on first render
+          // (e.g. the "Clear local state" row is conditional).
+          firstFocusableRef.current = el?.querySelector<HTMLElement>(
+            'button[aria-label="close menu"]',
+          ) ?? null
+        }}
+        role="dialog"
+        aria-modal="true"
         aria-label="menu"
         className={`fixed z-40 bg-bg-app shadow-2xl flex flex-col
                     inset-x-0 bottom-0 top-auto h-[90vh] rounded-t-ios-lg
@@ -404,6 +559,32 @@ export function Drawer({
                 })}
               </>
             )}
+          </GroupedSection>
+
+          {/* Danger zone — local state reset. Wipes all client-side
+              state (lastViewed, columnPrefs, readEntries, mobileCol,
+              briefCollapsed) so the dashboard renders as a fresh
+              install. Source-side data (entries, sources, briefs)
+              lives in the backend and is untouched. The button is
+              red and labelled "Clear local state" so the cost is
+              obvious. ``window.confirm`` keeps this one-click
+              cheap; an inline modal would be nicer UX but the
+              consequence is reversible (a refresh re-fetches
+              everything) so the simpler path is fine. */}
+          <GroupedSection label="Reset">
+            <button
+              onClick={() => {
+                if (typeof window === 'undefined') return
+                const ok = window.confirm(
+                  'Clear all local state (read marks, column prefs, last-viewed timestamps)?',
+                )
+                if (!ok) return
+                onResetLocalState()
+              }}
+              className="w-full text-left px-4 min-h-[44px] flex items-center gap-3 active:bg-bg-elevated"
+            >
+              <span className="text-ios-body text-red-400">Clear local state</span>
+            </button>
           </GroupedSection>
         </nav>
       </aside>

@@ -25,6 +25,7 @@ import { Drawer } from './components/Drawer'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
 import { SearchResults } from './components/SearchResults'
+import { ShortcutsSheet } from './components/ShortcutsSheet'
 import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { recordImmediate } from './lib/interactions'
@@ -221,6 +222,12 @@ export function App() {
   // from its own cache column on second ask). Persisting every
   // expanded card to localStorage would just be surprise.
   const [expandedSummaries, setExpandedSummaries] = useState<Set<number>>(() => new Set())
+  // Keyboard shortcuts overlay. Bare ``?`` opens; Esc closes. The
+  // overlay is modal so it steals focus from the dashboard's normal
+  // navigation while open — opening it during a search query keeps
+  // the search results mounted (the overlay sits above them, not in
+  // place of them).
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
 
   const touchStartX = useRef<number | null>(null)
   // Set of entry ids observed on the previous successful refresh.
@@ -453,6 +460,34 @@ export function App() {
       // doesn't break the dashboard. Leave the previous value in
       // place and let the next tick try again.
     }
+  }, [])
+
+  // Wipe every namespaced localStorage key and reload. Wired
+  // through to the Drawer's "Clear local state" button. A full
+  // page reload (rather than local state reset + re-render)
+  // because every component has its own state mirrors; rebuilding
+  // them inline is more code than ``location.reload()`` and
+  // prone to one-component-behind-another race conditions.
+  const resetLocalState = useCallback(() => {
+    try {
+      // Wipe everything under the ``popping.`` namespace. Use
+      // ``localStorage.key`` + prefix-match rather than enumerating
+      // STORAGE_KEYS so any future key added to storage.ts is
+      // cleared too. Falls through to a no-op in SSR / private-mode
+      // where ``localStorage.key`` doesn't exist.
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const toRemove: string[] = []
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const k = window.localStorage.key(i)
+          if (k && k.startsWith('popping.')) toRemove.push(k)
+        }
+        for (const k of toRemove) window.localStorage.removeItem(k)
+      }
+    } catch {
+      // Quota / private-mode — best effort; the reload still
+      // happens and re-fetches everything.
+    }
+    window.location.reload()
   }, [])
 
   // Probe auth state once on mount.
@@ -730,6 +765,16 @@ export function App() {
         return
       }
 
+      if (e.key === '?' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        // ``?`` is Shift+/ on US layouts — key value is the literal
+        // ``?`` character regardless. Guard modifiers so it doesn't
+        // fire under Cmd+/ or Ctrl+/ which the OS / browser may
+        // already bind.
+        e.preventDefault()
+        setShortcutsOpen(true)
+        return
+      }
+
       if (e.key === 'Escape' && searchQuery) {
         setSearchInput('')
         return
@@ -886,7 +931,17 @@ export function App() {
   // --- Render gates -----------------------------------------------------
 
   if (!authProbed) {
-    return <div className="h-full" />
+    // Splash while the ``/api/me`` probe resolves. Centred spinner +
+    // "Connecting…" copy so the user knows the app is alive and not
+    // blank — an empty div here made the dashboard feel frozen on
+    // cold loads. Spinner is the same shape as the Refresh button's
+    // ``animate-spin`` so the visual language stays consistent.
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-3 bg-bg-app">
+        <div className="w-8 h-8 rounded-full border-2 border-hairline border-t-accent animate-spin" />
+        <p className="text-ios-body text-label-secondary">Connecting…</p>
+      </div>
+    )
   }
 
   if (!oidcDisabled && user === null) {
@@ -1214,6 +1269,12 @@ export function App() {
         onBriefToneChange={setBriefTone}
         onError={setError}
         onSourceRenamed={onSourceRenamed}
+        onResetLocalState={resetLocalState}
+      />
+
+      <ShortcutsSheet
+        open={shortcutsOpen}
+        onClose={() => setShortcutsOpen(false)}
       />
 
       <ToastHost />

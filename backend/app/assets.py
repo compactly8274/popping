@@ -100,6 +100,11 @@ _MAX_FAVICON_BYTES = 256 * 1024
 # payloads. Keep the streaming cap (don't trust Content-Length);
 # just raise the threshold.
 _MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
+# Default per-stream timeout for the shared client's connection /
+# read. Per-call overrides (``_FAVICON_TIMEOUT`` / ``_THUMBNAIL_TIMEOUT``)
+# apply to the per-stream read window when set; this fallback covers
+# the ``init_client`` and any test paths that don't override.
+_TIMEOUT = 30.0
 # Favicon stays at 10s (5-15 KB downloads are trivial).
 # Thumbnail bumps to 30s because news CDNs routinely stream at
 # 50 KB/s when cold — a 1.5 MB hero image needs a real read window.

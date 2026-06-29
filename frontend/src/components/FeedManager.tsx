@@ -288,6 +288,16 @@ function SourceRow({
 }) {
   const builtIn = isBuiltIn(source)
   const [busy, setBusy] = useState(false)
+  // Inline two-tap delete confirm. ``confirmingDelete`` swaps the
+  // single ``delete`` button into a ``confirm delete`` + ``cancel``
+  // pair, scoped to this row. Auto-cancels after
+  // ``CONFIRM_TIMEOUT_MS`` so an abandoned confirm doesn't linger
+  // forever (user opened delete, looked away, came back). The native
+  // ``window.confirm`` modal was jarring inside a drawer — competing
+  // iOS sheet for the user's attention. Inline keep the gesture in
+  // the drawer's frame.
+  const CONFIRM_TIMEOUT_MS = 4000
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
 
   const toggleActive = async () => {
     setBusy(true)
@@ -315,21 +325,32 @@ function SourceRow({
   }
 
   const onDelete = async () => {
-    // Browser confirm is fine — the cost of a custom modal here is
-    // not worth it for a once-per-feed action. The backend's 400
-    // protects built-ins if the user has stale code.
-    const ok = window.confirm(`Delete "${source.name}"? This stops fetching immediately.`)
-    if (!ok) return
+    // Inline two-tap — the first tap set ``confirmingDelete`` to
+    // true (button became "confirm delete"). This is the second tap.
+    // Backend protects built-ins with a 400; we also hide the
+    // button for built-ins so this path is dynamic-only.
     setBusy(true)
     try {
       await api.deleteSource(source.id)
+      setConfirmingDelete(false)
       await onRefresh()
     } catch (err) {
       onError(parseApiError(err, 'failed to delete source'))
+      setConfirmingDelete(false)
     } finally {
       setBusy(false)
     }
   }
+
+  // Auto-cancel the confirm after a few seconds. Reset the timer on
+  // each new confirmation so a user who taps, waits, taps again gets
+  // a fresh window. ``useRef`` avoids re-firing the effect when only
+  // the timeout id changes.
+  useEffect(() => {
+    if (!confirmingDelete) return
+    const t = window.setTimeout(() => setConfirmingDelete(false), CONFIRM_TIMEOUT_MS)
+    return () => window.clearTimeout(t)
+  }, [confirmingDelete])
 
   // Edit form local state — initialized from props so the user
   // always sees the current row values, not stale defaults. Reset
@@ -691,15 +712,35 @@ function SourceRow({
             cancel
           </button>
         )}
-        {!builtIn && (
+        {!builtIn && !confirmingDelete && (
           <button
-            onClick={onDelete}
+            onClick={() => setConfirmingDelete(true)}
             disabled={busy}
             className="ml-auto text-ios-caption text-red-400 active:opacity-60 disabled:opacity-40"
             aria-label={`delete ${source.name}`}
           >
             delete
           </button>
+        )}
+        {!builtIn && confirmingDelete && (
+          <>
+            <button
+              onClick={onDelete}
+              disabled={busy}
+              className="ml-auto text-ios-caption text-red-400 active:opacity-60 disabled:opacity-40 font-semibold"
+              aria-label={`confirm delete ${source.name}`}
+            >
+              confirm delete
+            </button>
+            <button
+              onClick={() => setConfirmingDelete(false)}
+              disabled={busy}
+              className="text-ios-caption text-label-secondary active:opacity-60 disabled:opacity-40"
+              aria-label={`cancel delete ${source.name}`}
+            >
+              cancel
+            </button>
+          </>
         )}
         {builtIn && (
           <span
