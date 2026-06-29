@@ -321,6 +321,7 @@ class BriefGenerator:
         # "trending right now". The shared convergence helper caches
         # the result for 30s, so a brief generation happening in the
         # same window as a /api/foryou poll is free.
+        from app.scoring import composite as composite_scorer
         from app.scoring import convergence as conv_helper
 
         conv_counts = await conv_helper.counts(
