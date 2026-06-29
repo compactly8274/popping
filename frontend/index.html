@@ -3,9 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#000000" />
     <title>Popping</title>
+    {/* Inline pre-React paint. The body + root backgrounds are set
+        inline so the browser shows pure black from the very first
+        pixel — before styles.css loads. Without this, mobile Safari
+        and Android Chrome render a default-white frame for 50-200ms
+        (the time it takes to fetch + parse the CSS bundle), which
+        reads as a "white flicker then goes black" on cold loads.
+        ``color-scheme: dark`` on <html> also tells the system UI
+        (Safari's chrome, Chrome's omnibox on Android) to render in
+        dark mode so the address bar / status bar match the app. */}
+    <style>
+      html, body { background-color: #000000; color: #ffffff; }
+    </style>
   </head>
-  <body class="bg-slate-950 text-slate-100">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
