@@ -103,7 +103,16 @@ async def _db_get(key: str) -> Optional[str]:
 
 async def _db_set(key: str, value: str) -> None:
     """Upsert a row. SQLAlchemy's ``merge`` keeps this single-statement
-    (INSERT … ON CONFLICT) and avoids the read-modify-write dance."""
+    (INSERT … ON CONFLICT) and avoids the read-modify-write dance.
+
+    The ``value`` column is VARCHAR, but the env-backed values we seed
+    on first boot can be int (e.g. ``brief_window_hours``) or bool
+    depending on the Settings field. We coerce to str here so any
+    stringifiable value lands cleanly without the caller having to
+    pre-stringify — keeps the public ``set`` contract simple.
+    """
+    if not isinstance(value, str):
+        value = str(value)
     async with SessionLocal() as session:
         async with session.begin():
             row = AppSetting(key=key, value=value)

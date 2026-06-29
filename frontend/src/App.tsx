@@ -325,6 +325,13 @@ export function App() {
   // Visibility-aware polling. The interval only runs while the tab
   // is visible; on return we force a refresh so the user sees fresh
   // data immediately. The interval cleanup runs on unmount.
+  //
+  // ``pollingMountedRef`` gates the initial ``refresh()`` call so the
+  // first fetch belongs to this effect, but re-mounts triggered by
+  // ``refresh`` recreating (e.g. when ``activeSources`` changes)
+  // don't issue a duplicate fetch — the source-filter effect below
+  // owns that case.
+  const pollingMountedRef = useRef(false)
   useEffect(() => {
     if (!authProbed) return
 
@@ -354,7 +361,10 @@ export function App() {
     }
 
     document.addEventListener('visibilitychange', onVisibility)
-    void refresh()
+    if (!pollingMountedRef.current) {
+      pollingMountedRef.current = true
+      void refresh()
+    }
     if (document.visibilityState === 'visible') startPolling()
 
     return () => {
@@ -362,6 +372,23 @@ export function App() {
       stopPolling()
     }
   }, [refresh, authProbed])
+
+  // Re-fetch whenever the active source filter changes. Without this,
+  // tapping a chip in the Drawer or in the chip-bar would update
+  // ``activeSources`` but leave ``entries`` showing whatever the
+  // previous fetch returned — the user sees the same unfiltered list
+  // until the 60s polling tick (or a visibility change) finally pulls
+  // the now-filtered set. The polling effect above owns the initial
+  // fetch, so we skip our own first run via a ref.
+  const initialRefreshDoneRef = useRef(false)
+  useEffect(() => {
+    if (!authProbed) return
+    if (!initialRefreshDoneRef.current) {
+      initialRefreshDoneRef.current = true
+      return
+    }
+    void refresh()
+  }, [activeSources, refresh, authProbed])
 
   // Keep ``mobileCol`` in bounds.
   useEffect(() => {
