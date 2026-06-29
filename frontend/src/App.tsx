@@ -658,10 +658,25 @@ export function App() {
                 <SearchIcon className="w-5 h-5" />
               </button>
             )}
-            {/* Hamburger lives next to the search affordance — both
-                are 44×44 tappable targets that match iOS nav-bar
-                icon-button conventions. On ``sm+`` it appears at the
-                right edge of the title row. */}
+            {/* Refresh affordance. Always-visible icon button so
+                mobile users can manually force a refresh without
+                having to open the Drawer (the only Refresh path on
+                mobile before this fix — one extra tap the user
+                shouldn't have to make). On ``sm+`` the icon is
+                hidden because the text Refresh button lives on the
+                sub-row below. */}
+            <button
+              type="button"
+              onClick={() => void refresh()}
+              disabled={refreshing}
+              aria-label="refresh"
+              className="sm:hidden w-11 h-11 flex items-center justify-center rounded-full text-label-primary active:bg-bg-elevated disabled:opacity-40"
+            >
+              <RefreshIcon className={`w-5 h-5 ${refreshing ? 'animate-spin' : ''}`} />
+            </button>
+            {/* Hamburger lives next to the search/refresh affordances
+                — each is a 44×44 tappable target that matches iOS
+                nav-bar icon-button conventions. */}
             <Hamburger onClick={() => setDrawerOpen(true)} />
           </div>
         </div>
@@ -894,6 +909,32 @@ function ClearIcon({ className }: { className?: string }) {
       <circle cx="12" cy="12" r="10" fill="currentColor" stroke="none" opacity="0.2" />
       <line x1="9" y1="9" x2="15" y2="15" />
       <line x1="15" y1="9" x2="9" y2="15" />
+    </svg>
+  )
+}
+
+// iOS-style refresh icon — an open arc ending in a chevron. The
+// chevron direction tells you which way the circle will rotate
+// (clockwise == moving forward). Same stroke weight as the rest of
+// the header icons. ``animate-spin`` (Tailwind) drives a CSS-only
+// spin when ``refreshing`` is true.
+function RefreshIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      {/* Two arcs that together describe a near-full circle, broken
+          at the 3-o'clock position so the chevron has space to live. */}
+      <path d="M20 12a8 8 0 0 1-8 8" />
+      <path d="M4 12a8 8 0 0 1 14.5-4.7" />
+      <polyline points="20 4 20 8 16 8" />
     </svg>
   )
 }

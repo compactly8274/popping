@@ -238,11 +238,20 @@ async def _ingest(plugin_cls: Any) -> dict:
                     .on_conflict_do_nothing(index_elements=["url"])
                     .returning(Entry.id)
                 )
+                # ``.returning(Entry.id)`` only emits a row on a
+                # successful insert; on a conflict (duplicate URL)
+                # the result set is empty. ``scalar_one_or_none()``
+                # gives us None in that case so we can branch.
+                # Note: SQLAlchemy 2.0 async returns a
+                # ``ChunkedIteratorResult`` which has no
+                # ``.rowcount`` attribute, so the only reliable check
+                # is whether ``scalar_one_or_none()`` returned a
+                # value.
                 result = await session.execute(stmt)
-                if result.rowcount == 1:
+                inserted_id = result.scalar_one_or_none()
+                if inserted_id is not None:
                     summary["inserted"] += 1
-                    inserted_id = result.scalar_one_or_none()
-                    if inserted_id is not None and remote_image_url:
+                    if remote_image_url:
                         # Defer the network fetch to a single pass
                         # after the commit (see below).
                         thumbnail_jobs.append((inserted_id, remote_image_url))

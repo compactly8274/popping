@@ -26,9 +26,23 @@ FOLLOW_BOOST = 1.2
 MUTE_DAMP = 0.5
 
 
-def _cosine(a: Optional[list[float]], b: Optional[list[float]]) -> Optional[float]:
+def _cosine(a, b) -> Optional[float]:
     """Cosine similarity in [-1, 1]. Returns None if either input is
-    missing or lengths don't match."""
+    missing or lengths don't match.
+
+    ``a`` / ``b`` may arrive as a Python list (``embedding`` column
+    when set in-process), a ``numpy.ndarray`` (when read back from
+    the Postgres ``vector`` column via the pgvector dialect), or
+    ``None``. Coerce to a list up front so the body can treat them
+    uniformly and ``not a`` doesn't trip numpy's "ambiguous truth
+    value" rule.
+    """
+    if a is None or b is None:
+        return None
+    if hasattr(a, "tolist"):
+        a = a.tolist()
+    if hasattr(b, "tolist"):
+        b = b.tolist()
     if not a or not b or len(a) != len(b):
         return None
     dot = 0.0
@@ -43,8 +57,12 @@ def _cosine(a: Optional[list[float]], b: Optional[list[float]]) -> Optional[floa
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
-def _vector_score(entry_emb: Optional[list[float]], pref_vec: Optional[list[float]]) -> float:
-    """Map cosine similarity → 0..100. None inputs return the neutral 50."""
+def _vector_score(entry_emb, pref_vec) -> float:
+    """Map cosine similarity → 0..100. None inputs return the neutral 50.
+
+    Both arguments can be a list, a numpy.ndarray (pgvector read-back),
+    or None — ``_cosine`` normalises either.
+    """
     c = _cosine(entry_emb, pref_vec)
     if c is None:
         return NEUTRAL
