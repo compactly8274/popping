@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +45,7 @@ from app.scoring import convergence as convergence_helper
 from app.scoring import recency
 from app.sources import list_sources
 from app.sources.base import SourcePlugin
+from app.sources.dynamic_reddit import DynamicRedditPlugin
 from app.sources.dynamic_rss import DynamicRssPlugin
 
 logger = logging.getLogger("popping.scheduler")
@@ -528,6 +530,130 @@ async def _daily_brief() -> None:
         logger.exception("daily brief failed")
 
 
+# --- Reddit cross-reference sweep ------------------------------------------
+#
+# Background job that walks every ``Entry`` whose ``meta`` does not
+# already have ``reddit_thread_url`` and asks Hydra's
+# ``/search?url=<entry.url>`` endpoint whether the URL is discussed on
+# Reddit. On a hit, ``meta`` is patched via the Postgres
+# ``jsonb || jsonb`` merge so other keys (engagement, image refs,
+# ...) survive. The card UI reads the new fields directly off
+# ``Entry.meta`` via the ``EntryListOut`` shape.
+
+# Batch size for the sweep. Small enough to finish in a single
+# scheduler tick even on a slow Hydra; large enough that the hourly
+# cadence keeps up with typical ingest volume (~200 entries/day).
+_CROSSREF_BATCH = 50
+# Inter-batch pause. 100ms between batches keeps us under ~5 req/s
+# average on the Hydra VPS — well within a single-user gateway's
+# comfort zone and polite enough that an outage / overload doesn't
+# happen just because the sweep ran.
+_CROSSREF_BATCH_SLEEP = 0.1
+
+
+async def _crossref_sweep() -> None:
+    """Hourly: stamp ``reddit_thread_url`` onto entries that have a
+    matching Reddit thread.
+
+    Skips entries that already have the key (idempotent — re-running
+    on a stable set is a no-op). Skips entries from Reddit sources
+    themselves (their own URL IS the thread, no separate cross-ref
+    to stamp). Batches ``_CROSSREF_BATCH`` entries per round to keep
+    Hydra load predictable; sleeps ``_CROSSREF_BATCH_SLEEP`` between
+    batches. Never raises — a Hydra outage just means no new stamps
+    this tick; the next hour retries.
+
+    Disabled (no-op) when ``settings.reddit_hydra_url`` is empty.
+    """
+    # Lazy import: keeps the startup hot path light when the feature
+    # is off, and isolates the cross-ref path from the rest of the
+    # scheduler imports.
+    from app import reddit_client
+    from app.models import Source as SourceModel
+
+    if not reddit_client.is_configured():
+        # Most common case on small deploys — silent skip.
+        return
+
+    try:
+        async with SessionLocal() as session:
+            # Pull all candidate entries. We do an in-Python filter for
+            # "no reddit_thread_url" + "not from a Reddit source"
+            # rather than a GIN-indexed ``NOT (meta ? 'reddit_thread_url')``
+            # predicate — the rows-to-stamp set is small after the
+            # first sweep, so the scan is cheap. The GIN index added
+            # in migration 0012 still helps when the entry count
+            # climbs into the tens of thousands.
+            stmt = (
+                select(Entry.id, Entry.url, Entry.source_id, Entry.meta)
+                .order_by(Entry.id.desc())
+                .limit(_CROSSREF_BATCH * 4)
+            )
+            candidates = (await session.execute(stmt)).all()
+
+            # Fetch the set of Source rows that are Reddit-typed so
+            # we can skip their entries (their own URL IS the
+            # Reddit thread). One small query, in-Python membership
+            # check after.
+            reddit_source_ids = set((
+                await session.scalars(
+                    select(SourceModel.id).where(SourceModel.type == "reddit")
+                )
+            ).all())
+
+            to_check: list[tuple[int, str]] = []
+            for row in candidates:
+                if row.source_id in reddit_source_ids:
+                    continue
+                if (row.meta or {}).get("reddit_thread_url"):
+                    continue
+                if not row.url:
+                    continue
+                to_check.append((row.id, row.url))
+
+            if not to_check:
+                return
+            logger.info("crossref sweep: %d entries to check", len(to_check))
+
+            stamped = 0
+            for entry_id, entry_url in to_check[:_CROSSREF_BATCH]:
+                match = await reddit_client.search_thread_by_url(entry_url)
+                if match is None:
+                    continue
+                thread_url = f"https://www.reddit.com{match['permalink']}"
+                # jsonb || jsonb merge — preserves any other meta
+                # keys the entry already has. The patch goes through
+                # raw SQL because SQLAlchemy's JSONB column type
+                # doesn't auto-merge on update.
+                await session.execute(
+                    text(
+                        "UPDATE entries "
+                        "SET meta = COALESCE(meta, '{}'::jsonb) || :patch::jsonb "
+                        "WHERE id = :id"
+                    ),
+                    {
+                        "patch": json.dumps({
+                            "reddit_thread_url": thread_url,
+                            "reddit_comment_count": int(match["num_comments"]),
+                        }),
+                        "id": entry_id,
+                    },
+                )
+                stamped += 1
+            if stamped:
+                await session.commit()
+                logger.info(
+                    "crossref sweep: stamped %d entries (of %d candidates)",
+                    stamped, len(to_check),
+                )
+            # If we had more candidates than we processed in this
+            # batch, the next hourly tick picks them up. Keeping the
+            # per-tick cap bounded so the sweep can't monopolise the
+            # scheduler's single thread.
+    except Exception:
+        logger.exception("reddit crossref sweep failed")
+
+
 async def _already_notified_urls(session: AsyncSession) -> set[str]:
     """URLs already in the CVE dedup ledger.
 
@@ -710,6 +836,24 @@ async def start_scheduler(notifier: Optional[Notifier] = None) -> AsyncIOSchedul
         coalesce=True,
     )
 
+    # Reddit cross-reference sweep. Walks entries that don't already
+    # have ``meta.reddit_thread_url`` and asks Hydra whether the URL
+    # is discussed on Reddit. On a hit, the entry's ``meta`` gets a
+    # ``reddit_thread_url`` + ``reddit_comment_count`` patch via
+    # ``meta || jsonb`` (preserves other keys). No-op when
+    # ``REDDIT_HYDRA_URL`` is unset (``reddit_client.is_configured``
+    # short-circuits).
+    _scheduler.add_job(
+        _crossref_sweep,
+        trigger=IntervalTrigger(hours=1),
+        id="reddit:crossref_sweep",
+        name="Reddit cross-reference sweep",
+        replace_existing=True,
+        next_run_time=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30),
+        max_instances=1,
+        coalesce=True,
+    )
+
     _scheduler.start()
     logger.info("scheduler: started")
     return _scheduler
@@ -775,6 +919,8 @@ def _plugin_for(row: Source) -> SourcePlugin | None:
     """
     if row.type == "rss":
         return DynamicRssPlugin(row)
+    if row.type == "reddit":
+        return DynamicRedditPlugin(row)
     # Phase 6/7 will add ``podcast`` and ``youtube_channel`` here.
     logger.debug(
         "scheduler: no plugin for source %s (id=%d, type=%s) — skipping",

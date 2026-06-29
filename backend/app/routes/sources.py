@@ -24,6 +24,7 @@ from app.feed_recommendations import recommendations_for, recommendations_for_us
 from app.models import Source
 from app.schemas import FeedRecommendation, SourceCreate, SourceOut, SourceUpdate
 from app.sources import list_sources as registered_plugin_names
+from app.sources.reddit import normalize_subreddit
 from app import scheduler
 
 router = APIRouter(tags=["sources"])
@@ -51,6 +52,12 @@ _NAME_RE = re.compile(r"^[a-z0-9_]{1,120}$")
 # that don't justify a per-row scheduler job.
 _REFRESH_MIN = 60
 _REFRESH_MAX = 86_400
+
+# Default refresh for ``type="reddit"`` rows. Reddit moves faster
+# than news but slower than HN — 15 min matches the per-subreddit
+# plugin's hard-coded default and gives the user a sane starting
+# point. The inline editor can override per-row.
+_REDDIT_DEFAULT_REFRESH = 900
 
 # Mirrors ``Source.category``'s ``String(40)``. A PATCH / POST with a
 # longer string would crash on the DB layer with a Postgres
@@ -89,6 +96,35 @@ def _validate_url(url: str) -> None:
         raise HTTPException(status_code=422, detail="url must be http or https")
     if not parsed.netloc:
         raise HTTPException(status_code=422, detail="url must include a host")
+
+
+def _validate_reddit_url(url: str) -> str:
+    """Validate a subreddit reference and return the canonical
+    ``https://www.reddit.com/r/<slug>`` URL.
+
+    Accepts the same loose inputs ``app.sources.reddit.normalize_subreddit``
+    does (``r/python``, ``/r/python``, ``https://reddit.com/r/python``,
+    bare slugs). Rejects everything else with 422. The canonical URL
+    is what's stored in ``Source.url`` so the user sees a uniform
+    shape in the source list and so any future cross-ref against the
+    row knows exactly what URL the user added (vs whatever the user
+    typed in).
+
+    Mirrors ``_validate_url``'s 422-on-failure shape — no separate
+    error code for "this looks like an RSS feed" (a Reddit URL also
+    parses as http/https) because the route layer dispatches by
+    ``body.type`` before calling either validator.
+    """
+    sub = normalize_subreddit(url)
+    if not sub:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "reddit url must be a subreddit reference "
+                "(e.g. 'r/python' or 'https://www.reddit.com/r/python')"
+            ),
+        )
+    return f"https://www.reddit.com/r/{sub}"
 
 
 def _validate_refresh(value: int) -> int:
@@ -191,26 +227,39 @@ async def create_source_endpoint(
 ) -> SourceOut:
     """Add a new dynamic source.
 
-    v1 accepts ``type="rss"`` only. Phase 6/7 will add ``"podcast"``
-    and ``"youtube_channel"`` and route them to their own plugin
-    dispatchers (see ``scheduler._plugin_for``).
+    v1 accepts ``type="rss"`` and ``type="reddit"`` (``"podcast"`` /
+    ``"youtube_channel"`` land in later phases and route to their
+    own plugin dispatchers via ``scheduler._plugin_for``).
     """
     _validate_name(body.name)
-    _validate_url(body.url)
-    if body.type != "rss":
+    # Type-aware URL validation. Reddit rows accept a subreddit
+    # reference (``r/python``) and get rewritten to the canonical
+    # Reddit thread URL; RSS rows take a plain http(s) feed URL.
+    if body.type == "reddit":
+        url = _validate_reddit_url(body.url)
+    else:
+        _validate_url(body.url)
+        url = body.url
+    if body.type not in ("rss", "reddit"):
         raise HTTPException(
             status_code=400,
-            detail=f"unsupported type {body.type!r} (only 'rss' is accepted in this build)",
+            detail=f"unsupported type {body.type!r} (only 'rss' and 'reddit' are accepted in this build)",
         )
     _validate_category(body.category)
-    refresh = _validate_refresh(body.refresh_interval_seconds)
+    # ``refresh_interval_seconds`` is optional in the schema; default
+    # to a per-type sensible value when absent. Reddit moves faster
+    # than news RSS so 15 min vs 1h is the right baseline.
+    if body.refresh_interval_seconds is None:
+        refresh = _REDDIT_DEFAULT_REFRESH if body.type == "reddit" else _REFRESH_MIN * 60
+    else:
+        refresh = _validate_refresh(body.refresh_interval_seconds)
     headers = _validate_custom_headers(body.custom_headers)
     row = await scheduler.add_source(
         session,
         name=body.name,
         type_=body.type,
         category=body.category,
-        url=body.url,
+        url=url,
         refresh=refresh,
         custom_headers=headers,
     )
@@ -245,7 +294,14 @@ async def update_source_endpoint(
                 detail=f"name {body.name!r} is reserved for a built-in source",
             )
     if body.url is not None:
-        _validate_url(body.url)
+        # PATCH URL is also type-aware: re-validate as a subreddit
+        # reference when the row is a Reddit row (so a typo'd edit
+        # doesn't store a malformed URL the plugin can't fetch).
+        # For non-Reddit rows fall through to the plain URL check.
+        if pre.type == "reddit":
+            body.url = _validate_reddit_url(body.url)
+        else:
+            _validate_url(body.url)
     if body.refresh_interval_seconds is not None:
         body.refresh_interval_seconds = _validate_refresh(body.refresh_interval_seconds)
     if body.category is not None:

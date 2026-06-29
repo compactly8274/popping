@@ -1,9 +1,11 @@
 """Curated feed recommendations.
 
-A hand-picked list of RSS/Atom feeds the user might want to add. The
+A hand-picked list of feeds the user might want to add. The
 FeedManager Drawer surface ("Recommended" tab) shows this list, minus
 anything the user has already added. Adding fires ``POST /api/sources``
-which uses the dynamic-RSS path — see ``backend/app/sources/dynamic_rss.py``.
+which uses the dynamic-source path — RSS rows go through
+``backend/app/sources/dynamic_rss.py``; ``type="reddit"`` rows go
+through ``backend/app/sources/dynamic_reddit.py``.
 
 Updating the static list is a code change + backend restart. That's
 deliberate: the curated list is the editorial seed; ``recommendations_for``
@@ -11,9 +13,12 @@ re-ranks it dynamically by interaction co-occurrence once the user
 has accumulated engagement signals.
 
 Conventions:
-    - All URLs are RSS / Atom feeds.
+    - All URLs are RSS / Atom feeds, or canonical
+      ``https://www.reddit.com/r/<sub>`` for ``type="reddit"`` rows.
     - Names are unique, lowercase, [a-z0-9_]+ — matches the regex
-      ``POST /api/sources`` validates against.
+      ``POST /api/sources`` validates against. Reddit entries use
+      the ``reddit_<sub>`` prefix so they're visually distinct
+      from RSS rows in the source list.
     - Categories are loose; the backend stores them verbatim. The
       dashboard groups by category so an unexpected value just
       becomes its own column.
@@ -24,6 +29,13 @@ Conventions:
       frontend tells us the active source names, but keeping them
       out of the source list avoids confusion if a future change
       drops the server-side filter.
+    - Reddit entries are only useful when the user has wired up
+      Hydra (``REDDIT_HYDRA_URL``). Without it, the per-subreddit
+      plugin's ``fetch`` short-circuits to ``[]`` and the row
+      appears in the Source list but produces no entries. The
+      curator-shipped Reddit rows surface that gap visually
+      because the user can see the empty column; they can then
+      either configure Hydra or delete the row.
 
 Ranking (``recommendations_for``):
     When the user has zero interaction rows we serve the list in its
@@ -270,6 +282,65 @@ RECOMMENDATIONS: list[dict] = [
         "category": "tech",
         "url": "https://blog.rust-lang.org/feed.xml",
         "blurb": "Rust language blog — release notes, RFCs",
+    },
+    # --- Reddit (per-subreddit; requires REDDIT_HYDRA_URL) ---------------
+    # The ``type: "reddit"`` discriminator is passed through to
+    # ``POST /api/sources`` by the Recommended tab, which routes the
+    # row to ``DynamicRedditPlugin`` instead of ``DynamicRssPlugin``.
+    # ``url`` is the canonical Reddit thread URL — the route layer
+    # also accepts ``r/python`` shorthand but we ship the full URL
+    # here so the source list renders a uniform shape. Subreddits
+    # are chosen for the same editorial reasons as the RSS rows:
+    # general-purpose + a few focused ones that overlap with the
+    # existing category structure (tech, news, science).
+    {
+        "name": "reddit_python",
+        "type": "reddit",
+        "category": "tech",
+        "url": "https://www.reddit.com/r/python",
+        "blurb": "r/python — news, discussion, project showcases",
+    },
+    {
+        "name": "reddit_programming",
+        "type": "reddit",
+        "category": "tech",
+        "url": "https://www.reddit.com/r/programming",
+        "blurb": "r/programming — language-agnostic dev discussion",
+    },
+    {
+        "name": "reddit_machinelearning",
+        "type": "reddit",
+        "category": "tech",
+        "url": "https://www.reddit.com/r/MachineLearning",
+        "blurb": "r/MachineLearning — papers, course announcements, industry",
+    },
+    {
+        "name": "reddit_technology",
+        "type": "reddit",
+        "category": "tech",
+        "url": "https://www.reddit.com/r/technology",
+        "blurb": "r/technology — broad tech news + discussion",
+    },
+    {
+        "name": "reddit_news",
+        "type": "reddit",
+        "category": "news",
+        "url": "https://www.reddit.com/r/news",
+        "blurb": "r/news — top stories, mainstream aggregation",
+    },
+    {
+        "name": "reddit_worldnews",
+        "type": "reddit",
+        "category": "news",
+        "url": "https://www.reddit.com/r/worldnews",
+        "blurb": "r/worldnews — international stories, heavy commentary",
+    },
+    {
+        "name": "reddit_science",
+        "type": "reddit",
+        "category": "science",
+        "url": "https://www.reddit.com/r/science",
+        "blurb": "r/science — peer-reviewed discussion + new papers",
     },
 ]
 

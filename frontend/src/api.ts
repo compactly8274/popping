@@ -24,6 +24,14 @@ export interface Entry {
   // Thumbnail (if the source ships one). Path is relative to /assets.
   image_url: string | null
   image_path: string | null
+  // Reddit cross-reference footer: populated by the background sweep
+  // (``app.scheduler._crossref_sweep``) when Hydra confirms the
+  // entry's URL has a matching discussion thread on Reddit. Both
+  // null = no cross-ref found (or feature disabled). The card
+  // renders "💬 Discussed on Reddit · N comments" linking to the
+  // thread when `reddit_thread_url` is non-null.
+  reddit_thread_url: string | null
+  reddit_comment_count: number | null
 }
 
 export interface Source {
@@ -223,6 +231,14 @@ export const api = {
     category: string
     url: string
     blurb: string
+    // ``Source.type`` to send on Add (``"rss"`` for the RSS rows,
+    // ``"reddit"`` for per-subreddit rows). Backend defaults to
+    // ``"rss"`` when the recommendation omits the field, so older
+    // cached payloads without the key still parse cleanly. The
+    // Recommended tab forwards this verbatim to
+    // ``POST /api/sources`` so the route layer picks the right
+    // URL validator and plugin dispatch.
+    type?: string
     // Optional HTTP header overrides applied on Add. Set on
     // entries whose CDN blocks our default UA (CBC). Read by the
     // frontend and forwarded as ``custom_headers`` to POST

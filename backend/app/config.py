@@ -114,6 +114,19 @@ class Settings(BaseSettings):
     # Optional PAT for the github_releases source. Unauthenticated = 60 req/hr;
     # with a PAT = 5000 req/hr. Recommended if you watch many repos.
     github_token: str = ""
+    # Optional Hydra Reddit client-server URL. When set, the Reddit source
+    # plugin (``app.sources.dynamic_reddit``) routes per-subreddit listings
+    # through this server instead of hitting Reddit directly, and the
+    # background cross-reference sweep in ``app.scheduler`` queries it for
+    # "discussed on Reddit" footers on every other entry. Empty string =
+    # feature disabled (Reddit rows aren't created, recommendation rows
+    # are skipped, cross-ref sweep is a no-op).
+    reddit_hydra_url: str = ""
+    # Bearer token for the Hydra server. Empty = unauthenticated Hydra.
+    # The token rides on every Hydra call via the shared httpx client
+    # (``app.reddit_client``), never per-stream — keeps the credentials
+    # scoped to a single client and out of the assets client.
+    reddit_hydra_token: str = ""
 
     # --- Notifications (phase 2+) -----------------------------------------
     pushover_user_key: str = ""

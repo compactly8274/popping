@@ -406,6 +406,39 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
           </button>
         )}
       </div>
+      {/* Reddit cross-reference footer. Rendered between the meta row
+          and the summary block so it reads as "extra metadata about
+          the article", not "extra metadata about the source". Only
+          appears when the background cross-ref sweep stamped the
+          entry (``reddit_thread_url`` non-null). The comment count
+          suffix is omitted when the sweep hasn't recorded a count yet
+          — same data path, just a defensive check for rows the sweep
+          is mid-update on. ``stopPropagation`` keeps the click from
+          opening the article (the link is to the Reddit thread, not
+          the article URL); ``data-card-interactive`` makes the long-
+          press / context-menu paths ignore the footer so a tap-and-
+          hold for "copy Reddit link" still works as expected. */}
+      {entry.reddit_thread_url && (
+        <a
+          href={entry.reddit_thread_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-card-interactive
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            recordImmediate({ entry_id: entry.id, type: 'click' })
+            window.open(entry.reddit_thread_url!, '_blank', 'noopener,noreferrer')
+          }}
+          className="mt-1.5 inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+        >
+          <span aria-hidden="true">💬</span>
+          <span>Discussed on Reddit</span>
+          {typeof entry.reddit_comment_count === 'number' && entry.reddit_comment_count > 0 && (
+            <span className="text-label-secondary">· {entry.reddit_comment_count} comments</span>
+          )}
+        </a>
+      )}
       {/* Inline summary. Sits between the meta row and the bottom
           edge of the card so it reads as "extra content below the
           metadata", not "extra metadata between two meta rows".

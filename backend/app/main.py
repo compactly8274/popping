@@ -24,6 +24,7 @@ from app import assets
 from app.config import settings
 from app.embeddings import embedder
 from app.notify import build_notifier
+from app import reddit_client
 from app.request_state import set_notifier
 from app import runtime_settings
 from app.routes import brief as brief_routes
@@ -67,6 +68,12 @@ async def lifespan(app: FastAPI):
     # handshakes. Set on startup; closed on teardown so connection
     # pools don't leak across ``uvicorn --reload`` cycles.
     assets.init_client()
+    # Build the Hydra Reddit client. No-op when REDDIT_HYDRA_URL is
+    # unset (feature off); otherwise builds a shared client with the
+    # bearer token from settings. Kept separate from the assets client
+    # because (a) the bearer token shouldn't leak to the thumbnail
+    # fetcher, (b) per-call timeouts diverge (Hydra wants short).
+    reddit_client.init_client()
     # Build the Redis pool up-front so the first request doesn't pay
     # the connect round-trip. ``init_redis`` is a no-op if the URL
     # is unset (pure file-system deploy), so we don't gate it on
@@ -116,11 +123,13 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # Teardown order: scheduler first (so no in-flight fetches
-        # race the closes), then the shared asset client, the Redis
-        # pool, and finally the SQLAlchemy engine. Each close is
-        # idempotent — a missing/broken subsystem just no-ops.
+        # race the closes), then the shared asset client, the Hydra
+        # Reddit client (same idempotent shape), the Redis pool, and
+        # finally the SQLAlchemy engine. Each close is idempotent —
+        # a missing/broken subsystem just no-ops.
         await stop_scheduler()
         await assets.close_client()
+        await reddit_client.close_client()
         await close_redis()
         await dispose_engine()
         logger.info("popping stopped")

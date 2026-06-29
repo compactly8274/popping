@@ -78,6 +78,12 @@ async def foryou(
             Entry.image_url,
             Entry.image_path,
             Entry.cached_summary,
+            # Reddit cross-reference footer. Same projection as
+            # ``/api/entries`` — ``->>`` returns unescaped text;
+            # NULL when the key is absent. Coerced to int in the
+            # _Row builder below (see comment there).
+            Entry.meta.op("->>")("reddit_thread_url").label("reddit_thread_url"),
+            Entry.meta.op("->>")("reddit_comment_count").label("reddit_comment_count_text"),
         )
         .join(Source, Entry.source_id == Source.id)
         .order_by(Entry.composite_score.desc(), Entry.published_at.desc().nullslast())
@@ -107,6 +113,7 @@ async def foryou(
             "id", "source_id", "title", "url", "published_at", "fetched_at",
             "composite_score", "personal_score", "raw_score",
             "image_url", "image_path", "cached_summary", "source",
+            "reddit_thread_url", "reddit_comment_count",
         )
         def __init__(self, raw, source):
             self.id = raw.id
@@ -122,6 +129,17 @@ async def foryou(
             self.image_path = raw.image_path
             self.cached_summary = raw.cached_summary
             self.source = source
+            self.reddit_thread_url = raw.reddit_thread_url
+            # ``reddit_comment_count`` projects as text from JSONB
+            # (``->>`` is always text). Coerce to int so the
+            # ``EntryListOut`` validator accepts it; fall back to
+            # None on a parse error so a bad migration doesn't 422
+            # the whole /foryou call.
+            raw_count = getattr(raw, "reddit_comment_count_text", None)
+            try:
+                self.reddit_comment_count = int(raw_count) if raw_count is not None else None
+            except (TypeError, ValueError):
+                self.reddit_comment_count = None
 
     candidates = [_Row(r, sources_by_id.get(r.source_id)) for r in rows]
 

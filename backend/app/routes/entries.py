@@ -110,6 +110,17 @@ async def list_entries(
         Entry.cached_summary,
         Entry.image_url,
         Entry.image_path,
+        # Reddit cross-reference footer. Pulled out of the JSONB blob
+        # via the ``->>`` operator so the list payload doesn't have to
+        # ship ``meta`` itself — the rest of meta is unused by the
+        # list render. ``->>`` returns the unescaped text (vs
+        # ``->`` which returns JSON-encoded with quotes); NULL when
+        # the key is absent → both columns NULL → ``EntryListOut``
+        # defaults both to None and the card skips the footer. The
+        # GIN index added in migration 0014 keeps the meta scan
+        # cheap on large entry tables.
+        Entry.meta.op("->>")("reddit_thread_url").label("reddit_thread_url"),
+        Entry.meta.op("->>")("reddit_comment_count").label("reddit_comment_count_text"),
     )
     stmt = select(*columns).join(Source, Entry.source_id == Source.id)
     if q:
@@ -157,7 +168,23 @@ async def list_entries(
         limit = min(limit, _SEARCH_LIMIT_CAP)
     stmt = stmt.limit(limit)
     rows = (await session.execute(stmt)).mappings().all()
-    return [EntryListOut.model_validate(r) for r in rows]
+    # ``reddit_comment_count`` projects as text (JSONB ``->>`` always
+    # returns text). The schema expects Optional[int]; coerce here so
+    # pydantic doesn't reject the value with a 422.
+    out: list[EntryListOut] = []
+    for r in rows:
+        raw_count = r.pop("reddit_comment_count_text", None)
+        if raw_count is not None:
+            try:
+                r["reddit_comment_count"] = int(raw_count)
+            except (TypeError, ValueError):
+                # Defensive: the JSONB value should always parse as an
+                # int (the sweep writes ``int(...)``). If a manual SQL
+                # write or a bad migration left a non-int string,
+                # null it out rather than 422 the whole list.
+                r["reddit_comment_count"] = None
+        out.append(EntryListOut.model_validate(r))
+    return out
 
 
 @router.post(

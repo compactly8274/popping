@@ -764,6 +764,12 @@ type Recommendation = {
   category: string
   url: string
   blurb: string
+  // ``Source.type`` — ``"rss"`` (default) or ``"reddit"``. Forwarded
+  // verbatim to ``POST /api/sources`` so the backend dispatches to
+  // the right plugin. Recommendations without the field fall through
+  // to the default ("rss") for forward compat with the editor rows
+  // that predate the Reddit rollout.
+  type?: string
   // Optional HTTP header overrides pre-applied at Add time. Set
   // on entries whose CDN blocks our default ``Popping/0.2`` UA
   // (CBC). The frontend passes them through to ``POST /api/sources``
@@ -810,13 +816,21 @@ function RecommendedTab({
 
   const add = async (rec: Recommendation) => {
     setAdding(rec.name)
+    // Per-type sensible default refresh when the recommendation
+    // doesn't ship one (none do today; the backend fills in the
+    // same default from ``routes/sources._REDDIT_DEFAULT_REFRESH``
+    // and ``_REFRESH_MIN * 60``). Mirroring the backend defaults
+    // client-side means the Source row renders with the right
+    // interval on first list refresh, before the backend's
+    // response comes back.
+    const isReddit = rec.type === 'reddit'
     try {
       await api.createSource({
         name: rec.name,
-        type: 'rss',
+        type: rec.type ?? 'rss',
         category: rec.category,
         url: rec.url,
-        refresh_interval_seconds: 3600,
+        refresh_interval_seconds: isReddit ? 900 : 3600,
         // Recommendation-supplied header overrides (e.g. CBC's
         // browser UA). Falls through to the route's ``None``
         // branch when the recommendation doesn't ship one —
@@ -886,6 +900,13 @@ function AddCustomTab({
   const [url, setUrl] = useState('')
   const [category, setCategory] = useState('news')
   const [refresh, setRefresh] = useState<number>(3600)
+  // Subtype selector — drives both the URL placeholder/label and the
+  // client-side validation. ``"rss"`` (default) takes a feed URL;
+  // ``"reddit"`` takes a subreddit reference (``r/python`` or full
+  // ``https://www.reddit.com/r/python``). The backend applies the
+  // same dispatch in ``routes/sources.create_source_endpoint`` so
+  // the field reaches ``POST /api/sources`` as ``type``.
+  const [sourceType, setSourceType] = useState<'rss' | 'reddit'>('rss')
   const [submitting, setSubmitting] = useState(false)
 
   const submit = async (e: React.FormEvent) => {
@@ -904,20 +925,34 @@ function AddCustomTab({
       onError('url is required')
       return
     }
-    try {
-      // Throws on parse failure — catches typos before the backend
-      // sees them, but the backend still validates because the
-      // client-side check isn't authoritative.
-      new URL(trimmedUrl)
-    } catch {
-      onError('url is not a valid URL')
-      return
+    if (sourceType === 'rss') {
+      // Only run the URL constructor when the subtype expects an
+      // http(s) URL. Reddit accepts ``r/python`` shorthand which
+      // isn't a parseable URL, so we let the backend
+      // ``normalize_subreddit`` handle it instead.
+      try {
+        new URL(trimmedUrl)
+      } catch {
+        onError('url is not a valid URL')
+        return
+      }
+    } else if (sourceType === 'reddit') {
+      // Light client-side sanity: reject obviously-empty / wrong-shape
+      // inputs so the user gets immediate feedback. Full validation
+      // (subreddit regex, lowercasing) happens backend-side; we just
+      // guard against the common "I typed `reddit.com/r/python`
+      // without a scheme" footgun by accepting it (the backend
+      // handles scheme-less inputs via ``normalize_subreddit``).
+      if (trimmedUrl.length < 3) {
+        onError('enter a subreddit like r/python or a full reddit.com/r/python URL')
+        return
+      }
     }
     setSubmitting(true)
     try {
       await api.createSource({
         name: trimmedName,
-        type: 'rss',
+        type: sourceType,
         category,
         url: trimmedUrl,
         refresh_interval_seconds: refresh,
@@ -948,14 +983,56 @@ function AddCustomTab({
           lowercase letters, digits, underscore
         </p>
       </div>
+      {/* Subtype selector. Drives the URL label + placeholder + the
+          validator branch in ``submit``. Two radios sit next to the
+          URL field so the user sees the choice immediately — a
+          dropdown would work but adds a click and hides the most
+          common choice (RSS). ``ml-auto`` on the radios block pushes
+          the group to the right edge so the label + radios share a
+          single visual row on mobile. */}
+      <fieldset className="flex items-center gap-3">
+        <legend className="sr-only">Source type</legend>
+        <span className="text-ios-caption uppercase tracking-wide text-label-tertiary">Type</span>
+        <label className="flex items-center gap-1 text-ios-caption text-label-primary">
+          <input
+            type="radio"
+            name="fm-type"
+            value="rss"
+            checked={sourceType === 'rss'}
+            onChange={() => setSourceType('rss')}
+            className="accent-accent"
+          />
+          RSS / Atom
+        </label>
+        <label className="flex items-center gap-1 text-ios-caption text-label-primary">
+          <input
+            type="radio"
+            name="fm-type"
+            value="reddit"
+            checked={sourceType === 'reddit'}
+            onChange={() => setSourceType('reddit')}
+            className="accent-accent"
+          />
+          Subreddit
+        </label>
+      </fieldset>
       <div>
-        <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-url">RSS / Atom URL</label>
+        <label
+          className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1"
+          htmlFor="fm-url"
+        >
+          {sourceType === 'rss' ? 'RSS / Atom URL' : 'Subreddit'}
+        </label>
         <input
           id="fm-url"
-          type="url"
+          type={sourceType === 'rss' ? 'url' : 'text'}
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://example.com/feed.xml"
+          placeholder={
+            sourceType === 'rss'
+              ? 'https://example.com/feed.xml'
+              : 'r/python or https://www.reddit.com/r/python'
+          }
           className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
         />
       </div>

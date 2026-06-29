@@ -101,11 +101,19 @@ class FeedRecommendation(BaseModel):
     browser-shaped UA that the frontend passes through to
     ``POST /api/sources`` as ``custom_headers``. Other entries
     leave it null and the user adds the source with the default
-    UA; the route layer accepts both."""
+    UA; the route layer accepts both.
+
+    ``type`` is the ``Source.type`` to pass to ``POST /api/sources``
+    when the user taps Add. Defaults to ``"rss"`` for forward
+    compat with the editor rows that predate the Reddit rollout;
+    Reddit recommendations set this to ``"reddit"`` so the Add
+    handler picks the right source-shape validator on the backend.
+    """
     name: str
     category: str
     url: str
     blurb: str
+    type: str = "rss"
     default_headers: Optional[dict] = None
 
 
@@ -162,6 +170,13 @@ class EntryListOut(BaseModel):
 
     The full ``EntryOut`` is still used for endpoints that need the
     meta — the per-card summary endpoint, etc.
+
+    ``reddit_thread_url`` + ``reddit_comment_count`` are pulled out of
+    ``Entry.meta`` at projection time (``routes/entries.py``) so the
+    card footer can read them as top-level fields. Cheaper than
+    shipping the whole ``meta`` blob — these two keys are tiny
+    (~80 bytes) and the rest of ``meta`` (engagement, source-natural
+    keys, etc.) is unused by the list render.
     """
     id: int
     source_id: int
@@ -179,6 +194,14 @@ class EntryListOut(BaseModel):
     cached_summary: Optional[str] = None
     image_url: Optional[str] = None
     image_path: Optional[str] = None
+    # Reddit cross-reference footer. Both null = no cross-ref found
+    # or feature disabled. The card renders a "Discussed on Reddit"
+    # link when ``reddit_thread_url`` is non-null. ``null`` (not
+    # missing) so the frontend's TypeScript discriminated-union
+    # narrowing on ``Entry.reddit_thread_url !== null`` works without
+    # optional-chaining on every render.
+    reddit_thread_url: Optional[str] = None
+    reddit_comment_count: Optional[int] = None
 
     class Config:
         from_attributes = True
