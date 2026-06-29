@@ -159,10 +159,10 @@ function TabButton({
       role="tab"
       aria-selected={active}
       onClick={onClick}
-      className={`flex-1 rounded px-2 py-1 text-[10px] uppercase tracking-wide transition ${
+      className={`flex-1 min-h-[36px] rounded-ios text-ios-body transition ${
         active
-          ? 'bg-blue-700 text-white'
-          : 'bg-slate-800 text-slate-300 [@media(hover:hover)]:hover:bg-slate-700'
+          ? 'bg-bg-elevated text-accent'
+          : 'bg-bg-surface text-label-primary active:bg-bg-elevated'
       }`}
     >
       {children}
@@ -188,7 +188,7 @@ function MyFeedsTab({
   onError: (msg: string) => void
 }) {
   if (sources.length === 0) {
-    return <p className="text-xs text-slate-500 italic px-1">no sources yet</p>
+    return <p className="text-ios-body text-label-secondary italic px-1">no sources yet</p>
   }
   return (
     <ul className="space-y-1">
@@ -269,22 +269,22 @@ function SourceRow({
   }
 
   return (
-    <div className={`rounded border border-slate-800 bg-slate-950 px-2 py-1.5 text-xs ${busy ? 'opacity-60' : ''}`}>
+    <div className={`px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0 ${busy ? 'opacity-60' : ''}`}>
       <div className="flex items-center gap-2 min-w-0">
         {/* SourceIcon — colored-letter fallback when the favicon
             hasn't landed yet. ``size={14}`` matches the original
             w-3.5 h-3.5 img (14px). */}
         <SourceIcon src={source.favicon_path} name={source.name} size={14} />
-        <span className={`truncate font-medium ${source.active ? 'text-slate-100' : 'text-slate-500 line-through'}`}>
+        <span className={`truncate font-medium ${source.active ? 'text-label-primary' : 'text-label-secondary line-through'}`}>
           {source.name}
         </span>
-        <span className="text-slate-500 shrink-0">{source.category}</span>
+        <span className="text-label-tertiary shrink-0 text-[11px]">{source.category}</span>
         {!source.active && (
-          <span className="text-[10px] text-amber-400 shrink-0">paused</span>
+          <span className="text-ios-caption text-amber-400 shrink-0">paused</span>
         )}
         {source.last_error && (
           <span
-            className="text-[10px] text-red-300 shrink-0 truncate"
+            className="text-ios-caption text-red-400 shrink-0 truncate"
             title={source.last_error}
           >
             ⚠
@@ -295,7 +295,7 @@ function SourceRow({
         <button
           onClick={toggleActive}
           disabled={busy}
-          className="text-[10px] text-slate-400 hover:text-slate-100 disabled:opacity-50"
+          className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
           aria-label={source.active ? 'pause source' : 'resume source'}
         >
           {source.active ? 'pause' : 'resume'}
@@ -305,7 +305,7 @@ function SourceRow({
             value={source.refresh_interval_seconds}
             onChange={(e) => setInterval(Number(e.target.value))}
             disabled={busy}
-            className="text-[10px] rounded bg-slate-900 border border-slate-800 px-1 py-0.5 text-slate-100"
+            className="text-ios-caption rounded-ios bg-bg-elevated border border-hairline px-1 py-0.5 text-label-primary"
             aria-label="refresh interval"
           >
             {REFRESH_PRESETS.map((p) => (
@@ -318,7 +318,7 @@ function SourceRow({
           <button
             onClick={onStartEditInterval}
             disabled={busy}
-            className="text-[10px] text-slate-400 hover:text-slate-100 disabled:opacity-50"
+            className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
             aria-label="edit refresh interval"
           >
             every {refreshLabel(source.refresh_interval_seconds)}
@@ -328,7 +328,7 @@ function SourceRow({
           <button
             onClick={onCancelEditInterval}
             disabled={busy}
-            className="text-[10px] text-slate-500 hover:text-slate-200 disabled:opacity-50"
+            className="text-ios-caption text-label-secondary active:opacity-60 disabled:opacity-40"
           >
             cancel
           </button>
@@ -337,7 +337,7 @@ function SourceRow({
           <button
             onClick={onDelete}
             disabled={busy}
-            className="ml-auto text-[10px] text-red-300 hover:text-red-200 disabled:opacity-50"
+            className="ml-auto text-ios-caption text-red-400 active:opacity-60 disabled:opacity-40"
             aria-label={`delete ${source.name}`}
           >
             delete
@@ -345,7 +345,7 @@ function SourceRow({
         )}
         {builtIn && (
           <span
-            className="ml-auto text-[10px] text-slate-600"
+            className="ml-auto text-ios-caption text-label-tertiary"
             title="built-in source — managed by the scheduler at startup"
           >
             built-in
@@ -426,35 +426,35 @@ function RecommendedTab({
   }
 
   if (loading) {
-    return <p className="text-xs text-slate-500 italic px-1">loading…</p>
+    return <p className="text-ios-body text-label-secondary italic px-1">loading…</p>
   }
   if (!recs || recs.length === 0) {
     return (
-      <p className="text-xs text-slate-500 italic px-1">
+      <p className="text-ios-body text-label-secondary italic px-1">
         you've added all the recommended feeds — try the Add custom tab
       </p>
     )
   }
   return (
-    <ul className="space-y-1">
+    <ul>
       {recs.map((r) => (
         <li
           key={r.name}
-          className="rounded border border-slate-800 bg-slate-950 px-2 py-1.5 text-xs"
+          className="px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0"
         >
           <div className="flex items-center gap-2 min-w-0">
-            <span className="truncate font-medium text-slate-100">{r.name}</span>
-            <span className="text-slate-500 shrink-0">{r.category}</span>
+            <span className="truncate font-medium text-label-primary">{r.name}</span>
+            <span className="text-label-tertiary shrink-0 text-[11px]">{r.category}</span>
             <button
               onClick={() => add(r)}
               disabled={adding === r.name}
-              className="ml-auto shrink-0 text-[10px] rounded bg-blue-800 hover:bg-blue-700 disabled:opacity-50 text-blue-100 px-2 py-0.5"
+              className="ml-auto shrink-0 min-h-[28px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white px-2 py-0.5 text-ios-caption"
               aria-label={`add ${r.name}`}
             >
               {adding === r.name ? 'adding…' : 'Add'}
             </button>
           </div>
-          <p className="text-[10px] text-slate-500 mt-0.5">{r.blurb}</p>
+          <p className="text-ios-caption text-label-secondary mt-0.5">{r.blurb}</p>
         </li>
       ))}
     </ul>
@@ -523,40 +523,40 @@ function AddCustomTab({
   }
 
   return (
-    <form onSubmit={submit} className="space-y-2 text-xs">
+    <form onSubmit={submit} className="space-y-3 text-ios-body">
       <div>
-        <label className="block text-slate-400 mb-1" htmlFor="fm-name">Name</label>
+        <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-name">Name</label>
         <input
           id="fm-name"
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="my_blog"
-          className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 placeholder:text-slate-600"
+          className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
         />
-        <p className="text-[10px] text-slate-500 mt-0.5">
+        <p className="text-ios-caption text-label-secondary mt-1">
           lowercase letters, digits, underscore
         </p>
       </div>
       <div>
-        <label className="block text-slate-400 mb-1" htmlFor="fm-url">RSS / Atom URL</label>
+        <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-url">RSS / Atom URL</label>
         <input
           id="fm-url"
           type="url"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder="https://example.com/feed.xml"
-          className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 placeholder:text-slate-600"
+          className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
         />
       </div>
       <div className="flex gap-2">
         <div className="flex-1">
-          <label className="block text-slate-400 mb-1" htmlFor="fm-category">Category</label>
+          <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-category">Category</label>
           <select
             id="fm-category"
             value={category}
             onChange={(e) => setCategory(e.target.value)}
-            className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
+            className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
           >
             {CATEGORY_OPTIONS.map((c) => (
               <option key={c} value={c}>{c}</option>
@@ -564,12 +564,12 @@ function AddCustomTab({
           </select>
         </div>
         <div className="flex-1">
-          <label className="block text-slate-400 mb-1" htmlFor="fm-refresh">Refresh</label>
+          <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-refresh">Refresh</label>
           <select
             id="fm-refresh"
             value={refresh}
             onChange={(e) => setRefresh(Number(e.target.value))}
-            className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
+            className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
           >
             {REFRESH_PRESETS.map((p) => (
               <option key={p.value} value={p.value}>every {p.label}</option>
@@ -580,7 +580,7 @@ function AddCustomTab({
       <button
         type="submit"
         disabled={submitting}
-        className="w-full rounded bg-blue-800 hover:bg-blue-700 disabled:opacity-50 text-blue-100 px-3 py-1.5"
+        className="w-full min-h-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white"
       >
         {submitting ? 'adding…' : 'Add feed'}
       </button>

@@ -128,39 +128,39 @@ export function Column({
         tabIndex={0}
         onClick={onHeaderClick}
         onKeyDown={onHeaderKey}
-        className="relative flex items-center justify-between px-1 pb-2 cursor-pointer select-none"
+        className="relative flex items-center justify-between px-1 pb-2 min-h-[44px] cursor-pointer select-none"
         title="tap to mark this column read"
       >
-        {/* Thin gradient underline. Sits below the title row and
-            gives each column a soft separator from its body without
-            a hard border. The transparent-to-transparent endpoint
-            keeps the line from "starting" — it reads as a continuous
-            gradient flow rather than a divider stuck across the top. */}
+        {/* Thin hairline underline. iOS-style list-header separator —
+          a single 1px line right at the bottom of the title row,
+          rendered slightly inset so the line reads as belonging to
+          the column rather than the page. */}
         <div
           aria-hidden="true"
-          className="absolute left-0 right-0 bottom-0 h-px bg-gradient-to-r from-transparent via-slate-700 to-transparent"
+          className="absolute left-1 right-1 bottom-0 h-px bg-hairline"
         />
         <div className="flex items-center gap-2 min-w-0">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300 truncate">
+          <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary truncate">
             {name}
           </h2>
           {/* New-entry chip. Only renders when newCount > 0 — when
               it hits 0 the user has acknowledged the column and the
-              chip just disappears. Pulsing slightly is overkill; the
-              blue bg against the dark header is enough signal. */}
+              chip just disappears. Pulses slightly via the accent
+              color rather than an animation, matching the iOS
+              "badge" pattern. */}
           {newCount != null && newCount > 0 && (
             <span
               data-new-chip
-              className="shrink-0 rounded-full bg-blue-600 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white"
+              className="shrink-0 rounded-full bg-accent px-2 py-0.5 text-ios-caption font-semibold uppercase tracking-wide text-white"
               title={`${newCount} new since last visit`}
             >
               +{newCount} new
             </span>
           )}
           {/* Entry count. "X of Y" when filters are hiding some,
-              plain "X" otherwise. text-slate-500 to keep it
+              plain "X" otherwise. text-label-secondary to keep it
               secondary to the new chip. */}
-          <span className="text-xs text-slate-500">
+          <span className="text-ios-caption text-label-secondary">
             {showTotal ? `${entries.length} of ${visible}` : visible}
           </span>
         </div>
@@ -181,11 +181,11 @@ export function Column({
               e.stopPropagation()
               setPopoverOpen((p) => !p)
             }}
-            className="shrink-0 rounded px-2 py-0.5 text-xs text-slate-400 active:bg-slate-800 [@media(hover:hover)]:hover:bg-slate-800 [@media(hover:hover)]:hover:text-slate-100"
+            className="shrink-0 w-8 h-8 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated"
             aria-label="column preferences"
             aria-expanded={popoverOpen}
           >
-            ⋯
+            <MoreIcon className="w-4 h-4" />
           </button>
         )}
 
@@ -194,20 +194,24 @@ export function Column({
             ref={popoverRef}
             data-column-popover
             // Position relative to the header so it lands just below
-            // the ⋯ button on the right edge. min-w-[220px] keeps
+            // the more-button on the right edge. min-w-[240px] keeps
             // the slider readable. z-20 puts it above cards but
-            // below the Drawer (z-30+).
-            className="absolute right-0 top-full mt-1 z-20 min-w-[220px] rounded border border-slate-700 bg-slate-900 shadow-xl p-3 text-xs space-y-3"
+            // below the Drawer (z-30+). The popover is the only
+            // place we still render a popover-shaped surface — the
+            // rest of the dashboard uses sheets / grouped lists.
+            className="absolute right-0 top-full mt-2 z-20 min-w-[240px] rounded-ios-lg bg-bg-elevated shadow-2xl p-3 text-ios-body space-y-3"
             onClick={(e) => e.stopPropagation()}
           >
             <div>
-              <label className="block text-slate-400 mb-1">Sort</label>
+              <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
+                Sort
+              </label>
               <select
                 value={prefs.sort}
                 onChange={(e) =>
                   onPrefsChange({ ...prefs, sort: e.target.value as ColumnPrefs['sort'] })
                 }
-                className="w-full rounded bg-slate-950 border border-slate-800 px-2 py-1 text-slate-100"
+                className="w-full min-h-[36px] rounded-ios bg-bg-surface border border-hairline px-2 text-label-primary"
               >
                 <option value="top">Top (composite score)</option>
                 <option value="newest">Newest first</option>
@@ -215,7 +219,7 @@ export function Column({
               </select>
             </div>
             <div>
-              <label className="block text-slate-400 mb-1">
+              <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
                 Min score: {prefs.minScore}
               </label>
               <input
@@ -227,11 +231,13 @@ export function Column({
                 onChange={(e) =>
                   onPrefsChange({ ...prefs, minScore: Number(e.target.value) })
                 }
-                className="w-full"
+                className="w-full accent-accent"
               />
             </div>
             <div>
-              <label className="block text-slate-400 mb-1">Hide if older than</label>
+              <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
+                Hide if older than
+              </label>
               <select
                 value={prefs.maxAgeHours == null ? 'all' : String(prefs.maxAgeHours)}
                 onChange={(e) => {
@@ -241,7 +247,7 @@ export function Column({
                     maxAgeHours: v === 'all' ? null : Number(v),
                   })
                 }}
-                className="w-full rounded bg-slate-950 border border-slate-800 px-2 py-1 text-slate-100"
+                className="w-full min-h-[36px] rounded-ios bg-bg-surface border border-hairline px-2 text-label-primary"
               >
                 <option value="all">All</option>
                 <option value="1">1 hour</option>
@@ -254,7 +260,7 @@ export function Column({
       </header>
       <div className="flex-1 overflow-y-auto space-y-2 pr-1">
         {entries.length === 0 ? (
-          <p className="text-sm text-slate-500 italic px-1">nothing yet</p>
+          <p className="text-ios-body text-label-secondary italic px-1">nothing yet</p>
         ) : (
           entries.map((e) => {
             // Build the ref-callback only when a Map is provided.
@@ -294,5 +300,23 @@ export function Column({
         )}
       </div>
     </section>
+  )
+}
+
+// iOS-style "more" glyph — three horizontal dots. Used for the
+// column-preferences affordance; matches the SF Symbols
+// "ellipsis" pictogram at small sizes.
+function MoreIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      className={className}
+      aria-hidden="true"
+    >
+      <circle cx="6"  cy="12" r="1.75" />
+      <circle cx="12" cy="12" r="1.75" />
+      <circle cx="18" cy="12" r="1.75" />
+    </svg>
   )
 }

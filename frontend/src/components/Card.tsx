@@ -49,7 +49,7 @@ function categoryStripeClass(category: string | undefined): string {
     case 'policy':   return 'bg-cyan-500/70'
     case 'longform': return 'bg-rose-500/70'
     case 'deals':    return 'bg-lime-500/70'
-    default:         return 'bg-slate-600/70'
+    default:         return 'bg-neutral-600/70'
   }
 }
 
@@ -72,8 +72,8 @@ function timeAgo(iso: string | null): string {
 function scoreBand(score: number): { color: string; label: string } {
   if (score >= 75) return { color: 'bg-gradient-to-br from-red-500 to-red-700',   label: 'hot' }
   if (score >= 50) return { color: 'bg-gradient-to-br from-amber-400 to-amber-600', label: 'warm' }
-  if (score >= 25) return { color: 'bg-gradient-to-br from-blue-500 to-blue-700',   label: 'cool' }
-  return               { color: 'bg-gradient-to-br from-slate-500 to-slate-700',   label: 'cold' }
+  if (score >= 25) return { color: 'bg-gradient-to-br from-accent to-blue-700',   label: 'cool' }
+  return               { color: 'bg-gradient-to-br from-neutral-500 to-neutral-700',   label: 'cold' }
 }
 
 // Long-press threshold. ~500ms is the conventional "long enough to
@@ -187,13 +187,13 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
 
   // Visual state for unread vs selected. Read cards stay at 100%
   // opacity but lose the ring — they're not "hidden", just clearly
-  // seen. Selected cards get a stronger ring regardless of read
-  // state so the keyboard focus is unambiguous.
+  // seen. Selected cards get a stronger accent ring regardless of
+  // read state so the keyboard focus is unambiguous.
   const opacityClass = unread ? 'opacity-100' : 'opacity-60'
   const ringClass = selected
-    ? 'ring-2 ring-blue-500/70'
+    ? 'ring-2 ring-accent/70'
     : unread
-      ? 'ring-1 ring-blue-500/40'
+      ? 'ring-1 ring-accent/40'
       : ''
 
   return (
@@ -201,16 +201,17 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
       ref={cardRef}
       data-card-id={entry.id}
       // ``tabIndex`` only on the selected card so the rest of the
-      // grid isn't a giant tab-stop forest. F6 sets tabIndex={0}
-      // and calls focus() when the user moves with the keyboard.
+      // grid isn't a giant tab-stop forest. Arrow keys set
+      // tabIndex={0} and call focus() when the user moves with the
+      // keyboard.
       tabIndex={selected ? 0 : -1}
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
       onTouchCancel={onTouchCancel}
       onContextMenu={onContextMenu}
-      className={`group relative rounded-lg border border-slate-800 bg-slate-900/60 p-4 pl-5
-                  hover:border-slate-700 hover:-translate-y-px hover:shadow-glow-md
+      className={`group relative rounded-ios-lg bg-bg-surface border border-hairline p-4 pl-5
+                  hover:-translate-y-px hover:shadow-glow-md
                   transition-[transform,box-shadow,border-color] duration-200
                   ${opacityClass} ${ringClass}`}
     >
@@ -221,7 +222,7 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
           the semantic. */}
       <div
         aria-hidden="true"
-        className={`absolute left-0 top-0 bottom-0 w-0.5 rounded-l-lg ${stripeClass}`}
+        className={`absolute left-0 top-0 bottom-0 w-0.5 rounded-l-ios-lg ${stripeClass}`}
       />
       <div className="flex items-start justify-between gap-3 mb-2">
         <a
@@ -231,16 +232,16 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
           aria-label="open in new tab"
           title="opens in a new tab"
           onClick={() => onActivate?.()}
-          className="flex-1 min-w-0 flex items-start gap-1.5 text-base font-medium text-slate-100 hover:text-white line-clamp-2"
+          className="flex-1 min-w-0 flex items-start gap-1.5 text-ios-body font-medium text-label-primary hover:text-white line-clamp-2"
         >
           <span className="min-w-0">{entry.title}</span>
           {/* "↗" affordance. Sits inline at the end of the title so it
               reads as part of the link, not a separate control. Group-
               hover brightens it on devices that have a hover state;
-              touch devices get the static ``text-slate-500`` baseline. */}
+              touch devices get the static tertiary baseline. */}
           <span
             aria-hidden="true"
-            className="shrink-0 text-slate-500 group-hover:text-slate-300 transition text-sm leading-tight"
+            className="shrink-0 text-label-tertiary group-hover:text-label-secondary transition text-ios-body leading-tight"
           >
             ↗
           </span>
@@ -257,14 +258,14 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
             that reads as "this is a label" rather than "this is a
             button". Title shows the raw number for power users. */}
         <span
-          className={`shrink-0 inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold text-white ring-1 ring-white/10 ${band.color}`}
+          className={`shrink-0 inline-flex items-center rounded-ios px-2 py-0.5 text-xs font-semibold text-white ring-1 ring-white/10 ${band.color}`}
           title={`composite score ${entry.composite_score.toFixed(0)}`}
         >
           {entry.composite_score.toFixed(0)}
         </span>
       </div>
-      <div className="flex items-center gap-2 text-xs text-slate-400">
-        {sourceName && <span className="font-medium text-slate-300">{sourceName}</span>}
+      <div className="flex items-center gap-2 text-ios-caption text-label-secondary">
+        {sourceName && <span className="font-medium text-label-primary">{sourceName}</span>}
         {sourceName && <span>·</span>}
         <time>{timeAgo(entry.published_at)}</time>
       </div>
@@ -324,7 +325,7 @@ function Thumbnail({ path, title, url }: { path: string; title: string; url: str
       onKeyDown={onKey}
       aria-label={`open ${title} in new tab`}
       title={title}
-      className="shrink-0 w-24 sm:w-32 aspect-video rounded-md overflow-hidden bg-bg-elevated cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-blue-500/60"
+      className="shrink-0 w-24 sm:w-32 aspect-video rounded-ios overflow-hidden bg-bg-elevated cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-accent/60"
     >
       <img
         src={`/assets/${path}`}
@@ -391,7 +392,7 @@ function showContextMenu(x: number, y: number, url: string) {
   const menu = document.createElement('div')
   menu.id = 'card-context-menu'
   menu.className =
-    'fixed z-50 min-w-[180px] rounded border border-slate-700 bg-slate-900 shadow-xl text-sm py-1'
+    'fixed z-50 min-w-[180px] rounded-ios bg-bg-elevated border border-hairline shadow-xl text-ios-body py-1'
   // Clamp to viewport so the menu never renders off-screen.
   const left = Math.min(x, window.innerWidth - 200)
   const top = Math.min(y, window.innerHeight - 100)
@@ -411,7 +412,7 @@ function showContextMenu(x: number, y: number, url: string) {
     const btn = document.createElement('button')
     btn.type = 'button'
     btn.className =
-      'block w-full text-left px-3 py-1.5 text-slate-200 hover:bg-slate-800'
+      'block w-full text-left px-3 py-1.5 text-label-primary active:bg-bg-surface'
     btn.textContent = item.label
     btn.onclick = () => {
       item.onClick()

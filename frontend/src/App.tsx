@@ -16,7 +16,7 @@
 //   - Brief tone picker (terse / narrative / alert)
 //   - Source filter chips in the header
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type Brief, type CurrentUser, type Entry, type Health, type Source } from './api'
 import { BriefCard } from './components/BriefCard'
 import { Column, DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
@@ -124,17 +124,16 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<Entry[]>([])
   const [searching, setSearching] = useState(false)
+  // Search-bar expansion. The header collapses search into a single
+  // magnifying-glass icon by default; tapping it expands the input
+  // to full width (matching Apple Mail's header behaviour). ``false``
+  // on first mount so the large title gets the full row.
+  const [searchOpen, setSearchOpen] = useState(false)
   // Keyboard selection.
   const [selectedColumnIndex, setSelectedColumnIndex] = useState(0)
   const [selectedCardId, setSelectedCardId] = useState<number | null>(null)
 
   const touchStartX = useRef<number | null>(null)
-  // Stable id for the logo SVG gradient. ``useId`` is React's
-  // SSR-safe id generator — without it, two App mounts (or a
-  // future extracted header component rendered twice) would emit
-  // duplicate ``id="logo-grad"`` and the second ``fill="url(#logo-grad)"``
-  // would resolve to the wrong gradient.
-  const logoGradId = useId()
   // Set of entry ids observed on the previous successful refresh.
   // Used to compute "new since last refresh" — entries whose id is
   // not in this set are flagged. ``null`` means "haven't completed a
@@ -579,86 +578,139 @@ export function App() {
 
   return (
     <div className="h-full flex flex-col">
-      {/* Sticky top bar. ``backdrop-blur`` + ``supports-[backdrop-filter]:bg-slate-950/80``
-          gives a frosted look on capable browsers (Chrome, Safari,
-          Firefox 103+) and falls back to a solid ``bg-slate-950``
-          elsewhere. The hairline shadow underneath reads as a
-          separator when the user scrolls a long column under the
-          bar. ``z-20`` keeps the bar above column content but below
-          the Drawer (z-30+). */}
-      <header className="sticky top-0 z-20 flex items-center gap-2 sm:gap-3 px-4 py-1.5 sm:py-3 border-b border-slate-800 bg-slate-950 supports-[backdrop-filter]:backdrop-blur supports-[backdrop-filter]:bg-slate-950/80 shadow-[0_1px_0_0_rgba(255,255,255,0.04)]">
-        <Hamburger onClick={() => setDrawerOpen(true)} />
-        {/* Logo + wordmark. The SVG is a tiny "P" — outer ring + inner
-            dot — sized at 20px so it sits next to the title without
-            crowding it. ``aria-hidden`` on the SVG because the
-            adjacent text is the actual wordmark. The gradient on the
-            outer ring reuses the same blue→violet stop as the
-            accent + filter-chip palette for visual continuity. */}
-        <span className="flex items-center gap-2">
-          <svg
-            width="20"
-            height="20"
-            viewBox="0 0 20 20"
-            aria-hidden="true"
-            className="shrink-0"
-          >
-            <defs>
-              <linearGradient id={logoGradId} x1="0" y1="0" x2="20" y2="20" gradientUnits="userSpaceOnUse">
-                <stop offset="0%" stopColor="#3b82f6" />
-                <stop offset="100%" stopColor="#8b5cf6" />
-              </linearGradient>
-            </defs>
-            <circle cx="10" cy="10" r="9" fill={`url(#${logoGradId})`} />
-            <circle cx="10" cy="10" r="3" fill="#020617" />
-          </svg>
-          <h1 className="text-base sm:text-lg font-bold tracking-tight">Popping</h1>
-        </span>
-        <input
-          id="app-search"
-          type="search"
-          inputMode="search"
-          value={searchInput}
-          onChange={(e) => setSearchInput(e.target.value)}
-          placeholder="search… (press /)"
-          className="hidden sm:block w-40 lg:w-56 rounded bg-slate-900 border border-slate-800 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-slate-600"
-        />
-        <span className="ml-auto hidden sm:inline text-xs text-slate-400">
-          {health
-            ? `${health.entries} entries · ${health.sources} sources · ${health.status}`
-            : 'connecting…'}
-        </span>
-        <button
-          onClick={() => void refresh()}
-          disabled={refreshing}
-          className="min-h-[36px] sm:min-h-[44px] rounded px-3 py-1 text-sm bg-slate-800 active:bg-slate-700 disabled:opacity-50 text-slate-200 [@media(hover:hover)]:hover:bg-slate-700"
-        >
-          {refreshing ? '…' : 'Refresh'}
-        </button>
-        <button
-          onClick={async () => {
-            if (generatingBrief) return
-            setGeneratingBrief(true)
-            try {
-              const next = await api.briefGenerate(briefTone)
-              setBrief(next)
-            } catch (err) {
-              setError((err as Error).message)
-            } finally {
-              setGeneratingBrief(false)
-            }
-          }}
-          disabled={generatingBrief}
-          className="hidden sm:inline-flex min-h-[44px] rounded px-3 py-1 text-sm bg-blue-800 active:bg-blue-900 disabled:opacity-50 text-blue-100 [@media(hover:hover)]:hover:bg-blue-700"
-          title="Generate today's brief now"
-        >
-          {generatingBrief ? '…' : 'Brief'}
-        </button>
-        {user && <UserBadge user={user} onSignedOut={() => setUser(null)} />}
+      {/* Large-title navigation bar. Mirrors Apple Mail / Music:
+          the title is large (34pt, iOS ``largeTitle`` weight) when the
+          bar is at the top of the scroll, and the row beneath it
+          carries the action buttons (hamburger, search, refresh,
+          brief). A hairline divider sits at the bottom — the entire
+          UI leans on these 1px ``rgba(255,255,255,0.08)`` lines as
+          the only border treatment. ``z-20`` keeps the bar above
+          column content but below the Drawer (z-30+). */}
+      <header className="sticky top-0 z-20 bg-bg-app/85 supports-[backdrop-filter]:backdrop-blur-xl border-b border-hairline">
+        {/* Title row. The hamburger sits on the trailing edge of the
+            row (right-aligned) rather than the leading edge — this
+            matches iOS where leading space is reserved for the title
+            and the trailing chrome owns the actions. The large title
+            is left-aligned at full width on its own row so it lands
+            with the iOS-weight feel. On ``sm+`` the row also includes
+            the search affordance and trailing health/brief buttons;
+            on mobile the trailing controls are stripped (the icons
+            only would crowd the small viewport). */}
+        <div className="flex items-end justify-between px-4 pt-3 pb-2 sm:pt-4 sm:pb-3">
+          <h1 className="text-ios-large-title text-label-primary truncate">
+            Popping
+          </h1>
+          <div className="flex items-center gap-1 sm:gap-2 pb-1">
+            {/* Search affordance. Collapsed: a 44×44 button with a
+                magnifying-glass icon. Expanded: full-width input with
+                a leading glass + trailing clear-X. The transition is
+                a plain width swap — no JS animation library; the
+                backdrop-blur above keeps the swap from feeling cheap. */}
+            {searchOpen ? (
+              <div className="flex items-center gap-2 bg-bg-elevated rounded-ios px-3 h-11 w-44 sm:w-72 animate-fade-in">
+                <SearchIcon className="w-4 h-4 text-label-secondary shrink-0" />
+                <input
+                  id="app-search"
+                  type="search"
+                  inputMode="search"
+                  autoFocus
+                  value={searchInput}
+                  onChange={(e) => setSearchInput(e.target.value)}
+                  onBlur={() => {
+                    // Collapse when the user blurs only if the
+                    // field is empty. Otherwise keep the input open
+                    // so a stray tap outside doesn't lose the query.
+                    if (!searchInput) setSearchOpen(false)
+                  }}
+                  placeholder="search"
+                  className="flex-1 min-w-0 bg-transparent text-ios-body text-label-primary placeholder:text-label-tertiary focus:outline-none"
+                />
+                {searchInput && (
+                  <button
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      setSearchInput('')
+                      setSearchOpen(false)
+                    }}
+                    aria-label="clear search"
+                    className="shrink-0 text-label-secondary active:text-label-primary"
+                  >
+                    <ClearIcon className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchOpen(true)
+                  // Focus the input on the next tick — the input
+                  // mounts in the same render but autoFocus only
+                  // fires once. Belt and braces.
+                  requestAnimationFrame(() =>
+                    document.getElementById('app-search')?.focus(),
+                  )
+                }}
+                aria-label="open search"
+                className="w-11 h-11 flex items-center justify-center rounded-full text-label-primary active:bg-bg-elevated"
+              >
+                <SearchIcon className="w-5 h-5" />
+              </button>
+            )}
+            {/* Hamburger lives next to the search affordance — both
+                are 44×44 tappable targets that match iOS nav-bar
+                icon-button conventions. On ``sm+`` it appears at the
+                right edge of the title row. */}
+            <Hamburger onClick={() => setDrawerOpen(true)} />
+          </div>
+        </div>
+        {/* Sub-row: health status + Refresh + Brief. Hidden on mobile
+            because the actions duplicate what the Drawer already
+            offers — opening the Drawer takes one tap. The row is
+            laid out as a single flex line so the trailing buttons
+            stay aligned with the title row's right edge. */}
+        <div className="hidden sm:flex items-center justify-between px-4 pb-2 -mt-1">
+          <span className="text-ios-caption text-label-secondary truncate">
+            {health
+              ? `${health.entries} entries · ${health.sources} sources · ${health.status}`
+              : 'connecting…'}
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => void refresh()}
+              disabled={refreshing}
+              className="min-h-[32px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
+            >
+              {refreshing ? '…' : 'Refresh'}
+            </button>
+            <button
+              onClick={async () => {
+                if (generatingBrief) return
+                setGeneratingBrief(true)
+                try {
+                  const next = await api.briefGenerate(briefTone)
+                  setBrief(next)
+                } catch (err) {
+                  setError((err as Error).message)
+                } finally {
+                  setGeneratingBrief(false)
+                }
+              }}
+              disabled={generatingBrief}
+              className="min-h-[32px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
+              title="Generate today's brief now"
+            >
+              {generatingBrief ? '…' : 'Brief'}
+            </button>
+            {user && <UserBadge user={user} onSignedOut={() => setUser(null)} />}
+          </div>
+        </div>
       </header>
 
       {activeSources.size > 0 && (
-        <div className="px-4 py-2 border-b border-slate-800 bg-slate-900 flex items-center gap-2 text-sm overflow-x-auto whitespace-nowrap">
-          <span className="text-slate-400 shrink-0">filtering by:</span>
+        <div className="px-4 py-2 border-b border-hairline bg-bg-surface flex items-center gap-2 text-ios-caption overflow-x-auto whitespace-nowrap">
+          <span className="text-label-secondary shrink-0">filtering by:</span>
           {Array.from(activeSources).map((src) => (
             // ``animate-fade-in`` fires on every mount (the animation
             // restarts when the chip re-mounts after a re-render).
@@ -670,7 +722,7 @@ export function App() {
             <button
               key={src}
               onClick={() => toggleSource(src)}
-              className="shrink-0 rounded-full bg-blue-900/50 border border-blue-700 px-2.5 py-0.5 text-blue-100 text-xs hover:border-blue-500/60 hover:bg-blue-800/60 transition-colors duration-200 motion-safe:animate-fade-in"
+              className="shrink-0 rounded-full bg-accent-soft px-2.5 py-0.5 text-accent text-ios-caption motion-safe:animate-fade-in"
               aria-label={`remove ${src} from filter`}
             >
               {src} ✕
@@ -678,7 +730,7 @@ export function App() {
           ))}
           <button
             onClick={() => setActiveSources(new Set())}
-            className="shrink-0 ml-auto text-xs text-slate-400 hover:text-slate-100 transition-colors duration-200"
+            className="shrink-0 ml-auto text-ios-caption text-accent active:opacity-60"
           >
             clear all
           </button>
@@ -686,7 +738,7 @@ export function App() {
       )}
 
       {error && (
-        <div className="px-4 py-2 bg-red-900/40 border-b border-red-800 text-sm text-red-200">
+        <div className="px-4 py-2 bg-red-500/15 border-b border-red-500/40 text-ios-caption text-red-200">
           {error}
         </div>
       )}
@@ -706,11 +758,11 @@ export function App() {
             sourcesById={sourcesById}
           />
           {searching && (
-            <p className="mt-2 text-xs text-slate-500 px-1">searching…</p>
+            <p className="mt-2 text-ios-caption text-label-secondary px-1">searching…</p>
           )}
         </main>
       ) : columns.length === 0 ? (
-        <div className="flex-1 flex items-center justify-center text-slate-500 px-4 text-center">
+        <div className="flex-1 flex items-center justify-center text-ios-body text-label-secondary px-4 text-center">
           no entries yet — the scheduler will fetch the first batch shortly, or hit Refresh
         </div>
       ) : (
@@ -774,7 +826,7 @@ export function App() {
                     }}
                     aria-label={`go to column ${c.name}`}
                     className={`h-2 w-2 rounded-full transition ${
-                      i === mobileCol ? 'bg-slate-300 w-4' : 'bg-slate-700'
+                      i === mobileCol ? 'bg-label-primary w-4' : 'bg-label-tertiary'
                     }`}
                   />
                 ))}
@@ -799,5 +851,49 @@ export function App() {
 
       <ToastHost />
     </div>
+  )
+}
+
+// iOS-style magnifying-glass icon. Used for the search affordance in
+// the top-bar. 1.75px stroke mirrors Apple's SF Symbols line weight
+// for "magnifyingglass" at small sizes; rounded caps/joins so the
+// ellipse ends look as soft as the SF Symbol rendering.
+function SearchIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <circle cx="11" cy="11" r="7" />
+      <line x1="20" y1="20" x2="16" y2="16" />
+    </svg>
+  )
+}
+
+// Small × glyph used to clear the expanded search field. Same stroke
+// weight as SearchIcon so the two sit visually paired inside the
+// rounded pill.
+function ClearIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="10" fill="currentColor" stroke="none" opacity="0.2" />
+      <line x1="9" y1="9" x2="15" y2="15" />
+      <line x1="15" y1="9" x2="9" y2="15" />
+    </svg>
   )
 }

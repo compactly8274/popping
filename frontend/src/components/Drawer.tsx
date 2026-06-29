@@ -1,9 +1,24 @@
-// Slide-in drawer. Lists the category columns and the registered
-// sources. Tapping a source toggles it in the active-source set
-// (multi-select — empty set = no filter). Also surfaces the
-// notifications backend status (Apprise / Pushover / none) and the
-// LLM provider status — useful confirmation that the user's env vars
-// are wired up.
+// iOS-style full-screen grouped-list Drawer.
+//
+// On mobile (<md) the Drawer is a bottom sheet that slides up to fill
+// the viewport, mimicking the iOS Settings app navigation. On
+// desktop (md+) it slides in from the left as a 360px sidebar, like
+// Apple Mail's column-show/hide popover or the menu pane in Music on
+// macOS. The dual treatment comes from one component: the same
+// ``<nav>`` renders inside different sized containers, with a
+// different backdrop opacity and slide-in direction per breakpoint.
+//
+// The body is five iOS-style grouped sections:
+//
+//   1. NOTIFICATIONS          — backend status + retry
+//   2. LLM                    — provider/model + tone + Generate now
+//   3. CATEGORIES             — jump-to-column buttons
+//   4. FEEDS                  — dynamic-source CRUD (FeedManager)
+//   5. SOURCES                — multi-select filter (tap-to-filter)
+//
+// Each section has a small uppercase ``UPPERCASE LABEL`` header in
+// ``text-ios-caption text-label-tertiary`` (the iOS "section header"
+// treatment). Rows are 44px tall, the iOS HIG minimum tap target.
 //
 // The Drawer surfaces three categories of "failed to load" state:
 //   - sources list (rendered with a retry button)
@@ -132,78 +147,111 @@ export function Drawer({
 
   return (
     <>
-      {/* backdrop. ``backdrop-blur-sm`` softens the dashboard behind
-          the drawer; ``bg-black/50`` is a touch darker than the
-          previous ``/40`` because the blur reduces the perceived
-          contrast. Transition stays the same — the drawer slides in
-          without a flash. */}
+      {/* Backdrop. Same backdrop-blur treatment on both breakpoints;
+          the only difference is the opacity — slightly heavier on
+          mobile so the sheet reads as a clearly separate surface,
+          lighter on desktop where the panel is a sidebar, not a
+          takeover. z-30 sits above the header (z-20) but below the
+          sheet chrome (z-40). */}
       <div
         onClick={onClose}
-        className={`fixed inset-0 bg-black/50 backdrop-blur-sm z-30 transition-opacity ${open ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+        aria-hidden="true"
+        className={`fixed inset-0 z-30 bg-black/60 md:bg-black/40 supports-[backdrop-filter]:backdrop-blur-sm transition-opacity duration-200 ${
+          open ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        }`}
       />
+
+      {/* Mobile: bottom sheet, slides up to fill the viewport (the iOS
+          Settings app presentation). Desktop (md+): slides in from
+          the left as a 360px sidebar. The two animations are
+          independent CSS classes so the swap is breakpoint-clean —
+          the mobile sheet never shows on desktop and vice versa. */}
       <aside
-        // ``bg-bg-app/95`` matches the app shell (slate-950) at 95%
-        // opacity so the blur underneath is visible at the panel
-        // edges. ``shadow-2xl`` casts a deeper shadow than the old
-        // ``shadow-xl`` because the panel is wider and the blur
-        // invites more attention to the panel's edge.
-        className={`fixed top-0 left-0 z-40 h-full w-72 bg-bg-app/95 border-r border-slate-800 backdrop-blur-md shadow-2xl transform transition-transform flex flex-col ${open ? 'translate-x-0' : '-translate-x-full'}`}
+        aria-label="menu"
+        className={`fixed z-40 bg-bg-app shadow-2xl flex flex-col
+                    inset-x-0 bottom-0 top-auto h-[90vh] rounded-t-ios-lg
+                    md:inset-y-0 md:left-0 md:top-0 md:right-auto md:h-full md:w-[360px] md:rounded-none
+                    transition-transform duration-300 ease-out
+                    md:translate-x-0
+                    ${open
+                      ? 'translate-y-0 md:translate-x-0'
+                      : 'translate-y-full md:-translate-x-full'
+                    }`}
       >
-        <div className="flex items-center justify-between p-4 border-b border-slate-800 shrink-0">
-          <h2 className="text-lg font-semibold">Popping</h2>
+        {/* Grabber on mobile — the small horizontal line at the top
+            of an iOS sheet. ``md:hidden`` because desktop drawers
+            don't show a grabber. The element is not interactive; it
+            just signals "this is a sheet you can dismiss by swiping
+            down" (a future iteration could add the swipe-down
+            dismiss gesture — for now we rely on tapping the
+            backdrop). */}
+        <div
+          aria-hidden="true"
+          className="md:hidden mx-auto mt-2 mb-1 h-1 w-10 rounded-full bg-label-tertiary"
+        />
+        {/* Header row — large title "Settings" on mobile (Apple
+            convention), or a smaller "Menu" on desktop where the
+            large-title header is already in App. Trailing Done button
+            mirrors iOS sheet dismissal. The hairlines at the bottom
+            is the standard iOS grouped-list section break. */}
+        <div className="flex items-center justify-between px-4 pt-3 pb-3 md:pt-5 md:pb-4 border-b border-hairline shrink-0">
+          <h2 className="text-2xl md:text-ios-large-title font-bold text-label-primary tracking-tight">
+            Menu
+          </h2>
           <button
             onClick={onClose}
-            className="rounded p-1 text-slate-400 hover:text-slate-100 hover:bg-slate-800"
-            aria-label="close drawer"
+            aria-label="close menu"
+            className="min-h-[32px] min-w-[32px] flex items-center justify-center rounded-ios text-accent active:bg-bg-elevated"
           >
-            ✕
+            <span className="text-ios-body font-normal">Done</span>
           </button>
         </div>
-        {/* ``min-h-0`` lets the nav actually shrink below its content
-            height — without it, ``overflow-y-auto`` is a no-op because
-            the flex item refuses to be smaller than its contents and
-            the parent grows to fit (overflowing the viewport). */}
-        <nav className="flex-1 min-h-0 p-4 space-y-4 overflow-y-auto">
-          <div>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
-              Notifications
-            </h3>
-            <div className="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs">
-              {notifError ? (
-                // Failed to fetch — show the actual error and offer
-                // a retry. Previously this silently rendered
-                // "not configured", which conflated a misconfigured
-                // backend with a transient network blip.
-                <button
-                  onClick={refetchNotif}
-                  className="text-red-300 underline decoration-dotted"
-                  title={`Error: ${notifError}`}
-                >
-                  couldn't check — tap to retry
-                </button>
-              ) : notif === null ? (
-                <span className="text-slate-500">checking…</span>
-              ) : notif.configured ? (
-                <span className="text-emerald-400">
-                  ✓ configured ({notif.backend} · {notif.scheme})
-                </span>
-              ) : (
-                <span className="text-amber-400">
-                  not configured — set APPRISE_URL or PUSHOVER_* in .env
-                </span>
-              )}
-            </div>
-          </div>
-          <div>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
-              LLM
-            </h3>
-            <LLMSection llm={llm} llmError={llmError} onChange={setLlm} onRetry={refetchLlm} />
+
+        {/* Body. ``min-h-0`` lets the nav actually shrink below its
+            content height — without it, ``overflow-y-auto`` is a
+            no-op because the flex item refuses to be smaller than
+            its contents and the parent grows to fit (overflowing
+            the viewport). ``p-4`` matches iOS grouped-list left/
+            right margins. Background ``bg-bg-app`` keeps the section
+            gaps from showing the sheet's underlying surface. */}
+        <nav className="flex-1 min-h-0 overflow-y-auto bg-bg-app pb-8">
+          <GroupedSection label="Notifications">
+            {notifError ? (
+              <GroupedRow
+                onClick={refetchNotif}
+                title="Couldn't check status"
+                subtitle={`tap to retry — ${notifError}`}
+                tone="destructive"
+              />
+            ) : notif === null ? (
+              <GroupedRow title="Notifications" subtitle="checking…" />
+            ) : notif.configured ? (
+              <GroupedRow
+                title="Configured"
+                subtitle={`${notif.backend} · ${notif.scheme}`}
+                tone="success"
+              />
+            ) : (
+              <GroupedRow
+                title="Not configured"
+                subtitle="set APPRISE_URL or PUSHOVER_* in .env"
+                tone="warning"
+              />
+            )}
+          </GroupedSection>
+
+          <GroupedSection label="LLM">
+            <LLMSection
+              llm={llm}
+              llmError={llmError}
+              onChange={setLlm}
+              onRetry={refetchLlm}
+            />
             {/* Brief tone picker — lifted state. Same UX as
                 BriefCard's pills but rendered inline in the Drawer
                 so the user can pre-pick a tone before clicking
                 "Generate brief now". */}
-            <div className="mt-2 flex items-center gap-1" role="group" aria-label="brief tone">
+            <div className="mx-4 mt-3 grid grid-cols-3 gap-0 rounded-ios overflow-hidden border border-hairline">
               {TONES.map((t) => {
                 const active = t.value === briefTone
                 return (
@@ -211,10 +259,10 @@ export function Drawer({
                     key={t.value}
                     type="button"
                     onClick={() => onBriefToneChange(t.value)}
-                    className={`flex-1 rounded px-2 py-1 text-[10px] uppercase tracking-wide transition ${
+                    className={`min-h-[44px] text-ios-body font-normal transition ${
                       active
-                        ? 'bg-blue-700 text-white'
-                        : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                        ? 'bg-bg-elevated text-accent'
+                        : 'bg-bg-surface text-label-primary active:bg-bg-elevated'
                     }`}
                     aria-pressed={active}
                   >
@@ -223,99 +271,91 @@ export function Drawer({
                 )
               })}
             </div>
-            <button
-              onClick={async () => {
-                setGenError(null)
-                setGenerating(true)
-                try {
-                  await api.briefGenerate(briefTone)
-                  onClose()
-                } catch (err) {
-                  setGenError((err as Error).message)
-                } finally {
-                  setGenerating(false)
-                }
-              }}
-              disabled={generating || (llm !== null && !llm.configured)}
-              className="mt-2 w-full rounded bg-blue-800 hover:bg-blue-700 disabled:opacity-50 text-blue-100 px-3 py-1.5 text-xs"
-            >
-              {generating ? 'Generating brief…' : 'Generate brief now'}
-            </button>
-            {genError && (
-              <p className="mt-1 text-[10px] text-red-300 break-words">{genError}</p>
-            )}
-          </div>
-          <div className="pt-4 border-t border-slate-800">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Categories</h3>
-            <ul className="space-y-1">
+            <div className="px-4 pt-3">
+              <button
+                onClick={async () => {
+                  setGenError(null)
+                  setGenerating(true)
+                  try {
+                    await api.briefGenerate(briefTone)
+                    onClose()
+                  } catch (err) {
+                    setGenError((err as Error).message)
+                  } finally {
+                    setGenerating(false)
+                  }
+                }}
+                disabled={generating || (llm !== null && !llm.configured)}
+                className="w-full min-h-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white text-ios-body font-medium"
+              >
+                {generating ? 'Generating brief…' : 'Generate brief now'}
+              </button>
+              {genError && (
+                <p className="mt-2 text-ios-caption text-red-400 break-words">
+                  {genError}
+                </p>
+              )}
+            </div>
+          </GroupedSection>
+
+          {categories.length > 0 && (
+            <GroupedSection label="Jump to column">
               {categories.map((c) => (
-                // Each category is now a real button. Tap → close
-                // drawer and scroll the desktop grid to that column.
-                // On mobile the column-swipe is the primary nav, so
-                // this is best-effort: App's handler can be a no-op
-                // on mobile.
-                <li key={c}>
-                  <button
-                    onClick={() => {
-                      onCategoryJump?.(c)
-                      onClose()
-                    }}
-                    className="w-full text-left rounded px-2 py-1 text-sm text-slate-200 hover:bg-slate-800"
-                  >
-                    {c}
-                  </button>
-                </li>
+                // Each category is its own row. Tap → close drawer
+                // and scroll the desktop grid to that column.
+                <GroupedRow
+                  key={c}
+                  title={c}
+                  onClick={() => {
+                    onCategoryJump?.(c)
+                    onClose()
+                  }}
+                  showChevron
+                />
               ))}
-            </ul>
-          </div>
-          <div className="pt-4 border-t border-slate-800">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Feeds</h3>
+            </GroupedSection>
+          )}
+
+          <GroupedSection label="Feeds">
             <FeedManager
               sources={sources}
               onRefresh={refetchSources}
               onError={onError}
             />
-          </div>
-          <div className="pt-4 border-t border-slate-800">
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Sources <span className="text-slate-600 normal-case font-normal">— tap to filter</span>
-              </h3>
-            </div>
-            {/* Filtering summary — surfaces the active set at the top
-                of the Sources section so the user can confirm what's
-                applied without scrolling back to the chip-bar in the
-                header. Hidden when the set is empty; the "clear all"
-                button is the only purpose this header serves while
-                a filter is active. */}
-            {activeSources.size > 0 && (
-              <div className="mb-2 rounded border border-blue-900/60 bg-blue-950/40 px-2 py-1.5 text-xs flex items-center gap-2">
-                <span className="text-blue-200 truncate min-w-0">
-                  filtering: {Array.from(activeSources).join(', ')}
-                </span>
-                {onClearAllFilters && (
-                  <button
-                    onClick={onClearAllFilters}
-                    className="shrink-0 ml-auto text-[10px] text-blue-300 hover:text-blue-100 underline decoration-dotted"
-                    aria-label="clear all source filters"
-                  >
-                    clear
-                  </button>
-                )}
-              </div>
-            )}
+          </GroupedSection>
+
+          <GroupedSection
+            label="Sources"
+            footnote={
+              activeSources.size > 0
+                ? `filtering: ${Array.from(activeSources).join(', ')}`
+                : undefined
+            }
+            action={
+              activeSources.size > 0 && onClearAllFilters ? (
+                <button
+                  onClick={onClearAllFilters}
+                  aria-label="clear all source filters"
+                  className="text-ios-body text-accent active:opacity-60"
+                >
+                  Clear
+                </button>
+              ) : undefined
+            }
+          >
             {sourcesError ? (
-              <button
+              <GroupedRow
                 onClick={refetchSources}
-                className="text-xs text-red-300 underline decoration-dotted"
-                title={`Error: ${sourcesError}`}
-              >
-                couldn't load sources — tap to retry
-              </button>
+                title="Couldn't load sources"
+                subtitle={`tap to retry — ${sourcesError}`}
+                tone="destructive"
+              />
             ) : sources.length === 0 ? (
-              <p className="text-xs text-slate-500 italic">loading…</p>
+              <p className="px-4 py-3 text-ios-body text-label-secondary">
+                loading…
+              </p>
             ) : (
-              // The Sources list is now a checkbox list, not a button
+              // The Sources list is a checkbox list, not a button
               // list. Visually honest: each row is a checkbox + label,
               // so the multi-select semantics match what the chip-bar
               // in the header does. ``<label>`` makes the entire row
@@ -325,44 +365,173 @@ export function Drawer({
               // filtered dashboard immediately — subsequent taps don't
               // close, so they can keep picking without the panel
               // ping-ponging shut.
-              <ul className="space-y-1">
+              <>
                 {sources.map((s) => {
                   const active = activeSources.has(s.name)
                   return (
-                    <li key={s.id}>
-                      <label
-                        className={`w-full rounded px-2 py-1 text-sm flex items-center gap-2 cursor-pointer transition ${
-                          active
-                            ? 'bg-slate-700 text-white'
-                            : 'text-slate-200 hover:bg-slate-800'
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={active}
-                          onChange={() => onSourceToggle(s.name)}
-                          // Visually hidden but kept in the DOM so
-                          // screen readers announce state correctly.
-                          // ``accent-blue-500`` colors the native check
-                          // mark to match the rest of the UI.
-                          className="shrink-0 h-3.5 w-3.5 accent-blue-500"
-                          aria-label={`filter by ${s.name}`}
-                        />
-                        {/* SourceIcon. Falls back to a colored letter
-                            when the favicon hasn't been fetched yet. */}
-                        <SourceIcon src={s.favicon_path} name={s.name} size={14} />
-                        <span className="truncate">{s.name}</span>
-                        <span className="text-xs text-slate-500 shrink-0 ml-auto">{s.category}</span>
-                      </label>
-                    </li>
+                    <label
+                      key={s.id}
+                      className={`flex items-center gap-3 px-4 min-h-[44px] cursor-pointer transition border-b border-hairline last:border-b-0 ${
+                        active ? 'bg-bg-elevated' : 'active:bg-bg-elevated'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={active}
+                        onChange={() => onSourceToggle(s.name)}
+                        className="shrink-0 h-4 w-4 accent-accent"
+                        aria-label={`filter by ${s.name}`}
+                      />
+                      {/* SourceIcon. Falls back to a colored letter
+                          when the favicon hasn't been fetched yet. */}
+                      <SourceIcon src={s.favicon_path} name={s.name} size={18} />
+                      <span className="flex-1 min-w-0 truncate text-ios-body text-label-primary">
+                        {s.name}
+                      </span>
+                      <span className="shrink-0 text-ios-caption text-label-tertiary">
+                        {s.category}
+                      </span>
+                    </label>
                   )
                 })}
-              </ul>
+              </>
             )}
-          </div>
+          </GroupedSection>
         </nav>
       </aside>
     </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// iOS grouped-list primitives
+// ---------------------------------------------------------------------------
+
+// Section. The iOS convention is to render an uppercase label in
+// ``text-label-tertiary`` above a rounded card of rows. The label has
+// generous left/right padding (``px-4``) and a small bottom margin.
+// The card is a single rounded ``bg-bg-surface`` block; rows inside
+// are separated by ``border-hairline`` so dividers extend to the
+// edges of the card (not full bleed). ``footnote`` sits below the
+// card in ``text-ios-caption text-label-secondary`` — useful for
+// explanatory copy (e.g. "filtering: reuters, hackernews").
+//
+// ``action`` (e.g. a "Clear" button) renders on the right side of
+// the label row, like the "Edit" button next to the "Reminders"
+// header in iOS Settings.
+function GroupedSection({
+  label,
+  footnote,
+  action,
+  children,
+}: {
+  label: string
+  footnote?: string
+  action?: React.ReactNode
+  children: React.ReactNode
+}) {
+  return (
+    <div className="mt-6 first:mt-2">
+      <div className="flex items-end justify-between px-4 mb-2">
+        <h3 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
+          {label}
+        </h3>
+        {action}
+      </div>
+      {/* The rows go inside a single rounded card so the iOS grouped-
+          list visual works: rounded card on the page, hairline
+          dividers between rows, no outside border. ``overflow-hidden``
+          keeps the first/last row from poking past the card corners. */}
+      <div className="mx-4 rounded-ios bg-bg-surface overflow-hidden">
+        {children}
+      </div>
+      {footnote && (
+        <p className="px-4 mt-2 text-ios-caption text-label-secondary">
+          {footnote}
+        </p>
+      )}
+    </div>
+  )
+}
+
+// Single iOS-style row. ``title`` is the primary text, ``subtitle``
+// is the secondary line beneath it (font-300, ``label-secondary``).
+// Renders as a 44px-tall button when ``onClick`` is set — the entire
+// row is the tap target. When used as a static display (no
+// ``onClick``) it falls back to a non-button ``<div>``.
+//
+// ``tone`` recolors the chevron-area / title when there's a state to
+// surface (success / warning / destructive) — iOS uses these for
+// health-check rows in Settings → Battery, for example.
+function GroupedRow({
+  title,
+  subtitle,
+  onClick,
+  showChevron,
+  tone,
+}: {
+  title: React.ReactNode
+  subtitle?: React.ReactNode
+  onClick?: () => void
+  showChevron?: boolean
+  tone?: 'success' | 'warning' | 'destructive'
+}) {
+  const toneClass =
+    tone === 'success'
+      ? 'text-emerald-400'
+      : tone === 'warning'
+      ? 'text-amber-400'
+      : tone === 'destructive'
+      ? 'text-red-400'
+      : 'text-label-primary'
+  const content = (
+    <>
+      <div className="flex-1 min-w-0">
+        <div className={`text-ios-body ${toneClass} truncate`}>{title}</div>
+        {subtitle && (
+          <div className="text-ios-caption text-label-secondary truncate">
+            {subtitle}
+          </div>
+        )}
+      </div>
+      {showChevron && (
+        <ChevronRight className="shrink-0 w-4 h-4 text-label-tertiary" />
+      )}
+    </>
+  )
+  const baseClass =
+    'flex items-center gap-3 px-4 min-h-[44px] border-b border-hairline last:border-b-0'
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        className={`${baseClass} w-full text-left active:bg-bg-elevated`}
+      >
+        {content}
+      </button>
+    )
+  }
+  return <div className={baseClass}>{content}</div>
+}
+
+// iOS chevron — used for navigation rows. Right-pointing, single 1.5
+// stroke. Pulled inline (rather than into an icon library) because
+// the Drawer is the only consumer.
+function ChevronRight({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <polyline points="9 6 15 12 9 18" />
+    </svg>
   )
 }
 
@@ -557,43 +726,69 @@ function LLMSection({
 
   return (
     <>
-      <div className="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs flex items-center justify-between gap-2">
+      {/* LLM status + edit affordance. Sits at the top of the LLM
+          grouped section as a single iOS-style row — title is the
+          status text, the trailing "edit" button is the secondary
+          affordance. */}
+      <div className="flex items-center gap-3 px-4 min-h-[44px] border-b border-hairline">
         {llmError ? (
           // Same shape as the notifications chip — error path with
           // a tap-to-retry affordance.
           <button
             onClick={onRetry}
-            className="text-red-300 underline decoration-dotted truncate text-left"
+            className="flex-1 min-w-0 text-left text-red-400 active:bg-bg-elevated"
             title={`Error: ${llmError}`}
           >
-            couldn't check — tap to retry
+            <div className="text-ios-body truncate">Couldn't check</div>
+            <div className="text-ios-caption text-label-secondary truncate">
+              tap to retry
+            </div>
           </button>
         ) : llm === null ? (
-          <span className="text-slate-500">checking…</span>
+          <div className="flex-1 min-w-0">
+            <div className="text-ios-body text-label-primary truncate">LLM</div>
+            <div className="text-ios-caption text-label-secondary truncate">
+              checking…
+            </div>
+          </div>
         ) : llm.configured ? (
-          <span className="text-emerald-400 truncate">
-            ✓ {llm.backend} · {llm.model}
-          </span>
+          <div className="flex-1 min-w-0">
+            <div className="text-ios-body text-label-primary truncate">
+              {llm.backend}
+            </div>
+            <div className="text-ios-caption text-label-secondary truncate">
+              {llm.model}
+            </div>
+          </div>
         ) : (
-          <span className="text-amber-400">no LLM provider configured</span>
+          <div className="flex-1 min-w-0">
+            <div className="text-ios-body text-amber-400 truncate">
+              Not configured
+            </div>
+            <div className="text-ios-caption text-label-secondary truncate">
+              set LLM env vars in .env
+            </div>
+          </div>
         )}
         <button
           onClick={openPicker}
-          className="shrink-0 rounded px-2 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+          className="shrink-0 text-ios-body text-accent active:opacity-60"
           aria-label="edit LLM settings"
         >
-          {pickerOpen ? 'close' : 'change'}
+          {pickerOpen ? 'Close' : 'Edit'}
         </button>
       </div>
 
       {pickerOpen && (
-        <div className="mt-2 rounded border border-slate-800 bg-slate-950 p-3 space-y-2 text-xs">
+        <div className="px-4 py-3 space-y-3 text-ios-body border-b border-hairline">
           <div>
-            <label className="block text-slate-400 mb-1">Provider</label>
+            <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
+              Provider
+            </label>
             <select
               value={provider}
               onChange={(e) => setProvider(e.target.value)}
-              className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
+              className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
             >
               {PROVIDER_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>
@@ -604,22 +799,24 @@ function LLMSection({
           </div>
           <div>
             <div className="flex items-center justify-between mb-1">
-              <label className="text-slate-400">Model (brief)</label>
+              <label className="text-ios-caption uppercase tracking-wide text-label-tertiary">
+                Model (brief)
+              </label>
               <button
                 onClick={refreshTags}
                 disabled={tagsLoading}
-                className="text-[10px] text-slate-400 hover:text-slate-100 disabled:opacity-50"
+                className="text-ios-caption text-accent disabled:opacity-40"
               >
                 {tagsLoading ? 'refreshing…' : 'refresh list'}
               </button>
             </div>
             {tagsError ? (
-              <p className="text-[10px] text-amber-400 break-words mb-1">
+              <p className="text-ios-caption text-amber-400 break-words mb-1">
                 couldn’t load model list: {tagsError}
               </p>
             ) : null}
             {tags?.stale ? (
-              <p className="text-[10px] text-amber-400 mb-1">
+              <p className="text-ios-caption text-amber-400 mb-1">
                 showing cached list (live fetch failed)
               </p>
             ) : null}
@@ -633,13 +830,13 @@ function LLMSection({
                   setModelBrief(e.target.value)
                 }}
                 placeholder="model name, e.g. gpt-oss:120b"
-                className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 placeholder:text-slate-600"
+                className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
               />
             ) : (
               <select
                 value={modelBrief}
                 onChange={(e) => setModelBrief(e.target.value)}
-                className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
+                className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
               >
                 <option value="">— pick a model —</option>
                 {tagOptions.map((m) => {
@@ -660,7 +857,7 @@ function LLMSection({
               </select>
             )}
             {hasRecommendations && tagOptions.length > 0 && (
-              <p className="mt-1 text-[10px] text-slate-500">
+              <p className="mt-1 text-ios-caption text-label-secondary">
                 ★ = recommended for Ollama Cloud
               </p>
             )}
@@ -678,14 +875,16 @@ function LLMSection({
                     setFreeTextBrief(modelBrief)
                   }
                 }}
-                className="mt-1 text-[10px] text-slate-400 hover:text-slate-100"
+                className="mt-1 text-ios-caption text-accent active:opacity-60"
               >
                 {useFreeText ? '← back to list' : 'type a name instead'}
               </button>
             )}
           </div>
           <div>
-            <label className="block text-slate-400 mb-1">Model (scoring)</label>
+            <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
+              Model (scoring)
+            </label>
             {scoringOptions.length === 0 ? (
               // No tags yet (initial load before fetch lands, or fetch
               // failed, or pinned to a non-Ollama provider). Plain text
@@ -695,13 +894,13 @@ function LLMSection({
                 value={modelScoring}
                 onChange={(e) => setModelScoring(e.target.value)}
                 placeholder="env default (or model name)"
-                className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 placeholder:text-slate-600"
+                className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
               />
             ) : (
               <select
                 value={modelScoring}
                 onChange={(e) => setModelScoring(e.target.value)}
-                className="w-full rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100"
+                className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
               >
                 {/* Sentinel maps to ``""`` on save, which the backend
                     treats as "delete the runtime override → fall back
@@ -722,29 +921,29 @@ function LLMSection({
               </select>
             )}
             {hasScoringRecommendations && scoringOptions.length > 0 && (
-              <p className="mt-1 text-[10px] text-slate-500">
+              <p className="mt-1 text-ios-caption text-label-secondary">
                 ★ = recommended for scoring
               </p>
             )}
           </div>
-          {saveError && <p className="text-[10px] text-red-300 break-words">{saveError}</p>}
+          {saveError && <p className="text-ios-caption text-red-400 break-words">{saveError}</p>}
           <div className="flex gap-2 pt-1">
             <button
               onClick={save}
               disabled={saving}
-              className="flex-1 rounded bg-blue-800 hover:bg-blue-700 disabled:opacity-50 text-blue-100 px-2 py-1"
+              className="flex-1 min-h-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white"
             >
               {saving ? 'saving…' : 'save'}
             </button>
             <button
               onClick={() => setPickerOpen(false)}
               disabled={saving}
-              className="flex-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 px-2 py-1"
+              className="flex-1 min-h-[44px] rounded-ios bg-bg-elevated active:opacity-60 disabled:opacity-40 text-label-primary"
             >
               cancel
             </button>
           </div>
-          <p className="text-[10px] text-slate-500 leading-snug">
+          <p className="text-ios-caption text-label-secondary leading-snug">
             Changes apply immediately — no restart needed. An empty
             value resets to the env default.
           </p>

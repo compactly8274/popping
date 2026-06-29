@@ -181,10 +181,10 @@ function TonePicker({
               e.stopPropagation()
               onToneChange(t.value)
             }}
-            className={`shrink-0 rounded px-2 py-1 text-[10px] uppercase tracking-wide transition disabled:opacity-50 ${
+            className={`shrink-0 min-h-[28px] rounded-ios px-3 text-ios-body transition disabled:opacity-40 ${
               active
-                ? 'bg-blue-700 text-white'
-                : 'bg-slate-800 text-slate-300 active:bg-slate-700 [@media(hover:hover)]:hover:bg-slate-700'
+                ? 'bg-bg-elevated text-accent'
+                : 'text-label-primary active:bg-bg-elevated'
             }`}
             aria-pressed={active}
           >
@@ -286,7 +286,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
 
   if (!brief) {
     return (
-      <section className="border-b border-slate-800 bg-gradient-to-r from-slate-900/80 via-slate-900/60 to-slate-900/30">
+      <section className="border-b border-hairline bg-bg-app">
         <div
           role="button"
           tabIndex={0}
@@ -299,26 +299,20 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
               toggleCollapsed()
             }
           }}
-          className="px-4 py-3 flex items-center gap-3 cursor-pointer select-none"
+          className="px-4 py-3 flex items-center gap-3 cursor-pointer select-none min-h-[44px]"
         >
-          {/* Chevron — finger-sized. Hover/active only on devices that
-              actually have a hover capability; touch devices that
-              leave :hover stuck on after a tap won't get a lingering
-              background. */}
           <span
             aria-hidden="true"
-            className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded text-slate-400 active:bg-slate-800/60 [@media(hover:hover)]:hover:bg-slate-800/60"
+            className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded-ios text-accent active:bg-bg-elevated"
           >
-            <span className="text-base leading-none">
-              {collapsed ? '▸' : '▾'}
-            </span>
+            <ChevronIcon className="w-4 h-4" collapsed={collapsed} />
           </span>
           <div className="flex-1 min-w-0">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
+            <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
               The Brief
             </h2>
             {!collapsed && (
-              <p className="text-xs text-slate-500 mt-0.5">
+              <p className="text-ios-body text-label-secondary mt-0.5">
                 No brief generated yet for today.
               </p>
             )}
@@ -338,13 +332,13 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
             data-brief-action="generate"
             onClick={onGenerate}
             disabled={generating}
-            className="shrink-0 min-h-[44px] rounded px-3 py-1.5 text-sm bg-blue-700 active:bg-blue-800 disabled:opacity-50 text-white [@media(hover:hover)]:hover:bg-blue-600"
+            className="shrink-0 min-h-[44px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
           >
-            {generating ? 'Generating…' : "Generate today's brief"}
+            {generating ? '…' : "Generate"}
           </button>
         </div>
         {!collapsed && error && (
-          <p className="px-4 pb-3 text-xs text-red-300">{error}</p>
+          <p className="px-4 pb-3 text-ios-caption text-red-400">{error}</p>
         )}
       </section>
     )
@@ -353,7 +347,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
   const parsed = parse(brief.content)
 
   return (
-    <section className="border-b border-slate-800 bg-gradient-to-r from-slate-900/80 via-slate-900/60 to-slate-900/30">
+    <section className="border-b border-hairline bg-bg-app">
       {/* Header row. The whole element is the toggle target — chevron,
           title, tone badge, timestamp — but Regenerate is a child
           marked ``data-brief-action`` so it bypasses the toggle. */}
@@ -374,13 +368,11 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
         <div className="flex items-center gap-2 min-w-0">
           <span
             aria-hidden="true"
-            className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded text-slate-400 active:bg-slate-800/60 [@media(hover:hover)]:hover:bg-slate-800/60"
+            className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded-ios text-accent active:bg-bg-elevated"
           >
-            <span className="text-base leading-none">
-              {collapsed ? '▸' : '▾'}
-            </span>
+            <ChevronIcon className="w-4 h-4" collapsed={collapsed} />
           </span>
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
+          <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
             The Brief
           </h2>
           {/* "TODAY'S BRIEF" pill. Anchors the brief as a
@@ -391,10 +383,10 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
               naturally. */}
           <span
             data-brief-action="today-pill"
-            className="inline-flex items-center gap-1 rounded-full bg-accent-soft border border-blue-800/40 px-2 py-0.5 text-[10px] uppercase tracking-wide text-blue-300"
+            className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-ios-caption uppercase tracking-wide text-accent"
             title="the most recent brief"
           >
-            <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-blue-400" />
+            <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-accent" />
             today's
           </span>
           {/* Tone picker replaces the static tone badge — the badge
@@ -406,7 +398,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
             disabled={generating}
           />
         </div>
-        <div className="flex items-center gap-2 text-xs text-slate-500 shrink-0">
+        <div className="flex items-center gap-2 text-ios-caption text-label-secondary shrink-0">
           <span title={brief.generated_at}>
             {/* "generated " prefix only on sm+; saves ~70px on mobile
                 so the Regenerate button isn't pushed off-screen. */}
@@ -417,7 +409,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
             data-brief-action="regenerate"
             onClick={onGenerate}
             disabled={generating}
-            className="min-h-[44px] rounded px-3 py-1.5 text-xs bg-slate-800 active:bg-slate-700 disabled:opacity-50 text-slate-200 [@media(hover:hover)]:hover:bg-slate-700"
+            className="min-h-[36px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
           >
             {generating ? '…' : 'Regenerate'}
           </button>
@@ -430,12 +422,12 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
               what the user reads first, and it's the line the model
               was asked to write most carefully. */}
           {parsed.oneSentence && (
-            <p className="text-lg sm:text-xl font-semibold leading-snug text-white">
+            <p className="text-lg sm:text-xl font-semibold leading-snug text-label-primary">
               {parsed.oneSentence}
             </p>
           )}
           {parsed.highlights.length > 0 && (
-            <ul className="space-y-1.5 text-sm text-slate-200 list-none">
+            <ul className="space-y-1.5 text-ios-body text-label-primary list-none">
               {parsed.highlights.map((h, i) => (
                 // Accent dot replaces the text bullet. ``items-start``
                 // so the dot sits aligned to the first line of the
@@ -443,7 +435,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
                 <li key={i} className="flex items-start gap-2">
                   <span
                     aria-hidden="true"
-                    className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-blue-400"
+                    className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
                   />
                   <span>{h}</span>
                 </li>
@@ -452,15 +444,15 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
           )}
           {parsed.watch.length > 0 && (
             <div className="pt-1">
-              <h3 className="text-[10px] font-semibold uppercase tracking-wide text-slate-400 mb-1">
+              <h3 className="text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
                 Watch
               </h3>
-              <ul className="space-y-0.5 text-xs text-slate-400 list-none">
+              <ul className="space-y-0.5 text-ios-caption text-label-secondary list-none">
                 {parsed.watch.map((w, i) => (
                   <li key={i} className="flex items-start gap-2">
                     <span
                       aria-hidden="true"
-                      className="mt-1 h-1 w-1 shrink-0 rounded-full bg-slate-500"
+                      className="mt-1 h-1 w-1 shrink-0 rounded-full bg-label-tertiary"
                     />
                     <span>{w}</span>
                   </li>
@@ -477,9 +469,29 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
               but it should require explicit opt-in (a flag on the
               parsed result, e.g. ``parsed.hasUsefulRemainder``)
               rather than render any leftover text by default. */}
-          {error && <p className="text-xs text-red-300">{error}</p>}
+          {error && <p className="text-ios-caption text-red-400">{error}</p>}
         </div>
       )}
     </section>
+  )
+}
+
+// Small chevron used as the BriefCard expand/collapse indicator.
+// Rendered with a single CSS transform so the animation is purely
+// GPU-driven and feels native.
+function ChevronIcon({ className, collapsed }: { className?: string; collapsed?: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`${className ?? ''} transition-transform duration-200 ${collapsed ? '' : 'rotate-90'}`}
+      aria-hidden="true"
+    >
+      <polyline points="9 6 15 12 9 18" />
+    </svg>
   )
 }

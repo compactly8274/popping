@@ -41,52 +41,58 @@ export function LoginPage({ returnTo, onSignedIn }: Props) {
   }
 
   return (
-    <div className="h-full flex items-center justify-center p-6">
-      <div className="w-full max-w-sm bg-slate-900 rounded-lg border border-slate-800 p-6 shadow-xl">
-        <h1 className="text-xl font-bold mb-1">Popping</h1>
-        <p className="text-sm text-slate-400 mb-6">Sign in to continue</p>
+    <div className="h-full flex items-center justify-center p-6 bg-bg-app">
+      <div className="w-full max-w-sm rounded-ios-lg bg-bg-surface border border-hairline p-6 shadow-2xl">
+        <h1 className="text-ios-large-title font-bold mb-1 text-label-primary tracking-tight">
+          Popping
+        </h1>
+        <p className="text-ios-body text-label-secondary mb-6">Sign in to continue</p>
 
         {/* OIDC: navigate, not submit — the IdP drives the roundtrip. */}
         <a
           href={api.loginUrl(returnTo)}
-          className="block w-full text-center rounded px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-medium"
+          className="block w-full text-center min-h-[44px] leading-[44px] rounded-ios bg-accent active:opacity-80 text-white text-ios-body font-medium"
         >
           Sign in with OIDC
         </a>
 
         {localAvailable && (
           <>
-            <div className="flex items-center gap-3 my-5 text-xs text-slate-500">
-              <div className="flex-1 h-px bg-slate-800" />
+            <div className="flex items-center gap-3 my-5 text-ios-caption text-label-secondary">
+              <div className="flex-1 h-px bg-hairline" />
               <span>or</span>
-              <div className="flex-1 h-px bg-slate-800" />
+              <div className="flex-1 h-px bg-hairline" />
             </div>
 
             <form onSubmit={onSubmitLocal} className="space-y-3">
               <label className="block">
-                <span className="text-xs text-slate-400">Username</span>
+                <span className="text-ios-caption uppercase tracking-wide text-label-tertiary">
+                  Username
+                </span>
                 <input
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   autoComplete="username"
-                  className="mt-1 w-full rounded bg-slate-950 border border-slate-800 px-3 py-2 text-sm focus:outline-none focus:border-slate-600"
+                  className="mt-1 w-full min-h-[44px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-body text-label-primary placeholder:text-label-tertiary focus:outline-none focus:border-accent"
                 />
               </label>
               <label className="block">
-                <span className="text-xs text-slate-400">Password</span>
+                <span className="text-ios-caption uppercase tracking-wide text-label-tertiary">
+                  Password
+                </span>
                 <input
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   autoComplete="current-password"
-                  className="mt-1 w-full rounded bg-slate-950 border border-slate-800 px-3 py-2 text-sm focus:outline-none focus:border-slate-600"
+                  className="mt-1 w-full min-h-[44px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-body text-label-primary placeholder:text-label-tertiary focus:outline-none focus:border-accent"
                 />
               </label>
               <button
                 type="submit"
                 disabled={busy || !username || !password}
-                className="w-full rounded px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 text-sm font-medium disabled:opacity-50"
+                className="w-full min-h-[44px] rounded-ios bg-bg-elevated active:bg-bg-surface text-label-primary text-ios-body font-medium disabled:opacity-40"
               >
                 {busy ? 'Signing in…' : 'Sign in'}
               </button>
@@ -95,7 +101,7 @@ export function LoginPage({ returnTo, onSignedIn }: Props) {
         )}
 
         {err && (
-          <div className="mt-4 px-3 py-2 rounded bg-red-900/40 border border-red-800 text-xs text-red-200">
+          <div className="mt-4 px-3 py-2 rounded-ios bg-red-500/15 border border-red-500/40 text-ios-caption text-red-200">
             {err}
           </div>
         )}

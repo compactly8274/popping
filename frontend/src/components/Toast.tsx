@@ -49,10 +49,14 @@ export function ToastHost() {
   }, [current])
 
   if (!current) return null
+  // Two-tone color scheme. Errors use a warm red fill so the toast
+  // reads as a "things went wrong" signal even from across the
+  // screen; the default toast is a translucent elevated card so it
+  // blends with the iOS-style surface palette.
   const color =
     current.kind === 'error'
-      ? 'bg-red-900/80 border-red-700 text-red-100'
-      : 'bg-slate-800/95 border-slate-700 text-slate-100'
+      ? 'bg-red-500/15 border-red-500/40 text-red-100 supports-[backdrop-filter]:backdrop-blur'
+      : 'bg-bg-elevated/95 border-hairline text-label-primary supports-[backdrop-filter]:backdrop-blur'
 
   return (
     <div
@@ -64,7 +68,7 @@ export function ToastHost() {
       className="fixed inset-x-0 bottom-6 z-50 flex justify-center pointer-events-none"
     >
       <div
-        className={`pointer-events-auto rounded border px-4 py-2 text-sm shadow-lg backdrop-blur ${color}`}
+        className={`pointer-events-auto rounded-ios border px-4 py-2 text-ios-body shadow-glow-md ${color}`}
       >
         {current.message}
       </div>

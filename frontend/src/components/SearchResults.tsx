@@ -17,17 +17,17 @@ type Props = {
 export function SearchResults({ query, entries, sourcesById }: Props) {
   return (
     <section className="flex flex-col h-full overflow-hidden">
-      <header className="flex items-center justify-between px-1 pb-2">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
+      <header className="flex items-center justify-between px-1 pb-2 border-b border-hairline">
+        <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
           Search results
         </h2>
-        <span className="text-xs text-slate-500">
+        <span className="text-ios-caption text-label-secondary">
           {entries.length} for "{query}"
         </span>
       </header>
       <div className="flex-1 overflow-y-auto space-y-2 pr-1">
         {entries.length === 0 ? (
-          <p className="text-sm text-slate-500 italic px-1">
+          <p className="text-ios-body text-label-secondary italic px-1">
             no matches — try a different keyword
           </p>
         ) : (
