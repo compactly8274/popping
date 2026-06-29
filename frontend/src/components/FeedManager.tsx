@@ -723,6 +723,11 @@ type Recommendation = {
   category: string
   url: string
   blurb: string
+  // Optional HTTP header overrides pre-applied at Add time. Set
+  // on entries whose CDN blocks our default ``Popping/0.2`` UA
+  // (CBC). The frontend passes them through to ``POST /api/sources``
+  // as ``custom_headers`` — no extra click needed.
+  default_headers?: Record<string, string> | null
 }
 
 function RecommendedTab({
@@ -771,6 +776,12 @@ function RecommendedTab({
         category: rec.category,
         url: rec.url,
         refresh_interval_seconds: 3600,
+        // Recommendation-supplied header overrides (e.g. CBC's
+        // browser UA). Falls through to the route's ``None``
+        // branch when the recommendation doesn't ship one —
+        // omitting the field leaves ``custom_headers`` at the
+        // backend default (empty map → use source-plugin defaults).
+        custom_headers: rec.default_headers ?? undefined,
       })
       await onAdded()
       // Optimistically remove from the local list so the row

@@ -110,16 +110,26 @@ RECOMMENDATIONS: list[dict] = [
     {
         # CBC's CDN hangs the connection when our default
         # ``Popping/0.2`` User-Agent identifies the request as a
-        # scraper. The user adds the source via this list, then
-        # opens the FeedManager's edit form on the new row and
-        # pastes a browser-shaped UA into the "custom headers"
-        # JSON field — that overrides the default for just this
-        # feed. The cmlink URL is the canonical short link; the
-        # 301 resolves to ``/webfeed/rss/rss-topstories``.
+        # scraper. The recommendation ships ``default_headers``
+        # with a browser-shaped UA so the Add button is one-tap —
+        # the frontend passes it through as ``custom_headers`` at
+        # POST time. The cmlink URL is the canonical short link;
+        # the 301 resolves to ``/webfeed/rss/rss-topstories``.
         "name": "cbc_top",
         "category": "news",
         "url": "https://www.cbc.ca/cmlink/rss-topstories",
-        "blurb": "CBC Top Stories — needs a browser UA (see edit form)",
+        "blurb": "CBC Top Stories — browser UA pre-applied",
+        # Mirror the UA used by ``app.assets._BROWSER_UA``. Kept in
+        # sync by code review; the cost of drifting is just CBC
+        # coming back blocked, but it's worth surfacing the
+        # dependency in this comment. ``default_headers`` is read
+        # only by the recommended-add path in FeedManager.
+        "default_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            )
+        },
     },
     {
         "name": "nyt_world",

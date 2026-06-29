@@ -223,6 +223,13 @@ export const api = {
     category: string
     url: string
     blurb: string
+    // Optional HTTP header overrides applied on Add. Set on
+    // entries whose CDN blocks our default UA (CBC). Read by the
+    // frontend and forwarded as ``custom_headers`` to POST
+    // /api/sources. See backend/app/feed_recommendations.py
+    // for the curated list and ``schemas.FeedRecommendation`` for
+    // the wire shape.
+    default_headers?: Record<string, string> | null
   }>>('/api/feed-recommendations'),
 
   /** Personal top-N feed. Requires auth when OIDC is enabled; local

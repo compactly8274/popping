@@ -40,17 +40,30 @@ class SourceOut(BaseModel):
 
 class SourceCreate(BaseModel):
     """Body for ``POST /api/sources``. All fields required except
-    ``refresh_interval_seconds`` (defaults to 1h).
+    ``refresh_interval_seconds`` (defaults to 1h) and
+    ``custom_headers`` (defaults to None — use the source-plugin defaults).
 
     The route layer validates ``name`` against ``^[a-z0-9_]{1,120}$``
     and ``url`` against an http/https URL parse — clients get a 422
     with a clear field-level error before any DB write.
+    ``custom_headers`` is rejected if it contains Cookie / Authorization
+    or is shaped like a non-object — see ``_validate_custom_headers``
+    in ``routes.sources``. This is the escape hatch for CDNs that
+    block our default ``Popping/0.2`` User-Agent (CBC, etc.).
     """
     name: str
     type: str = "rss"
     category: str
     url: str
     refresh_interval_seconds: int = 3600
+    # Per-source HTTP header overrides merged on top of the defaults
+    # at fetch time. NULL = use defaults. Most-common use is
+    # ``{"User-Agent": "<browser UA>"}`` for CDNs that block our
+    # default UA. Validated at the route layer — without this
+    # field, the route's ``body.custom_headers`` lookup raises
+    # ``AttributeError`` and the request 500s before reaching any
+    # client-visible error message.
+    custom_headers: Optional[dict] = None
 
 
 class SourceUpdate(BaseModel):
@@ -82,11 +95,21 @@ class SourceUpdate(BaseModel):
 class FeedRecommendation(BaseModel):
     """One row of ``GET /api/feed-recommendations``. The frontend
     renders the ``name`` + ``blurb`` and shows the ``url`` only on
-    demand (e.g. long-press / copy-link)."""
+    demand (e.g. long-press / copy-link).
+
+    ``default_headers`` is an optional map of HTTP header overrides
+    pre-applied when the user taps Add on the recommendation. Today
+    only CBC needs it — the CBC CDN hangs requests with our default
+    ``Popping/0.2`` User-Agent, so the recommendation ships a
+    browser-shaped UA that the frontend passes through to
+    ``POST /api/sources`` as ``custom_headers``. Other entries
+    leave it null and the user adds the source with the default
+    UA; the route layer accepts both."""
     name: str
     category: str
     url: str
     blurb: str
+    default_headers: Optional[dict] = None
 
 
 class EntryOut(BaseModel):
