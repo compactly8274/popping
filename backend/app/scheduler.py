@@ -49,6 +49,14 @@ from app.sources.dynamic_rss import DynamicRssPlugin
 logger = logging.getLogger("popping.scheduler")
 
 _scheduler: AsyncIOScheduler | None = None
+
+# Sentinel for ``update_source``'s ``custom_headers`` parameter:
+# ``None`` is a meaningful value ("set the column to NULL / clear the
+# override") so we need a separate marker for "field absent from the
+# PATCH body, leave untouched." The route layer translates an
+# explicit ``body.custom_headers == {}`` to ``None`` and anything
+# missing to ``_UNSET``.
+_UNSET: Any = object()
 _brief_generator: Optional[BriefGenerator] = None
 
 
@@ -835,6 +843,7 @@ async def add_source(
     category: str,
     url: str,
     refresh: int,
+    custom_headers: dict | None = None,
 ) -> Source:
     """Create a Source row and register its scheduler job.
 
@@ -857,6 +866,7 @@ async def add_source(
         url=url,
         refresh_interval_seconds=refresh,
         active=True,
+        custom_headers=custom_headers,
     )
     session.add(row)
     await session.commit()
@@ -875,6 +885,7 @@ async def update_source(
     category: str | None = None,
     name: str | None = None,
     url: str | None = None,
+    custom_headers: dict | None = _UNSET,
 ) -> Source | None:
     """Apply a partial update to a Source row and reschedule if needed.
 
@@ -917,7 +928,12 @@ async def update_source(
     category_changed = category is not None and category != row.category
     name_changed = name is not None and name != row.name
     url_changed = url is not None and url != row.url
-    # ALL five fields participate in the early-return guard. The
+    # ``custom_headers`` compares order-insensitively so an idempotent
+    # PATCH with the same map doesn't trigger a scheduler rebuild.
+    headers_changed = (
+        custom_headers is not _UNSET and custom_headers != row.custom_headers
+    )
+    # ALL six fields participate in the early-return guard. The
     # original three-field version silently dropped name/url-only
     # PATCHes because the commit lives below the guard; the new
     # fields would have suffered the same bug.
@@ -927,6 +943,7 @@ async def update_source(
         or category_changed
         or name_changed
         or url_changed
+        or headers_changed
     ):
         return row
     if refresh is not None:
@@ -953,6 +970,10 @@ async def update_source(
                 )
         row.favicon_url = None
         row.favicon_path = None
+    if custom_headers is not _UNSET:
+        # Route layer has already normalized this (None → NULL,
+        # empty dict → NULL). Storing ``{}`` would be wasteful.
+        row.custom_headers = custom_headers
     await session.commit()
     await session.refresh(row)
 

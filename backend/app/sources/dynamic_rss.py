@@ -60,7 +60,12 @@ class DynamicRssPlugin(SourcePlugin):
         self.refresh_interval_seconds = source_row.refresh_interval_seconds
 
     async def fetch(self) -> list[dict]:
-        return await fetch_rss(self.url)
+        # ``custom_headers`` overrides the default User-Agent for
+        # feeds whose CDN blocks ``Popping/0.2`` (CBC). The route
+        # layer validates that headers are str→str and blocks
+        # ``Cookie`` / ``Authorization``, so we don't need to defend
+        # against abuse here.
+        return await fetch_rss(self.url, headers=self._source_row.custom_headers)
 
     def normalize(self, raw: dict) -> dict:
         # RFD-shaped sources get engagement extraction via the

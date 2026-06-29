@@ -118,7 +118,7 @@ _RSS_TIMEOUT = httpx.Timeout(
 )
 
 
-async def fetch_rss(url: str) -> list[dict]:
+async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dict]:
     """Fetch and parse any RSS/Atom feed at ``url``.
 
     Module-level helper so the class-driven ``_RssPlugin`` and the
@@ -129,6 +129,13 @@ async def fetch_rss(url: str) -> list[dict]:
     No DB / scheduler awareness here — this is a pure HTTP→list[dict]
     function that the scheduler's ``_ingest`` consumes through the
     plugin's ``fetch()`` method.
+
+    ``headers`` (optional) is merged on top of ``_DEFAULT_HEADERS``
+    so a source that blocks our default User-Agent (CBC) can be
+    unblocked by setting ``custom_headers`` on the row. Keys are
+    case-insensitive; values are sent verbatim. The route layer
+    blocks ``Cookie`` / ``Authorization`` so this can't be used to
+    forge another session.
 
     One retry on transient network errors and 5xx. CBC's CDN in
     particular has been observed to time out the first request of a
@@ -144,13 +151,17 @@ async def fetch_rss(url: str) -> list[dict]:
     a tooltip with the actual response excerpt — better than silently
     showing zero entries with no explanation.
     """
+    # Merge caller's overrides on top of defaults. httpx doesn't
+    # raise on collisions — the later key wins — so the order here
+    # is the priority order: defaults first, then overrides.
+    merged_headers = {**_DEFAULT_HEADERS, **(headers or {})}
     last_exc: Exception | None = None
     for attempt in (1, 2):
         try:
             async with httpx.AsyncClient(
                 timeout=_RSS_TIMEOUT, follow_redirects=True
             ) as client:
-                resp = await client.get(url, headers=_DEFAULT_HEADERS)
+                resp = await client.get(url, headers=merged_headers)
                 resp.raise_for_status()
             feed = feedparser.parse(resp.text)
             items: list[dict] = []

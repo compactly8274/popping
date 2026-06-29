@@ -41,6 +41,10 @@ export interface Source {
   favicon_url: string | null
   // Local path under /assets, e.g. "favicons/3.ico".
   favicon_path: string | null
+  // Per-source HTTP header overrides. NULL = use defaults.
+  // Most common use is ``{"User-Agent": "<browser UA>"}`` for CDNs
+  // that block our default ``Popping/0.2`` UA.
+  custom_headers: Record<string, string> | null
 }
 
 export interface Health {
@@ -169,6 +173,7 @@ export const api = {
     category: string
     url: string
     refresh_interval_seconds?: number
+    custom_headers?: Record<string, string> | null
   }) =>
     jsonFetch<Source>('/api/sources', {
       method: 'POST',
@@ -189,6 +194,11 @@ export const api = {
       category?: string
       name?: string
       url?: string
+      // Per-source HTTP header overrides (e.g. ``{User-Agent: ...}``).
+      // Send ``{}`` (empty object) to clear an existing override;
+      // omit the field to leave it untouched. Cookie/Authorization
+      // /Host are rejected by the backend.
+      custom_headers?: Record<string, string> | null
     },
   ) =>
     jsonFetch<Source>(`/api/sources/${id}`, {

@@ -311,6 +311,19 @@ function SourceRow({
   const [editName, setEditName] = useState(source.name)
   const [editUrl, setEditUrl] = useState(source.url)
   const [editCategory, setEditCategory] = useState(source.category)
+  // ``editHeaders`` is a JSON-string textarea. Empty string means
+  // "no override" (custom_headers column will be cleared on save);
+  // any non-empty value must parse to a ``str → str`` map. We keep
+  // it as a string rather than a parsed object because the user
+  // expects to see exactly what they typed, and showing parsed keys
+  // back to them in a different order would feel broken.
+  const [editHeaders, setEditHeaders] = useState(
+    source.custom_headers ? JSON.stringify(source.custom_headers) : '',
+  )
+  // Parse error from the last editHeaders change. Surfaced inline
+  // so the user sees why Save is disabled rather than getting a
+  // generic 422 on submit.
+  const [headersError, setHeadersError] = useState<string | null>(null)
 
   // When edit mode opens, seed the inputs from the current row. Use
   // an effect keyed on ``isEditing`` rather than re-deriving in the
@@ -322,17 +335,69 @@ function SourceRow({
       setEditName(source.name)
       setEditUrl(source.url)
       setEditCategory(source.category)
+      setEditHeaders(
+        source.custom_headers ? JSON.stringify(source.custom_headers) : '',
+      )
+      setHeadersError(null)
     }
-  }, [isEditing, source.name, source.url, source.category])
+  }, [isEditing, source.name, source.url, source.category, source.custom_headers])
+
+  // Live-validate the headers textarea. Treat empty as "no override";
+  // for non-empty, try-parse and confirm it's a flat string→string map.
+  // We do this on every keystroke so the Save button can flip between
+  // enabled and disabled without a click round-trip.
+  const parsedHeaders = (() => {
+    if (!editHeaders.trim()) return { ok: true as const, value: null as Record<string, string> | null }
+    try {
+      const parsed = JSON.parse(editHeaders)
+      if (
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        Object.entries(parsed).some(
+          ([k, v]) => typeof k !== 'string' || typeof v !== 'string',
+        )
+      ) {
+        return { ok: false as const, error: 'must be a flat {"Header": "value"} map' }
+      }
+      return { ok: true as const, value: parsed as Record<string, string> }
+    } catch (e) {
+      return { ok: false as const, error: 'invalid JSON' }
+    }
+  })()
+  // Push the error string into state so the inline error renders,
+  // but only if it changed (avoids re-renders on every keystroke
+  // when the message is the same).
+  useEffect(() => {
+    const next = parsedHeaders.ok ? null : parsedHeaders.error
+    if (next !== headersError) setHeadersError(next)
+  }, [parsedHeaders.ok, parsedHeaders.error]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const saveEdit = async () => {
     const nameChanged = editName.trim() !== source.name
     const urlChanged = editUrl.trim() !== source.url
     const categoryChanged = editCategory.trim() !== source.category
-    if (!nameChanged && !urlChanged && !categoryChanged) {
+    // Compare parsed headers against the source's current map. We
+    // parse the textarea first so trailing-whitespace differences
+    // don't accidentally trigger a no-op PATCH.
+    const headersChanged =
+      JSON.stringify(parsedHeaders.value ?? null) !==
+      JSON.stringify(source.custom_headers ?? null)
+    if (
+      !nameChanged &&
+      !urlChanged &&
+      !categoryChanged &&
+      !headersChanged
+    ) {
       // Nothing to save — close the form so the user doesn't think
       // the click was eaten by a bug.
       onCancelEdit()
+      return
+    }
+    if (!parsedHeaders.ok) {
+      // Guard against the rare race where the user clicks Save with
+      // an invalid textarea. The button is disabled when not
+      // ``parsedHeaders.ok`` but we re-check here as a safety net.
       return
     }
     setBusy(true)
@@ -341,10 +406,13 @@ function SourceRow({
         name?: string
         url?: string
         category?: string
+        // ``null`` clears the column; an object sets/replaces it.
+        custom_headers?: Record<string, string> | null
       } = {}
       if (nameChanged) body.name = editName.trim()
       if (urlChanged) body.url = editUrl.trim()
       if (categoryChanged) body.category = editCategory.trim()
+      if (headersChanged) body.custom_headers = parsedHeaders.value
       const updated = await api.updateSource(source.id, body)
       const oldName = source.name
       const newName = updated.name
@@ -417,10 +485,46 @@ function SourceRow({
             ))}
           </datalist>
         </label>
+        {/*
+          Custom HTTP headers. Hidden for built-ins — the URL is
+          locked too, and overriding headers on a built-in would
+          defeat the point of the static plugin contract. Empty
+          textarea means "use defaults"; non-empty must parse as a
+          flat str→str map. ``User-Agent`` is the only override
+          anyone realistically needs (CBC blocks our default UA),
+          but the textarea lets power users add e.g.
+          ``Accept-Language`` for region-gated feeds.
+        */}
+        {!builtIn && (
+          <label className="block">
+            <span className="text-label-tertiary text-[11px] uppercase tracking-wide">
+              custom headers (JSON)
+            </span>
+            <textarea
+              value={editHeaders}
+              onChange={(e) => setEditHeaders(e.target.value)}
+              disabled={busy}
+              rows={3}
+              spellCheck={false}
+              placeholder='{"User-Agent": "Mozilla/5.0 ..."}'
+              className="mt-0.5 w-full bg-bg-elevated border border-hairline rounded-ios px-2 py-1 text-ios-caption text-label-primary font-mono disabled:opacity-50"
+            />
+            {headersError && (
+              <span className="block text-red-400 text-[10px] mt-0.5">
+                {headersError}
+              </span>
+            )}
+            {!headersError && editHeaders.trim() && (
+              <span className="block text-label-tertiary text-[10px] mt-0.5">
+                sent on every fetch; clear to use defaults
+              </span>
+            )}
+          </label>
+        )}
         <div className="flex items-center gap-2 pt-1">
           <button
             onClick={saveEdit}
-            disabled={busy}
+            disabled={busy || !parsedHeaders.ok}
             className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
           >
             save

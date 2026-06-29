@@ -58,6 +58,19 @@ _REFRESH_MAX = 86_400
 # 500 to the client. Catching it here returns a clean 422.
 _CATEGORY_MAX = 40
 
+# Headers we refuse to let users override via ``custom_headers``.
+# ``Cookie`` / ``Authorization`` would let a multi-tenant LAN user
+# forge another user's session; ``Host`` is set by httpx from the
+# URL. The rest are accepted but rarely useful — keep the denylist
+# short and obvious so the validator is easy to audit.
+_HEADER_DENYLIST = frozenset({"cookie", "authorization", "host"})
+
+# Bound the size of an override map. Real UAs are ~120 chars; Allow
+# some headroom for ``Accept-Language`` etc. but reject obvious
+# abuse (a multi-MB blob in the DB).
+_CUSTOM_HEADERS_MAX = 20
+_HEADER_VALUE_MAX = 512
+
 
 def _validate_name(name: str) -> None:
     if not _NAME_RE.match(name):
@@ -102,6 +115,44 @@ def _validate_category(value: str) -> None:
             status_code=422,
             detail=f"category must be {_CATEGORY_MAX} characters or fewer",
         )
+
+
+def _validate_custom_headers(value: dict | None) -> dict | None:
+    """Validate the ``custom_headers`` payload. Returns a fresh dict
+    (or None) ready for persistence. Keys are case-insensitive —
+    httpx sends them verbatim but most servers normalize on lookup.
+    Empty dict becomes NULL so an explicit "clear the override" PATCH
+    doesn't keep a useless empty map in the DB."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=422, detail="custom_headers must be a JSON object"
+        )
+    if len(value) > _CUSTOM_HEADERS_MAX:
+        raise HTTPException(
+            status_code=422,
+            detail=f"custom_headers may have at most {_CUSTOM_HEADERS_MAX} entries",
+        )
+    out: dict[str, str] = {}
+    for k, v in value.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise HTTPException(
+                status_code=422,
+                detail="custom_headers keys and values must be strings",
+            )
+        if k.lower() in _HEADER_DENYLIST:
+            raise HTTPException(
+                status_code=422,
+                detail=f"header {k!r} cannot be overridden per-source",
+            )
+        if len(v) > _HEADER_VALUE_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=f"header {k!r} value exceeds {_HEADER_VALUE_MAX} chars",
+            )
+        out[k] = v
+    return out or None
 
 
 # --- GETs (read-only, public) --------------------------------------------
@@ -153,6 +204,7 @@ async def create_source_endpoint(
         )
     _validate_category(body.category)
     refresh = _validate_refresh(body.refresh_interval_seconds)
+    headers = _validate_custom_headers(body.custom_headers)
     row = await scheduler.add_source(
         session,
         name=body.name,
@@ -160,6 +212,7 @@ async def create_source_endpoint(
         category=body.category,
         url=body.url,
         refresh=refresh,
+        custom_headers=headers,
     )
     return SourceOut.model_validate(row)
 
@@ -197,6 +250,11 @@ async def update_source_endpoint(
         body.refresh_interval_seconds = _validate_refresh(body.refresh_interval_seconds)
     if body.category is not None:
         _validate_category(body.category)
+    headers = (
+        _validate_custom_headers(body.custom_headers)
+        if body.custom_headers is not None
+        else None
+    )
 
     # Built-in rows can be paused / re-categorized (these are
     # row-level state, not class-level). Renaming or re-URLing a
@@ -222,6 +280,7 @@ async def update_source_endpoint(
             category=body.category,
             name=body.name,
             url=body.url,
+            custom_headers=headers,
         )
     except IntegrityError:
         # Most likely cause: ``Source.name`` has a UNIQUE constraint

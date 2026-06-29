@@ -108,6 +108,20 @@ RECOMMENDATIONS: list[dict] = [
         "blurb": "Guardian world — long-running international coverage",
     },
     {
+        # CBC's CDN hangs the connection when our default
+        # ``Popping/0.2`` User-Agent identifies the request as a
+        # scraper. The user adds the source via this list, then
+        # opens the FeedManager's edit form on the new row and
+        # pastes a browser-shaped UA into the "custom headers"
+        # JSON field — that overrides the default for just this
+        # feed. The cmlink URL is the canonical short link; the
+        # 301 resolves to ``/webfeed/rss/rss-topstories``.
+        "name": "cbc_top",
+        "category": "news",
+        "url": "https://www.cbc.ca/cmlink/rss-topstories",
+        "blurb": "CBC Top Stories — needs a browser UA (see edit form)",
+    },
+    {
         "name": "nyt_world",
         "category": "news",
         "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",

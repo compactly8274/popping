@@ -59,6 +59,18 @@ class Source(Base):
     # frontend renders <img src=/assets/{favicon_path}>.
     favicon_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     favicon_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Free-form per-source HTTP header overrides. Merged on top of
+    # ``_DEFAULT_HEADERS`` (see ``app/sources/rss.py``) at fetch
+    # time. Used for feeds whose CDN blocks our default
+    # ``Popping/0.2`` User-Agent (CBC) — the user points it at a
+    # browser-shaped UA via the FeedManager's "advanced" section
+    # without changing the global UA. Validated at the route layer
+    # (``routes/sources._validate_custom_headers``): ``str → str``
+    # only, with a small denylist of headers we don't want anyone to
+    # be able to set (Cookie, Authorization, Host).
+    custom_headers: Mapped[Optional[dict]] = mapped_column(
+        postgresql.JSONB, nullable=True
+    )
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

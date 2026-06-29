@@ -26,6 +26,14 @@ class SourceOut(BaseModel):
     # Local path under /assets, e.g. "favicons/3.png".
     favicon_path: Optional[str] = None
 
+    # Local path under /assets, e.g. "favicons/3.png".
+    favicon_path: Optional[str] = None
+    # Per-source HTTP header overrides merged on top of the defaults
+    # at fetch time. NULL = use defaults. Most-common use is
+    # ``{"User-Agent": "<browser UA>"}`` for CDNs that block our
+    # default ``Popping/0.2`` UA. Validated at the route layer.
+    custom_headers: Optional[dict] = None
+
     class Config:
         from_attributes = True
 
@@ -65,6 +73,10 @@ class SourceUpdate(BaseModel):
     category: Optional[str] = None
     name: Optional[str] = None
     url: Optional[str] = None
+    # Set to ``{}`` (or empty dict) to clear an existing override.
+    # ``None`` leaves the column untouched (the PATCH endpoint
+    # treats missing fields as no-ops).
+    custom_headers: Optional[dict] = None
 
 
 class FeedRecommendation(BaseModel):
