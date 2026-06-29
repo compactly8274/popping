@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "prebuild": "node scripts/check-html-comments.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview --host 0.0.0.0"
   },
