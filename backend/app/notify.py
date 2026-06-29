@@ -19,12 +19,46 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from app.config import settings
 
 logger = logging.getLogger("popping.notify")
+
+
+def _scrub_url_for_log(raw: str) -> str:
+    """Return ``raw`` with any userinfo (``user:pass@``) stripped.
+
+    Apprise URLs are opaque credential-bearing strings
+    (``pover://userkey/appkey``, ``tgram://bottoken/chatid``,
+    ``mailto://user:pass@host``, …). Logging the raw URL writes the
+    tokens to whatever log aggregator captures the message — a
+    sequence number or stdout-shipper with broad read access is
+    enough to leak them. Replace userinfo with ``***`` and re-emit
+    so operators still see ``scheme://***@host/path`` and can
+    distinguish "auth BadURL" from "network timeout" at a glance.
+    """
+    if not raw:
+        return raw
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        # Malformed URL — return the raw string. Nothing to scrub on
+        # a parse failure anyway; logging parsers don't crash on
+        # garbage and the operator sees the same thing they'd see
+        # for any other broken input.
+        return raw
+    if not parts.netloc or "@" not in parts.netloc:
+        return raw
+    # ``netloc`` for ``user:pass@host:port`` is ``user:pass@host:port``.
+    # Split on the rightmost ``@`` so an IPv6 literal (``[::1]@host``)
+    # doesn't get its brackets mistaken for the userinfo boundary.
+    userinfo, _, hostinfo = parts.netloc.rpartition("@")
+    return urlunsplit(
+        (parts.scheme, f"***@{hostinfo}", parts.path, parts.query, parts.fragment)
+    )
 
 
 class Notifier(ABC):
@@ -63,7 +97,7 @@ class AppriseNotifier(Notifier):
         def _do() -> bool:
             ap = Apprise()
             if not ap.add(self._url):
-                logger.error("apprise: invalid URL '%s'", self._url)
+                logger.error("apprise: invalid URL '%s'", _scrub_url_for_log(self._url))
                 return False
             kwargs: dict = {"title": title, "body": body}
             if url:
@@ -75,9 +109,14 @@ class AppriseNotifier(Notifier):
         try:
             ok = await asyncio.get_running_loop().run_in_executor(None, _do)
             if not ok:
-                logger.warning("apprise: notify returned False (URL=%s)", self._url)
+                logger.warning(
+                    "apprise: notify returned False (URL=%s)",
+                    _scrub_url_for_log(self._url),
+                )
         except Exception:
-            logger.exception("apprise: send failed (URL=%s)", self._url)
+            logger.exception(
+                "apprise: send failed (URL=%s)", _scrub_url_for_log(self._url)
+            )
 
 
 class PushoverNotifier(Notifier):

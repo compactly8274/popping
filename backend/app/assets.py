@@ -36,6 +36,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from app.config import settings
+from app.url_safety import check_url_safe
 
 logger = logging.getLogger("popping.assets")
 
@@ -206,6 +207,17 @@ async def _pick_favicon_url(page_url: str) -> Optional[str]:
 
     Never raises — caller falls back to ``/favicon.ico`` on None.
     """
+    # SSRF guard. The page URL was user-supplied (a Source row) or
+    # scraped from one (a thumb URL in an RSS feed). Reject anything
+    # that resolves to a private / loopback / link-local range
+    # *before* we open the socket. Defense in depth — the route
+    # layer's validator catches the obvious case at POST/PATCH time
+    # but a feed whose RSS XML points at a 10.x image wouldn't be
+    # stopped by that.
+    safe, _reason = check_url_safe(page_url)
+    if not safe:
+        logger.debug("assets: HTML probe rejected: %s", page_url)
+        return None
     try:
         client = _get_client()
         async with client.stream(
@@ -281,7 +293,24 @@ async def _download(
     Accept header to bypass CDN 403s. ``dest`` is a path WITHOUT an
     extension — we derive the extension from the response's
     Content-Type (e.g. "favicons/3" → "favicons/3.png").
+
+    SSRF: the URL is allowlist-checked at entry AND at every redirect
+    hop. ``httpx`` exposes the final URL on the response after
+    ``follow_redirects=True`` has walked the chain; we re-check that
+    final URL in case any hop redirected to a private / loopback
+    address. The hop-by-hop check is what catches the
+    ``public.example.com → 127.0.0.1/admin`` attack that the entry
+    check alone would miss.
     """
+    # Entry-time SSRF check. The URL is user-controlled (favicon
+    # link from RSS / scraped <link> tag) so a sloppy check at the
+    # route layer isn't enough — the user-supplied Source URL has
+    # already been validated, but ``_download`` is also called for
+    # thumbnail URLs that came from the feed's XML.
+    safe, _reason = check_url_safe(url)
+    if not safe:
+        logger.debug("assets: %s rejected by URL safety check", url)
+        return None
     try:
         async with client.stream(
             "GET", url, follow_redirects=True,
@@ -290,6 +319,21 @@ async def _download(
             if resp.status_code >= 400:
                 logger.debug("assets: %s → HTTP %s", url, resp.status_code)
                 return None
+            # Re-check the FINAL URL after the redirect chain. This
+            # is the per-hop SSRF guard — a chain
+            # ``public.example.com → 192.168.0.1/admin`` clears
+            # entry (public host) but fails here (private hop).
+            # ``resp.url`` reflects the last hop's URL; ``httpx``
+            # only sets it once the response object exists, so
+            # checking it after the status_code branch is fine.
+            final_url = str(resp.url)
+            if final_url != url:
+                final_safe, _reason = check_url_safe(final_url)
+                if not final_safe:
+                    logger.debug(
+                        "assets: %s redirected to denied host %s", url, final_url,
+                    )
+                    return None
             ct = resp.headers.get("content-type")
             # We accept any content-type here. The size cap is the
             # real safety against abuse — many CDNs return

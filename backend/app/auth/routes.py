@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
@@ -54,6 +55,42 @@ def _cookie_attrs(cfg: OIDCConfig) -> dict[str, Any]:
     }
 
 
+def _safe_return_to(value: str) -> str:
+    """Tighten the post-login redirect target.
+
+    Browsers historically treat ``\\`` and ``//`` as scheme-relative
+    boundary characters; Starlette's ``URL`` and ``urllib.parse`` also
+    treat ``\\`` as ``/`` on some platforms (notably older browsers
+    + Windows-native URL parsers). A return_to like ``/\\evil.com`` or
+    ``/\\\\evil.com`` can therefore escape the origin. Also reject
+    anything with a non-empty netloc (an absolute URL like
+    ``https://evil.com``) and any path containing ``:`` before the
+    first ``/`` (a scheme-shaped prefix the browser may resolve as
+    ``javascript:``-style).
+
+    The result is a same-origin relative path only. Anything else
+    falls back to ``/`` so the worst case is "you land on the root",
+    not "you got phished".
+    """
+    if not isinstance(value, str) or not value:
+        return "/"
+    if not value.startswith("/") or value.startswith("//") or value.startswith("/\\"):
+        return "/"
+    # Anything past the first ``/``/``\`` is a path — reject control
+    # chars and absolute-URL prefixes anywhere in it. ``\\`` is
+    # already blocked at the start above, but defense-in-depth on the
+    # full string catches ``/foo\\bar`` style payloads too.
+    if "\\" in value:
+        return "/"
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return "/"
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    return value
+
+
 # ---------------------------------------------------------------------------
 # /auth/login — kick off the OIDC flow
 # ---------------------------------------------------------------------------
@@ -63,9 +100,9 @@ def _cookie_attrs(cfg: OIDCConfig) -> dict[str, Any]:
 async def login(return_to: str = "/") -> Response:
     """Redirect to the IdP. Stashes state+verifier in a short cookie."""
     cfg = oidc_config()
-    # Disallow open redirects: only allow relative paths starting with /
-    if not return_to.startswith("/") or return_to.startswith("//"):
-        return_to = "/"
+    # Disallow open redirects. ``_safe_return_to`` returns either the
+    # user-supplied path (when safe) or ``/`` as a fallback.
+    return_to = _safe_return_to(return_to)
     try:
         authorize_url, state_cookie_value = build_authorize_url(cfg, return_to=return_to)
     except OIDCError as e:

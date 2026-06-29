@@ -25,6 +25,7 @@ from app.models import Source
 from app.schemas import FeedRecommendation, SourceCreate, SourceOut, SourceUpdate
 from app.sources import list_sources as registered_plugin_names
 from app.sources.reddit import normalize_subreddit
+from app.url_safety import check_url_safe
 from app import scheduler
 
 router = APIRouter(tags=["sources"])
@@ -72,11 +73,45 @@ _CATEGORY_MAX = 40
 # short and obvious so the validator is easy to audit.
 _HEADER_DENYLIST = frozenset({"cookie", "authorization", "host"})
 
+# Headers we also reject because they're request-shaping rather
+# than request-data: ``X-Forwarded-For`` would let a user spoof the
+# client IP seen by the upstream, and ``X-Real-IP`` / ``X-Original-URL``
+# are reverse-proxy conventions. None of these are useful for
+# bypassing CDN UA blocks (the legitimate use case for the override
+# map) and they all change the trust surface.
+_HEADER_DENYLIST_EXTRA = frozenset(
+    {
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "x-original-url",
+        "x-rewrite-url",
+    }
+)
+_HEADER_DENYLIST_ALL = _HEADER_DENYLIST | _HEADER_DENYLIST_EXTRA
+
 # Bound the size of an override map. Real UAs are ~120 chars; Allow
 # some headroom for ``Accept-Language`` etc. but reject obvious
 # abuse (a multi-MB blob in the DB).
 _CUSTOM_HEADERS_MAX = 20
 _HEADER_VALUE_MAX = 512
+
+# Characters disallowed in header VALUES. httpx / urllib will pass
+# arbitrary bytes through; if a value contains ``\r\n`` the upstream
+# HTTP parser can interpret them as additional headers, which is a
+# classic CRLF injection / response-splitting primitive (CWE-93 /
+# CWE-113). Reject anything outside printable ASCII plus tab.
+#
+# Real header values are ASCII text; rejecting non-ASCII keeps the
+# door closed on smuggling tricks that exploit encoders that map
+# non-ASCII bytes to ASCII control codes (e.g. ISO-2022-JP). ``\0``
+# is also banned because some libraries truncate on NUL and a
+# truncated value can become a different header in the log/trace.
+import re as _re
+
+_BAD_HEADER_VALUE_RE = _re.compile(r"[^\t\x20-\x7e]")
+"""Match any byte outside tab and printable ASCII (0x20-0x7e)."""
 
 
 def _validate_name(name: str) -> None:
@@ -96,6 +131,19 @@ def _validate_url(url: str) -> None:
         raise HTTPException(status_code=422, detail="url must be http or https")
     if not parsed.netloc:
         raise HTTPException(status_code=422, detail="url must include a host")
+    # SSRF guard. Reject URLs whose host resolves (or is a literal
+    # for) any private / loopback / link-local / metadata range.
+    # Done at the route layer so the row never lands in the DB with a
+    # hostile URL — the scheduler then has no chance of triggering it.
+    safe, reason = check_url_safe(url)
+    if not safe:
+        # Don't echo the reason back to the user — it leaks which
+        # internal subnets we care about. Generic "url is not
+        # reachable" is enough for the UI to surface a clean error.
+        raise HTTPException(
+            status_code=422,
+            detail="url is not reachable (must be a public host)",
+        )
 
 
 def _validate_reddit_url(url: str) -> str:
@@ -113,7 +161,9 @@ def _validate_reddit_url(url: str) -> str:
     Mirrors ``_validate_url``'s 422-on-failure shape — no separate
     error code for "this looks like an RSS feed" (a Reddit URL also
     parses as http/https) because the route layer dispatches by
-    ``body.type`` before calling either validator.
+    ``body.type`` before calling either validator. The canonical
+    Reddit URL is always a public host (``reddit.com``) so it clears
+    ``check_url_safe`` without an explicit call.
     """
     sub = normalize_subreddit(url)
     if not sub:
@@ -177,7 +227,7 @@ def _validate_custom_headers(value: dict | None) -> dict | None:
                 status_code=422,
                 detail="custom_headers keys and values must be strings",
             )
-        if k.lower() in _HEADER_DENYLIST:
+        if k.lower() in _HEADER_DENYLIST_ALL:
             raise HTTPException(
                 status_code=422,
                 detail=f"header {k!r} cannot be overridden per-source",
@@ -186,6 +236,19 @@ def _validate_custom_headers(value: dict | None) -> dict | None:
             raise HTTPException(
                 status_code=422,
                 detail=f"header {k!r} value exceeds {_HEADER_VALUE_MAX} chars",
+            )
+        # CRLF / control-char check (CWE-93 / CWE-113). Anything
+        # outside tab + printable ASCII is rejected — httpx will
+        # happily send it but an upstream parser may interpret
+        # ``\r\n`` as a header boundary, smuggling a second header
+        # through the request.
+        if _BAD_HEADER_VALUE_RE.search(v):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"header {k!r} value contains disallowed characters "
+                    "(must be printable ASCII or tab)"
+                ),
             )
         out[k] = v
     return out or None
@@ -276,6 +339,18 @@ async def update_source_endpoint(
     body: SourceUpdate,
     session: AsyncSession = Depends(get_session),
 ) -> SourceOut:
+    # Fetch the existing row FIRST. The URL-validator block below
+    # needs ``pre.type`` to decide which validator to run, and the
+    # built-in guard at the bottom needs ``pre.name`` and
+    # ``pre.type`` to enforce the "no rename / no re-URL on built-ins"
+    # invariant. Fetching here means a missing row returns 404 before
+    # we run any other validator (so the user sees a clean error
+    # rather than a cascade of 422s on a PATCH aimed at a deleted
+    # source).
+    pre = await session.get(Source, source_id)
+    if pre is None:
+        raise HTTPException(status_code=404, detail="source not found")
+
     # Pre-validate before hitting the scheduler. The row-level guards
     # (built-in rejection, name collision) need a DB lookup; do them
     # here so the user sees a clean 400/409 rather than a generic 500
@@ -316,9 +391,6 @@ async def update_source_endpoint(
     # row-level state, not class-level). Renaming or re-URLing a
     # built-in is not allowed — the registry key is fixed, and the
     # URL is bound to the plugin class's fetch logic.
-    pre = await session.get(Source, source_id)
-    if pre is None:
-        raise HTTPException(status_code=404, detail="source not found")
     if pre.name in registered_plugin_names() and (
         body.name is not None or body.url is not None
     ):
