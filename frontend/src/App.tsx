@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type Brief, type CurrentUser, type Entry, type Health, type Source } from './api'
 import { BriefCard } from './components/BriefCard'
+import { Card } from './components/Card'
 import { Column, DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
 import { Drawer } from './components/Drawer'
 import { Hamburger } from './components/Hamburger'
@@ -185,18 +186,42 @@ export function App() {
 
   const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
 
-  // For You used to live here as a stacked first column. The user
-  // feedback was clear: it's a personal feed, not a category, and
-  // stacking it on top of the grid made the dashboard read as
-  // "mostly For You". For You now lives in the Drawer as an
-  // inline-expandable section. We still fetch it (refresh() calls
-  // ``api.forYou``) and keep it in state — the Drawer consumes it.
-  const baseColumns = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
-    return categories.map((cat) => ({
-      name: cat,
-      entries: byCategory.get(cat) ?? [],
-    }))
-  }, [categories, byCategory])
+  // Apollo-style 3-surface model:
+  //   1. For You     — top row on the dashboard, the personal front page.
+  //   2. All Subs    — by-category grid (desktop) / single-column swipe (mobile).
+  //   3. Multi-Sub   — when the user picks 1+ sources, the dashboard
+  //                    replaces For You + categories with a single
+  //                    filtered column. Empty filter = back to #1 + #2.
+  //
+  // ``viewKind`` is the derived switch. ``activeSources.size > 0`` flips
+  // us into Multi-Sub; otherwise we're in All (which still owns For You
+  // as its first column on mobile).
+  const viewKind: 'all' | 'multisub' = activeSources.size > 0 ? 'multisub' : 'all'
+
+  // All-subs columns. For You is the first column on mobile so swiping
+  // between tabs goes For You → news → tech → … The desktop grid
+  // renders For You as a separate row above the category columns (see
+  // the render block); on mobile the For You column *is* the For You
+  // row, in a single-column swipe.
+  const allSubsColumns = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
+    const out: Array<{ name: string; entries: Entry[] }> = []
+    if (forYou.length > 0) out.push({ name: 'For You', entries: forYou })
+    for (const cat of categories) {
+      out.push({ name: cat, entries: byCategory.get(cat) ?? [] })
+    }
+    return out
+  }, [forYou, categories, byCategory])
+
+  // Multi-sub column. One column, name reads "Filtering" so it stays
+  // distinct from any category. The chip-bar header above the column
+  // carries the actual source list (see render). Entries come from
+  // ``entries`` directly — the backend already filtered by source when
+  // ``activeSources`` was non-empty at fetch time.
+  const multisubColumn = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
+    return [{ name: 'Filtering', entries }]
+  }, [entries])
+
+  const baseColumns = viewKind === 'multisub' ? multisubColumn : allSubsColumns
 
   // Apply per-column prefs. For You skips the sort filter (backend
   // pre-sorts by composite_score) but still respects min-score +
@@ -813,25 +838,56 @@ export function App() {
         </div>
       ) : (
         <>
-          <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
-            {columns.map((col, ci) => (
-              <div key={col.name} ref={setColumnRef(col.name)} className="contents">
-                <Column
-                  name={col.name}
-                  entries={col.entries}
-                  sourcesById={sourcesById}
-                  newCount={newCountByColumn.get(col.name)}
-                  unreadIds={unreadIdsByColumn.get(col.name)}
-                  selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
-                  cardRefs={cardRefs}
-                  onMarkRead={() => markColumnRead(col.name)}
-                  prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
-                  onPrefsChange={(next) => setPrefsFor(col.name, next)}
-                  totalCount={col.totalCount}
-                  categoriesBySourceId={categoriesBySourceId}
-                />
+          {/* Desktop. The view is two surfaces stacked:
+              1. For You row — only in 'all' view, only when forYou is
+                 non-empty. Full-width card grid; no column chrome so
+                 the personal feed reads as the "front page".
+              2. By-category grid — the All Subs columns. Skipped in
+                 'multisub' view because the multi-sub column is the
+                 whole dashboard there. */}
+          {viewKind === 'all' && forYou.length > 0 && (
+            <section className="hidden md:block px-4 pt-4 pb-3 border-b border-hairline">
+              <header className="flex items-center justify-between mb-2">
+                <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
+                  For You
+                </h2>
+                <span className="text-ios-caption text-label-tertiary">
+                  {forYou.length} {forYou.length === 1 ? 'entry' : 'entries'}
+                </span>
+              </header>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {forYou.map((e) => (
+                  <Card
+                    key={e.id}
+                    entry={e}
+                    sourceName={sourcesById.get(e.source_id)}
+                    category={categoriesBySourceId.get(e.source_id)}
+                  />
+                ))}
               </div>
-            ))}
+            </section>
+          )}
+          <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
+            {columns
+              .filter((col) => viewKind === 'multisub' || col.name !== 'For You')
+              .map((col, ci) => (
+                <div key={col.name} ref={setColumnRef(col.name)} className="contents">
+                  <Column
+                    name={col.name}
+                    entries={col.entries}
+                    sourcesById={sourcesById}
+                    newCount={newCountByColumn.get(col.name)}
+                    unreadIds={unreadIdsByColumn.get(col.name)}
+                    selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
+                    cardRefs={cardRefs}
+                    onMarkRead={() => markColumnRead(col.name)}
+                    prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
+                    onPrefsChange={(next) => setPrefsFor(col.name, next)}
+                    totalCount={col.totalCount}
+                    categoriesBySourceId={categoriesBySourceId}
+                  />
+                </div>
+              ))}
           </main>
 
           <main
@@ -893,8 +949,6 @@ export function App() {
         briefTone={briefTone}
         onBriefToneChange={setBriefTone}
         onError={setError}
-        forYou={forYou}
-        sourcesById={sourcesById}
       />
 
       <ToastHost />
