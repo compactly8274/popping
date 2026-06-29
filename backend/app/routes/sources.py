@@ -52,6 +52,12 @@ _NAME_RE = re.compile(r"^[a-z0-9_]{1,120}$")
 _REFRESH_MIN = 60
 _REFRESH_MAX = 86_400
 
+# Mirrors ``Source.category``'s ``String(40)``. A PATCH / POST with a
+# longer string would crash on the DB layer with a Postgres
+# ``value too long for type character varying(40)`` — surfaced as a
+# 500 to the client. Catching it here returns a clean 422.
+_CATEGORY_MAX = 40
+
 
 def _validate_name(name: str) -> None:
     if not _NAME_RE.match(name):
@@ -82,6 +88,20 @@ def _validate_refresh(value: int) -> int:
         # visible in the returned row.
         return clamped
     return value
+
+
+def _validate_category(value: str) -> None:
+    stripped = value.strip()
+    if not stripped:
+        raise HTTPException(status_code=422, detail="category cannot be empty")
+    if len(stripped) > _CATEGORY_MAX:
+        # Mirror the column constraint instead of letting Postgres
+        # raise ``value too long for type character varying(40)`` —
+        # that path leaks as a 500 to the user.
+        raise HTTPException(
+            status_code=422,
+            detail=f"category must be {_CATEGORY_MAX} characters or fewer",
+        )
 
 
 # --- GETs (read-only, public) --------------------------------------------
@@ -131,6 +151,7 @@ async def create_source_endpoint(
             status_code=400,
             detail=f"unsupported type {body.type!r} (only 'rss' is accepted in this build)",
         )
+    _validate_category(body.category)
     refresh = _validate_refresh(body.refresh_interval_seconds)
     row = await scheduler.add_source(
         session,
@@ -174,8 +195,8 @@ async def update_source_endpoint(
         _validate_url(body.url)
     if body.refresh_interval_seconds is not None:
         body.refresh_interval_seconds = _validate_refresh(body.refresh_interval_seconds)
-    if body.category is not None and not body.category.strip():
-        raise HTTPException(status_code=422, detail="category cannot be empty")
+    if body.category is not None:
+        _validate_category(body.category)
 
     # Built-in rows can be paused / re-categorized (these are
     # row-level state, not class-level). Renaming or re-URLing a

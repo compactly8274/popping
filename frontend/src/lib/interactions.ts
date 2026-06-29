@@ -102,25 +102,41 @@ function scheduleFlush(): void {
 // On page hide the user is leaving — anything still in the queue
 // goes via sendBeacon so the request doesn't depend on the
 // page staying alive long enough for a fetch to resolve. sendBeacon
-// silently caps body size to 64KB; our events are tiny, so the only
-// real risk is more than ~3000 events queued which can't happen
-// (we cap at MAX_QUEUE per flush).
+// silently caps body size to 64KB and returns ``false`` when the
+// payload can't be queued (oversized, fatal error); we MUST NOT
+// drain the queue before knowing the beacon succeeded — the
+// fallback path then needs the events.
 function onPageHide(): void {
   if (queue.length === 0) return
-  const payload = JSON.stringify({ events: queue })
-  queue.length = 0
+  // Drain into a local snapshot BEFORE attempting any send, so a
+  // failed sendBeacon still has the events to fall back to. We swap
+  // the queue with a fresh empty array rather than clearing in
+  // place so any in-flight ``recordBatched`` between the splice and
+  // the send lands in the new (now-abandoned) array. Those events
+  // are lost on tab close anyway — the user is leaving.
+  const batch = queue.splice(0, queue.length)
   try {
+    const payload = JSON.stringify({ events: batch })
     const blob = new Blob([payload], { type: 'application/json' })
     if (navigator.sendBeacon?.('/api/interactions/batch', blob)) {
       return
     }
   } catch {
-    // Fall through to the best-effort flush below.
+    // Fall through to the keepalive fetch below.
   }
-  // sendBeacon unavailable (rare; very old browsers). Try the
-  // normal POST anyway — most page-hide handlers DO get a chance to
-  // complete a fetch. Best-effort.
-  void api.recordInteractionBatch(queue)
+  // sendBeacon failed or unavailable. ``keepalive: true`` lets the
+  // browser finish an in-flight fetch even after the document
+  // unloads — much better odds than a bare fetch().
+  void fetch('/api/interactions/batch', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ events: batch }),
+    keepalive: true,
+  }).catch(() => {
+    // Best-effort. We don't escalate this to a toast — the user is
+    // already closing the tab.
+  })
 }
 
 if (typeof window !== 'undefined' && !uninstalled) {
