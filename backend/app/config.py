@@ -172,12 +172,20 @@ class Settings(BaseSettings):
     embedding_enabled: bool = True
 
     # --- Phase 2: composite scoring weights ---------------------------------
-    # final = w_recency * recency + w_personal * personal + w_source * source_weighted
+    # final = w_recency * recency + w_personal * personal
+    #       + w_source * source_weighted + w_engagement * engagement
     # Weights don't have to sum to 1 — the values are weights, not
     # probabilities — but the defaults do sum to 1.
-    scoring_weight_recency: float = 0.4
-    scoring_weight_personal: float = 0.4
-    scoring_weight_source: float = 0.2
+    #
+    # Engagement (votes/comments) joins recency+personal+source as a
+    # fourth component. Sources that don't ship engagement signals
+    # (BBC, NVD, CISA, Wikipedia) get a zero contribution here, so
+    # re-weighting doesn't move them; engagement-aware sources (HN,
+    # RFD, Reddit, GitHub) get a lift proportional to their signal.
+    scoring_weight_recency: float = 0.30
+    scoring_weight_personal: float = 0.30
+    scoring_weight_source: float = 0.15
+    scoring_weight_engagement: float = 0.25
 
     # --- Phase 2: convergence boost ----------------------------------------
     # Cross-source story clusters (same normalized title in 24h) get a

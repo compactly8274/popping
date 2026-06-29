@@ -1,4 +1,4 @@
-"""Composite scoring: blends recency, personal, and source weight.
+"""Composite scoring: blends recency, personal, source weight, and engagement.
 
 The final score a card sorts by. Weights come from Settings so they
 can be tuned without a code change:
@@ -6,11 +6,21 @@ can be tuned without a code change:
     composite = w_r * recency
               + w_p * personal
               + w_s * (raw_score * source_weight)
+              + w_e * engagement
 
 ``raw_score`` (an existing column) is the recency score at ingest time,
 so newly-ingested entries start high and decay. The convergence boost
 (applied at query time, not here) multiplies composite for items that
 appear in multiple sources within the window.
+
+Engagement is the new fourth component. Sources that ship votes /
+comments / replies (HN, RFD, Reddit, GitHub) populate ``Entry.meta``
+with the canonical ``engagement_score`` / ``engagement_comments``
+keys (or the legacy ``score`` / ``comments`` names) and this
+component lifts them. Sources without engagement signals
+(BBC, NVD, CISA, Wikipedia) contribute zero — re-weighting the
+formula doesn't move them. See ``app.scoring.engagement`` for the
+per-source mapping and the log-tanh curve.
 """
 
 from __future__ import annotations
@@ -19,7 +29,7 @@ import datetime as dt
 
 from app.config import settings
 from app.models import Entry, Source, UserProfile
-from app.scoring import personal, recency, source as source_helper
+from app.scoring import engagement, personal, recency, source as source_helper
 
 
 def score(
@@ -36,10 +46,12 @@ def score(
     # entire sources up or down. Both default to neutral.
     raw = float(entry.raw_score or 0.0)
     s = raw * sw
+    e = engagement.score(entry, source)
     total = (
         settings.scoring_weight_recency * r
         + settings.scoring_weight_personal * p
         + settings.scoring_weight_source * s
+        + settings.scoring_weight_engagement * e
     )
     return round(total, 2)
 

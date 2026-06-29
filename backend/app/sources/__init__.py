@@ -74,6 +74,7 @@ from app.sources import (
     github_releases,         # noqa: F401, E402
     hn,                      # noqa: F401, E402
     nvd,                     # noqa: F401, E402
+    rfd,                     # noqa: F401, E402
     rss,                     # noqa: F401, E402
     wikipedia_on_this_day,   # noqa: F401, E402
 )

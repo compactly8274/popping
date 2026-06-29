@@ -82,9 +82,19 @@ class HnTop(SourcePlugin):
                     "summary": data.get("text", "") or "",
                     "meta": {
                         "hn_id": item_id,
+                        # Legacy per-source keys kept for the schema and
+                        # any UI that reads them by name.
                         "score": data.get("score"),
                         "comments": data.get("descendants"),
                         "by": data.get("by"),
+                        # Canonical engagement keys consumed by
+                        # ``app.scoring.engagement``. Same data as the
+                        # legacy keys above; the canonical pair is what
+                        # ``composite.score`` reads. Mirrored rather
+                        # than renamed so the API surface for HN entries
+                        # doesn't change.
+                        "engagement_score": data.get("score"),
+                        "engagement_comments": data.get("descendants"),
                     },
                 }
 

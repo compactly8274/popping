@@ -14,12 +14,23 @@ Behavior parity with ``_RssPlugin`` is the goal: same HTTP fetch,
 same image-picking priority, same summary handling. Anything that
 differs (e.g. a future podcast-specific RSS plugin) should be its
 own subclass / its own ``type`` value, not a special case here.
+
+Source-shape branches
+---------------------
+``DynamicRssPlugin`` is the row-driven catch-all for ``type="rss"``.
+A few feed shapes warrant specialized extraction on top of the
+generic RSS path — RFD forum feeds ship engagement counts in their
+HTML summary that the generic normalizer drops, so when the row's
+URL is RFD-shaped we delegate to ``rfd.rfd_normalize_dynamic`` for
+the normalizer step. Adding more feed shapes here (e.g. a future
+podcast-specific dynamic source) follows the same pattern.
 """
 
 from __future__ import annotations
 
 from app.models import Source
 from app.sources.base import SourcePlugin
+from app.sources.rfd import _is_rfd_url, rfd_normalize_dynamic
 from app.sources.rss import fetch_rss
 
 
@@ -51,7 +62,13 @@ class DynamicRssPlugin(SourcePlugin):
     async def fetch(self) -> list[dict]:
         return await fetch_rss(self.url)
 
-    # ``normalize`` comes from the base class — title/url/published_at
-    # validation is the same for all RSS-shaped plugins, and the
-    # default normalizer's "drop everything except the reserved keys"
-    # behavior already captures the summary / image_url into meta.
+    def normalize(self, raw: dict) -> dict:
+        # RFD-shaped sources get engagement extraction via the
+        # dedicated normalizer. Sniff the URL rather than the row's
+        # ``name`` so user-added ``rfd_*`` rows created before
+        # ``rfd_hot_deals`` was added (e.g. ``rfd_all``, ``rfd_focued``
+        # — typos and all) still light up. Cost is a single ``in``
+        # check on the URL string per item.
+        if _is_rfd_url(self.url):
+            return rfd_normalize_dynamic(self.name, raw)
+        return super().normalize(raw)
