@@ -6,21 +6,86 @@
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#000000" />
     <title>Popping</title>
-    {/* Inline pre-React paint. The body + root backgrounds are set
-        inline so the browser shows pure black from the very first
-        pixel — before styles.css loads. Without this, mobile Safari
-        and Android Chrome render a default-white frame for 50-200ms
-        (the time it takes to fetch + parse the CSS bundle), which
-        reads as a "white flicker then goes black" on cold loads.
-        ``color-scheme: dark`` on <html> also tells the system UI
-        (Safari's chrome, Chrome's omnibox on Android) to render in
-        dark mode so the address bar / status bar match the app. */}
+    {/* Inline pre-React paint.
+        ------------------------------------------------------------------
+        1. html/body background -> pure black from the first frame so the
+           browser never paints its default white during the gap before
+           styles.css is fetched + parsed. Mobile Safari + Android Chrome
+           show a white viewport shell otherwise, which reads as a
+           "white flicker then goes black" on cold loads.
+        2. color-scheme: dark in CSS tells Safari / Android Chrome to
+           render their system chrome (address bar, status bar) in dark
+           mode so they match the app.
+        3. The splash lives INSIDE ``#root`` so ReactDOM.createRoot's
+           mount replaces it with the real tree. No DOM juggling needed
+           (no separate ``#splash`` element to remove once React is
+           ready). The splash's own styles are inline so it renders even
+           if the Tailwind bundle hasn't parsed yet. The spinner uses
+           a CSS-only @keyframes animation (no JS, no Tailwind
+           dependency) so the ring spins before the module graph has
+           loaded.
+        4. The ``<noscript>`` fallback shows a static "you need JavaScript"
+           message instead of the spinner — same inline-styling rule.
+    ------------------------------------------------------------------ */}
     <style>
-      html, body { background-color: #000000; color: #ffffff; }
+      html, body { background-color: #000000; color: #ffffff; margin: 0; }
+      html { color-scheme: dark; }
+      /* Splash sits inside #root; React will replace it on mount. */
+      #root-splash {
+        position: fixed; inset: 0;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        gap: 16px;
+        background-color: #000000;
+        color: #ffffff;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+                     "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        z-index: 2147483647;  /* always above any browser chrome */
+      }
+      #root-splash .ring {
+        width: 32px; height: 32px;
+        border-radius: 50%;
+        border: 2px solid rgba(255, 255, 255, 0.08);
+        border-top-color: #0a84ff;  /* iOS systemBlue, same accent as the app */
+        animation: popping-spin 0.9s linear infinite;
+      }
+      #root-splash .wordmark {
+        font-size: 17px; font-weight: 600;
+        letter-spacing: -0.41px;  /* matches iOS body text tracking */
+        color: rgba(235, 235, 245, 0.6);  /* iOS .secondaryLabel */
+      }
+      /* Spinner keyframes — same shape Tailwind's ``animate-spin`` uses,
+         declared locally so we don't need the Tailwind config loaded. */
+      @keyframes popping-spin {
+        to { transform: rotate(360deg); }
+      }
+      /* Respect users who've asked the OS to reduce motion. Show the
+         wordmark + a static dot instead of a spinning ring — the
+         ring would be a distraction (and a vestibular trigger) for
+         users sensitive to motion. */
+      @media (prefers-reduced-motion: reduce) {
+        #root-splash .ring { animation: none; border-top-color: rgba(255,255,255,0.08); }
+      }
     </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      {/* Pre-React splash. Replaced by ReactDOM.createRoot on mount.
+          aria-hidden so the spinner isn't announced to screen readers
+          (React mounts the real tree within ~100ms on warm loads). */}
+      <div id="root-splash" aria-hidden="true">
+        <div class="ring"></div>
+        <div class="wordmark">Popping</div>
+      </div>
+    </div>
+    <noscript>
+      <div id="root-splash">
+        <div class="wordmark" style="text-align:center; max-width: 280px; line-height: 22px;">
+          Popping needs JavaScript to run. Please enable it and reload.
+        </div>
+      </div>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
