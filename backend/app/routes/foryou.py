@@ -17,6 +17,7 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.auth.deps import current_user
 from app.config import settings
@@ -76,9 +77,20 @@ async def foryou(
     profile = await _load_profile(session)
 
     over_fetch = min(max(limit * 4, 200), 500)
+    # ``selectinload(Entry.source)`` eagerly fetches the related
+    # ``Source`` rows in a single follow-up SELECT and populates them
+    # on each entry before we leave the async session. Without it,
+    # ``composite_scorer.score(entry, entry.source, ...)`` below
+    # triggers a lazy load on the SyncSession-bridged async session,
+    # which raises ``MissingGreenlet: greenlet_spawn has not been
+    # called`` — the symptom was a 500 on every /api/foryou call
+    # once a recent /api/entries?source=… call had primed enough
+    # rows. ``selectinload`` issues one IN(…) query regardless of
+    # candidate count, so the cost is bounded.
     stmt = (
         select(Entry)
         .join(Source, Entry.source_id == Source.id)
+        .options(selectinload(Entry.source))
         .order_by(Entry.composite_score.desc(), Entry.published_at.desc().nullslast())
         .limit(over_fetch)
     )
