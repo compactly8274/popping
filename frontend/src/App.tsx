@@ -25,12 +25,17 @@ import { Drawer } from './components/Drawer'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
 import { SearchResults } from './components/SearchResults'
-import { ToastHost } from './components/Toast'
+import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { recordImmediate } from './lib/interactions'
 import { STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
 
 const REFRESH_INTERVAL_MS = 60_000
+// Health pings don't need 60s cadence — DB / Redis status is slow-
+// moving and the user only needs to see "everything is green" most
+// of the time. 5 min cuts the request count by 5x for the cost of
+// up-to-5-minute staleness on the status chip.
+const HEALTH_INTERVAL_MS = 5 * 60_000
 // Hidden longer than this → treat return as "fresh start"; the new-
 // entry indicator resets and all entries surface as unread. Without
 // this, returning from a long absence shows nothing flagged (because
@@ -387,10 +392,12 @@ export function App() {
     setRefreshing(true)
     try {
       const sourceArg = activeSources.size > 0 ? Array.from(activeSources) : undefined
-      const [e, s, h, fy] = await Promise.all([
+      // Hot path: entries + sources + for-you. These change with
+      // every ingest and the user expects them to be near-real-time
+      // when the dashboard is open.
+      const [e, s, fy] = await Promise.all([
         api.entries({ limit: 200, source: sourceArg }),
         api.sources(),
-        api.health(),
         api.forYou({ limit: 25 }).catch(() => [] as Entry[]),
       ])
       const prevSeen = seenEntryIdsRef.current
@@ -412,15 +419,41 @@ export function App() {
       hiddenAtRef.current = null
       setEntries(e)
       setSources(s)
-      setHealth(h)
       setForYou(fy)
       setError(null)
+      // Surface a brief success toast so the user knows the
+      // pull actually happened — the Refresh button's …→
+      // normal transition is otherwise invisible if the request
+      // was sub-second. The count is the most useful signal:
+      // "0 new" tells the user nothing landed, which is honest
+      // and saves them a second click.
+      const newCount = prevSeen == null
+        ? 0
+        : e.reduce((acc, row) => (prevSeen.has(row.id) ? acc : acc + 1), 0)
+      toast(newCount > 0 ? `${newCount} new since last refresh` : 'refreshed', 'info')
     } catch (err) {
       setError((err as Error).message)
+      toast((err as Error).message, 'error')
     } finally {
       setRefreshing(false)
     }
   }, [activeSources])
+
+  // Cold path: health pings (DB / Redis / sources count). Pulled on
+  // its own slower interval so a single 5xx doesn't sit visible
+  // for 60s on every entry-poll failure. ``refreshHealth`` is a
+  // separate useCallback so the hot-path effect doesn't re-attach
+  // when only the slow poller has fired.
+  const refreshHealth = useCallback(async () => {
+    try {
+      const h = await api.health()
+      setHealth(h)
+    } catch {
+      // Health is informational; an outage of the health endpoint
+      // doesn't break the dashboard. Leave the previous value in
+      // place and let the next tick try again.
+    }
+  }, [])
 
   // Probe auth state once on mount.
   useEffect(() => {
@@ -493,6 +526,48 @@ export function App() {
     }
   }, [refresh, authProbed])
 
+  // One-shot initial health fetch so the Drawer status chip renders
+  // without waiting up to 5 min for the cold poller to tick. Mount-
+  // gated via ``authProbed`` so we don't fire before auth state is
+  // resolved (avoids a 401-then-retry race on OIDC deploys).
+  useEffect(() => {
+    if (!authProbed) return
+    void refreshHealth()
+  }, [authProbed, refreshHealth])
+
+  // Cold health poller. 5 min cadence is plenty for the Drawer
+  // status chip; pulling faster just costs an extra round-trip per
+  // page-open with no real change to the user-visible state. The
+  // hot poller (above) doesn't re-run when only this fires because
+  // ``refreshHealth`` is a stable callback. Errors are swallowed —
+  // a broken health endpoint shouldn't break the dashboard.
+  useEffect(() => {
+    if (!authProbed) return
+    let id: number | null = null
+    const start = () => {
+      if (id != null) return
+      id = window.setInterval(() => {
+        if (document.visibilityState === 'visible') void refreshHealth()
+      }, HEALTH_INTERVAL_MS)
+    }
+    const stop = () => {
+      if (id != null) {
+        window.clearInterval(id)
+        id = null
+      }
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') stop()
+      else start()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    if (document.visibilityState === 'visible') start()
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      stop()
+    }
+  }, [refreshHealth, authProbed])
+
   // Re-fetch whenever the active source filter changes. Without this,
   // tapping a chip in the Drawer or in the chip-bar would update
   // ``activeSources`` but leave ``entries`` showing whatever the
@@ -500,6 +575,11 @@ export function App() {
   // until the 60s polling tick (or a visibility change) finally pulls
   // the now-filtered set. The polling effect above owns the initial
   // fetch, so we skip our own first run via a ref.
+  //
+  // Debounced 250ms so rapid chip taps (the Drawer renders all
+  // source chips at once and tap-spamming is common) coalesce into
+  // a single fetch. Without this, a "deselect bbc, tap cbc, tap reuters"
+  // burst fires three back-to-back 200-row pulls.
   const initialRefreshDoneRef = useRef(false)
   useEffect(() => {
     if (!authProbed) return
@@ -507,7 +587,10 @@ export function App() {
       initialRefreshDoneRef.current = true
       return
     }
-    void refresh()
+    const id = window.setTimeout(() => {
+      void refresh()
+    }, 250)
+    return () => window.clearTimeout(id)
   }, [activeSources, refresh, authProbed])
 
   // Keep ``mobileCol`` in bounds.
@@ -695,11 +778,17 @@ export function App() {
         if (e.metaKey || e.ctrlKey || e.altKey) return
         e.preventDefault()
         toggleSummary(selectedCardId)
+      } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        // Refresh the dashboard. Bare ``r``; Cmd+R / Ctrl+R
+        // already triggers the browser reload so we don't fight
+        // it. Same affordance as the header Refresh button.
+        e.preventDefault()
+        void refresh()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [columns, selectedColumnIndex, selectedCardId, searchQuery, markEntryRead, toggleSummary])
+  }, [columns, selectedColumnIndex, selectedCardId, searchQuery, markEntryRead, toggleSummary, refresh])
 
   // Scroll the keyboard-selected card into view.
   useEffect(() => {
