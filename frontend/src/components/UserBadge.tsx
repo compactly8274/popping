@@ -30,16 +30,16 @@ export function UserBadge({ user, onSignedOut }: Props) {
   }
 
   return (
-    <div className="flex items-center gap-2 text-xs">
-      <span className="text-slate-300">
+    <div className="flex items-center gap-2 text-ios-caption">
+      <span className="text-label-primary">
         {user.name || user.email}
         {user.auth_method === 'bypass' && (
-          <span className="ml-1 text-slate-500">(local bypass)</span>
+          <span className="ml-1 text-label-tertiary">(local bypass)</span>
         )}
       </span>
       <button
         onClick={onSignOut}
-        className="rounded px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300"
+        className="rounded-ios px-2 py-0.5 bg-bg-elevated text-label-primary active:bg-label-tertiary/20"
       >
         Sign out
       </button>
