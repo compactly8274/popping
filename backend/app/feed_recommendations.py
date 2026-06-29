@@ -71,12 +71,19 @@ RECOMMENDATIONS: list[dict] = [
         "blurb": "startups, funding rounds, founder interviews",
     },
     {
-        "name": "hackernews_best",
-        "category": "tech",
-        "url": "https://hnrss.org/best",
-        "blurb": "HN front page filtered to high-vote posts",
-    },
-    {
+        # NOTE: ``hackernews_best`` (hnrss.org/best) was previously
+        # here but the upstream serves a Ubiquiti self-signed cert
+        # on its public endpoint, so TLS verification fails for
+        # any client without that private CA in its trust store.
+        # Not something we can work around from this side. The
+        # built-in ``hn_top`` plugin (Hacker News via the official
+        # firebaseio.com API) is already registered and works;
+        # users who specifically want the "best" filtered subset
+        # can add a custom source pointing at the endpoint once
+        # hnrss.org sorts their cert. The entry is intentionally
+        # removed from the curated list rather than shipped with a
+        # broken URL — surfacing a feed we know fails costs more
+        # user trust than not recommending it at all.
         "name": "lobsters",
         "category": "tech",
         "url": "https://lobste.rs/rss",
@@ -96,12 +103,18 @@ RECOMMENDATIONS: list[dict] = [
         "blurb": "Reuters world wire — wire-service neutrality",
     },
     {
-        "name": "ap_top",
-        "category": "news",
-        "url": "https://feeds.feedburner.com/ap-topnews",
-        "blurb": "Associated Press top stories",
-    },
-    {
+        # NOTE: AP News has been the search for an alternate URL
+        # since AP shut down their official RSS feeds in late 2017.
+        # The legacy ``feeds.feedburner.com/ap-topnews`` (which used
+        # to work via Feedburner's redirector) now resolves to a
+        # 200-OK body that is just the move-to-new-host notice —
+        # no actual feed. The community AWS mirror at
+        # ``associated-press.s3-website-us-east-1.amazonaws.com``
+        # is also dead (all files are 55-byte stubs). AP's own
+        # ``apnews.com/hub/apf-topnews?format=xml`` is just the
+        # HTML hub page (not a feed). No working public RSS exists
+        # for AP today. Reuters World is the substitute; if AP
+        # ships a real feed later, drop it back in here.
         "name": "the_guardian_world",
         "category": "news",
         "url": "https://www.theguardian.com/world/rss",
