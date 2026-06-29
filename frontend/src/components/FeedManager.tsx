@@ -95,6 +95,33 @@ function refreshLabel(seconds: number): string {
   return `${Math.round(seconds / 86400)} d`
 }
 
+// Same shape as Card.tsx's ``timeAgo`` — kept duplicated rather than
+// extracted to a shared module because the function is six lines
+// and the call sites are UI-local. If a third caller appears, lift
+// it to ``frontend/src/lib/format.ts``.
+function timeAgo(iso: string | null): string {
+  if (!iso) return 'never'
+  const ms = Date.now() - new Date(iso).getTime()
+  if (ms < 0) return 'just now'
+  const mins = Math.floor(ms / 60000)
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
+// True when ``last_fetch_at`` is older than 2× the configured
+// refresh interval — heuristic for "the scheduler should have run by
+// now but hasn't (or just ran and didn't update last_fetch_at
+// because of a fetch error)." The 2× grace is generous because
+// scheduler jobs queue up if multiple sources hit at once.
+function isStale(source: Source): boolean {
+  if (!source.last_fetch_at) return true
+  const ageMs = Date.now() - new Date(source.last_fetch_at).getTime()
+  return ageMs > source.refresh_interval_seconds * 2 * 1000
+}
+
 function parseApiError(err: unknown, fallback: string): string {
   // FastAPI returns 422 with `{detail: [{loc: [...], msg: "..."}, ...]}`.
   // The message field is the most useful bit; flatten to a single string.
@@ -556,19 +583,43 @@ function SourceRow({
             hasn't landed yet. ``size={14}`` matches the original
             w-3.5 h-3.5 img (14px). */}
         <SourceIcon src={source.favicon_path} name={source.name} size={14} />
-        <span className={`truncate font-medium ${source.active ? 'text-label-primary' : 'text-label-secondary line-through'}`}>
+        <span
+          className={`truncate font-medium ${
+            !source.active
+              ? 'text-label-secondary line-through'
+              : isStale(source)
+                ? 'text-label-secondary italic'
+                : 'text-label-primary'
+          }`}
+          title={
+            isStale(source)
+              ? `last fetched ${timeAgo(source.last_fetch_at)} — refresh interval is ${refreshLabel(source.refresh_interval_seconds)}`
+              : undefined
+          }
+        >
           {source.name}
         </span>
         <span className="text-label-tertiary shrink-0 text-[11px]">{source.category}</span>
         {!source.active && (
           <span className="text-ios-caption text-amber-400 shrink-0">paused</span>
         )}
-        {source.last_error && (
+        {/* Quantitative error chip. ``error_count > 1`` shows the
+            number so the user can distinguish a chronic failure
+            (``⚠ 144``) from a one-off (``⚠`` alone is fine for
+            ``error_count === 1``). Gated on the count rather than
+            ``last_error`` truthiness so a source that recovered
+            between fetches but still has a nonzero counter doesn't
+            silently flash a warning. */}
+        {source.error_count > 0 && (
           <span
-            className="text-ios-caption text-red-400 shrink-0 truncate"
-            title={source.last_error}
+            className="text-ios-caption text-red-400 shrink-0"
+            title={
+              source.last_error
+                ? `${source.error_count} consecutive failure${source.error_count === 1 ? '' : 's'} — last: ${source.last_error}`
+                : `${source.error_count} consecutive failure${source.error_count === 1 ? '' : 's'}`
+            }
           >
-            ⚠
+            ⚠ {source.error_count > 1 ? source.error_count : ''}
           </span>
         )}
       </div>
@@ -589,6 +640,24 @@ function SourceRow({
         >
           edit
         </button>
+        {/* Last-fetched caption. Renders inline with the action
+            buttons so the user can read at-a-glance freshness
+            without hovering for a tooltip. ``text-label-tertiary``
+            keeps it secondary to the action affordances. Stale
+            sources get ``text-amber-400`` to flag the row without
+            using up another glyph in the title row. */}
+        <span
+          className={`text-ios-caption text-label-tertiary ${
+            isStale(source) ? 'text-amber-400' : ''
+          }`}
+          title={
+            source.last_fetch_at
+              ? `last fetch: ${new Date(source.last_fetch_at).toLocaleString()}`
+              : 'never fetched'
+          }
+        >
+          · fetched {timeAgo(source.last_fetch_at)}
+        </span>
         {isEditingInterval ? (
           <select
             value={source.refresh_interval_seconds}

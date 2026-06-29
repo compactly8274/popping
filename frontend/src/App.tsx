@@ -27,6 +27,7 @@ import { LoginPage } from './components/LoginPage'
 import { SearchResults } from './components/SearchResults'
 import { ToastHost } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
+import { recordImmediate } from './lib/interactions'
 
 const REFRESH_INTERVAL_MS = 60_000
 // Hidden longer than this → treat return as "fresh start"; the new-
@@ -40,6 +41,11 @@ const HIDDEN_RESET_MS = 2 * 60 * 1000
 const LS_LAST_VIEWED = 'col.lastViewed'
 const LS_COLUMN_PREFS = 'col.prefs'
 const LS_MOBILE_COL = 'mobileCol.last'
+// Per-card manual-read state. Persisted so a refresh mid-day doesn't
+// re-flag entries the user explicitly dismissed. Separate from
+// ``LS_LAST_VIEWED`` (column-level "I've seen the column") because
+// the per-card flip is granular and shouldn't reset the column chip.
+const LS_READ_ENTRIES = 'col.readEntries'
 
 function loadLastViewed(): Record<string, string> {
   if (typeof window === 'undefined') return {}
@@ -84,6 +90,32 @@ function loadMobileCol(): number {
   }
 }
 
+// Per-card manual read-set. Stored as ``{columnName: number[]}`` so
+// JSON.stringify round-trips cleanly. Entries that disappear from
+// the dashboard (older than the column's filter, or pruned by the
+// 200-row fetch cap) are eventually garbage-collected when their
+// column isn't rendered, but a few stale ids are cheap — they just
+// sit in localStorage. Valued-shaped (numbers only) so the per-card
+// JSON.parse stays fast at boot.
+function loadReadEntries(): Record<string, number[]> {
+  if (typeof window === 'undefined') return {}
+  try {
+    const raw = window.localStorage?.getItem(LS_READ_ENTRIES)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return {}
+    const out: Record<string, number[]> = {}
+    for (const [k, v] of Object.entries(parsed)) {
+      if (Array.isArray(v) && v.every((x) => typeof x === 'number')) {
+        out[k] = v
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
 function safeSetItem(key: string, value: string) {
   try {
     window.localStorage?.setItem(key, value)
@@ -117,6 +149,11 @@ export function App() {
   const [refreshing, setRefreshing] = useState(false)
   // Per-column last-viewed timestamps.
   const [lastViewed, setLastViewed] = useState<Record<string, string>>(loadLastViewed)
+  // Per-card manual-read state. Init from localStorage (entries the
+  // user explicitly marked read at any prior session). Live as a
+  // ``Set`` in the merged view (below) but stored as an array so
+  // JSON.stringify/parse keeps element order stable.
+  const [readEntries, setReadEntries] = useState<Record<string, number[]>>(loadReadEntries)
   // Per-column sort/filter preferences.
   const [columnPrefs, setColumnPrefs] = useState<Record<string, ColumnPrefs>>(loadColumnPrefs)
   // Search state. ``searchInput`` is the controlled input value;
@@ -275,22 +312,30 @@ export function App() {
   }, [columns, lastViewed])
 
   // Unread entry ids per column — used to dim read cards.
+  //
+  // Unread = entry's ``fetched_at`` is after the column's
+  // ``lastViewed`` timestamp AND the user has not manually marked
+  // this entry read via the per-card ✓ button. The manual set
+  // overrides the timestamp heuristic so a single tap dims one
+  // card without resetting the whole column.
   const unreadIdsByColumn = useMemo(() => {
     const out = new Map<string, Set<number>>()
     for (const col of columns) {
       const last = lastViewed[col.name]
-      if (!last) continue
-      const lastMs = new Date(last).getTime()
+      const lastMs = last ? new Date(last).getTime() : 0
+      const manual = new Set(readEntries[col.name] ?? [])
       const ids = new Set<number>()
       for (const e of col.entries) {
-        if (e.fetched_at && new Date(e.fetched_at).getTime() > lastMs) {
+        // Skip entries the user explicitly marked read.
+        if (manual.has(e.id)) continue
+        if (lastMs > 0 && e.fetched_at && new Date(e.fetched_at).getTime() > lastMs) {
           ids.add(e.id)
         }
       }
       if (ids.size > 0) out.set(col.name, ids)
     }
     return out
-  }, [columns, lastViewed])
+  }, [columns, lastViewed, readEntries])
 
   const refresh = useCallback(async () => {
     setRefreshing(true)
@@ -438,6 +483,10 @@ export function App() {
   }, [lastViewed])
 
   useEffect(() => {
+    safeSetItem(LS_READ_ENTRIES, JSON.stringify(readEntries))
+  }, [readEntries])
+
+  useEffect(() => {
     safeSetItem(LS_COLUMN_PREFS, JSON.stringify(columnPrefs))
   }, [columnPrefs])
 
@@ -480,6 +529,31 @@ export function App() {
       cancelled = true
     }
   }, [searchQuery])
+
+  // Per-card mark-read. Hoisted above the keyboard effect so the
+  // ``m`` shortcut (defined further down) can reference it without
+  // tripping TypeScript's "used before declaration" check. Adds the
+  // entry id to the column's manual read-set; ``unreadIdsByColumn``
+  // uses the set to exclude that entry on the next render, dimming
+  // its ring without touching the column-wide ``lastViewed``
+  // timestamp. Idempotent — re-marking a read card is a no-op so the
+  // keyboard ``m`` shortcut stays side-effect free when pressed on
+  // a card the user has already acknowledged.
+  //
+  // Recording the engagement event (``view``) is the caller's job
+  // — the keyboard shortcut and the ✓ button each fire
+  // ``recordImmediate`` themselves so the ranker sees both paths.
+  // This function is a pure UI flip.
+  //
+  // ``useCallback`` so the keyboard-shortcut effect doesn't re-bind
+  // on every render. ``setReadEntries`` is stable across renders.
+  const markEntryRead = useCallback((columnName: string, entryId: number) => {
+    setReadEntries((prev) => {
+      const cur = prev[columnName] ?? []
+      if (cur.includes(entryId)) return prev
+      return { ...prev, [columnName]: [...cur, entryId] }
+    })
+  }, [])
 
   // Keyboard navigation. Skips when an input/textarea/select has
   // focus so the LLM picker's free-text fields stay typeable. ``/``
@@ -536,11 +610,22 @@ export function App() {
         const card = cardRefs.current.get(selectedCardId)
         const link = card?.querySelector('a')
         link?.click()
+      } else if (e.key === 'm' && selectedCardId != null) {
+        // Mark the selected card read. Mirrors the ✓ button on the
+        // card so keyboard users get the same affordance. Modifier
+        // guards below — Cmd+M minimizes the window on macOS, so we
+        // only fire on bare ``m``.
+        if (e.metaKey || e.ctrlKey || e.altKey) return
+        e.preventDefault()
+        const col = columns[selectedColumnIndex]
+        if (!col) return
+        markEntryRead(col.name, selectedCardId)
+        recordImmediate({ entry_id: selectedCardId, type: 'view' })
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [columns, selectedColumnIndex, selectedCardId, searchQuery])
+  }, [columns, selectedColumnIndex, selectedCardId, searchQuery, markEntryRead])
 
   // Scroll the keyboard-selected card into view.
   useEffect(() => {
@@ -896,6 +981,7 @@ export function App() {
                     selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
                     cardRefs={cardRefs}
                     onMarkRead={() => markColumnRead(col.name)}
+                    onMarkEntryRead={(entryId) => markEntryRead(col.name, entryId)}
                     prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
                     onPrefsChange={(next) => setPrefsFor(col.name, next)}
                     totalCount={col.totalCount}
@@ -921,6 +1007,9 @@ export function App() {
               }
               cardRefs={cardRefs}
               onMarkRead={() => markColumnRead(columns[mobileCol]?.name ?? '')}
+              onMarkEntryRead={(entryId) =>
+                markEntryRead(columns[mobileCol]?.name ?? '', entryId)
+              }
               prefs={
                 columns[mobileCol]
                   ? columnPrefs[columns[mobileCol].name] ?? DEFAULT_PREFS
@@ -935,12 +1024,14 @@ export function App() {
             {columns.length > 1 && (
               <div className="flex justify-center gap-1 mt-2">
                 {columns.map((c, i) => (
+                  // Navigation, not mark-read. Merely peeking at a column
+                  // shouldn't drop its "+N new" chip — that violates the
+                  // universal-inbox rule. The column header (desktop) and
+                  // the per-card ✓ button are the explicit mark-read
+                  // affordances.
                   <button
                     key={c.name}
-                    onClick={() => {
-                      setMobileCol(i)
-                      markColumnRead(c.name)
-                    }}
+                    onClick={() => setMobileCol(i)}
                     aria-label={`go to column ${c.name}`}
                     className={`h-2 w-2 rounded-full transition ${
                       i === mobileCol ? 'bg-label-primary w-4' : 'bg-label-tertiary'

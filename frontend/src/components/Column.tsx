@@ -41,6 +41,11 @@ type Props = {
   // Triggered when the user taps the column header. App uses this
   // to mark the column read in localStorage.
   onMarkRead?: () => void
+  // Per-card mark-read. App flips the entry's read state via this —
+  // see ``markEntryRead`` in App.tsx. The Column just forwards the
+  // clicked entry id up so the keyboard ``m`` shortcut and the
+  // button on each card share one code path.
+  onMarkEntryRead?: (entryId: number) => void
   // Prefs + setter for the ⋯ popover. For You column passes
   // ``undefined`` — no popover, just the chip + count.
   prefs?: ColumnPrefs
@@ -65,6 +70,7 @@ export function Column({
   selectedId,
   cardRefs,
   onMarkRead,
+  onMarkEntryRead,
   prefs,
   onPrefsChange,
   totalCount,
@@ -294,6 +300,7 @@ export function Column({
                 selected={selectedId === e.id}
                 cardRef={refCb}
                 category={categoriesBySourceId?.get(e.source_id)}
+                onMarkRead={onMarkEntryRead ? () => onMarkEntryRead(e.id) : undefined}
               />
             )
           })

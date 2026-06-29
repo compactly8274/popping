@@ -33,6 +33,11 @@ type Props = {
   // absent the card just renders without a stripe. The Column passes
   // it through from ``sourcesByMeta``.
   category?: string
+  // Per-card mark-read. When present, an inline ✓ button renders on
+  // the card so the user can dim one entry without nuking the
+  // column. Hides itself once the card is read (tapping ✓ on an
+  // already-dim card is a no-op up at App.markEntryRead).
+  onMarkRead?: () => void
 }
 
 // Map a category name to a Tailwind background class for the left
@@ -83,7 +88,7 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
-export function Card({ entry, sourceName, unread, selected, cardRef, onActivate, category }: Props) {
+export function Card({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   // Touch tracking for long-press → copy URL.
@@ -286,8 +291,57 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
         {sourceName && <span className="font-medium text-label-primary">{sourceName}</span>}
         {sourceName && <span>·</span>}
         <time>{timeAgo(entry.published_at)}</time>
+        {/* Per-card mark-read ✓. Sits on the trailing edge of the
+            meta row so it's visually associated with the read-state
+            line above it. ``opacity-0 group-hover:opacity-100``
+            keeps it out of the way on desktop until the user hovers;
+            the ``@media (hover: none)`` escape hatch makes it always
+            visible on touch where there's no hover state to discover
+            it. ``onMouseDown`` swallows the press so it doesn't
+            bubble into the article's long-press / context-menu
+            paths. Fires ``view`` so the ranker sees the same signal
+            it sees for headline and thumbnail clicks. */}
+        {onMarkRead && (
+          <button
+            type="button"
+            data-card-interactive
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              recordImmediate({ entry_id: entry.id, type: 'view' })
+              onMarkRead()
+            }}
+            aria-label="mark this card as read"
+            title="mark as read (m)"
+            className="ml-auto w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100"
+          >
+            <CheckIcon className="w-4 h-4" />
+          </button>
+        )}
       </div>
     </article>
+  )
+}
+
+// iOS-style checkmark. Used for the per-card mark-read ✓. 2px stroke
+// is heavier than the 1.75 the header icons use — the ✓ is the
+// primary affordance on its button so it should be assertive.
+function CheckIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <polyline points="4 12 10 18 20 6" />
+    </svg>
   )
 }
 
