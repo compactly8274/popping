@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 from typing import Any
 
@@ -29,6 +30,10 @@ logger = logging.getLogger("popping.sources.hn")
 _BASE = "https://hacker-news.firebaseio.com/v0"
 _TOP_N = 30  # plenty for a personal feed; well within rate-limit courtesy
 _TIMEOUT = 10.0
+# 5 MB. topstories.json is ~30 KB; per-item JSON is <5 KB.
+# The cap defends against a compromised / misconfigured
+# upstream returning a multi-gigabyte body before we OOM.
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 _DEFAULT_HEADERS = {
     "User-Agent": "Popping/0.2 (+https://github.com/compactly8274/popping)",
 }
@@ -56,10 +61,34 @@ class HnTop(SourcePlugin):
     refresh_interval_seconds = 300  # 5 min — HN moves fast
 
     async def fetch(self) -> list[dict]:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_DEFAULT_HEADERS) as client:
-            r = await client.get(self.url)
-            r.raise_for_status()
-            ids: list[int] = r.json()[:_TOP_N]
+        async with httpx.AsyncClient(
+            timeout=_TIMEOUT, headers=_DEFAULT_HEADERS,
+            follow_redirects=True, max_redirects=5,
+        ) as client:
+            # Body cap helper: enforce ``_MAX_RESPONSE_BYTES`` on the
+            # actual streamed bytes, not just the advisory
+            # Content-Length header. Returns the parsed JSON or raises
+            # ``ValueError`` if the body is too large / unparseable.
+            async def _get_json(url: str) -> Any:
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    cl = resp.headers.get("content-length")
+                    if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
+                        raise ValueError(
+                            f"hn: response Content-Length {cl} exceeds "
+                            f"{_MAX_RESPONSE_BYTES} cap"
+                        )
+                    buf = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > _MAX_RESPONSE_BYTES:
+                            raise ValueError(
+                                f"hn: response body exceeds "
+                                f"{_MAX_RESPONSE_BYTES} cap"
+                            )
+                return json.loads(bytes(buf))
+
+            ids: list[int] = (await _get_json(self.url))[:_TOP_N]
             # Concurrent per-item fetch; cap concurrency so a slow HN
             # doesn't hold open 30 sockets if the API hiccups.
             sem = asyncio.Semaphore(8)
@@ -67,12 +96,10 @@ class HnTop(SourcePlugin):
             async def _one(item_id: int) -> dict | None:
                 async with sem:
                     try:
-                        resp = await client.get(f"{_BASE}/item/{item_id}.json")
-                        resp.raise_for_status()
-                    except httpx.HTTPError as exc:
+                        data = await _get_json(f"{_BASE}/item/{item_id}.json")
+                    except (httpx.HTTPError, ValueError) as exc:
                         logger.debug("hn: item %d failed: %s", item_id, exc)
                         return None
-                data = resp.json()
                 if not data or data.get("deleted") or data.get("dead"):
                     return None
                 return {

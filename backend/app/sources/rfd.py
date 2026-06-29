@@ -41,7 +41,7 @@ import logging
 import re
 
 from app.sources import register_source
-from app.sources.base import SourcePlugin
+from app.sources.base import SourcePlugin, validate_required
 from app.sources.rss import fetch_rss
 
 logger = logging.getLogger("popping.sources.rfd")
@@ -196,15 +196,18 @@ def rfd_normalize_dynamic(name: str, raw: dict) -> dict:
 
 def _rfd_normalize(name: str, raw: dict) -> dict:
     """Shared normalize() for both the class-driven plugin and dynamic
-    RFD rows. Validates required keys (delegated to the base class)
-    and then layers on engagement extraction."""
-    # Defer the base validation so the contract (title/url required)
-    # stays consistent with the rest of the RSS plugins. We build a
-    # shallow SourcePlugin for the validation pass so we don't have
-    # to duplicate the "raise on missing title or url" logic.
-    base = SourcePlugin()
-    base.name = name
-    normalized = base.normalize(raw)
+    RFD rows. Validates required keys (delegated to the base) and then
+    layers on engagement extraction.
+
+    Why ``validate_required`` and not ``base = SourcePlugin()``: the
+    base class declares ``fetch`` as ``@abstractmethod`` so direct
+    instantiation raises ``TypeError``. Calling the free function
+    gets the same contract — title/url required — without needing a
+    plugin instance. (Previously the indirection called
+    ``SourcePlugin().normalize(...)`` which crashed on every entry;
+    that bug shipped zero entries per RFD tick.)
+    """
+    normalized = validate_required(name, raw)
 
     summary, content = _summary_from_raw(raw)
     votes, replies, views = _extract_from_haystack(summary, content)

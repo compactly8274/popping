@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 from typing import Any
 
@@ -29,6 +30,12 @@ logger = logging.getLogger("popping.sources.github_releases")
 
 _BASE = "https://api.github.com"
 _TIMEOUT = 15.0
+# 5 MB. Per-repo releases JSON is ~50 KB.
+# The cap defends against a compromised upstream returning a
+# multi-gigabyte body before we OOM. Unrelated to the
+# per-thumbnail 2 MB cap in ``app.assets`` — that one gates the
+# ``image_path`` write, this one gates the JSON parse.
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 _TOP_PER_REPO = 5  # only the most recent N releases per repo make the feed
 
 # Default repo set. Operators can fork and tweak the source plugin to
@@ -76,29 +83,50 @@ async def _fetch_repo(
     if (etag := _etag_cache.get(repo)):
         headers["If-None-Match"] = etag
     try:
-        resp = await client.get(url, headers=headers)
-    except httpx.HTTPError as exc:
-        logger.warning("github_releases: %s transport error: %s", repo, exc)
+        # Stream so we can enforce the byte cap on the actual body,
+        # not just the advisory Content-Length header. OOM protection
+        # against a compromised upstream returning a multi-gigabyte
+        # JSON document.
+        async with client.stream("GET", url, headers=headers) as resp:
+            if resp.status_code == 304:
+                logger.debug("github_releases: %s not modified (304)", repo)
+                return []
+            if resp.status_code != 200:
+                # Rate limit (403 with x-ratelimit-remaining=0) is
+                # the most common. Log it once and back off; the next
+                # refresh will try again. Cap the excerpt so a 10 MB
+                # body can't spam the logs.
+                excerpt = await resp.aread()
+                logger.warning(
+                    "github_releases: %s returned %d: %s",
+                    repo,
+                    resp.status_code,
+                    excerpt[:200].decode("utf-8", "replace"),
+                )
+                return []
+            cl = resp.headers.get("content-length")
+            if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
+                raise ValueError(
+                    f"github_releases: {repo} response Content-Length "
+                    f"{cl} exceeds {_MAX_RESPONSE_BYTES} cap"
+                )
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes():
+                buf.extend(chunk)
+                if len(buf) > _MAX_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"github_releases: {repo} response body exceeds "
+                        f"{_MAX_RESPONSE_BYTES} cap"
+                    )
+            # Stash the new ETag for next time.
+            if (etag := resp.headers.get("ETag")):
+                _etag_cache[repo] = etag
+            rels = json.loads(bytes(buf))
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("github_releases: %s fetch failed: %s", repo, exc)
         return []
-    if resp.status_code == 304:
-        logger.debug("github_releases: %s not modified (304)", repo)
-        return []
-    if resp.status_code != 200:
-        # Rate limit (403 with x-ratelimit-remaining=0) is the most
-        # common. Log it once and back off; the next refresh will try
-        # again.
-        logger.warning(
-            "github_releases: %s returned %d: %s",
-            repo,
-            resp.status_code,
-            resp.text[:200],
-        )
-        return []
-    # Stash the new ETag for next time.
-    if (etag := resp.headers.get("ETag")):
-        _etag_cache[repo] = etag
     items: list[dict] = []
-    for rel in resp.json():
+    for rel in rels:
         title = rel.get("name") or rel.get("tag_name") or repo
         # Some repos have no body — fall back to the tag.
         body = rel.get("body") or ""
@@ -131,7 +159,10 @@ class GithubReleases(SourcePlugin):
     repos: list[str] = _DEFAULT_REPOS  # class-level so tests can override
 
     async def fetch(self) -> list[dict]:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            follow_redirects=True, max_redirects=5,
+        ) as client:
             # Concurrent across repos — keeps total wall time at one
             # round-trip. 5 in flight is fine for our default list.
             per_repo = await asyncio.gather(

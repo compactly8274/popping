@@ -48,8 +48,19 @@ _THUMBNAIL_DIR = _ASSETS_DIR / "thumbnails"
 # misbehaving source can't fill the volume, but legitimate thumbnails
 # don't get silently truncated to "image failed".
 _MAX_FAVICON_BYTES = 256 * 1024
-_MAX_THUMBNAIL_BYTES = 1024 * 1024
-_TIMEOUT = 10.0
+# 2 MB. NYT / Verge / Wired hero images routinely land in the
+# 800 KB-1.5 MB range; 1 MB silently dropped them and ``image_path``
+# stayed NULL forever. The audit found this matches real-world
+# payloads. Keep the streaming cap (don't trust Content-Length);
+# just raise the threshold.
+_MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
+# Favicon stays at 10s (5-15 KB downloads are trivial).
+# Thumbnail bumps to 30s because news CDNs routinely stream at
+# 50 KB/s when cold — a 1.5 MB hero image needs a real read window.
+# Using a single 30s blanket was misleading for the favicon path,
+# so we split them: 10s for the small file, 30s for the large one.
+_FAVICON_TIMEOUT = 10.0
+_THUMBNAIL_TIMEOUT = 30.0
 # Cap on the homepage HTML probe — icons never need more than the
 # <head>. Keeps a chatty site from running us out of memory before we
 # even see the link tags.
@@ -288,7 +299,7 @@ async def fetch_favicon(source_url: str, source_id: int) -> Tuple[Optional[str],
     last_err: Optional[str] = None
     for attempt in (1, 2):
         async with httpx.AsyncClient(
-            timeout=_TIMEOUT,
+            timeout=_FAVICON_TIMEOUT,
             follow_redirects=True,
             headers={"User-Agent": _BROWSER_UA, "Accept": _IMAGE_ACCEPT},
         ) as client:
@@ -309,14 +320,19 @@ async def fetch_thumbnail(remote_url: str, entry_id: int) -> Optional[str]:
     """Download an entry's thumbnail to ``assets/thumbnails/<id>.<ext>``.
 
     Returns the local relative path (e.g. ``"thumbnails/1234.jpg"``) on
-    success, None on failure. Never raises. Uses the 1 MB cap so
-    news-site thumbnails up to ~1 MB land; bigger images are skipped
-    rather than truncated.
+    success, None on failure. Never raises. Uses the 2 MB cap so
+    news-site thumbnails up to ~2 MB land (NYT, Verge, Wired routinely
+    ship 800 KB-1.5 MB hero images); bigger images are skipped rather
+    than truncated.
     """
     last_err: Optional[str] = None
     for attempt in (1, 2):
+        # Thumbnail path: 30s read window because news CDNs routinely
+        # stream at 50 KB/s when cold — a 1.5 MB hero image needs a
+        # real read window. Re-running on a freshly-opened socket
+        # often clears a transient hiccup.
         async with httpx.AsyncClient(
-            timeout=_TIMEOUT,
+            timeout=_THUMBNAIL_TIMEOUT,
             follow_redirects=True,
             headers={"User-Agent": _BROWSER_UA, "Accept": _IMAGE_ACCEPT},
         ) as client:

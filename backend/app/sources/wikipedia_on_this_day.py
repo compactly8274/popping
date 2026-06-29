@@ -13,6 +13,7 @@ stored in meta so the UI can render "1865: …" if it wants.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 
 import httpx
@@ -25,6 +26,12 @@ logger = logging.getLogger("popping.sources.wikipedia_on_this_day")
 _BASE = "https://en.wikipedia.org/api/rest_v1/feed/onthisday/all"
 _TIMEOUT = 15.0
 _MAX_EVENTS = 50  # plenty; the feed has ~60 events per day
+# 5 MB. The feed is ~100 KB. The cap defends against a
+# compromised upstream returning a multi-gigabyte body before
+# we OOM. Unrelated to the per-thumbnail 2 MB cap in
+# ``app.assets`` — that one gates the ``image_path`` write, this
+# one gates the JSON parse.
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 _DEFAULT_HEADERS = {
     "User-Agent": "Popping/0.2 (+https://github.com/compactly8274/popping)",
     "Accept": "application/json",
@@ -47,14 +54,33 @@ class WikipediaOnThisDay(SourcePlugin):
         now = dt.datetime.now(dt.timezone.utc)
         url = f"{_BASE}/{now.month:02d}/{now.day:02d}"
         try:
-            async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_DEFAULT_HEADERS) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-        except httpx.HTTPError as exc:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, headers=_DEFAULT_HEADERS,
+                follow_redirects=True, max_redirects=5,
+            ) as client:
+                # Stream so we can enforce the byte cap on the actual
+                # body, not just the advisory Content-Length header.
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    cl = resp.headers.get("content-length")
+                    if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
+                        raise ValueError(
+                            f"wikipedia_on_this_day: response Content-Length "
+                            f"{cl} exceeds {_MAX_RESPONSE_BYTES} cap"
+                        )
+                    buf = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > _MAX_RESPONSE_BYTES:
+                            raise ValueError(
+                                f"wikipedia_on_this_day: response body exceeds "
+                                f"{_MAX_RESPONSE_BYTES} cap"
+                            )
+        except (httpx.HTTPError, ValueError) as exc:
             logger.warning("wikipedia_on_this_day: fetch failed: %s", exc)
             return []
         try:
-            data = resp.json()
+            data = json.loads(bytes(buf))
         except ValueError:
             logger.warning("wikipedia_on_this_day: non-JSON response")
             return []

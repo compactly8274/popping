@@ -41,14 +41,29 @@ class SourcePlugin(ABC):
         Plugins can override to do source-specific cleanup (e.g. strip
         tracking params from URLs, decode HTML entities in titles).
         """
-        title = raw.get("title")
-        url = raw.get("url")
-        if not title or not url:
-            raise ValueError(f"{self.name}: item missing title or url: {raw!r}")
-        published_at = raw.get("published_at")
-        return {
-            "title": str(title).strip(),
-            "url": str(url).strip(),
-            "published_at": published_at,
-            "meta": {k: v for k, v in raw.items() if k not in ("title", "url", "published_at")},
-        }
+        return validate_required(self.name, raw)
+
+
+def validate_required(name: str, raw: dict) -> dict:
+    """Validate the universal contract every entry must satisfy.
+
+    Raises ``ValueError`` when ``title`` or ``url`` is missing. Returns
+    the normalized dict on success. Lives as a free function (not a
+    method) so callers that need validation without a plugin instance
+    — ``_rfd_normalize`` in ``rfd.py``, future per-source normalizers —
+    don't have to instantiate the abstract ``SourcePlugin`` (which
+    raises ``TypeError`` because ``fetch`` is unimplemented). Keeping
+    the same body as ``SourcePlugin.normalize`` means any change to
+    the contract flows through both call sites.
+    """
+    title = raw.get("title")
+    url = raw.get("url")
+    if not title or not url:
+        raise ValueError(f"{name}: item missing title or url: {raw!r}")
+    published_at = raw.get("published_at")
+    return {
+        "title": str(title).strip(),
+        "url": str(url).strip(),
+        "published_at": published_at,
+        "meta": {k: v for k, v in raw.items() if k not in ("title", "url", "published_at")},
+    }

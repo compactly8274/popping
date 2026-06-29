@@ -280,7 +280,17 @@ async def _ingest(plugin_cls: Any) -> dict:
                     newly_inserted.append((row, source))
     except Exception as exc:
         logger.exception("ingest failed for %s", plugin_cls.name)
-        summary["error"] = f"{type(exc).__name__}: {exc}"
+        # Strip newlines (multi-line traceback in a tooltip is
+        # unreadable) and cap at 200 chars (native HTML ``title=``
+        # balloons truncate past ~400 chars anyway, and the full
+        # traceback is already captured via ``logger.exception``
+        # above). Without this cap a verbose exception (e.g. an
+        # HTML Cloudflare challenge body) renders as a multi-line
+        # unreadable tooltip.
+        exc_type = type(exc).__name__
+        msg = str(exc).strip()
+        msg = msg.splitlines()[0][:200] if msg else ""
+        summary["error"] = f"{exc_type}: {msg}" if msg else exc_type
         try:
             async with SessionLocal() as session:
                 source = await session.scalar(

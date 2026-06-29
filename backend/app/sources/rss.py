@@ -19,6 +19,7 @@ import datetime as dt
 import logging
 import re
 from typing import Any
+from urllib.parse import urljoin
 
 import feedparser
 import httpx
@@ -40,11 +41,27 @@ _DEFAULT_HEADERS = {
 
 
 def _parse_published(entry: Any) -> dt.datetime | None:
-    """Best-effort parse of a feedparser entry's published/updated field."""
+    """Best-effort parse of a feedparser entry's published/updated field.
+
+    Tries ``published_parsed`` / ``updated_parsed`` first (struct_time
+    populated by feedparser from RFC-822 dates) and falls back to
+    ISO-8601 strings in ``published`` / ``updated`` / ``created`` when
+    the struct parse fails. Without the string fallback, an entry that
+    ships ``<pubDate>2026-06-28T12:34:56Z</pubDate>`` (non-RFC-822)
+    lands with ``published_at=None`` and zero recency contribution —
+    silently excluded from the convergence boost.
+    """
     for key in ("published_parsed", "updated_parsed"):
         t = getattr(entry, key, None)
         if t:
             return dt.datetime(*t[:6], tzinfo=dt.timezone.utc)
+    for key in ("published", "updated", "created"):
+        s = getattr(entry, key, None)
+        if s and isinstance(s, str):
+            try:
+                return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except ValueError:
+                continue
     return None
 
 
@@ -66,6 +83,17 @@ def _pick_image_url(entry: Any) -> str | None:
       3. enclosure with image/* type (RSS 2.0)
       4. itunes:image (podcast artwork)
       5. first <img src> regex over summary (HTML summaries)
+
+    Relative ``<img src="/path/...">`` URLs are resolved against the
+    entry's ``link`` field so the asset fetcher sends an absolute
+    request. Without the resolve, a feed that ships WordPress-style
+    relative paths stores ``image_url="/2026/06/x.jpg"``; the fetcher
+    GETs that path against the source's host (often wrong) and
+    receives a 404, so the thumbnail never lands and ``image_path``
+    stays NULL forever. Absolute URLs from media:thumbnail /
+    media:content / enclosure / itunes:image pass through unchanged
+    (those branches already ship absolute URLs from real-world
+    feeds).
     """
     # 1. media:thumbnail
     mt = entry.get("media_thumbnail")
@@ -90,12 +118,14 @@ def _pick_image_url(entry: Any) -> str | None:
     ii = entry.get("image")
     if isinstance(ii, dict) and ii.get("href"):
         return ii["href"]
-    # 5. inline <img src> in summary
+    # 5. inline <img src> in summary — resolve relative paths
+    # against the entry's URL so the asset fetcher doesn't 404.
     summary = entry.get("summary") or ""
     if summary:
         m = _IMG_SRC_RE.search(summary)
         if m:
-            return m.group(1)
+            entry_url = entry.get("link") or ""
+            return urljoin(entry_url, m.group(1)) if entry_url else m.group(1)
     return None
 
 
@@ -159,7 +189,8 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
     for attempt in (1, 2):
         try:
             async with httpx.AsyncClient(
-                timeout=_RSS_TIMEOUT, follow_redirects=True
+                timeout=_RSS_TIMEOUT,
+                follow_redirects=True, max_redirects=5,
             ) as client:
                 resp = await client.get(url, headers=merged_headers)
                 resp.raise_for_status()
@@ -185,15 +216,29 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
             # entries. Surface it as an error so the scheduler can
             # record a useful tooltip instead of silently emptying
             # the dashboard.
-            if not items and (bool(feed.bozo) or not _looks_like_feed(resp)):
+            #
+            # Also guard the "feedparser happily parsed garbage"
+            # case: a truncated XML body can yield a non-empty
+            # ``entries`` list whose items have empty ``title`` /
+            # ``url``. Without this check, the pipeline lands
+            # phantom rows with ``title=''`` and ``url=<feed url>``
+            # that pollute the dashboard. We treat "any entry is
+            # missing title or url" as malformed and surface a
+            # useful tooltip instead of silently accepting the
+            # damage.
+            all_ok = bool(items) and all(
+                e.get("title") and e.get("url") for e in items
+            )
+            if not all_ok and (bool(feed.bozo) or not _looks_like_feed(resp)):
                 snippet = resp.text[:200].replace("\n", " ").strip()
                 raise ValueError(
-                    f"rss: {url} returned 0 entries with a non-feed body "
-                    f"(bozo={feed.bozo}, content-type={resp.headers.get('content-type')!r}, "
+                    f"rss: {url} returned malformed entries "
+                    f"(bozo={feed.bozo}, ok={all_ok}, count={len(items)}, "
+                    f"content-type={resp.headers.get('content-type')!r}, "
                     f"excerpt={snippet!r})"
                 )
             return items
-        except (httpx.ReadTimeout, httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        except (httpx.ReadTimeout, httpx.ConnectError, httpx.ConnectTimeout, httpx.TooManyRedirects) as exc:
             last_exc = exc
             logger.warning(
                 "rss: %s attempt %d failed (%s); retrying", url, attempt, exc,
