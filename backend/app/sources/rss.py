@@ -16,6 +16,7 @@ uncontroversial.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import re
 from typing import Any
 
@@ -24,6 +25,8 @@ import httpx
 
 from app.sources import register_source
 from app.sources.base import SourcePlugin
+
+logger = logging.getLogger("popping.sources.rss")
 
 _USER_AGENT = "Popping/0.2 (+https://github.com/compactly8274/popping)"
 _ACCEPT = (
@@ -96,6 +99,25 @@ def _pick_image_url(entry: Any) -> str | None:
     return None
 
 
+# Per-stage timeouts for the RSS fetch. ``connect`` is the TCP /
+# TLS handshake budget — failing fast here is correct, because a
+# host that can't accept the connection in 10s isn't coming back.
+# ``read`` is the body budget — feeds on slow CDNs (CBC, NYT
+# metered) routinely take 30-60s to start streaming. Using a
+# blanket timeout=30 was misleading: a 30s ``httpx.Timeout`` applies
+# to every stage including read, which is too tight for these.
+# Splitting the two keeps the failure modes honest: connection
+# refused → 10s fail; slow body → 60s read window.
+_CONNECT_TIMEOUT = 10.0
+_READ_TIMEOUT = 60.0
+_RSS_TIMEOUT = httpx.Timeout(
+    connect=_CONNECT_TIMEOUT,
+    read=_READ_TIMEOUT,
+    write=_READ_TIMEOUT,
+    pool=_READ_TIMEOUT,
+)
+
+
 async def fetch_rss(url: str) -> list[dict]:
     """Fetch and parse any RSS/Atom feed at ``url``.
 
@@ -107,30 +129,49 @@ async def fetch_rss(url: str) -> list[dict]:
     No DB / scheduler awareness here — this is a pure HTTP→list[dict]
     function that the scheduler's ``_ingest`` consumes through the
     plugin's ``fetch()`` method.
+
+    One retry on ``ReadTimeout`` / ``ConnectError``. CBC's CDN in
+    particular has been observed to time out the first request of a
+    cold connection but respond fine to a follow-up; the same TCP
+    socket reuse isn't always available because we open a fresh
+    client per ingest. One retry is enough — past that the upstream
+    is genuinely degraded and we'd rather skip the tick than hold
+    up the scheduler for a feed that's not going to land.
     """
-    # 30s — feeds hosted on slow CDNs (CBC, NYT metered) routinely
-    # exceed 20s. Worth the longer wait on the cold path since every
-    # failed ingest leaves a stale ``last_error`` that makes the source
-    # look broken in the UI until the next tick.
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        resp = await client.get(url, headers=_DEFAULT_HEADERS)
-        resp.raise_for_status()
-    feed = feedparser.parse(resp.text)
-    items: list[dict] = []
-    for entry in feed.entries:
-        image_url = _pick_image_url(entry)
-        items.append(
-            {
-                "title": entry.get("title", ""),
-                "url": entry.get("link", ""),
-                "published_at": _parse_published(entry),
-                "summary": entry.get("summary", ""),
-                # Top-level so the ingest pipeline can pop it out of
-                # meta cleanly. NULL when the feed ships no image.
-                "image_url": image_url,
-            }
-        )
-    return items
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(
+                timeout=_RSS_TIMEOUT, follow_redirects=True
+            ) as client:
+                resp = await client.get(url, headers=_DEFAULT_HEADERS)
+                resp.raise_for_status()
+            feed = feedparser.parse(resp.text)
+            items: list[dict] = []
+            for entry in feed.entries:
+                image_url = _pick_image_url(entry)
+                items.append(
+                    {
+                        "title": entry.get("title", ""),
+                        "url": entry.get("link", ""),
+                        "published_at": _parse_published(entry),
+                        "summary": entry.get("summary", ""),
+                        # Top-level so the ingest pipeline can pop it out of
+                        # meta cleanly. NULL when the feed ships no image.
+                        "image_url": image_url,
+                    }
+                )
+            return items
+        except (httpx.ReadTimeout, httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_exc = exc
+            logger.warning(
+                "rss: %s attempt %d failed (%s); retrying", url, attempt, exc,
+            )
+            continue
+    # Both attempts failed. Bubble the last error so the scheduler's
+    # per-source try/except logs it as the ingest failure.
+    assert last_exc is not None
+    raise last_exc
 
 
 class _RssPlugin(SourcePlugin):
