@@ -21,14 +21,17 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from collections import defaultdict
 from typing import Optional
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.llm import ProviderError, router
 from app.models import Brief, Entry, Source
 from app.notify import Notifier
+from app import brief_filter
 from app import runtime_settings
 
 logger = logging.getLogger("popping.brief")
@@ -254,7 +257,20 @@ class BriefGenerator:
 
     @staticmethod
     async def _select_entries(session: AsyncSession, *, limit: int) -> list[tuple[Entry, Source]]:
-        """Top-N entries ingested in the lookback window, by composite_score.
+        """Top-N entries ingested in the lookback window, by composite_score
+        with a convergence multiplier applied.
+
+        Sort key is ``composite_score * convergence_multiplier(slug)``
+        — a story appearing in 3+ sources gets a 1.20× boost, 2 sources
+        gets 1.10×, 1 source gets 1.0. Same multipliers the For You
+        route applies, so a brief pick is consistent with what the
+        user sees when they scroll their personal feed.
+
+        Clickbait titles (ALL-CAPS, listicles, "shocking"-style
+        adjectives, emoji noise) are dropped at this layer. The
+        dashboard feed still surfaces them — only the brief editor
+        filters them out, since the brief is a curated editorial
+        product and the user already opted in to it by generating.
 
         Filter is on ``fetched_at`` (when the row landed in our DB), not
         ``published_at`` (when the source article was published). Wikipedia
@@ -267,7 +283,17 @@ class BriefGenerator:
         ``wikipedia_on_this_day``) are excluded by slug. Their entries
         still surface in the dashboard's browse view; only the brief
         skips them. Joined to Source so the prompt can show category +
-        source name."""
+        source name.
+
+        Convergence counts are computed in the same window as the
+        ``for you`` route (``settings.convergence_window_hours``,
+        default 24) so a story trending across feeds right now is
+        the one that bubbles up here.
+        """
+        # Over-fetch so convergence-boosted entries still have room to
+        # climb into the result set. Cap at 500 — same bound as the
+        # foryou route — so the post-filter pass stays cheap.
+        over_fetch = min(max(limit * 4, 200), 500)
         window_hours = await BriefGenerator._resolve_window_hours()
         since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
         stmt = (
@@ -276,10 +302,68 @@ class BriefGenerator:
             .where(Entry.fetched_at >= since)
             .where(Source.name.notin_(_HISTORICAL_SOURCE_SLUGS))
             .order_by(desc(Entry.composite_score))
-            .limit(limit)
+            .limit(over_fetch)
         )
         rows = (await session.execute(stmt)).all()
-        return [(e, s) for e, s in rows]
+        if not rows:
+            return []
+
+        # Clickbait filter — drop loud, deterministic patterns. The
+        # dashboard keeps these; the brief doesn't.
+        filtered = [
+            (e, s) for e, s in rows
+            if not brief_filter.is_clickbait(e.title)
+        ]
+        if not filtered:
+            return []
+
+        # Convergence boost — same window as /api/foryou so brief
+        # picks are consistent with the personal feed's notion of
+        # "trending right now". Counts use ``published_at`` (when the
+        # article was actually written) rather than ``fetched_at`` —
+        # that's what makes the convergence detector meaningful
+        # (Wikipedia's old entries shouldn't trip the cluster
+        # detector for today's news).
+        from app.scoring import composite as composite_scorer
+
+        conv_window = settings.convergence_window_hours
+        conv_since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=conv_window)
+        conv_rows = (
+            await session.execute(
+                select(Entry.title, Source.name)
+                .join(Source, Entry.source_id == Source.id)
+                .where(Entry.published_at >= conv_since)
+            )
+        ).all()
+        slug_to_sources: dict[str, set[str]] = defaultdict(set)
+        for title, source_name in conv_rows:
+            slug = composite_scorer.title_slug(title)
+            if slug:
+                slug_to_sources[slug].add(source_name)
+        conv_counts = {
+            slug: len(srcs) for slug, srcs in slug_to_sources.items()
+            if len(srcs) > 1
+        }
+
+        scored: list[tuple[float, Entry, Source]] = []
+        for entry, source in filtered:
+            slug = composite_scorer.title_slug(entry.title)
+            mult = composite_scorer.convergence_multiplier(
+                conv_counts.get(slug, 1)
+            )
+            base = entry.composite_score or 0.0
+            scored.append((base * mult, entry, source))
+
+        # Sort descending by boosted score; tie-break on published_at
+        # so two equal-scored stories prefer the more recent one.
+        scored.sort(
+            key=lambda t: (
+                t[0],
+                t[1].published_at or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            ),
+            reverse=True,
+        )
+        return [(e, s) for _score, e, s in scored[:limit]]
 
     @staticmethod
     async def _select_entries_by_slug(
@@ -315,22 +399,19 @@ class BriefGenerator:
     @staticmethod
     def _format_entries(entries: list[tuple[Entry, Source]]) -> str:
         """Render a compact entry list for the prompt. One entry per line:
-        ``[source · category · score] title — summary``."""
+        ``[source · category · score] title — summary``.
+
+        ``summary`` here is the best long-form description we can find
+        in ``Entry.meta`` — see ``brief_filter.extract_summary`` for the
+        priority order across sources. Up to 600 chars (up from the
+        previous 240) so the LLM has real context to summarize from
+        rather than just a fragment of the lede.
+        """
         lines: list[str] = []
         for entry, source in entries:
             score = entry.composite_score or 0.0
             title = (entry.title or "").strip()
-            summary = ""
-            if entry.meta and isinstance(entry.meta, dict):
-                summary = (
-                    entry.meta.get("summary")
-                    or entry.meta.get("vulnerabilityName")
-                    or entry.meta.get("shortDescription")
-                    or ""
-                )
-                # Truncate aggressively — the digest doesn't need the
-                # full CVE description.
-                summary = (str(summary).strip()[:240]).strip()
+            summary = brief_filter.extract_summary(entry.meta or {}, max_chars=600)
             line = f"[{source.name} · {source.category} · {score:.0f}] {title}"
             if summary:
                 line += f" — {summary}"
@@ -379,6 +460,20 @@ class BriefGenerator:
         # The accompanying Ollama-side mitigation (stop sequences +
         # reduced max_tokens) lives in the ollama providers; the prompt
         # alone wouldn't be enough against the more verbose models.
+
+        # Editing guidance. Tells the model to read the description
+        # AFTER the em-dash and summarize from there, not to parrot
+        # the title. Sensational titles can slip past the regex
+        # filter ("Why everyone's wrong about X"), and without this
+        # hint the model often amplifies them rather than cutting to
+        # what's actually happening.
+        editing_guidance = (
+            "For each highlight, summarize what is ACTUALLY happening "
+            "based on the description after the em-dash, not the title "
+            "alone. If the title is editorialized or sensational, write "
+            "the plain factual version. Lead with the fact."
+        )
+
         format_directive = (
             "Reply with the brief only. No preamble. No analysis, no reasoning, "
             "no explanations, no labels, no headers, no bold, no italic, no "
@@ -419,6 +514,7 @@ class BriefGenerator:
         return (
             f"You are the editor of a personal intelligence brief. Tone: {tone}. "
             f"{tone_blurb}\n\n"
+            f"{editing_guidance}\n\n"
             f"{format_directive}\n\n"
             f"Example of the exact shape to produce:\n"
             f"{format_example}\n\n"
