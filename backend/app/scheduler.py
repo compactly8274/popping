@@ -873,23 +873,40 @@ async def update_source(
     refresh: int | None = None,
     active: bool | None = None,
     category: str | None = None,
+    name: str | None = None,
+    url: str | None = None,
 ) -> Source | None:
     """Apply a partial update to a Source row and reschedule if needed.
 
     Returns the updated row, or None if no row exists with that id.
 
-    Only fields the Phase 5 UI exposes are accepted. ``name`` /
-    ``url`` changes would invalidate the favicon cache and aren't
-    supported — the UI points users to delete + recreate.
+    All fields are optional — missing fields are left untouched. The
+    route layer enforces name/url constraints (``^[a-z0-9_]+$``,
+    URL parse, no built-in collisions, no name collisions with other
+    rows); this function assumes the inputs have already passed
+    validation.
 
     Scheduler effects:
       - ``active`` False → remove the dynamic job. A class-driven
         source (``name in list_sources()``) is left alone; the
         class-driven job continues independently of the row.
-      - ``active`` True or ``refresh`` change → re-add the dynamic
-        job with the new trigger (``replace_existing=True`` handles
-        idempotency).
+      - ``active`` True, ``refresh`` change, ``name`` change, or
+        ``url`` change → re-add the dynamic job with the new trigger
+        (``replace_existing=True`` handles idempotency). ``replace_existing=True``
+        rebinds the job's args — for dynamic rows this means the
+        next tick uses a freshly-constructed ``DynamicRssPlugin``
+        instance built from the renamed row.
+
+    URL changes clear the cached favicon: ``favicon_url`` and
+    ``favicon_path`` are NULLed on the row, and the on-disk file
+    at ``assets/favicons/<id>.*`` is unlinked via
+    ``assets.delete_favicon``. The next ingest re-downloads the new
+    favicon into the same path via ``os.replace`` (atomic
+    overwrite). The file is keyed by ``source.id`` (stable across
+    URL changes) so no rename is needed.
     """
+    from app import assets as assets_mod
+
     row = await session.get(Source, source_id)
     if row is None:
         return None
@@ -898,7 +915,19 @@ async def update_source(
     )
     active_changed = active is not None and active != row.active
     category_changed = category is not None and category != row.category
-    if not (refresh_changed or active_changed or category_changed):
+    name_changed = name is not None and name != row.name
+    url_changed = url is not None and url != row.url
+    # ALL five fields participate in the early-return guard. The
+    # original three-field version silently dropped name/url-only
+    # PATCHes because the commit lives below the guard; the new
+    # fields would have suffered the same bug.
+    if not (
+        refresh_changed
+        or active_changed
+        or category_changed
+        or name_changed
+        or url_changed
+    ):
         return row
     if refresh is not None:
         row.refresh_interval_seconds = refresh
@@ -906,6 +935,24 @@ async def update_source(
         row.active = active
     if category is not None:
         row.category = category
+    if name is not None:
+        row.name = name
+    if url_changed:
+        row.url = url
+        # Clear the cached favicon for the OLD URL. The row's
+        # ``favicon_url`` / ``favicon_path`` columns carry the cache
+        # state — if there was nothing cached, there's nothing to
+        # unlink and we skip the filesystem call.
+        if row.favicon_path:
+            try:
+                assets_mod.delete_favicon(source_id)
+            except Exception:
+                logger.debug(
+                    "scheduler: delete_favicon(%d) raised — continuing",
+                    source_id, exc_info=True,
+                )
+        row.favicon_url = None
+        row.favicon_path = None
     await session.commit()
     await session.refresh(row)
 
@@ -931,7 +978,10 @@ async def update_source(
             pass
         return row
 
-    # Re-add (covers: enabled, refresh changed, or both).
+    # Re-add (covers: enabled, refresh / name / url changed, or any
+    # combination). ``replace_existing=True`` rebinds the args so
+    # the freshly-constructed ``DynamicRssPlugin(row)`` below picks
+    # up the new name/url.
     _add_or_replace_dynamic_job(_scheduler, row)
     return row
 

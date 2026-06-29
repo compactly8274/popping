@@ -64,6 +64,12 @@ type Props = {
   // Phase 5: FeedManager errors flow up to App's red banner for
   // a single, consistent error surface.
   onError: (msg: string) => void
+  // Phase 5+: when the user renames a source via FeedManager's
+  // inline edit, the Drawer bubbles the old→new mapping up so App
+  // can remap ``activeSources`` in the same render cycle. Without
+  // this, the chip bar briefly loses the renamed source during the
+  // gap between PATCH and the next ``refresh()`` resolving.
+  onSourceRenamed?: (oldName: string, newName: string) => void
 }
 
 // Whitelist mirrors backend ``_VALID_PROVIDERS``. Includes a sentinel
@@ -98,6 +104,7 @@ export function Drawer({
   briefTone,
   onBriefToneChange,
   onError,
+  onSourceRenamed,
 }: Props) {
   const [sources, setSources] = useState<Source[]>([])
   const [sourcesError, setSourcesError] = useState<string | null>(null)
@@ -321,6 +328,7 @@ export function Drawer({
               sources={sources}
               onRefresh={refetchSources}
               onError={onError}
+              onSourceRenamed={onSourceRenamed}
             />
           </GroupedSection>
 

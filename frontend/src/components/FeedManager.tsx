@@ -26,6 +26,11 @@ type Props = {
   sources: Source[]
   onRefresh: () => Promise<void>
   onError: (msg: string) => void
+  // Bubbles up from ``SourceRow`` when the user renames a source via
+  // the inline edit form. See ``App.tsx`` — the parent remaps
+  // ``activeSources`` synchronously so the chip bar stays consistent
+  // through the rename.
+  onSourceRenamed?: (oldName: string, newName: string) => void
 }
 
 type Tab = 'mine' | 'recommended' | 'add'
@@ -104,9 +109,10 @@ function parseApiError(err: unknown, fallback: string): string {
   return fallback
 }
 
-export function FeedManager({ sources, onRefresh, onError }: Props) {
+export function FeedManager({ sources, onRefresh, onError, onSourceRenamed }: Props) {
   const [tab, setTab] = useState<Tab>('mine')
   const [editingInterval, setEditingInterval] = useState<number | null>(null)
+  const [editingRowId, setEditingRowId] = useState<number | null>(null)
 
   return (
     <div className="space-y-2">
@@ -127,8 +133,11 @@ export function FeedManager({ sources, onRefresh, onError }: Props) {
           sources={sources}
           editingInterval={editingInterval}
           setEditingInterval={setEditingInterval}
+          editingRowId={editingRowId}
+          setEditingRowId={setEditingRowId}
           onRefresh={onRefresh}
           onError={onError}
+          onSourceRenamed={onSourceRenamed}
         />
       )}
       {tab === 'recommended' && (
@@ -178,14 +187,23 @@ function MyFeedsTab({
   sources,
   editingInterval,
   setEditingInterval,
+  editingRowId,
+  setEditingRowId,
   onRefresh,
   onError,
+  onSourceRenamed,
 }: {
   sources: Source[]
   editingInterval: number | null
   setEditingInterval: (id: number | null) => void
+  // ID of the row currently in inline edit mode. Mutually exclusive
+  // with ``editingInterval`` for that row — editing the metadata
+  // closes any open interval picker on the same row.
+  editingRowId: number | null
+  setEditingRowId: (id: number | null) => void
   onRefresh: () => Promise<void>
   onError: (msg: string) => void
+  onSourceRenamed?: (oldName: string, newName: string) => void
 }) {
   if (sources.length === 0) {
     return <p className="text-ios-body text-label-secondary italic px-1">no sources yet</p>
@@ -199,8 +217,18 @@ function MyFeedsTab({
             isEditingInterval={editingInterval === s.id}
             onStartEditInterval={() => setEditingInterval(s.id)}
             onCancelEditInterval={() => setEditingInterval(null)}
+            isEditing={editingRowId === s.id}
+            onStartEdit={() => {
+              setEditingInterval(null)
+              setEditingRowId(s.id)
+            }}
+            onCancelEdit={() => setEditingRowId(null)}
             onRefresh={onRefresh}
             onError={onError}
+            onRenamed={(oldName, newName) => {
+              setEditingRowId(null)
+              onSourceRenamed?.(oldName, newName)
+            }}
           />
         </li>
       ))}
@@ -213,15 +241,23 @@ function SourceRow({
   isEditingInterval,
   onStartEditInterval,
   onCancelEditInterval,
+  isEditing,
+  onStartEdit,
+  onCancelEdit,
   onRefresh,
   onError,
+  onRenamed,
 }: {
   source: Source
   isEditingInterval: boolean
   onStartEditInterval: () => void
   onCancelEditInterval: () => void
+  isEditing: boolean
+  onStartEdit: () => void
+  onCancelEdit: () => void
   onRefresh: () => Promise<void>
   onError: (msg: string) => void
+  onRenamed?: (oldName: string, newName: string) => void
 }) {
   const builtIn = isBuiltIn(source)
   const [busy, setBusy] = useState(false)
@@ -268,6 +304,147 @@ function SourceRow({
     }
   }
 
+  // Edit form local state — initialized from props so the user
+  // always sees the current row values, not stale defaults. Reset
+  // on each edit-start so cancelling a rename and starting again
+  // doesn't show the previously-typed (and rejected) values.
+  const [editName, setEditName] = useState(source.name)
+  const [editUrl, setEditUrl] = useState(source.url)
+  const [editCategory, setEditCategory] = useState(source.category)
+
+  // When edit mode opens, seed the inputs from the current row. Use
+  // an effect keyed on ``isEditing`` rather than re-deriving in the
+  // ``useState`` initializer because React only runs the initializer
+  // once — closing + reopening edit mode would otherwise show stale
+  // text from the previous edit.
+  useEffect(() => {
+    if (isEditing) {
+      setEditName(source.name)
+      setEditUrl(source.url)
+      setEditCategory(source.category)
+    }
+  }, [isEditing, source.name, source.url, source.category])
+
+  const saveEdit = async () => {
+    const nameChanged = editName.trim() !== source.name
+    const urlChanged = editUrl.trim() !== source.url
+    const categoryChanged = editCategory.trim() !== source.category
+    if (!nameChanged && !urlChanged && !categoryChanged) {
+      // Nothing to save — close the form so the user doesn't think
+      // the click was eaten by a bug.
+      onCancelEdit()
+      return
+    }
+    setBusy(true)
+    try {
+      const body: {
+        name?: string
+        url?: string
+        category?: string
+      } = {}
+      if (nameChanged) body.name = editName.trim()
+      if (urlChanged) body.url = editUrl.trim()
+      if (categoryChanged) body.category = editCategory.trim()
+      const updated = await api.updateSource(source.id, body)
+      const oldName = source.name
+      const newName = updated.name
+      await onRefresh()
+      if (nameChanged && oldName !== newName) {
+        // Bubble up so App can remap the active filter chip in the
+        // same render cycle as the refresh.
+        onRenamed?.(oldName, newName)
+      } else {
+        // No rename — close edit mode without triggering the remap.
+        onCancelEdit()
+      }
+    } catch (err) {
+      onError(parseApiError(err, 'failed to save changes'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (isEditing) {
+    // Inline edit form — replaces the read-only row chrome while
+    // open. The fields mirror what's editable via PATCH (name +
+    // url + category). ``url`` is locked for built-ins because the
+    // backend rejects it with a 400 anyway; locking client-side
+    // avoids the user typing something that would just bounce.
+    return (
+      <div className={`px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0 space-y-2 ${busy ? 'opacity-60' : ''}`}>
+        <label className="block">
+          <span className="text-label-tertiary text-[11px] uppercase tracking-wide">name</span>
+          <input
+            type="text"
+            value={editName}
+            onChange={(e) => setEditName(e.target.value)}
+            disabled={busy || builtIn}
+            className="mt-0.5 w-full bg-bg-elevated border border-hairline rounded-ios px-2 py-1 text-ios-body text-label-primary disabled:opacity-50"
+            autoFocus
+            spellCheck={false}
+          />
+        </label>
+        <label className="block">
+          <span className="text-label-tertiary text-[11px] uppercase tracking-wide">url</span>
+          <input
+            type="url"
+            value={editUrl}
+            onChange={(e) => setEditUrl(e.target.value)}
+            disabled={busy || builtIn}
+            className="mt-0.5 w-full bg-bg-elevated border border-hairline rounded-ios px-2 py-1 text-ios-body text-label-primary disabled:opacity-50"
+            spellCheck={false}
+          />
+          {builtIn && (
+            <span className="block text-label-tertiary text-[10px] mt-0.5">
+              built-in — url is bound to the plugin
+            </span>
+          )}
+        </label>
+        <label className="block">
+          <span className="text-label-tertiary text-[11px] uppercase tracking-wide">category</span>
+          <input
+            type="text"
+            value={editCategory}
+            onChange={(e) => setEditCategory(e.target.value)}
+            disabled={busy}
+            className="mt-0.5 w-full bg-bg-elevated border border-hairline rounded-ios px-2 py-1 text-ios-body text-label-primary disabled:opacity-50"
+            list="feed-category-options"
+            spellCheck={false}
+          />
+          <datalist id="feed-category-options">
+            {CATEGORY_OPTIONS.map((c) => (
+              <option key={c} value={c} />
+            ))}
+          </datalist>
+        </label>
+        <div className="flex items-center gap-2 pt-1">
+          <button
+            onClick={saveEdit}
+            disabled={busy}
+            className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
+          >
+            save
+          </button>
+          <button
+            onClick={onCancelEdit}
+            disabled={busy}
+            className="text-ios-caption text-label-secondary active:opacity-60 disabled:opacity-40"
+          >
+            cancel
+          </button>
+          {!builtIn && source.url !== editUrl && (
+            <span
+              className="text-ios-caption text-amber-400 ml-auto"
+              title="changing the url clears the cached favicon; the next ingest re-downloads"
+            >
+              ⚠ favicon resets
+            </span>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className={`px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0 ${busy ? 'opacity-60' : ''}`}>
       <div className="flex items-center gap-2 min-w-0">
@@ -299,6 +476,14 @@ function SourceRow({
           aria-label={source.active ? 'pause source' : 'resume source'}
         >
           {source.active ? 'pause' : 'resume'}
+        </button>
+        <button
+          onClick={onStartEdit}
+          disabled={busy}
+          className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
+          aria-label={`edit ${source.name}`}
+        >
+          edit
         </button>
         {isEditingInterval ? (
           <select

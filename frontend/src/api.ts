@@ -175,11 +175,21 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }),
-  /** Partial update of a source. All fields optional. URL/name
-   * changes are intentionally not exposed — delete + recreate. */
+  /** Partial update of a source. All fields optional.
+   *
+   * ``name`` and ``url`` are now editable for dynamic rows. The
+   * backend rejects PATCH on built-ins (BBC, HN, etc.) with a 400
+   * and returns 409 on a name collision. URL changes clear the
+   * cached favicon; the next ingest re-downloads. */
   updateSource: (
     id: number,
-    body: { refresh_interval_seconds?: number; active?: boolean; category?: string },
+    body: {
+      refresh_interval_seconds?: number
+      active?: boolean
+      category?: string
+      name?: string
+      url?: string
+    },
   ) =>
     jsonFetch<Source>(`/api/sources/${id}`, {
       method: 'PATCH',
@@ -219,6 +229,51 @@ export const api = {
       `/api/ingest/${encodeURIComponent(sourceName)}`,
       { method: 'POST' },
     ),
+
+  // ---- Engagement events (Phase 8) ----
+  /** Record one engagement event immediately. The endpoint requires
+   * auth when OIDC is on; for click events the synchronous response
+   * is preferable so we know the server saw it. Use the batch
+   * endpoint for view events. */
+  recordInteraction: (event: {
+    entry_id: number
+    type:
+      | 'view'
+      | 'click'
+      | 'dwell'
+      | 'thumb_up'
+      | 'thumb_down'
+      | 'bookmark'
+      | 'share'
+      | 'never'
+    value?: number
+  }) =>
+    jsonFetch<{ id: number }>('/api/interactions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+    }),
+  /** Record a batch of engagement events. The frontend schedules
+   * view events into a buffer and flushes on idle / pagehide —
+   * see ``frontend/src/lib/interactions.ts``. */
+  recordInteractionBatch: (events: Array<{
+    entry_id: number
+    type:
+      | 'view'
+      | 'click'
+      | 'dwell'
+      | 'thumb_up'
+      | 'thumb_down'
+      | 'bookmark'
+      | 'share'
+      | 'never'
+    value?: number
+  }>) =>
+    jsonFetch<{ inserted: number }>('/api/interactions/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events }),
+    }),
 
   // ---- The Brief (phase 4) ----
   briefLatest: (opts?: { tone?: string; limit?: number }) => {

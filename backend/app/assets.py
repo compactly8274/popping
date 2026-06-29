@@ -338,3 +338,38 @@ def ensure_dirs() -> None:
     lifespan startup so a fresh volume doesn't 404 the StaticFiles mount."""
     _FAVICON_DIR.mkdir(parents=True, exist_ok=True)
     _THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def delete_favicon(source_id: int) -> bool:
+    """Unlink the cached favicon for a source row. Returns True when
+    a file was removed, False when nothing was cached.
+
+    The favicon file is keyed by source id (not URL), so the
+    extension is the only thing that varies — ``<id>.png`` / ``.ico``
+    / ``.svg`` / etc. Glob the directory for any extension; only
+    files whose stem is exactly ``str(source_id)`` belong to this
+    row, so a stray file with the same prefix won't be touched.
+
+    Called from ``scheduler.update_source`` when the row's URL
+    changes — the next ingest will redownload into the same path via
+    ``os.replace`` (atomic overwrite, see ``_download``). Caller is
+    expected to also clear ``favicon_url``/``favicon_path`` on the
+    row; this helper only touches the filesystem.
+    """
+    stem = str(source_id)
+    removed = False
+    # ``iterdir`` is more portable than ``glob`` here — we're matching
+    # exact stem + any suffix, so a glob of ``<stem>.*`` would also
+    # catch ``12345.tmp`` style leftovers from a partial download.
+    # Iterdir + name check is the precise form.
+    try:
+        for entry in _FAVICON_DIR.iterdir():
+            if entry.is_file() and entry.name.split(".", 1)[0] == stem:
+                entry.unlink(missing_ok=True)
+                removed = True
+    except OSError as exc:
+        # Don't raise — a failed unlink shouldn't break the PATCH.
+        # Logged at debug so an operator chasing a stale favicon sees
+        # the cause without it spamming info-level logs.
+        logger.debug("assets: delete_favicon(%d) failed: %s", source_id, exc)
+    return removed

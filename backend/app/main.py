@@ -31,6 +31,7 @@ from app.routes import entries as entries_routes
 from app.routes import foryou as foryou_routes
 from app.routes import health as health_routes
 from app.routes import ingest as ingest_routes
+from app.routes import interactions as interactions_routes
 from app.routes import settings as settings_routes
 from app.routes import sources as sources_routes
 from app.scheduler import start_scheduler, stop_scheduler
@@ -126,6 +127,7 @@ app.include_router(sources_routes.router, prefix="/api")
 app.include_router(entries_routes.router, prefix="/api")
 app.include_router(foryou_routes.router, prefix="/api")
 app.include_router(ingest_routes.router, prefix="/api")
+app.include_router(interactions_routes.router, prefix="/api")
 app.include_router(brief_routes.router, prefix="/api")
 app.include_router(settings_routes.router, prefix="/api")
 

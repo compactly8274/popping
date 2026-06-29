@@ -14,12 +14,13 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.deps import require_user
+from app.auth.deps import current_user, require_user
 from app.config import settings
 from app.db import get_session
-from app.feed_recommendations import recommendations_for
+from app.feed_recommendations import recommendations_for, recommendations_for_user
 from app.models import Source
 from app.schemas import FeedRecommendation, SourceCreate, SourceOut, SourceUpdate
 from app.sources import list_sources as registered_plugin_names
@@ -152,17 +153,65 @@ async def update_source_endpoint(
     body: SourceUpdate,
     session: AsyncSession = Depends(get_session),
 ) -> SourceOut:
+    # Pre-validate before hitting the scheduler. The row-level guards
+    # (built-in rejection, name collision) need a DB lookup; do them
+    # here so the user sees a clean 400/409 rather than a generic 500
+    # from a SQLAlchemy IntegrityError or a defensive guard deeper in
+    # the scheduler.
+    if body.name is not None:
+        _validate_name(body.name)
+        # Reject names that collide with a registered plugin. A
+        # dynamic row that takes a built-in name would silently become
+        # "class-driven" at the next scheduler check (see
+        # ``scheduler.update_source``'s ``row.name in registered_names``
+        # branch), so the route layer enforces the invariant.
+        if body.name in registered_plugin_names():
+            raise HTTPException(
+                status_code=400,
+                detail=f"name {body.name!r} is reserved for a built-in source",
+            )
+    if body.url is not None:
+        _validate_url(body.url)
     if body.refresh_interval_seconds is not None:
         body.refresh_interval_seconds = _validate_refresh(body.refresh_interval_seconds)
     if body.category is not None and not body.category.strip():
         raise HTTPException(status_code=422, detail="category cannot be empty")
-    row = await scheduler.update_source(
-        session,
-        source_id,
-        refresh=body.refresh_interval_seconds,
-        active=body.active,
-        category=body.category,
-    )
+
+    # Built-in rows can be paused / re-categorized (these are
+    # row-level state, not class-level). Renaming or re-URLing a
+    # built-in is not allowed — the registry key is fixed, and the
+    # URL is bound to the plugin class's fetch logic.
+    pre = await session.get(Source, source_id)
+    if pre is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    if pre.name in registered_plugin_names() and (
+        body.name is not None or body.url is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"built-in source {pre.name!r} cannot be renamed or re-URLed",
+        )
+
+    try:
+        row = await scheduler.update_source(
+            session,
+            source_id,
+            refresh=body.refresh_interval_seconds,
+            active=body.active,
+            category=body.category,
+            name=body.name,
+            url=body.url,
+        )
+    except IntegrityError:
+        # Most likely cause: ``Source.name`` has a UNIQUE constraint
+        # (``models.py:44``) and the new name collides with another
+        # row. Surface as 409 so the client knows it's a recoverable
+        # conflict, not a server fault.
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"source name {body.name!r} is already in use",
+        )
     if row is None:
         raise HTTPException(status_code=404, detail="source not found")
     return SourceOut.model_validate(row)
@@ -207,13 +256,20 @@ async def delete_source_endpoint(
 @router.get("/feed-recommendations", response_model=list[FeedRecommendation])
 async def feed_recommendations_endpoint(
     session: AsyncSession = Depends(get_session),
+    user: dict | None = Depends(current_user),
 ) -> list[FeedRecommendation]:
-    """Curated list of feeds the user might want to add, minus any
-    they already have. See ``backend/app/feed_recommendations.py``
-    for the editorial rationale and how to update the list.
-
-    The list is static today (Phase 5); Phase 8 will re-rank by
-    co-engagement signals once ``Interaction`` rows start landing.
+    """Curated list of feeds the user might want to add, re-ranked by
+    the user's last-30-days interaction co-occurrence. Without a
+    logged-in user the list is returned in the editorial order.
+    See ``backend/app/feed_recommendations.py`` for the ranking math
+    and how to update the curated list.
     """
     rows = (await session.scalars(select(Source.name))).all()
-    return [FeedRecommendation(**r) for r in recommendations_for(list(rows))]
+    active = list(rows)
+    if user is None:
+        # Anonymous: no engagement rows to score, so serve the static
+        # list. We still strip already-added sources so a freshly
+        # deleted session doesn't leak "Add BBC News" duplicates.
+        return [FeedRecommendation(**r) for r in recommendations_for(active)]
+    recs = await recommendations_for_user(session, active, user["sub"])
+    return [FeedRecommendation(**r) for r in recs]

@@ -7,7 +7,8 @@ Different sources ship different engagement signals:
     RFD        vote / reply / view counts (forum RSS exposes them
                inconsistently across feed versions)
     GitHub     ``stargazers_count`` / ``forks_count`` / comments
-    YouTube    ``view_count`` / ``like_count``
+    YouTube    ``like_count`` (view_count is audience-size, NOT
+               treated as engagement here)
 
 The composite scorer needs ONE signal: how much interaction is
 this item getting, on a 0-100 scale, normalized so a high-engagement
@@ -17,7 +18,8 @@ populate the canonical ``engagement_*`` meta keys.
 
 Two-tier metadata scheme:
     1. Source-specific meta keys live in ``Entry.meta`` under their
-       natural names (``score``, ``comments``, ``votes``, ``view_count``).
+       natural names (``score``, ``comments``, ``votes``, ``stars``,
+       ``likes``, ``reactions``, ``bookmarks``, ``shares``, …).
        Sources write them and existing UI/queries that look at
        ``meta.score`` keep working.
     2. Canonical engagement keys (``engagement_score``,
@@ -32,6 +34,22 @@ site is the right place to map them, and source plugins only need
 to write the canonical names they care about. Existing per-source
 keys (HN's ``meta.score``) stay for backwards compat with the
 schema / frontend.
+
+What we DO treat as engagement:
+    - ``stars`` / ``star_count`` — GitHub stars, podcast ratings
+    - ``reactions`` / ``reactions_count`` — Facebook / Slack /
+      Reddit-style aggregates
+    - ``likes`` — explicit thumbs-up
+    - ``bookmarks`` — saved-for-later (Pocket, HN favorite)
+    - ``shares`` — explicit share events
+    - ``replies`` / ``replies_count`` — discussion-shaped comments
+
+What we DO NOT treat as engagement (deliberately excluded):
+    - ``view_count`` / ``plays`` / ``listens`` — audience size,
+      not per-item interest. A 1M-view YouTube video isn't "more
+      engaged" than a 200-comment HN thread.
+    - ``clicks`` — outbound CTR is a marketing-funnel metric, not
+      content-engagement. Mixing it would dilute the votes signal.
 
 The math:
     - log10(1+n) compresses the long tail so 10000 votes isn't 100×
@@ -59,6 +77,42 @@ from app.models import Entry
 # this module's formula.
 _VOTE_WEIGHT = 0.6
 _COMMENT_WEIGHT = 0.9
+
+
+# Lookup tables for the fallback chain in ``score()``. Tuples (not sets)
+# because order matters: we return the FIRST numeric value we find.
+# Sources write their natural key — ``points``, ``stars``, ``likes``,
+# whatever — and we look it up here.
+#
+# Adding a new key is a deliberate act: it has to be unambiguously
+# engagement-shaped and not a "this looks large enough to count"
+# heuristic. See the module docstring's "What we DO treat as
+# engagement" / "What we DO NOT" lists for the inclusion criteria.
+#
+# Canonical ``engagement_score`` / ``engagement_comments`` always come
+# first so a source that writes both gets canonical semantics.
+ENGAGEMENT_VOTE_KEYS: tuple[str, ...] = (
+    "engagement_score",
+    "score",
+    "votes",
+    "upvotes",
+    "points",
+    "stars",
+    "star_count",
+    "reactions",
+    "reactions_count",
+    "likes",
+    "bookmarks",
+    "shares",
+)
+ENGAGEMENT_COMMENT_KEYS: tuple[str, ...] = (
+    "engagement_comments",
+    "comments",
+    "replies",
+    "replies_count",
+    "descendants",
+    "num_comments",
+)
 
 
 def _safe_log1p(n: Optional[int | float]) -> float:
@@ -104,13 +158,12 @@ def _read_meta(meta: Any, *keys: str) -> Optional[float]:
 def score(entry: Entry, source: Any = None) -> float:
     """Engagement score for an entry in [0, 100].
 
-    Reads canonical meta keys first, then falls back to legacy
-    per-source names so already-ingested rows score correctly
-    without a backfill:
-
-        canonical           legacy fallback
-        engagement_score    score, votes, upvotes, points, view_count
-        engagement_comments comments, replies, descendants, num_comments
+    Reads canonical meta keys first, then falls back to a wide
+    per-source-name list (see ``ENGAGEMENT_VOTE_KEYS`` and
+    ``ENGAGEMENT_COMMENT_KEYS``) so already-ingested rows score
+    correctly without a backfill and so a new source plugin that
+    writes ``meta.stars`` / ``meta.likes`` / ``meta.reactions``
+    lights up engagement scoring without code changes here.
 
     Returns 0 when no engagement signals are present (BBC, NVD,
     CISA, Wikipedia — none ship engagement today). That's a
@@ -119,22 +172,8 @@ def score(entry: Entry, source: Any = None) -> float:
     """
     meta = entry.meta if entry.meta else {}
 
-    votes = _read_meta(
-        meta,
-        "engagement_score",
-        "score",
-        "votes",
-        "upvotes",
-        "points",
-    )
-    comments = _read_meta(
-        meta,
-        "engagement_comments",
-        "comments",
-        "replies",
-        "descendants",
-        "num_comments",
-    )
+    votes = _read_meta(meta, *ENGAGEMENT_VOTE_KEYS)
+    comments = _read_meta(meta, *ENGAGEMENT_COMMENT_KEYS)
 
     # If a source ships one signal but not the other, treat the
     # missing one as zero — not None — so the formula still runs.

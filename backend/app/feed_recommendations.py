@@ -5,10 +5,10 @@ FeedManager Drawer surface ("Recommended" tab) shows this list, minus
 anything the user has already added. Adding fires ``POST /api/sources``
 which uses the dynamic-RSS path — see ``backend/app/sources/dynamic_rss.py``.
 
-Updating the list is a code change + backend restart. That's deliberate:
-Phase 5's "personalization" IS the editorial pick. A DB-backed
-recommendations table would let the user curate their own, which is
-exactly what Phase 8 wires up once ``Interaction`` rows start landing.
+Updating the static list is a code change + backend restart. That's
+deliberate: the curated list is the editorial seed; ``recommendations_for``
+re-ranks it dynamically by interaction co-occurrence once the user
+has accumulated engagement signals.
 
 Conventions:
     - All URLs are RSS / Atom feeds.
@@ -24,9 +24,26 @@ Conventions:
       frontend tells us the active source names, but keeping them
       out of the source list avoids confusion if a future change
       drops the server-side filter.
+
+Ranking (``recommendations_for``):
+    When the user has zero interaction rows we serve the list in its
+    curated order. Once ``Interaction`` rows land, we aggregate per
+    source-category scores from the last 30 days, negate
+    ``thumb_down`` / ``never`` events, and squeeze through ``tanh``
+    so a single hot category doesn't dominate the ordering. We then
+    sort the candidates by ``score desc, curated_index asc`` so ties
+    fall back to the editorial order and the list feels stable.
 """
 
 from __future__ import annotations
+
+import math
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import case, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import Entry, Interaction, Source
 
 
 # A tuple of (name, category, url, blurb). Storing as a list of dicts
@@ -234,3 +251,106 @@ def recommendations_for(active_source_names: list[str]) -> list[dict]:
     """
     active = set(active_source_names or [])
     return [r for r in RECOMMENDATIONS if r["name"] not in active]
+
+
+# Event types that subtract from a category's net score. Listed here
+# once so the SQL stays readable; the route layer's InteractionType
+# enum shares these names.
+_NEGATIVE_TYPES = ("thumb_down", "never")
+
+# Window for the co-occurrence aggregate. Matches the recency decay
+# used elsewhere (brief scheduling, brief deduplication); a 30-day
+# window means a one-off click from three months ago won't move the
+# recommendation needle.
+_LOOKBACK = timedelta(days=30)
+
+# Divisor inside tanh: a raw score of 5 in a category maps to
+# tanh(5/5) ≈ 0.76; 10 maps to tanh(2) ≈ 0.96. Larger values stay
+# close to 1.0 so the ordering stays stable at the top.
+_TANH_DIVISOR = 5.0
+
+
+async def _category_scores(
+    session: AsyncSession, user_id: str
+) -> dict[str, float]:
+    """Return ``{category: net_score}`` for the user, rolled up across
+    the last ``_LOOKBACK`` window. ``net_score`` is the sum of
+    ``+1`` per positive interaction and ``-1`` per ``thumb_down`` /
+    ``never``. Categories with no engagement don't appear.
+
+    Negative types live as constants so the SQL reads cleanly. We do
+    the negation in SQL rather than fetching rows and folding in
+    Python — cheaper at the typical engagement volume (hundreds per
+    user, not millions).
+    """
+    cutoff = datetime.now(timezone.utc) - _LOOKBACK
+    # Build the per-row sign once so the aggregate stays readable.
+    # ``case`` translates to a portable ``CASE WHEN`` across both
+    # SQLite (tests) and Postgres (prod); ``func.IF`` would be MySQL.
+    sign = case(
+        (Interaction.type.in_(_NEGATIVE_TYPES), -1.0),  # type: ignore[arg-type]
+        else_=1.0,
+    )
+    net_expr = func.sum(sign)
+    stmt = (
+        select(Source.category.label("category"), net_expr.label("net_score"))
+        .join(Entry, Entry.source_id == Source.id)
+        .join(Interaction, Interaction.entry_id == Entry.id)
+        .where(Interaction.user_id == user_id)
+        .where(Interaction.created_at >= cutoff)
+        .group_by(Source.category)
+    )
+    rows = (await session.execute(stmt)).all()
+    return {row.category: float(row.net_score or 0.0) for row in rows}
+
+
+def _squeeze(raw: float) -> float:
+    """Map raw net-score to ``[0, 1]`` via ``tanh`` so a single hot
+    category can't pull every recommendation toward it. Output is
+    non-negative because all candidates with a net score below 0 are
+    sorted by their (already clamped) value."""
+    if raw <= 0:
+        return 0.0
+    return math.tanh(raw / _TANH_DIVISOR)
+
+
+async def recommendations_for_user(
+    session: AsyncSession,
+    active_source_names: list[str],
+    user_id: str,
+) -> list[dict]:
+    """Re-ranked recommendation list for a logged-in user.
+
+    Filtering matches ``recommendations_for`` (skip already-added
+    sources). Ranking uses the user's last-30-days interaction
+    co-occurrence: candidates in a category the user engages with
+    float up; candidates in a category the user has thumbed-down
+    sink (or stay neutral if no signal). Ties fall back to the
+    curated ``RECOMMENDATIONS`` order so the list is stable when
+    the user has no data.
+
+    Returns a fresh list — the caller may serialize it directly.
+    """
+    candidates = recommendations_for(active_source_names)
+    if not candidates:
+        return candidates
+
+    raw_scores = await _category_scores(session, user_id)
+    if not raw_scores:
+        # No engagement yet — fall through to curated order, which is
+        # already what ``recommendations_for`` returned.
+        return candidates
+
+    squeezed = {cat: _squeeze(score) for cat, score in raw_scores.items()}
+    # Pre-compute the curated index so ties are deterministic.
+    for idx, item in enumerate(candidates):
+        item.setdefault("_curated_index", idx)
+    # Sort by descending category score, then by curated index ascending.
+    candidates.sort(
+        key=lambda item: (-squeezed.get(item["category"], 0.0), item["_curated_index"])
+    )
+    # Strip the helper key before returning — the API serializer
+    # doesn't know about it.
+    for item in candidates:
+        item.pop("_curated_index", None)
+    return candidates

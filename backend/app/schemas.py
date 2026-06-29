@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import enum
 from typing import Optional
 
 from pydantic import BaseModel
@@ -46,13 +47,24 @@ class SourceCreate(BaseModel):
 
 class SourceUpdate(BaseModel):
     """Body for ``PATCH /api/sources/{id}``. All fields optional —
-    missing fields are left untouched. ``url`` and ``name`` are
-    deliberately not exposed: changing them invalidates the cached
-    favicon and thumbnail and would require a "re-cache" hook. The
-    user-facing path is delete + recreate."""
+    missing fields are left untouched.
+
+    ``name`` and ``url`` are now editable for dynamic sources. The
+    route layer validates ``name`` against ``^[a-z0-9_]{1,120}$``
+    (same regex as POST), rejects built-in sources, and surfaces a
+    409 on a name collision. URL changes clear the cached favicon
+    and let the next ingest re-download.
+
+    Built-in sources still reject PATCH on name/url: the row's
+    name is the registry key, and a built-in's URL is bound to its
+    plugin class. The route layer enforces this with the same
+    `row.name in registered_plugin_names()` check DELETE uses.
+    """
     refresh_interval_seconds: Optional[int] = None
     active: Optional[bool] = None
     category: Optional[str] = None
+    name: Optional[str] = None
+    url: Optional[str] = None
 
 
 class FeedRecommendation(BaseModel):
@@ -178,3 +190,56 @@ class HealthOut(BaseModel):
     db: str
     redis: str
     last_fetch: Optional[dt.datetime] = None
+
+
+class InteractionType(str, enum.Enum):
+    """The set of engagement events a client can POST. ``view`` /
+    ``click`` are the common ones; ``thumb_up`` / ``thumb_down``
+    record explicit preference; ``never`` is a "I never want to see
+    this again" signal (used by the recommendation co-occurrence
+    ranker to subtract category scores); ``dwell`` measures
+    how long the user spent reading an entry; ``bookmark`` /
+    ``share`` are high-value positive signals.
+
+    The string values match the canonical names the recommendations
+    SQL aggregates (``thumb_down``, ``never`` subtract 1 from the
+    per-category count). Adding a new enum value here requires
+    updating the ranker in ``app.feed_recommendations`` if the
+    event should count toward preferences.
+    """
+    view = "view"
+    click = "click"
+    dwell = "dwell"
+    thumb_up = "thumb_up"
+    thumb_down = "thumb_down"
+    bookmark = "bookmark"
+    share = "share"
+    never = "never"
+
+
+class InteractionIn(BaseModel):
+    """Body for ``POST /api/interactions``. Records one event.
+
+    ``value`` defaults to 1.0 and accepts negative floats so
+    ``thumb_down`` / ``never`` can record a -1.0 contribution to
+    the recommendation ranker. ``entry_id`` is validated against
+    the entries table inside the route handler — pydantic only
+    enforces the type, not the referential integrity (the FK is
+    on the column; a missing entry would surface as a 422 from
+    SQLAlchemy, which we convert to a 404).
+    """
+    entry_id: int
+    type: InteractionType
+    value: float = 1.0
+
+
+class InteractionBatchIn(BaseModel):
+    """Body for ``POST /api/interactions/batch``. Up to 50 events at
+    once. The frontend batches view events (one per visible card on
+    a dashboard render) into a single request, flushing on
+    ``requestIdleCallback`` or ``visibilitychange: hidden`` via
+    ``navigator.sendBeacon``. Click events go through the single-
+    shot endpoint because they're sparse and want immediate
+    feedback.
+    """
+    events: list[InteractionIn]

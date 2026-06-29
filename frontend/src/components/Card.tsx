@@ -13,8 +13,9 @@
 //     so cards that haven't been computed (e.g. before F2 lands on
 //     a given column) don't all flash unread.
 
-import { useRef, type MouseEvent, type TouchEvent } from 'react'
+import { useEffect, useRef, type MouseEvent, type TouchEvent } from 'react'
 import type { Entry } from '../api'
+import { recordBatched, recordImmediate } from '../lib/interactions'
 import { toast } from './Toast'
 
 type Props = {
@@ -89,6 +90,15 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
   // Kept in refs so the values don't trigger re-renders mid-press.
   const touchStart = useRef<{ x: number; y: number; t: number; id: number; onInteractiveChild: boolean } | null>(null)
   const longPressTimer = useRef<number | null>(null)
+
+  // Record one ``view`` event per (entry, session). ``recordBatched``
+  // dedups internally so even if React strict-mode mounts the card
+  // twice in dev, only one event lands. Effect fires on mount and
+  // when the entry id changes; no dependency on entry itself — we
+  // only care that the card is on screen.
+  useEffect(() => {
+    recordBatched({ entry_id: entry.id, type: 'view' })
+  }, [entry.id])
 
   const clearLongPress = () => {
     if (longPressTimer.current != null) {
@@ -231,7 +241,14 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
           rel="noopener noreferrer"
           aria-label="open in new tab"
           title="opens in a new tab"
-          onClick={() => onActivate?.()}
+          onClick={() => {
+            // Fire-and-forget: the click POST doesn't gate the
+            // navigation. We don't await because the browser opens
+            // the new tab synchronously and we don't want a slow
+            // network to delay it.
+            recordImmediate({ entry_id: entry.id, type: 'click' })
+            onActivate?.()
+          }}
           className="flex-1 min-w-0 flex items-start gap-1.5 text-ios-body font-medium text-label-primary hover:text-white line-clamp-2"
         >
           <span className="min-w-0">{entry.title}</span>
@@ -251,6 +268,7 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
             path={entry.image_path}
             title={entry.title}
             url={entry.url}
+            entryId={entry.id}
           />
         )}
         {/* Score badge. The gradient gives the badge a tiny bit of
@@ -295,9 +313,14 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
 // so a developer chasing a 403 / 404 sees which thumbnail URL is
 // the offender. Hidden state is the same as before (display:none on
 // the wrapper) so the badge still lands flush right.
-function Thumbnail({ path, title, url }: { path: string; title: string; url: string }) {
+function Thumbnail({ path, title, url, entryId }: { path: string; title: string; url: string; entryId: number }) {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const open = () => {
+    // The thumbnail click is its own affordance and uses
+    // ``e.stopPropagation`` to bypass the article-level handlers —
+    // so the headline's onClick won't fire. Record the click event
+    // here so the recommendation ranker sees both kinds of opens.
+    recordImmediate({ entry_id: entryId, type: 'click' })
     window.open(url, '_blank', 'noopener,noreferrer')
   }
   const onClick = (e: MouseEvent<HTMLDivElement>) => {

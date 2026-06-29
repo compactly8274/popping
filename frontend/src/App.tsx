@@ -579,6 +579,21 @@ export function App() {
       return next
     })
   }
+  // When a user renames a source via the FeedManager inline editor,
+  // remap any active filter chip in the same render cycle so the
+  // chip bar doesn't briefly lose the source between PATCH and the
+  // next ``refresh()`` resolving. A no-op if the renamed source
+  // wasn't in the active set.
+  const onSourceRenamed = (oldName: string, newName: string) => {
+    if (oldName === newName) return
+    setActiveSources((prev) => {
+      if (!prev.has(oldName)) return prev
+      const next = new Set(prev)
+      next.delete(oldName)
+      next.add(newName)
+      return next
+    })
+  }
   // Same as ``toggleSource`` but also closes the drawer the first time
   // the user adds a source to an empty filter. The "empty → first tap"
   // transition is the confusing one — the user picked a source, the
@@ -949,6 +964,7 @@ export function App() {
         briefTone={briefTone}
         onBriefToneChange={setBriefTone}
         onError={setError}
+        onSourceRenamed={onSourceRenamed}
       />
 
       <ToastHost />
