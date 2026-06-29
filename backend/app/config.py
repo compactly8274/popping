@@ -240,6 +240,18 @@ class Settings(BaseSettings):
     # but doesn't need to be tight.
     convergence_check_interval_minutes: int = 15
 
+    # Retention window for ``notification_dedup``. The table grows
+    # by one row per unique CVE URL / convergence slug that ever
+    # fired (the ``ON CONFLICT DO UPDATE`` only bumps the timestamp
+    # on re-fires); without a prune job it grows unbounded. 30 days
+    # is long enough that a CVE re-reported tomorrow still dedups
+    # against this week's ledger; short enough that a vuln-heavy
+    # install tops out around "two weeks of CVE volume + a few
+    # hundred convergence slugs". Set to 0 to disable pruning
+    # (keep full history). Override with
+    # POPPING_NOTIFICATION_DEDUP_RETENTION_DAYS.
+    notification_dedup_retention_days: int = 30
+
     # --- Runtime settings (LLM picker) -----------------------------------
     # TTL for the /api/llm/tags response cache. The picker fetches this
     # on drawer-open; 1 h is plenty because the user's available models

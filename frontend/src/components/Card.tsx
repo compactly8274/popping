@@ -669,6 +669,18 @@ function showContextMenu(x: number, y: number, url: string) {
   menu.style.left = `${left}px`
   menu.style.top = `${top}px`
 
+  // Single teardown. The original implementation leaked a keydown
+  // listener on ``document`` whenever the user dismissed the menu via
+  // the backdrop or by clicking a button — only the Escape branch
+  // detached its handler, so each right-click → backdrop-click round
+  // trip left another active listener closing over the orphaned
+  // menu/backdrop DOM nodes. Use one close() callback that removes
+  // every node and every listener, and call it from every exit path.
+  const close = () => {
+    menu.remove()
+    backdrop.remove()
+    document.removeEventListener('keydown', onKey, true)
+  }
   const items: Array<{ label: string; onClick: () => void }> = [
     { label: 'Copy link', onClick: () => copyUrl(url) },
     {
@@ -686,29 +698,21 @@ function showContextMenu(x: number, y: number, url: string) {
     btn.textContent = item.label
     btn.onclick = () => {
       item.onClick()
-      menu.remove()
-      backdrop.remove()
+      close()
     }
     menu.appendChild(btn)
   }
 
   const backdrop = document.createElement('div')
   backdrop.className = 'fixed inset-0 z-40'
-  backdrop.onclick = () => {
-    menu.remove()
-    backdrop.remove()
-  }
+  backdrop.onclick = () => close()
   document.body.appendChild(backdrop)
   document.body.appendChild(menu)
 
   // Esc dismisses too. Listeners are per-menu so multiple opens
   // don't fight over a single handler.
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === 'Escape') {
-      menu.remove()
-      backdrop.remove()
-      document.removeEventListener('keydown', onKey, true)
-    }
+    if (e.key === 'Escape') close()
   }
   document.addEventListener('keydown', onKey, true)
 }

@@ -18,6 +18,7 @@ import base64
 import hashlib
 import logging
 import secrets
+import time
 from typing import Any
 from urllib.parse import urlencode
 
@@ -34,15 +35,45 @@ class OIDCError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Discovery metadata (cached per process)
+# Discovery metadata (cached per process, with TTL)
 # ---------------------------------------------------------------------------
 
-_metadata_cache: dict[str, dict] = {}
+# Cached discovery document per issuer. The first ``_discovery`` call
+# hits ``<issuer>/.well-known/openid-configuration`` and stashes the
+# result here; subsequent calls reuse it. The audit found this cache
+# previously had no expiration, so an IdP rotation (key endpoint
+# change, JWKS URL change, token endpoint change) would only be
+# picked up on a full process restart.
+#
+# TTL: 1 hour. OIDC discovery is cheap (single GET), so the trade-off
+# is "stale metadata for up to an hour after an IdP rotation" vs.
+# "discovery hit on every login". An hour is short enough that a
+# midnight IdP rollover is recovered by morning, long enough that
+# ``_check_convergence`` (per-tick) doesn't accidentally hammer the
+# IdP's discovery endpoint.
+#
+# The cache key is the issuer URL so a single process supporting
+# multiple IdPs (not currently used but cheap to support) gets a
+# separate entry per issuer.
+_METADATA_TTL_SECONDS = 3600
+_metadata_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _metadata_fresh(entry: tuple[float, dict]) -> bool:
+    """``True`` if the cached entry's age is under ``_METADATA_TTL_SECONDS``.
+
+    ``time.monotonic`` rather than wall-clock — a wall-clock jump
+    (NTP step, daylight-savings, manual clock set) shouldn't
+    invalidate a fresh cache nor keep a stale one alive.
+    """
+    cached_at, _ = entry
+    return (time.monotonic() - cached_at) < _METADATA_TTL_SECONDS
 
 
 def _discovery(cfg: OIDCConfig) -> dict:
-    if cfg.issuer in _metadata_cache:
-        return _metadata_cache[cfg.issuer]
+    entry = _metadata_cache.get(cfg.issuer)
+    if entry is not None and _metadata_fresh(entry):
+        return entry[1]
     try:
         with httpx.Client(timeout=10.0) as c:
             resp = c.get(f"{cfg.issuer}/.well-known/openid-configuration")
@@ -57,7 +88,7 @@ def _discovery(cfg: OIDCConfig) -> dict:
             raise OIDCError(
                 f"OIDC discovery at {cfg.issuer} is missing {required!r}"
             )
-    _metadata_cache[cfg.issuer] = meta
+    _metadata_cache[cfg.issuer] = (time.monotonic(), meta)
     logger.info("OIDC discovery loaded from %s", cfg.issuer)
     return meta
 

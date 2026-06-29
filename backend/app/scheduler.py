@@ -418,6 +418,50 @@ async def _backfill_embeddings(batch_size: int | None = None) -> None:
         logger.exception("embedding backfill failed (will retry on next startup)")
 
 
+async def _prune_notification_dedup() -> None:
+    """Prune ``notification_dedup`` rows older than the retention window.
+
+    Each CVE URL or convergence slug that fires once and never again
+    leaves a row that sits in the table forever — the
+    ``ON CONFLICT DO UPDATE`` only bumps ``last_notified_at`` on
+    re-fires, so steady-state ingest on a vuln-heavy mix grows the
+    table by one row per unique URL. Over months this hits tens of
+    thousands of rows on a single-user install. Reads stay cheap (PK
+    lookups) but the index size grows linearly.
+
+    Prune rows whose ``last_notified_at`` is older than
+    ``NOTIFICATION_DEDUP_RETENTION_DAYS`` (default 30). 30 days is
+    long enough that a CVE re-reported tomorrow still dedups
+    against this week's ledger; short enough that the table tops
+    out around "two weeks of CVE volume + a few hundred
+    convergence slugs".
+
+    Runs daily. Scheduled by ``start_scheduler`` next to the
+    session-purge job.
+    """
+    from app.config import settings as _s  # avoid cycle at module load
+
+    retention_days = getattr(_s, "notification_dedup_retention_days", 30)
+    if retention_days <= 0:
+        # 0 = unbounded (opt-out for users who want the full history).
+        return
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=retention_days)
+    try:
+        async with SessionLocal() as session:
+            stmt = delete(NotificationDedup).where(
+                NotificationDedup.last_notified_at < cutoff,
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            if result.rowcount:
+                logger.info(
+                    "scheduler: notification_dedup pruned %d rows older than %d days",
+                    result.rowcount, retention_days,
+                )
+    except Exception:
+        logger.exception("notification_dedup prune failed — continuing")
+
+
 async def _purge_sessions() -> None:
     """Delete expired session rows. Best-effort; logs on failure."""
     # Imported lazily so module load order is independent of auth availability.
@@ -466,11 +510,21 @@ async def _maybe_notify_cves(inserted: list[tuple[Entry, Source]]) -> None:
                 fresh.append((entry, src))
             if not fresh:
                 return
+            # Record the dedup BEFORE sending the notification.
+            # The previous order (send, then record, then commit)
+            # had a partial-state hazard: a transient commit failure
+            # between the notifier call and the dedup ledger INSERT
+            # left the user with a sent notification AND no dedup
+            # row, so the next tick re-sent the same alert. Flip the
+            # order so the dedup is durable BEFORE the side effect
+            # fires. Trade-off: a notifier failure post-commit leaves
+            # the dedup row but no notification sent, so the user
+            # misses one alert — preferred over duplicate alerts.
+            await _record_notified_urls(session, [e.url for e, _ in fresh if e.url])
+            await session.commit()
             body = "\n\n".join(_format_cve(e, s) for e, s in fresh[:10])
             title = f"🚨 {len(fresh)} high-severity CVE{'s' if len(fresh) != 1 else ''}"
             await notifier.send(title=title, body=body)
-            await _record_notified_urls(session, [e.url for e, _ in fresh if e.url])
-            await session.commit()
             logger.info("cve notify: %d fresh alert(s) sent", len(fresh))
     except Exception:
         logger.exception("cve notify failed")
@@ -501,13 +555,33 @@ async def _check_convergence() -> None:
                 return
             for slug, count in list(new_slugs.items())[:5]:  # cap per tick
                 try:
+                    # Record the dedup ledger FIRST, then dispatch
+                    # the alert. The previous order (generate_alert,
+                    # then record, then commit) had a partial-state
+                    # hazard if the final commit failed: the LLM
+                    # call had already run and the notifier had
+                    # already fired (side effects), but the dedup
+                    # ledger INSERT was uncommitted and rolled back,
+                    # so the next tick re-ran the same alert. Flip
+                    # the order so the dedup ledger is durable
+                    # BEFORE the side effects. A notifier failure
+                    # post-commit leaves a dedup row but no alert
+                    # sent — the user misses one alert, instead of
+                    # receiving the same alert every tick until a
+                    # successful send.
+                    await _record_alerted_slug(session, slug)
+                    await session.commit()
                     await _brief_generator.generate_alert(
                         session=session, slug=slug, source_count=count,
                     )
-                    # Mark the slug in the dedup ledger. Done after the
-                    # Brief row is created so a failed alert leaves the
-                    # ledger untouched (next tick retries).
-                    await _record_alerted_slug(session, slug)
+                    # ``generate_alert`` only flushes the Brief row
+                    # (no internal commit), so persist it now. The
+                    # dedup ledger from the commit above is the
+                    # durable dedup; this commit carries the Brief
+                    # row itself. If this second commit fails the
+                    # dedup is still durable — the user just won't
+                    # see the Brief in the dashboard, which is
+                    # preferable to a duplicate alert.
                     await session.commit()
                 except Exception:
                     logger.exception("alert brief failed for slug=%s", slug)
@@ -854,6 +928,24 @@ async def start_scheduler(notifier: Optional[Notifier] = None) -> AsyncIOSchedul
         coalesce=True,
     )
 
+    # Daily prune of the ``notification_dedup`` ledger. Without it
+    # the table grows by one row per unique CVE URL / convergence
+    # slug that ever fired — never freed, because
+    # ``ON CONFLICT DO UPDATE`` only refreshes the timestamp on
+    # re-fires. The audit flagged this as unbounded growth.
+    # 24-hour cadence is plenty for a retention window measured in
+    # days; the prune itself is a single DELETE bounded by an index.
+    _scheduler.add_job(
+        _prune_notification_dedup,
+        trigger=IntervalTrigger(hours=24),
+        id="notify:prune_dedup",
+        name="Notification dedup ledger prune",
+        replace_existing=True,
+        next_run_time=dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1),
+        max_instances=1,
+        coalesce=True,
+    )
+
     _scheduler.start()
     logger.info("scheduler: started")
     return _scheduler
@@ -1110,25 +1202,42 @@ async def update_source(
         row.name = name
     if url_changed:
         row.url = url
-        # Clear the cached favicon for the OLD URL. The row's
-        # ``favicon_url`` / ``favicon_path`` columns carry the cache
-        # state — if there was nothing cached, there's nothing to
-        # unlink and we skip the filesystem call.
-        if row.favicon_path:
-            try:
-                assets_mod.delete_favicon(source_id)
-            except Exception:
-                logger.debug(
-                    "scheduler: delete_favicon(%d) raised — continuing",
-                    source_id, exc_info=True,
-                )
+        # Capture the OLD favicon metadata BEFORE nulling the
+        # columns, then null them in-row so the next commit
+        # persists the cleared state. The actual filesystem unlink
+        # happens AFTER ``session.commit`` (see block below) so a
+        # commit failure can't leave the row pointing at a deleted
+        # file. The previous version unlinked first and committed
+        # second — a transient DB error (name collision,
+        # connection blip) left the row pointing at a missing file,
+        # so the next render showed a broken image until the next
+        # ingest ran. Commit-first / delete-second flips that:
+        # a delete failure leaves a stale favicon on disk (the
+        # next ingest's ``os.replace`` overwrites it via
+        # ``assets._download``); far better than a dangling path.
+        old_favicon_path = row.favicon_path
         row.favicon_url = None
         row.favicon_path = None
+    else:
+        old_favicon_path = None
     if custom_headers is not _UNSET:
         # Route layer has already normalized this (None → NULL,
         # empty dict → NULL). Storing ``{}`` would be wasteful.
         row.custom_headers = custom_headers
     await session.commit()
+    if url_changed and old_favicon_path:
+        # Post-commit filesystem cleanup. Only reached on a
+        # successful commit, so the row no longer references the
+        # cached file; a failed unlink here leaves a stale favicon
+        # on disk for one ingest cycle (the next ingest's
+        # ``os.replace`` overwrites it via ``assets._download``).
+        try:
+            assets_mod.delete_favicon(source_id)
+        except Exception:
+            logger.debug(
+                "scheduler: delete_favicon(%d) raised — continuing",
+                source_id, exc_info=True,
+            )
     await session.refresh(row)
 
     if _scheduler is None:

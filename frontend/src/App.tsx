@@ -101,6 +101,15 @@ function loadMobileCol(): number {
 // column isn't rendered, but a few stale ids are cheap — they just
 // sit in localStorage. Valued-shaped (numbers only) so the per-card
 // JSON.parse stays fast at boot.
+//
+// ``MAX_PER_COLUMN`` caps each column's list so a long-running
+// install doesn't grow ``readEntries`` past the 5 MB localStorage
+// quota (the bug sweep found the cap was previously unbounded —
+// every mark-read appended forever and ``safeSetItem``'s quota
+// rejection was silently swallowed by App). When the cap is hit
+// we keep the LAST ``MAX_PER_COLUMN`` ids (newest reads win; the
+// oldest "I marked this read" decisions are also the ones most
+// likely to have been rotated out of the column's fetch window).
 function loadReadEntries(): Record<string, number[]> {
   if (typeof window === 'undefined') return {}
   try {
@@ -111,7 +120,10 @@ function loadReadEntries(): Record<string, number[]> {
     const out: Record<string, number[]> = {}
     for (const [k, v] of Object.entries(parsed)) {
       if (Array.isArray(v) && v.every((x) => typeof x === 'number')) {
-        out[k] = v
+        // Trim on load: the list may have been written before
+        // ``MAX_PER_COLUMN`` existed. Slice keeps the most-recent
+        // N entries (appended in chronological order).
+        out[k] = v.slice(-MAX_PER_COLUMN)
       }
     }
     return out
@@ -119,6 +131,16 @@ function loadReadEntries(): Record<string, number[]> {
     return {}
   }
 }
+
+// Per-column upper bound on manually-marked read entries. Chosen
+// to fit comfortably in localStorage across all columns combined:
+// 8 active columns × 200 entries × ~12 bytes JSON each ≈ 19 KB,
+// well under the 5 MB quota even for a power user with extra
+// columns. If a single column has more than this many manual marks
+// (it shouldn't, given the 50-item entry fetch cap), the oldest
+// marks are dropped — which is fine, because those entries have
+// long since aged out of the column's view.
+const MAX_PER_COLUMN = 200
 
 export function App() {
   const [entries, setEntries] = useState<Entry[]>([])
@@ -230,6 +252,13 @@ export function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
 
   const touchStartX = useRef<number | null>(null)
+  // Tracks whether the user has already been informed that localStorage
+  // writes are being rejected. When ``true``, subsequent
+  // ``safeSetItem`` failures stay silent — otherwise every refresh
+  // would re-fire the same toast and overwhelm the ToastHost. Reset to
+  // ``false`` if the user clears the issue (manual ``localStorage.clear``
+  // in DevTools, reduced browser quota, etc.).
+  const quotaWarnedRef = useRef(false)
   // Set of entry ids observed on the previous successful refresh.
   // Used to compute "new since last refresh" — entries whose id is
   // not in this set are flagged. ``null`` means "haven't completed a
@@ -628,26 +657,48 @@ export function App() {
     return () => window.clearTimeout(id)
   }, [activeSources, refresh, authProbed])
 
-  // Keep ``mobileCol`` in bounds.
+  // Keep ``mobileCol`` in bounds AND persist to localStorage. This
+  // effect is the only writer to ``STORAGE_KEYS.mobileColLast``: a
+  // previous version had a separate write effect that fired every
+  // time ``mobileCol`` changed, but React runs effects in source
+  // order within a single commit — so when a stored value came back
+  // out-of-bounds, the clamp's ``setMobileCol(next)`` would queue a
+  // re-render and the write effect would immediately stamp the OLD
+  // (bad) value back to storage before the queue settled. Merging
+  // clamp + write into a single effect with both deps in the array
+  // gives us "validate, then persist" in the right order.
   useEffect(() => {
     if (columns.length === 0) return
     if (mobileCol >= columns.length) {
       const next = columns.length - 1
       setMobileCol(next)
       safeSetItem(STORAGE_KEYS.mobileColLast, String(next))
+    } else {
+      safeSetItem(STORAGE_KEYS.mobileColLast, String(mobileCol))
     }
   }, [columns.length, mobileCol])
-
-  useEffect(() => {
-    safeSetItem(STORAGE_KEYS.mobileColLast, String(mobileCol))
-  }, [mobileCol])
 
   useEffect(() => {
     safeSetItem(STORAGE_KEYS.lastViewed, JSON.stringify(lastViewed))
   }, [lastViewed])
 
   useEffect(() => {
-    safeSetItem(STORAGE_KEYS.readEntries, JSON.stringify(readEntries))
+    // Surface quota / private-mode failures the first time they
+    // happen so the user knows their read marks won't persist. The
+    // bug sweep found silent quota rejection was the trigger for
+    // data loss across months of use — every other localStorage
+    // write below follows the same pattern.
+    const ok = safeSetItem(
+      STORAGE_KEYS.readEntries,
+      JSON.stringify(readEntries),
+    )
+    if (!ok && !quotaWarnedRef.current) {
+      quotaWarnedRef.current = true
+      toast(
+        "browser storage is full — your read marks won't persist across reloads",
+        'error',
+      )
+    }
   }, [readEntries])
 
   useEffect(() => {
@@ -722,7 +773,13 @@ export function App() {
     setReadEntries((prev) => {
       const cur = prev[columnName] ?? []
       if (cur.includes(entryId)) return prev
-      return { ...prev, [columnName]: [...cur, entryId] }
+      // Trim on write too — without this, every mark-read between
+      // sessions would re-grow the list and eventually blow past the
+      // 5 MB localStorage quota. ``slice(-MAX_PER_COLUMN)`` keeps the
+      // newest reads (older ones are most likely already aged out of
+      // the column's view anyway).
+      const next = [...cur, entryId].slice(-MAX_PER_COLUMN)
+      return { ...prev, [columnName]: next }
     })
   }, [])
 
