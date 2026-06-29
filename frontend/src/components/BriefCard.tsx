@@ -363,42 +363,47 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange }: Props) {
             toggleCollapsed()
           }
         }}
-        className="flex items-center justify-between px-4 pt-3 pb-2 cursor-pointer select-none min-h-[44px]"
+        className="flex flex-wrap items-center gap-x-2 gap-y-2 px-4 pt-3 pb-2 cursor-pointer select-none"
       >
-        <div className="flex items-center gap-2 min-w-0">
-          <span
-            aria-hidden="true"
-            className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded-ios text-accent active:bg-bg-elevated"
-          >
-            <ChevronIcon className="w-4 h-4" collapsed={collapsed} />
-          </span>
-          <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
-            The Brief
-          </h2>
-          {/* "TODAY'S BRIEF" pill. Anchors the brief as a
-              recognizable recurring surface — same idea as a
-              newsletter masthead — without committing to a date
-              string (which would need to update daily). The pill
-              sits inline next to the title; on mobile it wraps
-              naturally. */}
-          <span
-            data-brief-action="today-pill"
-            className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-ios-caption uppercase tracking-wide text-accent"
-            title="the most recent brief"
-          >
-            <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-accent" />
-            today's
-          </span>
-          {/* Tone picker replaces the static tone badge — the badge
-              was informational, the picker is the same surface turned
-              interactive. */}
-          <TonePicker
-            tone={tone}
-            onToneChange={onToneChange}
-            disabled={generating}
-          />
-        </div>
-        <div className="flex items-center gap-2 text-ios-caption text-label-secondary shrink-0">
+        <span
+          aria-hidden="true"
+          className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded-ios text-accent active:bg-bg-elevated"
+        >
+          <ChevronIcon className="w-4 h-4" collapsed={collapsed} />
+        </span>
+        <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary shrink-0">
+          The Brief
+        </h2>
+        {/* "TODAY'S BRIEF" pill. Anchors the brief as a
+            recognizable recurring surface — same idea as a
+            newsletter masthead — without committing to a date
+            string (which would need to update daily). The pill
+            sits inline next to the title; on mobile it wraps
+            naturally. */}
+        <span
+          data-brief-action="today-pill"
+          className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-ios-caption uppercase tracking-wide text-accent shrink-0"
+          title="the most recent brief"
+        >
+          <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-accent" />
+          today's
+        </span>
+        {/* Tone picker replaces the static tone badge — the badge
+            was informational, the picker is the same surface turned
+            interactive. ``shrink-0`` so it never collapses into a
+            segmented nub when other chrome on the row widens. */}
+        <TonePicker
+          tone={tone}
+          onToneChange={onToneChange}
+          disabled={generating}
+        />
+        {/* Trailing chrome (timestamp + Regenerate) sits on its own
+            row on mobile so it can't collide with the tone picker
+            or the "today's" pill. On ``sm+`` it's ``ml-auto`` so it
+            floats to the right edge of the same first row. The
+            conditional ``sm:ml-auto sm:basis-auto`` resets the
+            mobile behaviour (where we want it on its own line). */}
+        <div className="flex items-center gap-2 text-ios-caption text-label-secondary shrink-0 basis-full sm:basis-auto sm:ml-auto">
           <span title={brief.generated_at}>
             {/* "generated " prefix only on sm+; saves ~70px on mobile
                 so the Regenerate button isn't pushed off-screen. */}
