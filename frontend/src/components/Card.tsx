@@ -13,8 +13,8 @@
 //     so cards that haven't been computed (e.g. before F2 lands on
 //     a given column) don't all flash unread.
 
-import { useEffect, useRef, type MouseEvent, type TouchEvent } from 'react'
-import type { Entry } from '../api'
+import { useEffect, useRef, useState, type MouseEvent, type TouchEvent } from 'react'
+import { api, type Entry } from '../api'
 import { recordBatched, recordImmediate } from '../lib/interactions'
 import { toast } from './Toast'
 
@@ -38,6 +38,12 @@ type Props = {
   // column. Hides itself once the card is read (tapping ✓ on an
   // already-dim card is a no-op up at App.markEntryRead).
   onMarkRead?: () => void
+  // Per-card inline summary. When ``expanded`` is true the card
+  // fetches the cached summary once and renders it under the
+  // title. ``onToggleSummary`` flips the expanded bit. Independent
+  // of mark-read — expanding a card doesn't mark it.
+  expanded?: boolean
+  onToggleSummary?: () => void
 }
 
 // Map a category name to a Tailwind background class for the left
@@ -88,13 +94,48 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
-export function Card({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead }: Props) {
+export function Card({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   // Touch tracking for long-press → copy URL.
   // Kept in refs so the values don't trigger re-renders mid-press.
   const touchStart = useRef<{ x: number; y: number; t: number; id: number; onInteractiveChild: boolean } | null>(null)
   const longPressTimer = useRef<number | null>(null)
+
+  // Summary panel state. ``null`` means we haven't loaded yet (or
+  // haven't tried); the string is the cleaned text; ``false`` marks
+  // a failed request so we don't loop on retries every time the
+  // card re-renders. The fetch only fires on the first expand —
+  // subsequent re-renders with ``expanded=true`` are a no-op until
+  // the user collapses + re-expands the same card.
+  const [summary, setSummary] = useState<string | null>(null)
+  const [summaryError, setSummaryError] = useState(false)
+
+  useEffect(() => {
+    if (!expanded) return
+    // Skip when the card is already showing a summary or when an
+    // earlier attempt failed. The latter stops a flapping card from
+    // firing one request per render — collapsing + re-expanding
+    // resets neither state, by design; a fresh attempt would
+    // require the user to reload the page or wait for the entry
+    // to disappear and re-appear.
+    if (summary !== null) return
+    if (summaryError) return
+    let cancelled = false
+    api
+      .entrySummary(entry.id)
+      .then((r) => {
+        if (cancelled) return
+        setSummary(r.summary ?? '')
+      })
+      .catch(() => {
+        if (cancelled) return
+        setSummaryError(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [expanded, entry.id, summary, summaryError])
 
   // Record one ``view`` event per (entry, session). ``recordBatched``
   // dedups internally so even if React strict-mode mounts the card
@@ -291,6 +332,36 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
         {sourceName && <span className="font-medium text-label-primary">{sourceName}</span>}
         {sourceName && <span>·</span>}
         <time>{timeAgo(entry.published_at)}</time>
+        {/* Per-card summary chevron. Sits inline on the meta row so
+            it reads as part of the same toolbar as the ✓ button. Same
+            ``data-card-interactive`` guard so a long-press / right-
+            click on the card itself doesn't fire while the user is
+            targeting the chevron. Title alternates by state so the
+            hover hint matches the keyboard shortcut (``s``).
+            Visually mirrors the ✓'s hover-reveal treatment — hidden
+            until hover on desktop, always visible on touch. */}
+        {onToggleSummary && (
+          <button
+            type="button"
+            data-card-interactive
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              onToggleSummary()
+            }}
+            aria-label={expanded ? 'hide summary' : 'show summary'}
+            aria-expanded={!!expanded}
+            title={expanded ? 'hide summary (s)' : 'show summary (s)'}
+            className={`ml-auto w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
+                        ${expanded ? 'opacity-100 text-accent' : 'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100'}`}
+          >
+            {/* Rotate 180° when expanded so the chevron flips up —
+                standard iOS disclosure-indicator idiom. */}
+            <ChevronDownIcon className={`w-4 h-4 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+          </button>
+        )}
         {/* Per-card mark-read ✓. Sits on the trailing edge of the
             meta row so it's visually associated with the read-state
             line above it. ``opacity-0 group-hover:opacity-100``
@@ -315,12 +386,36 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
             }}
             aria-label="mark this card as read"
             title="mark as read (m)"
-            className="ml-auto w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100"
+            className={`w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
+                        ${onToggleSummary ? '' : 'ml-auto'} opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100`}
           >
             <CheckIcon className="w-4 h-4" />
           </button>
         )}
       </div>
+      {/* Inline summary. Sits between the meta row and the bottom
+          edge of the card so it reads as "extra content below the
+          metadata", not "extra metadata between two meta rows".
+          ``onClick`` stops propagation because the card-level
+          onContextMenu / long-press paths would otherwise fire when
+          the user is just trying to read the summary text. The
+          click target is the card itself; selecting text inside
+          works because the inner ``e.stopPropagation`` only fires
+          on a true click, not on text-selection dragstart. */}
+      {expanded && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap line-clamp-3"
+        >
+          {summaryError
+            ? <span className="italic">couldn't load summary</span>
+            : summary === null
+              ? <span className="italic text-label-tertiary">loading…</span>
+              : summary === ''
+                ? <span className="italic text-label-tertiary">no summary available</span>
+                : summary}
+        </div>
+      )}
     </article>
   )
 }
@@ -341,6 +436,27 @@ function CheckIcon({ className }: { className?: string }) {
       aria-hidden="true"
     >
       <polyline points="4 12 10 18 20 6" />
+    </svg>
+  )
+}
+
+// Down-chevron used for the per-card summary disclosure. 2px stroke
+// matches CheckIcon so the two buttons read as visual siblings on the
+// meta row. Rotated 180° via Tailwind's ``rotate-180`` when the
+// panel is open — standard iOS disclosure-indicator idiom.
+function ChevronDownIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <polyline points="6 9 12 15 18 9" />
     </svg>
   )
 }

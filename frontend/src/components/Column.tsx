@@ -59,6 +59,12 @@ type Props = {
   // it can render the colored left stripe. Without it the cards just
   // skip the stripe.
   categoriesBySourceId?: Map<number, string>
+  // Per-card summary expansion set + toggle callback. App owns both
+  // so the keyboard ``s`` shortcut and the per-card chevron stay in
+  // sync. Both optional — older callers (none today) just omit
+  // them and the cards render with summaries permanently collapsed.
+  expandedSummaries?: Set<number>
+  onToggleSummary?: (entryId: number) => void
 }
 
 export function Column({
@@ -75,6 +81,8 @@ export function Column({
   onPrefsChange,
   totalCount,
   categoriesBySourceId,
+  expandedSummaries,
+  onToggleSummary,
 }: Props) {
   const [popoverOpen, setPopoverOpen] = useState(false)
   const popoverRef = useRef<HTMLDivElement | null>(null)
@@ -301,6 +309,8 @@ export function Column({
                 cardRef={refCb}
                 category={categoriesBySourceId?.get(e.source_id)}
                 onMarkRead={onMarkEntryRead ? () => onMarkEntryRead(e.id) : undefined}
+                expanded={expandedSummaries?.has(e.id) ?? false}
+                onToggleSummary={onToggleSummary ? () => onToggleSummary(e.id) : undefined}
               />
             )
           })

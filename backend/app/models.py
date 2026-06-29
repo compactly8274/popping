@@ -108,6 +108,15 @@ class Entry(Base):
     # renders <img src=/assets/{image_path}>.
     image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Per-entry summary extracted on first request. Populated by
+    # POST /api/entries/{id}/summary from ``meta.summary`` (with
+    # HTML stripped and a length cap) so the second read is just a
+    # column fetch — no re-extract. NULL means "not asked yet" (vs
+    # empty string which would mean "asked, none available"). The
+    # column lives on Entry rather than being computed every time
+    # so a future LLM-summary path can populate the same column
+    # under a different source without another migration.
+    cached_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     fetched_at: Mapped[dt.datetime] = mapped_column(

@@ -246,6 +246,18 @@ export const api = {
       `/api/ingest/${encodeURIComponent(sourceName)}`,
       { method: 'POST' },
     ),
+  /** Per-card summary. Returns the feed's own ``meta.summary``
+   * (HTML-stripped, length-capped) on first call, or the cached
+   * column on subsequent calls. ``summary`` is ``null`` when the
+   * source shipped no usable text; the UI surfaces "no summary
+   * available" in that case. ``cached`` is true after the first
+   * call so the frontend can show a "summary ready" badge later
+   * if we want — for now it's informational. */
+  entrySummary: (entryId: number) =>
+    jsonFetch<{ summary: string | null; cached: boolean }>(
+      `/api/entries/${entryId}/summary`,
+      { method: 'POST' },
+    ),
 
   // ---- Engagement events (Phase 8) ----
   /** Record one engagement event immediately. The endpoint requires

@@ -112,6 +112,18 @@ class FeedRecommendation(BaseModel):
     default_headers: Optional[dict] = None
 
 
+class EntrySummaryOut(BaseModel):
+    """Body of ``POST /api/entries/{id}/summary``.
+
+    ``summary`` is the cleaned text (HTML stripped, length-capped)
+    or ``None`` when the feed shipped nothing usable. ``cached`` is
+    True when the row already had ``cached_summary`` populated and
+    the route returned it without re-extracting — useful for
+    debugging but not load-bearing for the UI."""
+    summary: Optional[str] = None
+    cached: bool = False
+
+
 class EntryOut(BaseModel):
     id: int
     source_id: int

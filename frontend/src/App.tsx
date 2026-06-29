@@ -170,6 +170,12 @@ export function App() {
   // Keyboard selection.
   const [selectedColumnIndex, setSelectedColumnIndex] = useState(0)
   const [selectedCardId, setSelectedCardId] = useState<number | null>(null)
+  // Per-card summary expansion. Session-scoped on purpose — the user
+  // typically expands once to scan, and re-expanding after a reload
+  // is cheap (the column has been refetched and the backend serves
+  // from its own cache column on second ask). Persisting every
+  // expanded card to localStorage would just be surprise.
+  const [expandedSummaries, setExpandedSummaries] = useState<Set<number>>(() => new Set())
 
   const touchStartX = useRef<number | null>(null)
   // Set of entry ids observed on the previous successful refresh.
@@ -555,6 +561,20 @@ export function App() {
     })
   }, [])
 
+  // Toggle the inline-summary panel for an entry. Independent of
+  // mark-read — expanding a card doesn't mark it, and marking a
+  // card doesn't collapse its summary. ``useCallback`` so the
+  // keyboard-shortcut effect can list it as a stable dependency
+  // (and so child re-renders are minimized when nothing changes).
+  const toggleSummary = useCallback((entryId: number) => {
+    setExpandedSummaries((prev) => {
+      const next = new Set(prev)
+      if (next.has(entryId)) next.delete(entryId)
+      else next.add(entryId)
+      return next
+    })
+  }, [])
+
   // Keyboard navigation. Skips when an input/textarea/select has
   // focus so the LLM picker's free-text fields stay typeable. ``/``
   // focuses search; Esc clears it.
@@ -621,11 +641,18 @@ export function App() {
         if (!col) return
         markEntryRead(col.name, selectedCardId)
         recordImmediate({ entry_id: selectedCardId, type: 'view' })
+      } else if (e.key === 's' && selectedCardId != null) {
+        // Toggle inline summary on the selected card. Mirrors the
+        // chevron button. Same modifier guards as ``m`` so Cmd+S
+        // (Save Page As) still works when the dashboard has focus.
+        if (e.metaKey || e.ctrlKey || e.altKey) return
+        e.preventDefault()
+        toggleSummary(selectedCardId)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [columns, selectedColumnIndex, selectedCardId, searchQuery, markEntryRead])
+  }, [columns, selectedColumnIndex, selectedCardId, searchQuery, markEntryRead, toggleSummary])
 
   // Scroll the keyboard-selected card into view.
   useEffect(() => {
@@ -962,6 +989,8 @@ export function App() {
                     entry={e}
                     sourceName={sourcesById.get(e.source_id)}
                     category={categoriesBySourceId.get(e.source_id)}
+                    expanded={expandedSummaries.has(e.id)}
+                    onToggleSummary={() => toggleSummary(e.id)}
                   />
                 ))}
               </div>
@@ -986,6 +1015,8 @@ export function App() {
                     onPrefsChange={(next) => setPrefsFor(col.name, next)}
                     totalCount={col.totalCount}
                     categoriesBySourceId={categoriesBySourceId}
+                    expandedSummaries={expandedSummaries}
+                    onToggleSummary={toggleSummary}
                   />
                 </div>
               ))}
@@ -1020,6 +1051,8 @@ export function App() {
               }
               totalCount={columns[mobileCol]?.totalCount}
               categoriesBySourceId={categoriesBySourceId}
+              expandedSummaries={expandedSummaries}
+              onToggleSummary={toggleSummary}
             />
             {columns.length > 1 && (
               <div className="flex justify-center gap-1 mt-2">
