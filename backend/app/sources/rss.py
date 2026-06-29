@@ -130,13 +130,19 @@ async def fetch_rss(url: str) -> list[dict]:
     function that the scheduler's ``_ingest`` consumes through the
     plugin's ``fetch()`` method.
 
-    One retry on ``ReadTimeout`` / ``ConnectError``. CBC's CDN in
+    One retry on transient network errors and 5xx. CBC's CDN in
     particular has been observed to time out the first request of a
     cold connection but respond fine to a follow-up; the same TCP
     socket reuse isn't always available because we open a fresh
     client per ingest. One retry is enough — past that the upstream
     is genuinely degraded and we'd rather skip the tick than hold
     up the scheduler for a feed that's not going to land.
+
+    Empty-result detection: if HTTP 200 but the body doesn't look
+    like a feed (wrong content-type or ``feed.bozo`` with zero
+    entries), raise so the scheduler's per-source error path writes
+    a tooltip with the actual response excerpt — better than silently
+    showing zero entries with no explanation.
     """
     last_exc: Exception | None = None
     for attempt in (1, 2):
@@ -161,6 +167,20 @@ async def fetch_rss(url: str) -> list[dict]:
                         "image_url": image_url,
                     }
                 )
+            # HTTP 200 but the body doesn't look like an RSS/Atom
+            # feed: Cloudflare challenges, paywall interstitials,
+            # JavaScript-rendered shells, etc. all return HTML that
+            # feedparser silently accepts with ``bozo=True`` and zero
+            # entries. Surface it as an error so the scheduler can
+            # record a useful tooltip instead of silently emptying
+            # the dashboard.
+            if not items and (bool(feed.bozo) or not _looks_like_feed(resp)):
+                snippet = resp.text[:200].replace("\n", " ").strip()
+                raise ValueError(
+                    f"rss: {url} returned 0 entries with a non-feed body "
+                    f"(bozo={feed.bozo}, content-type={resp.headers.get('content-type')!r}, "
+                    f"excerpt={snippet!r})"
+                )
             return items
         except (httpx.ReadTimeout, httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_exc = exc
@@ -168,10 +188,37 @@ async def fetch_rss(url: str) -> list[dict]:
                 "rss: %s attempt %d failed (%s); retrying", url, attempt, exc,
             )
             continue
+        except httpx.HTTPStatusError as exc:
+            # 5xx is "server had a hiccup" — retry once. 4xx is
+            # permanent (auth failure, gone, not-found, paywall
+            # block) and there's no point in another attempt; let it
+            # bubble so the user sees a precise reason in the
+            # tooltip.
+            if 500 <= exc.response.status_code < 600 and attempt == 1:
+                last_exc = exc
+                logger.warning(
+                    "rss: %s attempt %d failed (%s); retrying", url, attempt, exc,
+                )
+                continue
+            raise
     # Both attempts failed. Bubble the last error so the scheduler's
     # per-source try/except logs it as the ingest failure.
     assert last_exc is not None
     raise last_exc
+
+
+def _looks_like_feed(resp: httpx.Response) -> bool:
+    """Best-effort sniff: does the response Content-Type look like an
+    RSS/Atom document? Used alongside ``feed.bozo`` to catch
+    Cloudflare / paywall HTML bodies that return 200 but aren't
+    actually feeds."""
+    ctype = resp.headers.get("content-type", "").lower()
+    return (
+        "rss" in ctype
+        or "atom" in ctype
+        or "xml" in ctype
+        or ctype.startswith("text/")
+    )
 
 
 class _RssPlugin(SourcePlugin):
