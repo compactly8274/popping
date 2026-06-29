@@ -185,14 +185,18 @@ export function App() {
 
   const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
 
+  // For You used to live here as a stacked first column. The user
+  // feedback was clear: it's a personal feed, not a category, and
+  // stacking it on top of the grid made the dashboard read as
+  // "mostly For You". For You now lives in the Drawer as an
+  // inline-expandable section. We still fetch it (refresh() calls
+  // ``api.forYou``) and keep it in state — the Drawer consumes it.
   const baseColumns = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
-    const out: Array<{ name: string; entries: Entry[] }> = []
-    if (forYou.length > 0) out.push({ name: 'For You', entries: forYou })
-    for (const cat of categories) {
-      out.push({ name: cat, entries: byCategory.get(cat) ?? [] })
-    }
-    return out
-  }, [forYou, categories, byCategory])
+    return categories.map((cat) => ({
+      name: cat,
+      entries: byCategory.get(cat) ?? [],
+    }))
+  }, [categories, byCategory])
 
   // Apply per-column prefs. For You skips the sort filter (backend
   // pre-sorts by composite_score) but still respects min-score +
@@ -889,6 +893,8 @@ export function App() {
         briefTone={briefTone}
         onBriefToneChange={setBriefTone}
         onError={setError}
+        forYou={forYou}
+        sourcesById={sourcesById}
       />
 
       <ToastHost />

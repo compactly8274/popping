@@ -33,6 +33,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   api,
+  type Entry,
   type LLMTagsResponse,
   type LLMStatus,
   type NotificationStatus,
@@ -64,7 +65,17 @@ type Props = {
   // Phase 5: FeedManager errors flow up to App's red banner for
   // a single, consistent error surface.
   onError: (msg: string) => void
+  // Personal top-N feed. Surfaced inside the Drawer as an
+  // inline-expandable section. Source-id → name map so we can label
+  // each row with its source.
+  forYou: Entry[]
+  sourcesById: Map<number, string>
 }
+
+// localStorage key for the For You section's collapsed/expanded
+// state. Mirrors the ``brief.collapsed`` convention; lives next to
+// it in localStorage as a sibling subkey.
+const FORYOU_EXPANDED_KEY = 'foryou.expanded'
 
 // Whitelist mirrors backend ``_VALID_PROVIDERS``. Includes a sentinel
 // empty value so the user can pick "use env default" (which is what
@@ -98,6 +109,8 @@ export function Drawer({
   briefTone,
   onBriefToneChange,
   onError,
+  forYou,
+  sourcesById,
 }: Props) {
   const [sources, setSources] = useState<Source[]>([])
   const [sourcesError, setSourcesError] = useState<string | null>(null)
@@ -238,6 +251,10 @@ export function Drawer({
                 tone="warning"
               />
             )}
+          </GroupedSection>
+
+          <GroupedSection label="For You">
+            <ForYouSection forYou={forYou} sourcesById={sourcesById} />
           </GroupedSection>
 
           <GroupedSection label="LLM">
@@ -947,6 +964,114 @@ function LLMSection({
             Changes apply immediately — no restart needed. An empty
             value resets to the env default.
           </p>
+        </div>
+      )}
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// For You section
+// ---------------------------------------------------------------------------
+//
+// For You used to live as the first column of the dashboard (stacked
+// above the category columns). The personal feed belongs on a
+// different surface, not mixed with the by-category groups — moving
+// it here, behind a Drawer section, gives it the room to live without
+// dominating the page.
+//
+// The section is collapsed by default to keep the Drawer compact.
+// When expanded, it shows the server-personalized top-N entries as
+// a stacked list inside the section card. Each row mirrors the
+// dashboard Card's title + source + score badge, but compressed —
+// no thumbnail, no time-ago — so the surface reads as "a peek at
+// your personal feed", not "the dashboard in miniature". Tapping a
+// row opens the article in a new tab (same affordance as the
+// dashboard Card).
+//
+// The expanded/collapsed state persists in localStorage so the
+// user doesn't have to re-expand on every Drawer open. SSR-safe
+// fallback to ``false`` when window/localStorage isn't available.
+
+function ForYouSection({
+  forYou,
+  sourcesById,
+}: {
+  forYou: Entry[]
+  sourcesById: Map<number, string>
+}) {
+  const [expanded, setExpanded] = useState<boolean>(
+    () =>
+      typeof window !== 'undefined' &&
+      window.localStorage?.getItem(FORYOU_EXPANDED_KEY) === '1',
+  )
+  const onToggle = () => {
+    setExpanded((prev) => {
+      const next = !prev
+      try {
+        window.localStorage?.setItem(FORYOU_EXPANDED_KEY, next ? '1' : '0')
+      } catch {
+        // Quota / private-mode — in-memory state is the source of
+        // truth for the current session.
+      }
+      return next
+    })
+  }
+  const count = forYou.length
+  const subtitle =
+    count === 0
+      ? 'no personalized entries yet'
+      : `${count} ${count === 1 ? 'entry' : 'entries'} scored for you — tap to view`
+
+  return (
+    <>
+      <GroupedRow
+        onClick={onToggle}
+        title="For You"
+        subtitle={subtitle}
+        tone={count === 0 ? 'warning' : 'success'}
+        showChevron
+      />
+      {expanded && (
+        <div className="border-t border-hairline">
+          {count === 0 ? (
+            <p className="px-4 py-3 text-ios-caption text-label-secondary">
+              Personal feeds improve as the embedder learns your
+              preferences — give it a few minutes of activity.
+            </p>
+          ) : (
+            <ul className="divide-y divide-hairline">
+              {forYou.map((e) => {
+                const sourceName = sourcesById.get(e.source_id) ?? 'unknown'
+                const score = Math.round(e.composite_score)
+                return (
+                  <li key={e.id}>
+                    <a
+                      href={e.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={`${e.title} — opens in a new tab`}
+                      aria-label={`${e.title} — opens in a new tab`}
+                      className="flex items-start gap-2 px-4 py-2 active:bg-bg-elevated"
+                    >
+                      <span className="flex-1 min-w-0 text-ios-caption text-label-primary line-clamp-2">
+                        {e.title}
+                      </span>
+                      <span
+                        className="shrink-0 inline-flex items-center rounded-ios px-2 py-0.5 text-ios-caption font-semibold text-white bg-bg-elevated"
+                        title={`composite score ${e.composite_score.toFixed(0)}`}
+                      >
+                        {score}
+                      </span>
+                      <span className="shrink-0 text-ios-caption text-label-tertiary max-w-[40%] truncate">
+                        {sourceName}
+                      </span>
+                    </a>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
         </div>
       )}
     </>
