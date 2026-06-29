@@ -6,27 +6,30 @@
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#000000" />
     <title>Popping</title>
-    {/* Inline pre-React paint.
-        ------------------------------------------------------------------
-        1. html/body background -> pure black from the first frame so the
-           browser never paints its default white during the gap before
-           styles.css is fetched + parsed. Mobile Safari + Android Chrome
-           show a white viewport shell otherwise, which reads as a
-           "white flicker then goes black" on cold loads.
-        2. color-scheme: dark in CSS tells Safari / Android Chrome to
-           render their system chrome (address bar, status bar) in dark
-           mode so they match the app.
-        3. The splash lives INSIDE ``#root`` so ReactDOM.createRoot's
-           mount replaces it with the real tree. No DOM juggling needed
-           (no separate ``#splash`` element to remove once React is
-           ready). The splash's own styles are inline so it renders even
-           if the Tailwind bundle hasn't parsed yet. The spinner uses
-           a CSS-only @keyframes animation (no JS, no Tailwind
-           dependency) so the ring spins before the module graph has
-           loaded.
-        4. The ``<noscript>`` fallback shows a static "you need JavaScript"
-           message instead of the spinner — same inline-styling rule.
-    ------------------------------------------------------------------ */}
+    <!--
+      Inline pre-React paint.
+      ----------------------------------------------------------------
+      1. html/body background -> pure black from the first frame so
+         the browser never paints its default white during the gap
+         before styles.css is fetched + parsed. Mobile Safari +
+         Android Chrome show a white viewport shell otherwise,
+         which reads as a "white flicker then goes black" on cold
+         loads.
+      2. color-scheme: dark in CSS tells Safari / Android Chrome to
+         render their system chrome (address bar, status bar) in
+         dark mode so they match the app.
+      3. The splash lives INSIDE ``#root`` so ReactDOM.createRoot's
+         mount replaces it with the real tree. No DOM juggling
+         needed (no separate ``#splash`` element to remove once
+         React is ready). The splash's own styles are inline so it
+         renders even if the Tailwind bundle hasn't parsed yet.
+         The spinner uses a CSS-only @keyframes animation (no JS,
+         no Tailwind dependency) so the ring spins before the
+         module graph has loaded.
+      4. The ``<noscript>`` fallback shows a static "you need
+         JavaScript" message instead of the spinner — same inline-
+         styling rule.
+    ---------------------------------------------------------------- -->
     <style>
       html, body { background-color: #000000; color: #ffffff; margin: 0; }
       html { color-scheme: dark; }
@@ -55,7 +58,7 @@
         letter-spacing: -0.41px;  /* matches iOS body text tracking */
         color: rgba(235, 235, 245, 0.6);  /* iOS .secondaryLabel */
       }
-      /* Spinner keyframes — same shape Tailwind's ``animate-spin`` uses,
+      /* Spinner keyframes — same shape Tailwind's animate-spin uses,
          declared locally so we don't need the Tailwind config loaded. */
       @keyframes popping-spin {
         to { transform: rotate(360deg); }
@@ -71,9 +74,10 @@
   </head>
   <body>
     <div id="root">
-      {/* Pre-React splash. Replaced by ReactDOM.createRoot on mount.
-          aria-hidden so the spinner isn't announced to screen readers
-          (React mounts the real tree within ~100ms on warm loads). */}
+      <!-- Pre-React splash. Replaced by ReactDOM.createRoot on mount.
+           aria-hidden so the spinner isn't announced to screen
+           readers (React mounts the real tree within ~100ms on warm
+           loads). -->
       <div id="root-splash" aria-hidden="true">
         <div class="ring"></div>
         <div class="wordmark">Popping</div>
