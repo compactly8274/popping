@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import Entry, Source
-from app.schemas import EntryOut, EntrySummaryOut
+from app.schemas import EntryListOut, EntrySummaryOut
 
 router = APIRouter(tags=["entries"])
 
@@ -38,6 +38,21 @@ _SUMMARY_MAX_CHARS = 800
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# Escape SQL LIKE metacharacters. ``q`` is bound, so this is not a
+# SQL-injection concern — it's a correctness one. Without escaping,
+# ``q="AI"`` matches every title containing "AI" or "remaining" or
+# "fail" (the "ai" substring), and ``q="%"`` matches everything.
+# We want literal substring matches, so any ``%`` / ``_`` the user
+# typed should be matched literally. ``\`` is the LIKE escape
+# character; we use ``ESCAPE '\\'`` in the SQL to make that explicit.
+_LIKE_ESCAPE_RE = re.compile(r"([\\%_])")
+
+
+def _escape_like(term: str) -> str:
+    """Escape LIKE wildcards. Called once per request to build the
+    search pattern. Cheap (linear scan, single regex)."""
+    return _LIKE_ESCAPE_RE.sub(r"\\\1", term)
+
 
 def _clean_summary(raw: str | None) -> str:
     """Strip HTML tags, collapse whitespace, trim.
@@ -54,7 +69,7 @@ def _clean_summary(raw: str | None) -> str:
     return text
 
 
-@router.get("/entries", response_model=list[EntryOut])
+@router.get("/entries", response_model=list[EntryListOut])
 async def list_entries(
     session: AsyncSession = Depends(get_session),
     category: str | None = Query(default=None, description="Filter by source category"),
@@ -77,12 +92,38 @@ async def list_entries(
         description="Substring search across title and meta.summary (case-insensitive)",
     ),
     limit: int = Query(default=50, ge=1, le=500),
-) -> list[EntryOut]:
-    stmt = (
-        select(Entry)
-        .join(Source, Entry.source_id == Source.id)
-        .order_by(Entry.composite_score.desc(), Entry.published_at.desc().nullslast())
+) -> list[EntryListOut]:
+    # Slim column projection — the list endpoint returns EntryListOut
+    # (no meta JSONB blob). The dashboard only ever reads meta.summary
+    # lazily via the per-card summary endpoint, so dropping it from
+    # the list payload saves ~100 KB per dashboard refresh.
+    columns = (
+        Entry.id,
+        Entry.source_id,
+        Entry.title,
+        Entry.url,
+        Entry.published_at,
+        Entry.fetched_at,
+        Entry.composite_score,
+        Entry.personal_score,
+        Entry.raw_score,
+        Entry.cached_summary,
+        Entry.image_url,
+        Entry.image_path,
     )
+    stmt = select(*columns).join(Source, Entry.source_id == Source.id)
+    if q:
+        # When a search query is set, order by recency within the
+        # search result set. The default composite_score sort is
+        # misleading for search — a high-scored story from last week
+        # that happens to mention "AI" would beat a fresh story
+        # actually about AI, and the user has no signal that this
+        # is the ordering they got.
+        stmt = stmt.order_by(Entry.published_at.desc().nullslast())
+    else:
+        stmt = stmt.order_by(
+            Entry.composite_score.desc(), Entry.published_at.desc().nullslast()
+        )
     if category:
         stmt = stmt.where(Source.category == category)
     if source:
@@ -97,11 +138,16 @@ async def list_entries(
         # JSONB ``.astext`` gives us the underlying string so ILIKE
         # works. Postgres needs the cast to be explicit; ``meta``
         # alone is a jsonb value and ILIKE on a jsonb fails.
-        pattern = f"%{q}%"
+        # Escape LIKE wildcards so a user query of "%" or "_" doesn't
+        # match every row; ``ESCAPE '\'`` tells PG the backslash is
+        # the escape character (the default is no escape, which would
+        # make the backslash literal — see
+        # https://www.postgresql.org/docs/current/functions-matching.html).
+        pattern = f"%{_escape_like(q)}%"
         stmt = stmt.where(
             or_(
-                Entry.title.ilike(pattern),
-                Entry.meta["summary"].astext.ilike(pattern),
+                Entry.title.ilike(pattern, escape="\\"),
+                Entry.meta["summary"].astext.ilike(pattern, escape="\\"),
             )
         )
         # Override the user-supplied limit to the search cap. We still
@@ -110,8 +156,8 @@ async def list_entries(
         # could otherwise try to return tens of thousands of rows.
         limit = min(limit, _SEARCH_LIMIT_CAP)
     stmt = stmt.limit(limit)
-    rows = (await session.scalars(stmt)).all()
-    return [EntryOut.model_validate(r) for r in rows]
+    rows = (await session.execute(stmt)).mappings().all()
+    return [EntryListOut.model_validate(r) for r in rows]
 
 
 @router.post(

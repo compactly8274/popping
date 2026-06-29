@@ -23,13 +23,12 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
-from collections import defaultdict
 from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,9 +37,10 @@ from app.brief import BriefGenerator
 from app.config import settings
 from app.db import SessionLocal
 from app.embeddings import embedder
-from app.models import Brief, Entry, Source, UserProfile
+from app.models import Brief, Entry, NotificationDedup, Source, UserProfile
 from app.notify import Notifier
 from app.scoring import composite as composite_scorer
+from app.scoring import convergence as convergence_helper
 from app.scoring import recency
 from app.sources import list_sources
 from app.sources.base import SourcePlugin
@@ -489,7 +489,7 @@ async def _check_convergence() -> None:
 
     try:
         async with SessionLocal() as session:
-            conv = await _convergence_counts(session, settings.convergence_window_hours)
+            conv = await convergence_helper.counts(session, settings.convergence_window_hours)
             candidates = {slug: count for slug, count in conv.items() if count >= threshold}
             if not candidates:
                 return
@@ -502,6 +502,10 @@ async def _check_convergence() -> None:
                     await _brief_generator.generate_alert(
                         session=session, slug=slug, source_count=count,
                     )
+                    # Mark the slug in the dedup ledger. Done after the
+                    # Brief row is created so a failed alert leaves the
+                    # ledger untouched (next tick retries).
+                    await _record_alerted_slug(session, slug)
                     await session.commit()
                 except Exception:
                     logger.exception("alert brief failed for slug=%s", slug)
@@ -524,72 +528,66 @@ async def _daily_brief() -> None:
         logger.exception("daily brief failed")
 
 
-async def _convergence_counts(session: AsyncSession, window_hours: int) -> dict[str, int]:
-    """Reused logic from /api/foryou — kept inline here so the scheduler
-    doesn't depend on the routes package."""
-    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
-    stmt = (
-        select(Entry.title, Source.name)
-        .join(Source, Entry.source_id == Source.id)
-        .where(Entry.published_at >= since)
-    )
-    rows = (await session.execute(stmt)).all()
-    counts: dict[str, set[str]] = defaultdict(set)
-    for title, source_name in rows:
-        slug = composite_scorer.title_slug(title)
-        if not slug:
-            continue
-        counts[slug].add(source_name)
-    return {slug: len(srcs) for slug, srcs in counts.items() if len(srcs) > 1}
-
-
 async def _already_notified_urls(session: AsyncSession) -> set[str]:
-    """Union of all ``meta.notified_urls`` arrays across Brief rows."""
-    stmt = select(Brief.meta)
-    rows = (await session.execute(stmt)).all()
-    out: set[str] = set()
-    for (meta,) in rows:
-        if not meta:
-            continue
-        urls = meta.get("notified_urls") or []
-        if isinstance(urls, list):
-            out.update(u for u in urls if isinstance(u, str))
-    return out
+    """URLs already in the CVE dedup ledger.
+
+    Backed by the ``notification_dedup`` table rather than
+    ``Brief.meta.notified_urls`` — the old layout wrote to one Brief
+    row and read across all rows, which silently dropped entries past
+    the 500-row bucket cap.
+    """
+    stmt = select(NotificationDedup.key).where(NotificationDedup.kind == "cve_url")
+    return {row[0] for row in (await session.execute(stmt)).all()}
 
 
 async def _already_alerted_slugs(session: AsyncSession) -> set[str]:
-    """Union of all ``meta.alert_slugs`` across Brief rows."""
-    stmt = select(Brief.meta)
-    rows = (await session.execute(stmt)).all()
-    out: set[str] = set()
-    for (meta,) in rows:
-        if not meta:
-            continue
-        slugs = meta.get("alert_slugs") or []
-        if isinstance(slugs, list):
-            out.update(s for s in slugs if isinstance(s, str))
-    return out
+    """Slugs already in the convergence alert dedup ledger.
+
+    Same ledger table, different ``kind`` discriminator. Was a union
+    across Brief rows; now a direct PK lookup.
+    """
+    stmt = select(NotificationDedup.key).where(NotificationDedup.kind == "convergence_slug")
+    return {row[0] for row in (await session.execute(stmt)).all()}
 
 
 async def _record_notified_urls(session: AsyncSession, urls: list[str]) -> None:
-    """Append ``urls`` to the latest Brief row's ``meta.notified_urls``.
-
-    Falls back to creating a marker row if no Brief exists yet — keeps
-    dedup working on a cold-start with no daily brief in the DB."""
+    """Insert CVE URL dedup rows. ``ON CONFLICT DO NOTHING`` so a
+    retried notify doesn't fail on duplicate-key; last_notified_at is
+    bumped on conflict via the ``DO UPDATE`` clause so maintenance
+    pruning has a useful timestamp.
+    """
     if not urls:
         return
-    row = await session.scalar(select(Brief).order_by(desc(Brief.generated_at)).limit(1))
-    if row is None:
-        row = Brief(tone="terse", content="(notification dedup ledger)", meta={"notified_urls": list(urls)})
-        session.add(row)
+    now = dt.datetime.now(dt.timezone.utc)
+    stmt = pg_insert(NotificationDedup).values(
+        [{"kind": "cve_url", "key": u, "last_notified_at": now} for u in urls if u]
+    )
+    # ON CONFLICT (kind, key) DO UPDATE bumps last_notified_at — without
+    # this, rows would keep their original timestamp and pruning by age
+    # would treat re-fires as fresh. The DO NOTHING alternative would
+    # also work and cost less; we want the timestamp bump.
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["kind", "key"],
+        set_={"last_notified_at": now},
+    )
+    await session.execute(stmt)
+
+
+async def _record_alerted_slug(session: AsyncSession, slug: str) -> None:
+    """Mark a convergence slug as alerted. Same ``ON CONFLICT … DO
+    UPDATE`` pattern as ``_record_notified_urls``.
+    """
+    if not slug:
         return
-    meta = dict(row.meta or {})
-    bucket = list(meta.get("notified_urls") or [])
-    bucket.extend(urls)
-    # Cap the list — JSON columns don't truncate gracefully and we don't
-    # care about CVE URLs from a month ago.
-    meta["notified_urls"] = bucket[-500:]
-    row.meta = meta
+    now = dt.datetime.now(dt.timezone.utc)
+    stmt = pg_insert(NotificationDedup).values(
+        [{"kind": "convergence_slug", "key": slug, "last_notified_at": now}]
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["kind", "key"],
+        set_={"last_notified_at": now},
+    )
+    await session.execute(stmt)
 
 
 def _cvss_score(entry: Entry) -> float:

@@ -34,6 +34,8 @@ from app.routes import ingest as ingest_routes
 from app.routes import interactions as interactions_routes
 from app.routes import settings as settings_routes
 from app.routes import sources as sources_routes
+from app.redis import close_redis, init_redis
+from app.db import dispose_engine
 from app.scheduler import start_scheduler, stop_scheduler
 
 
@@ -59,6 +61,20 @@ async def lifespan(app: FastAPI):
             "assets: cannot create %s (%s) — favicons/thumbnails will be unavailable",
             settings.assets_dir, exc,
         )
+    # Build the shared HTTP client used by the favicon + thumbnail
+    # fetchers. Connection pooling across fetches amortises the TCP/
+    # TLS handshake — a 50-item ingest would otherwise pay 150+
+    # handshakes. Set on startup; closed on teardown so connection
+    # pools don't leak across ``uvicorn --reload`` cycles.
+    assets.init_client()
+    # Build the Redis pool up-front so the first request doesn't pay
+    # the connect round-trip. ``init_redis`` is a no-op if the URL
+    # is unset (pure file-system deploy), so we don't gate it on
+    # ``settings.redis_url``. A failed Redis call will be raised
+    # here and logged; if you want graceful degrade, wrap in try/
+    # except — today we let it crash because the rest of the app
+    # assumes Redis exists.
+    await init_redis()
     # Load embedder first — the scheduler's ingest path will call
     # embed() on every entry, and we want the model warm before the
     # first fetch lands. If the model download fails (offline cold
@@ -99,7 +115,14 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Teardown order: scheduler first (so no in-flight fetches
+        # race the closes), then the shared asset client, the Redis
+        # pool, and finally the SQLAlchemy engine. Each close is
+        # idempotent — a missing/broken subsystem just no-ops.
         await stop_scheduler()
+        await assets.close_client()
+        await close_redis()
+        await dispose_engine()
         logger.info("popping stopped")
 
 

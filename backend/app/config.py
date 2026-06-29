@@ -155,6 +155,18 @@ class Settings(BaseSettings):
     # the backend on a private interface, or add explicit proxy-trust
     # support (out of scope for the local bypass).
     local_auth_bypass: bool = False
+    # CIDR allow-list for the local bypass. Default is loopback-only
+    # (127.0.0.0/8, ::1/128). Set to a comma-separated list of CIDRs
+    # to grant bypass to additional networks — e.g. "127.0.0.0/8,
+    # 10.0.0.0/8, ::1/128" for a private LAN. **Any host on the
+    # allow-listed networks can authenticate without a password**;
+    # only enable this on networks you trust.
+    #
+    # The previous default included RFC1918 + link-local + ULA, which
+    # silently auto-granted bypass to any reverse-proxy peer that
+    # talked to the backend on a private interface (Docker bridge,
+    # k8s pod CIDRs, etc.). The loopback-only default closes that hole.
+    local_bypass_allowed_cidrs: str = "127.0.0.0/8,::1/128"
 
     # --- Session hygiene ---------------------------------------------------
     # How often to delete expired rows from the sessions table.

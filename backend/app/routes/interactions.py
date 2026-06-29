@@ -39,6 +39,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import require_user
@@ -54,21 +55,24 @@ _route_deps = [Depends(require_user)] if settings.oidc_enabled else []
 router = APIRouter(tags=["interactions"], dependencies=_route_deps)
 
 
-async def _entries_exist(
-    session: AsyncSession, entry_ids: list[int]
-) -> set[int]:
-    """Return the subset of ``entry_ids`` that exist in the entries
-    table. Used to filter out stale / deleted entries before
-    inserting — a delete-source cascade drops entries transparently,
-    so a queued view event for a deleted entry would otherwise 500
-    on the FK constraint. Returns empty set when the table is
-    empty (no rows to query against)."""
-    if not entry_ids:
-        return set()
-    rows = await session.scalars(
-        select(Entry.id).where(Entry.id.in_(entry_ids))
-    )
-    return set(rows.all())
+async def _commit_unique(session: AsyncSession, event: Interaction) -> int | None:
+    """Persist one ``Interaction`` row, returning the row id on
+    success or None if the FK violated (entry was deleted between
+    dashboard load and tap).
+
+    Letting the FK fire avoids a pre-flight ``SELECT id FROM entries
+    WHERE id IN (...)`` round-trip on every POST/batch — the FK
+    constraint is the source of truth, so we let it speak. asyncpg's
+    IntegrityError wraps the underlying ``23503`` (foreign_key_violation).
+    """
+    session.add(event)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        return None
+    await session.refresh(event)
+    return event.id
 
 
 @router.post("/interactions", status_code=201)
@@ -78,14 +82,6 @@ async def post_interaction(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Record one engagement event. Returns the inserted row id."""
-    existing = await _entries_exist(session, [body.entry_id])
-    if not existing:
-        # Surface as 404 (not 422) so the client can treat it as
-        # "the entry is gone, drop the event" rather than a bug.
-        raise HTTPException(
-            status_code=404,
-            detail=f"entry {body.entry_id} not found",
-        )
     user_id = user["sub"]
     row = Interaction(
         entry_id=body.entry_id,
@@ -93,14 +89,19 @@ async def post_interaction(
         type=body.type.value,
         value=body.value,
     )
-    session.add(row)
-    await session.commit()
-    await session.refresh(row)
+    row_id = await _commit_unique(session, row)
+    if row_id is None:
+        # Surface as 404 (not 422) so the client can treat it as
+        # "the entry is gone, drop the event" rather than a bug.
+        raise HTTPException(
+            status_code=404,
+            detail=f"entry {body.entry_id} not found",
+        )
     logger.debug(
         "interaction: user=%s entry=%d type=%s value=%s",
         user_id, body.entry_id, body.type.value, body.value,
     )
-    return {"id": row.id}
+    return {"id": row_id}
 
 
 # Cap the batch so a runaway client can't enqueue thousands of
@@ -108,6 +109,22 @@ async def post_interaction(
 # × 10 visible cards) with headroom. Anything larger would be a
 # misuse — split it client-side.
 _BATCH_MAX = 50
+
+
+async def _existing_entry_ids(
+    session: AsyncSession, entry_ids: list[int]
+) -> set[int]:
+    """Return the subset of ``entry_ids`` that exist. One round-trip
+    regardless of batch size. Used only on the batch path; the
+    single-shot endpoint lets the FK do the talking — cheaper than
+    a SELECT on the hot path of one POST per click.
+    """
+    if not entry_ids:
+        return set()
+    rows = await session.scalars(
+        select(Entry.id).where(Entry.id.in_(entry_ids))
+    )
+    return set(rows.all())
 
 
 @router.post("/interactions/batch", status_code=201)
@@ -118,7 +135,13 @@ async def post_interactions_batch(
 ) -> dict:
     """Record a batch of engagement events. The single response field
     ``inserted`` reports how many rows landed (after dropping
-    invalid entry_ids)."""
+    invalid entry_ids).
+
+    One pre-flight SELECT filters stale ids (single round-trip);
+    the remaining rows land in one INSERT + commit. Compared to
+    per-event ``flush()``/FK-catch, this is one round-trip for
+    large batches (50 events is the cap) versus ``n`` flushes.
+    """
     if not body.events:
         return {"inserted": 0}
     if len(body.events) > _BATCH_MAX:
@@ -127,7 +150,7 @@ async def post_interactions_batch(
             detail=f"batch size {len(body.events)} exceeds limit {_BATCH_MAX}",
         )
     entry_ids = list({e.entry_id for e in body.events})
-    valid_ids = await _entries_exist(session, entry_ids)
+    valid_ids = await _existing_entry_ids(session, entry_ids)
     user_id = user["sub"]
     inserted = 0
     for evt in body.events:

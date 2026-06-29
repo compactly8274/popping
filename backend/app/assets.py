@@ -43,6 +43,52 @@ _ASSETS_DIR = Path(settings.assets_dir)
 _FAVICON_DIR = _ASSETS_DIR / "favicons"
 _THUMBNAIL_DIR = _ASSETS_DIR / "thumbnails"
 
+# Shared HTTP client. One client per process — connection pooling
+# across fetches amortises the TCP/TLS handshake (a 50-item ingest
+# would otherwise pay 150+ handshakes). Different headers/timeouts
+# per call-site are passed as kwargs to ``client.stream`` rather
+# than via separate clients. Set on lifespan startup; closed on
+# lifespan teardown so connection pools don't leak across reloads.
+_client: Optional[httpx.AsyncClient] = None
+
+
+def init_client() -> None:
+    """Build the shared client. Idempotent — a second call replaces
+    the existing client (and closes the old one)."""
+    global _client
+    if _client is not None:
+        return
+    # Per-call headers/timeout go through ``client.stream(..., headers=...)``
+    # so the shared client only needs the defaults that are common to
+    # every call (follow_redirects, base timeout).
+    _client = httpx.AsyncClient(
+        timeout=_TIMEOUT,
+        follow_redirects=True,
+        headers={"User-Agent": _APP_UA},
+    )
+
+
+async def close_client() -> None:
+    """Tear down the shared client. Called from FastAPI lifespan exit
+    so connection pools don't leak across ``uvicorn --reload`` cycles."""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    if _client is None:
+        # Defensive — if a route fires before lifespan startup (e.g.
+        # during tests), build a one-off. The shared pool is the
+        # common case.
+        return httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            follow_redirects=True,
+            headers={"User-Agent": _APP_UA},
+        )
+    return _client
+
 # Favicons are tiny (5-15 KB); thumbnails can be 300-500 KB on news
 # sites and 800+ KB on social-media embeds. Splitting the cap means a
 # misbehaving source can't fill the volume, but legitimate thumbnails
@@ -156,25 +202,23 @@ async def _pick_favicon_url(page_url: str) -> Optional[str]:
     Never raises — caller falls back to ``/favicon.ico`` on None.
     """
     try:
-        async with httpx.AsyncClient(
-            timeout=_TIMEOUT,
-            follow_redirects=True,
-            headers={"User-Agent": _APP_UA, "Accept": _HTML_ACCEPT},
-        ) as client:
-            async with client.stream("GET", page_url) as resp:
-                if resp.status_code >= 400:
-                    logger.debug("assets: %s → HTTP %s (icon probe)", page_url, resp.status_code)
-                    return None
-                ct = resp.headers.get("content-type") or ""
-                if "html" not in ct.lower() and "xml" not in ct.lower():
-                    # RSS / JSON / etc — no <link> tags. Don't waste
-                    # bytes parsing it.
-                    return None
-                buf = bytearray()
-                async for chunk in resp.aiter_bytes(chunk_size=16 * 1024):
-                    buf.extend(chunk)
-                    if len(buf) >= _HTML_PROBE_BYTES:
-                        break
+        client = _get_client()
+        async with client.stream(
+            "GET", page_url, headers={"Accept": _HTML_ACCEPT},
+        ) as resp:
+            if resp.status_code >= 400:
+                logger.debug("assets: %s → HTTP %s (icon probe)", page_url, resp.status_code)
+                return None
+            ct = resp.headers.get("content-type") or ""
+            if "html" not in ct.lower() and "xml" not in ct.lower():
+                # RSS / JSON / etc — no <link> tags. Don't waste
+                # bytes parsing it.
+                return None
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes(chunk_size=16 * 1024):
+                buf.extend(chunk)
+                if len(buf) >= _HTML_PROBE_BYTES:
+                    break
     except (httpx.HTTPError, OSError) as exc:
         logger.debug("assets: HTML probe %s failed: %s", page_url, exc)
         return None
@@ -217,6 +261,8 @@ async def _download(
     dest: Path,
     *,
     max_bytes: int,
+    timeout: Optional[float] = None,
+    headers: Optional[dict] = None,
 ) -> Optional[str]:
     """GET ``url`` and write to ``dest``. Returns the relative path under
     the assets root on success, None on failure.
@@ -224,11 +270,18 @@ async def _download(
     Streams the body and aborts past ``max_bytes`` so we never trust
     the Content-Length header (which can lie or be missing).
 
-    ``dest`` is a path WITHOUT an extension — we derive the extension
-    from the response's Content-Type (e.g. "favicons/3" → "favicons/3.png").
+    ``timeout`` / ``headers`` override the shared client's defaults
+    on a per-call basis — favicon probes use a 10s read window while
+    thumbnails need 30s; image fetches set a browser UA and image/*
+    Accept header to bypass CDN 403s. ``dest`` is a path WITHOUT an
+    extension — we derive the extension from the response's
+    Content-Type (e.g. "favicons/3" → "favicons/3.png").
     """
     try:
-        async with client.stream("GET", url, follow_redirects=True) as resp:
+        async with client.stream(
+            "GET", url, follow_redirects=True,
+            headers=headers, timeout=timeout,
+        ) as resp:
             if resp.status_code >= 400:
                 logger.debug("assets: %s → HTTP %s", url, resp.status_code)
                 return None
@@ -292,21 +345,20 @@ async def fetch_favicon(source_url: str, source_id: int) -> Tuple[Optional[str],
     if chosen_url is None:
         chosen_url = f"{origin}/favicon.ico"
 
-    # Browser UA + image/* Accept. Two separate client constructions so
-    # a 403 from the chosen URL can be retried with a fresh socket —
-    # some CDNs rotate per-connection and a stale 200+403 sequence can
-    # look like "the asset is fine" when it isn't.
+    # Browser UA + image/* Accept. Two separate attempts so a 403 from
+    # the chosen URL can be retried with a fresh socket — some CDNs
+    # rotate per-connection and a stale 200+403 sequence can look like
+    # "the asset is fine" when it isn't. The shared client handles
+    # connection pooling, so attempts share the same underlying pool.
     last_err: Optional[str] = None
+    client = _get_client()
     for attempt in (1, 2):
-        async with httpx.AsyncClient(
+        rel = await _download(
+            client, chosen_url, _FAVICON_DIR / str(source_id),
+            max_bytes=_MAX_FAVICON_BYTES,
             timeout=_FAVICON_TIMEOUT,
-            follow_redirects=True,
             headers={"User-Agent": _BROWSER_UA, "Accept": _IMAGE_ACCEPT},
-        ) as client:
-            rel = await _download(
-                client, chosen_url, _FAVICON_DIR / str(source_id),
-                max_bytes=_MAX_FAVICON_BYTES,
-            )
+        )
         if rel is not None:
             return (chosen_url, rel)
         last_err = "download returned None"
@@ -326,20 +378,18 @@ async def fetch_thumbnail(remote_url: str, entry_id: int) -> Optional[str]:
     than truncated.
     """
     last_err: Optional[str] = None
+    client = _get_client()
     for attempt in (1, 2):
         # Thumbnail path: 30s read window because news CDNs routinely
         # stream at 50 KB/s when cold — a 1.5 MB hero image needs a
         # real read window. Re-running on a freshly-opened socket
         # often clears a transient hiccup.
-        async with httpx.AsyncClient(
+        rel = await _download(
+            client, remote_url, _THUMBNAIL_DIR / str(entry_id),
+            max_bytes=_MAX_THUMBNAIL_BYTES,
             timeout=_THUMBNAIL_TIMEOUT,
-            follow_redirects=True,
             headers={"User-Agent": _BROWSER_UA, "Accept": _IMAGE_ACCEPT},
-        ) as client:
-            rel = await _download(
-                client, remote_url, _THUMBNAIL_DIR / str(entry_id),
-                max_bytes=_MAX_THUMBNAIL_BYTES,
-            )
+        )
         if rel is not None:
             return rel
         last_err = "download returned None"

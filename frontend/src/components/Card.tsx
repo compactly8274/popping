@@ -13,7 +13,7 @@
 //     so cards that haven't been computed (e.g. before F2 lands on
 //     a given column) don't all flash unread.
 
-import { useEffect, useRef, useState, type MouseEvent, type TouchEvent } from 'react'
+import { memo, useEffect, useRef, useState, type MouseEvent, type TouchEvent } from 'react'
 import { api, type Entry } from '../api'
 import { recordBatched, recordImmediate } from '../lib/interactions'
 import { toast } from './Toast'
@@ -94,13 +94,26 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
-export function Card({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary }: Props) {
+export function _CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   // Touch tracking for long-press → copy URL.
   // Kept in refs so the values don't trigger re-renders mid-press.
   const touchStart = useRef<{ x: number; y: number; t: number; id: number; onInteractiveChild: boolean } | null>(null)
   const longPressTimer = useRef<number | null>(null)
+
+  // Stable DOM-ref callback. The Column passes a fresh lambda per
+  // card per render; we stash the latest in a ref and forward
+  // through a single closure that never changes identity. React's
+  // ref semantics compare by identity, so a stable wrapper means
+  // no re-attach on every parent re-render — and combined with
+  // ``Card.memo`` this keeps the card's DOM truly stable across
+  // polls that don't change any of its data props.
+  const cardRefLatest = useRef<typeof cardRef>(cardRef)
+  cardRefLatest.current = cardRef
+  const stableCardRef = useRef((el: HTMLElement | null) => {
+    cardRefLatest.current?.(el)
+  }).current
 
   // Summary panel state. ``null`` means we haven't loaded yet (or
   // haven't tried); the string is the cleaned text; ``false`` marks
@@ -254,7 +267,7 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
 
   return (
     <article
-      ref={cardRef}
+      ref={stableCardRef}
       data-card-id={entry.id}
       // ``tabIndex`` only on the selected card so the rest of the
       // grid isn't a giant tab-stop forest. Arrow keys set
@@ -331,7 +344,7 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
       <div className="flex items-center gap-2 text-ios-caption text-label-secondary">
         {sourceName && <span className="font-medium text-label-primary">{sourceName}</span>}
         {sourceName && <span>·</span>}
-        <time>{timeAgo(entry.published_at)}</time>
+        <time dateTime={entry.published_at ?? ''}>{timeAgo(entry.published_at)}</time>
         {/* Per-card summary chevron. Sits inline on the meta row so
             it reads as part of the same toolbar as the ✓ button. Same
             ``data-card-interactive`` guard so a long-press / right-
@@ -419,6 +432,37 @@ export function Card({ entry, sourceName, unread, selected, cardRef, onActivate,
     </article>
   )
 }
+
+// ``memo`` wrap. Default shallow-equal check would still let the
+// inline ref / callback lambdas at the Column level defeat the
+// memo, because they're allocated fresh on every Column render.
+// So we use a custom areEqual that ignores the per-card callback
+// props (``cardRef``, ``onActivate``, ``onMarkRead``,
+// ``onToggleSummary``). They're inherently per-render at the
+// Column layer; the parent passes them through to whatever the
+// latest closure captures. The data-driven props — ``entry``,
+// ``sourceName``, ``unread``, ``selected``, ``category``,
+// ``expanded`` — are what we actually re-render against.
+//
+// Trade-off: if a callback's logic changes without the data
+// changing, this Card won't re-render. That can't happen in
+// practice because callbacks here only depend on data props
+// (``onMarkEntryRead(e.id)`` reads from the same entry id) and
+// App-level state. If a future caller starts passing callbacks
+// that close over mutable refs, lift this to a stable ref and
+// re-evaluate.
+function _cardPropsEqual(prev: Props, next: Props): boolean {
+  return (
+    prev.entry === next.entry &&
+    prev.sourceName === next.sourceName &&
+    prev.unread === next.unread &&
+    prev.selected === next.selected &&
+    prev.category === next.category &&
+    prev.expanded === next.expanded
+  )
+}
+
+export const Card = memo(_CardInner, _cardPropsEqual) as typeof _CardInner
 
 // iOS-style checkmark. Used for the per-card mark-read ✓. 2px stroke
 // is heavier than the 1.75 the header icons use — the ✓ is the

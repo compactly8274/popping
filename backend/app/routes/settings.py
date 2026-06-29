@@ -60,14 +60,18 @@ _VALID_PROVIDERS: frozenset[str | None] = frozenset(
 async def get_settings() -> SettingsOut:
     """Return the current runtime overrides. Each field is the value in
     ``app_settings`` if present and non-empty, else None — the frontend
-    shows ``None`` as "using env default"."""
-    provider = await runtime_settings.get("llm.provider", default=None)
-    model_brief = await runtime_settings.get("llm.model_brief", default=None)
-    model_scoring = await runtime_settings.get("llm.model_scoring", default=None)
+    shows ``None`` as "using env default".
+
+    All three knobs are read in one DB round-trip (cached separately
+    in the runtime_settings module) so a stale-cache Drawer open
+    doesn't serialise three SELECTs."""
+    values = await runtime_settings.get_many(
+        ["llm.provider", "llm.model_brief", "llm.model_scoring"]
+    )
     return SettingsOut(
-        llm_provider=provider,
-        llm_model_brief=model_brief,
-        llm_model_scoring=model_scoring,
+        llm_provider=values["llm.provider"],
+        llm_model_brief=values["llm.model_brief"],
+        llm_model_scoring=values["llm.model_scoring"],
     )
 
 

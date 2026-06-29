@@ -12,9 +12,15 @@ type Props = {
   query: string
   entries: Entry[]
   sourcesById: Map<number, string>
+  // Network/5xx error from the underlying fetch. Distinct from
+  // "no matches" — the panel renders the error in a red block so
+  // the user can tell the search itself failed, vs. there simply
+  // being no rows for their query.
+  error?: string | null
+  searching?: boolean
 }
 
-export function SearchResults({ query, entries, sourcesById }: Props) {
+export function SearchResults({ query, entries, sourcesById, error, searching }: Props) {
   return (
     <section className="flex flex-col h-full overflow-hidden">
       <header className="flex items-center justify-between px-1 pb-2 border-b border-hairline">
@@ -22,11 +28,19 @@ export function SearchResults({ query, entries, sourcesById }: Props) {
           Search results
         </h2>
         <span className="text-ios-caption text-label-secondary">
-          {entries.length} for "{query}"
+          {error
+            ? 'failed'
+            : searching
+              ? 'searching…'
+              : `${entries.length} for "${query}"`}
         </span>
       </header>
       <div className="flex-1 overflow-y-auto space-y-2 pr-1">
-        {entries.length === 0 ? (
+        {error ? (
+          <p className="text-ios-body text-red-400 px-1" role="alert">
+            search failed — {error}
+          </p>
+        ) : entries.length === 0 ? (
           <p className="text-ios-body text-label-secondary italic px-1">
             no matches — try a different keyword
           </p>

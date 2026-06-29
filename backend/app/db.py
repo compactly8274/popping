@@ -26,3 +26,10 @@ async def get_session() -> AsyncIterator[AsyncSession]:
     """FastAPI dependency that yields a session and ensures it closes."""
     async with SessionLocal() as session:
         yield session
+
+
+async def dispose_engine() -> None:
+    """Tear down the SQLAlchemy engine pool. Called from FastAPI
+    lifespan exit so connection pools don't leak across
+    ``uvicorn --reload`` cycles."""
+    await engine.dispose()

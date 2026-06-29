@@ -268,3 +268,26 @@ class AppSetting(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# NotificationDedup: dedup ledger for outbound alert paths (CVE URL,
+# convergence slug). Replaces the old "store on the latest Brief row's
+# meta and truncate at 500" approach, which silently dropped older
+# entries and re-notified the same CVE. Composite PK (kind, key) makes
+# INSERT … ON CONFLICT DO NOTHING atomic; no truncation needed because
+# rows are pruned on their own clock by future maintenance.
+# ---------------------------------------------------------------------------
+
+
+class NotificationDedup(Base):
+    __tablename__ = "notification_dedup"
+
+    # Small discriminator. ``cve_url`` for CVE URL dedup,
+    # ``convergence_slug`` for cross-source convergence alerts.
+    # New kinds land here without a schema change.
+    kind: Mapped[str] = mapped_column(String(40), primary_key=True)
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    last_notified_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

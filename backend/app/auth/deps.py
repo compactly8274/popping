@@ -50,31 +50,35 @@ _BYPASS_SYNTHETIC = {
     "auth_method": "bypass",
 }
 
-# Networks considered "local" for the bypass. Composed at import time
-# so the membership check is just a flat ``in`` against a small list.
-# IPv4 first:
-#   127.0.0.0/8        — loopback
-#   10.0.0.0/8         — RFC1918
-#   172.16.0.0/12      — RFC1918
-#   192.168.0.0/16     — RFC1918
-#   169.254.0.0/16     — link-local
-# IPv6:
-#   ::1/128            — loopback
-#   fe80::/10          — link-local
-#   fc00::/7           — ULA (covers fc00::/8 and fd00::/8)
-_PRIVATE_NETS: tuple = tuple(
-    ipaddress.ip_network(cidr)
-    for cidr in (
-        "127.0.0.0/8",
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "169.254.0.0/16",
-        "::1/128",
-        "fe80::/10",
-        "fc00::/7",
-    )
-)
+# Networks considered "local" for the bypass. Loaded from the
+# ``local_bypass_allowed_cidrs`` setting (comma-separated CIDRs) at
+# import time. Default is loopback-only; LAN operators opt in
+# explicitly by setting ``LOCAL_BYPASS_ALLOWED_CIDRS``.
+#
+# We deliberately do NOT include RFC1918 / link-local / ULA by
+# default — those CIDRs cover Docker bridge networks, k8s pod
+# CIDRs, and reverse-proxy peers bound to private interfaces. A
+# request from any of those would have been silently auto-granted
+# under the old default; see config.py ``local_auth_bypass`` for the
+# full threat model.
+def _load_bypass_nets() -> tuple:
+    out: list = []
+    for cidr in (settings.local_bypass_allowed_cidrs or "").split(","):
+        cidr = cidr.strip()
+        if not cidr:
+            continue
+        try:
+            out.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError as exc:
+            # Misconfiguration should be loud at startup, not on every
+            # request. We log once via the module logger and skip.
+            logger.warning(
+                "local_bypass: ignoring invalid CIDR %r (%s)", cidr, exc,
+            )
+    return tuple(out)
+
+
+_BYPASS_NETS: tuple = _load_bypass_nets()
 
 
 def _client_ip(request: Request) -> Optional[str]:
@@ -92,12 +96,21 @@ def _client_ip(request: Request) -> Optional[str]:
 
 
 def _is_private_address(ip_str: str) -> bool:
-    """True if the address is loopback, RFC1918, link-local, or IPv6 ULA."""
+    """True if the address matches one of the configured bypass CIDRs.
+
+    The default is loopback-only; the operator can widen this via
+    ``LOCAL_BYPASS_ALLOWED_CIDRS``. The old "any RFC1918 / loopback /
+    link-local / ULA" hard-coded set was removed because Docker
+    bridges, k8s pod CIDRs, and reverse-proxy peers all sit in
+    RFC1918 space — a deployment with ``local_auth_bypass=true`` and
+    a reverse proxy would have silently granted every public-facing
+    request the bypass identity.
+    """
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    return any(ip in net for net in _PRIVATE_NETS)
+    return any(ip in net for net in _BYPASS_NETS)
 
 
 def _maybe_bypass_user(request: Request) -> Optional[dict]:

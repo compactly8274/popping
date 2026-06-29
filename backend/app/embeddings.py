@@ -20,12 +20,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from app.config import settings
 
 logger = logging.getLogger("popping.embeddings")
+
+# Worker count for the embedding thread pool. One worker serialized
+# every per-entry embed (and the backfill job) through a single
+# thread — a busy backfill starved live ingest. Multiple workers let
+# several sentence-transformers encodes run in parallel. ``encode``
+# releases the GIL via numpy, so this scales almost linearly up to
+# the CPU count. Falls back to 2 on hosts where ``cpu_count`` is
+# unset (cgroup-limited containers).
+_DEFAULT_WORKERS = max(os.cpu_count() or 2, 2)
 
 # Singleton — module-level so the scheduler and the foryou endpoint
 # share the loaded model.
@@ -77,7 +87,12 @@ class Embedder:
         # The actual sentence_transformers import lives inside _load_sync
         # so the binding is in scope on the worker thread.
         await loop.run_in_executor(None, self._load_sync, settings.embedding_model)
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
+        # Multi-worker pool — was 1, which serialized every embedding
+        # call. With one worker the periodic backfill job (50k rows)
+        # queued up calls that blocked live ingest behind them.
+        self._executor = ThreadPoolExecutor(
+            max_workers=_DEFAULT_WORKERS, thread_name_prefix="embed"
+        )
         self._loaded = True
         logger.info("embedding model loaded: %s (dim=%d)", settings.embedding_model, self._dim)
 

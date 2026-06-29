@@ -28,6 +28,7 @@ import { SearchResults } from './components/SearchResults'
 import { ToastHost } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { recordImmediate } from './lib/interactions'
+import { STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
 
 const REFRESH_INTERVAL_MS = 60_000
 // Hidden longer than this → treat return as "fresh start"; the new-
@@ -36,21 +37,18 @@ const REFRESH_INTERVAL_MS = 60_000
 // the seen-set still has the old ids).
 const HIDDEN_RESET_MS = 2 * 60 * 1000
 
-// localStorage keys. Dotted namespace matches BriefCard's existing
-// ``brief.collapsed`` convention — each feature owns its own subtree.
-const LS_LAST_VIEWED = 'col.lastViewed'
-const LS_COLUMN_PREFS = 'col.prefs'
-const LS_MOBILE_COL = 'mobileCol.last'
-// Per-card manual-read state. Persisted so a refresh mid-day doesn't
-// re-flag entries the user explicitly dismissed. Separate from
-// ``LS_LAST_VIEWED`` (column-level "I've seen the column") because
-// the per-card flip is granular and shouldn't reset the column chip.
-const LS_READ_ENTRIES = 'col.readEntries'
+// localStorage keys live in ``lib/storage.ts`` so feature
+// modules share one namespaced key registry. Per-card manual-read
+// state is persisted so a refresh mid-day doesn't re-flag entries
+// the user explicitly dismissed; separate from
+// ``STORAGE_KEYS.lastViewed`` (column-level "I've seen the
+// column") because the per-card flip is granular and shouldn't
+// reset the column chip.
 
 function loadLastViewed(): Record<string, string> {
   if (typeof window === 'undefined') return {}
   try {
-    const raw = window.localStorage?.getItem(LS_LAST_VIEWED)
+    const raw = safeGetItem(STORAGE_KEYS.lastViewed)
     if (!raw) return {}
     const parsed = JSON.parse(raw)
     return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, string>) : {}
@@ -62,7 +60,7 @@ function loadLastViewed(): Record<string, string> {
 function loadColumnPrefs(): Record<string, ColumnPrefs> {
   if (typeof window === 'undefined') return {}
   try {
-    const raw = window.localStorage?.getItem(LS_COLUMN_PREFS)
+    const raw = safeGetItem(STORAGE_KEYS.columnPrefs)
     if (!raw) return {}
     const parsed = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null) return {}
@@ -81,7 +79,7 @@ function loadColumnPrefs(): Record<string, ColumnPrefs> {
 function loadMobileCol(): number {
   if (typeof window === 'undefined') return 0
   try {
-    const raw = window.localStorage?.getItem(LS_MOBILE_COL)
+    const raw = safeGetItem(STORAGE_KEYS.mobileColLast)
     if (!raw) return 0
     const n = Number(raw)
     return Number.isInteger(n) && n >= 0 ? n : 0
@@ -100,7 +98,7 @@ function loadMobileCol(): number {
 function loadReadEntries(): Record<string, number[]> {
   if (typeof window === 'undefined') return {}
   try {
-    const raw = window.localStorage?.getItem(LS_READ_ENTRIES)
+    const raw = safeGetItem(STORAGE_KEYS.readEntries)
     if (!raw) return {}
     const parsed = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null) return {}
@@ -113,15 +111,6 @@ function loadReadEntries(): Record<string, number[]> {
     return out
   } catch {
     return {}
-  }
-}
-
-function safeSetItem(key: string, value: string) {
-  try {
-    window.localStorage?.setItem(key, value)
-  } catch {
-    // Quota / private-mode — the in-memory state is the source of
-    // truth for the current session.
   }
 }
 
@@ -144,6 +133,51 @@ export function App() {
   // the Drawer "Generate brief now" button, and the BriefCard pills
   // all stay in sync.
   const [briefTone, setBriefTone] = useState<'terse' | 'narrative' | 'alert'>('terse')
+  // Kick off brief generation + poll the job-status endpoint until
+  // the LLM call lands. Shared between the header Brief button and
+  // BriefCard's Regenerate/Generate buttons so both surfaces get
+  // the same 202+ack→poll UX. ``onError`` lets BriefCard surface a
+  // local error string and the header button bubble it into the
+  // toast queue.
+  const triggerBriefGenerate = useCallback(
+    async (tone: 'terse' | 'narrative' | 'alert', onError?: (msg: string) => void) => {
+      setGeneratingBrief(true)
+      try {
+        const ack = await api.briefGenerate(tone)
+        const jobId = ack.job_id
+        const POLL_MS = 800
+        const TIMEOUT_MS = 30_000
+        const startedAt = Date.now()
+        while (true) {
+          if (Date.now() - startedAt > TIMEOUT_MS) {
+            onError?.('brief generation timed out')
+            return
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS))
+          let status: Awaited<ReturnType<typeof api.briefJobStatus>>
+          try {
+            status = await api.briefJobStatus(jobId)
+          } catch {
+            onError?.('brief job no longer tracked — please try again')
+            return
+          }
+          if (status.status === 'completed' && status.brief) {
+            setBrief(status.brief)
+            return
+          }
+          if (status.status === 'failed') {
+            onError?.(status.error ?? 'brief generation failed')
+            return
+          }
+        }
+      } catch (err) {
+        onError?.((err as Error).message)
+      } finally {
+        setGeneratingBrief(false)
+      }
+    },
+    [],
+  )
   // Refresh in-flight state — drives the Refresh button's disabled
   // state so a second tap doesn't fire a parallel fetch.
   const [refreshing, setRefreshing] = useState(false)
@@ -162,6 +196,12 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<Entry[]>([])
   const [searching, setSearching] = useState(false)
+  // Distinct from "no matches": a network/5xx error leaves
+  // ``searchResults`` empty AND sets ``searchError`` so the user
+  // can tell "your query didn't match anything" from "the search
+  // request blew up". Reset on each new query so a stale error
+  // doesn't bleed across successive searches.
+  const [searchError, setSearchError] = useState<string | null>(null)
   // Search-bar expansion. The header collapses search into a single
   // magnifying-glass icon by default; tapping it expands the input
   // to full width (matching Apple Mail's header behaviour). ``false``
@@ -476,24 +516,24 @@ export function App() {
     if (mobileCol >= columns.length) {
       const next = columns.length - 1
       setMobileCol(next)
-      safeSetItem(LS_MOBILE_COL, String(next))
+      safeSetItem(STORAGE_KEYS.mobileColLast, String(next))
     }
   }, [columns.length, mobileCol])
 
   useEffect(() => {
-    safeSetItem(LS_MOBILE_COL, String(mobileCol))
+    safeSetItem(STORAGE_KEYS.mobileColLast, String(mobileCol))
   }, [mobileCol])
 
   useEffect(() => {
-    safeSetItem(LS_LAST_VIEWED, JSON.stringify(lastViewed))
+    safeSetItem(STORAGE_KEYS.lastViewed, JSON.stringify(lastViewed))
   }, [lastViewed])
 
   useEffect(() => {
-    safeSetItem(LS_READ_ENTRIES, JSON.stringify(readEntries))
+    safeSetItem(STORAGE_KEYS.readEntries, JSON.stringify(readEntries))
   }, [readEntries])
 
   useEffect(() => {
-    safeSetItem(LS_COLUMN_PREFS, JSON.stringify(columnPrefs))
+    safeSetItem(STORAGE_KEYS.columnPrefs, JSON.stringify(columnPrefs))
   }, [columnPrefs])
 
   // Debounced search. 300ms — standard "feels live but doesn't fire
@@ -506,9 +546,11 @@ export function App() {
       setSearchQuery('')
       setSearchResults([])
       setSearching(false)
+      setSearchError(null)
       return
     }
     setSearching(true)
+    setSearchError(null)
     const id = window.setTimeout(() => {
       setSearchQuery(trimmed)
     }, 300)
@@ -523,10 +565,15 @@ export function App() {
       .then((rows) => {
         if (cancelled) return
         setSearchResults(rows)
+        setSearchError(null)
       })
-      .catch(() => {
+      .catch((err: Error) => {
         if (cancelled) return
         setSearchResults([])
+        // Surface the error verbatim — the user can tell the
+        // difference between "no matches" (results=[], error=null)
+        // and "the request failed" (results=[], error="…").
+        setSearchError(err?.message ?? 'search failed')
       })
       .finally(() => {
         if (!cancelled) setSearching(false)
@@ -883,18 +930,7 @@ export function App() {
               {refreshing ? '…' : 'Refresh'}
             </button>
             <button
-              onClick={async () => {
-                if (generatingBrief) return
-                setGeneratingBrief(true)
-                try {
-                  const next = await api.briefGenerate(briefTone)
-                  setBrief(next)
-                } catch (err) {
-                  setError((err as Error).message)
-                } finally {
-                  setGeneratingBrief(false)
-                }
-              }}
+              onClick={() => void triggerBriefGenerate(briefTone, setError)}
               disabled={generatingBrief}
               className="min-h-[32px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
               title="Generate today's brief now"
@@ -946,6 +982,7 @@ export function App() {
         onBriefChange={setBrief}
         tone={briefTone}
         onToneChange={setBriefTone}
+        triggerGenerate={triggerBriefGenerate}
       />
 
       {showSearchView ? (
@@ -954,10 +991,9 @@ export function App() {
             query={searchQuery}
             entries={searchResults}
             sourcesById={sourcesById}
+            error={searchError}
+            searching={searching}
           />
-          {searching && (
-            <p className="mt-2 text-ios-caption text-label-secondary px-1">searching…</p>
-          )}
         </main>
       ) : columns.length === 0 ? (
         <div className="flex-1 flex items-center justify-center text-ios-body text-label-secondary px-4 text-center">

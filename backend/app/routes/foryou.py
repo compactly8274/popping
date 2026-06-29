@@ -5,14 +5,13 @@ boost applied. Computed at query time, not at ingest, so cross-source
 story clusters get a multiplicative bump as soon as they form.
 
 The convergence SQL is one GROUP BY over the last
-``convergence_window_hours``, so it stays cheap even with tens of
-thousands of recent entries.
+``convergence_window_hours``, cached at the process level for 30s —
+see ``app.scoring.convergence`` for the helper.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from collections import defaultdict
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
@@ -23,47 +22,20 @@ from app.auth.deps import current_user
 from app.config import settings
 from app.db import get_session
 from app.models import Entry, Source, UserProfile
-from app.schemas import EntryOut
+from app.schemas import EntryListOut
 from app.scoring import composite as composite_scorer
+from app.scoring import convergence
 
 router = APIRouter(tags=["foryou"])
 
 
-async def _load_profile(session: AsyncSession) -> UserProfile | None:
-    profile = await session.scalar(select(UserProfile).where(UserProfile.id == 1))
-    return profile
-
-
-async def _convergence_counts(
-    session: AsyncSession,
-    window_hours: int,
-) -> dict[str, int]:
-    """Map title_slug → number of distinct sources mentioning it within
-    the window. Only slugs seen in 2+ sources are returned (saves a
-    pass over the candidates that won't get boosted anyway)."""
-    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
-    stmt = (
-        select(Entry.title, Source.name)
-        .join(Source, Entry.source_id == Source.id)
-        .where(Entry.published_at >= since)
-    )
-    rows = (await session.execute(stmt)).all()
-    counts: dict[str, int] = defaultdict(set)
-    for title, source_name in rows:
-        slug = composite_scorer.title_slug(title)
-        if not slug:
-            continue
-        counts[slug].add(source_name)
-    return {slug: len(srcs) for slug, srcs in counts.items() if len(srcs) > 1}
-
-
-@router.get("/foryou", response_model=list[EntryOut])
+@router.get("/foryou", response_model=list[EntryListOut])
 async def foryou(
     session: AsyncSession = Depends(get_session),
     user: dict | None = Depends(current_user),
     limit: int = Query(default=50, ge=1, le=200),
     category: str | None = Query(default=None, description="Filter by source category"),
-) -> list[EntryOut]:
+) -> list[EntryListOut]:
     """Top-N personal feed.
 
     Order:
@@ -74,7 +46,7 @@ async def foryou(
          applied (per-row source_count for the entry's title slug).
       3. Re-sort and trim to ``limit``.
     """
-    profile = await _load_profile(session)
+    profile = await session.scalar(select(UserProfile).where(UserProfile.id == 1))
 
     over_fetch = min(max(limit * 4, 200), 500)
     # ``selectinload(Entry.source)`` eagerly fetches the related
@@ -87,28 +59,85 @@ async def foryou(
     # once a recent /api/entries?source=… call had primed enough
     # rows. ``selectinload`` issues one IN(…) query regardless of
     # candidate count, so the cost is bounded.
+    #
+    # Slim SELECT: we only need the columns the frontend renders plus
+    # the source join. ``embedding`` (Vector(384)) is ~3KB serialized
+    # and unused at this layer, ``meta`` JSONB is ~500B and unused
+    # here (the per-card summary endpoint pulls it on demand).
     stmt = (
-        select(Entry)
+        select(
+            Entry.id,
+            Entry.source_id,
+            Entry.title,
+            Entry.url,
+            Entry.published_at,
+            Entry.fetched_at,
+            Entry.composite_score,
+            Entry.personal_score,
+            Entry.raw_score,
+            Entry.image_url,
+            Entry.image_path,
+            Entry.cached_summary,
+        )
         .join(Source, Entry.source_id == Source.id)
-        .options(selectinload(Entry.source))
         .order_by(Entry.composite_score.desc(), Entry.published_at.desc().nullslast())
         .limit(over_fetch)
     )
     if category:
         stmt = stmt.where(Source.category == category)
-    candidates = (await session.scalars(stmt)).all()
-    if not candidates:
+    rows = (await session.execute(stmt)).all()
+    if not rows:
         return []
+    # Hydrate into ORM-ish objects the score loop can read. We can't
+    # use scalars() + .all() here because we project specific columns
+    # (no Entry row); re-attach the source via a follow-up IN query
+    # so composite_scorer.score() can read entry.source.
+    source_ids = list({r.source_id for r in rows})
+    sources_by_id = {
+        s.id: s
+        for s in (
+            await session.scalars(select(Source).where(Source.id.in_(source_ids)))
+        ).all()
+    }
 
-    conv = await _convergence_counts(session, settings.convergence_window_hours)
+    conv = await convergence.counts(session, settings.convergence_window_hours)
 
-    boosted: list[tuple[float, Entry]] = []
+    class _Row:
+        __slots__ = (
+            "id", "source_id", "title", "url", "published_at", "fetched_at",
+            "composite_score", "personal_score", "raw_score",
+            "image_url", "image_path", "cached_summary", "source",
+        )
+        def __init__(self, raw, source):
+            self.id = raw.id
+            self.source_id = raw.source_id
+            self.title = raw.title
+            self.url = raw.url
+            self.published_at = raw.published_at
+            self.fetched_at = raw.fetched_at
+            self.composite_score = raw.composite_score
+            self.personal_score = raw.personal_score
+            self.raw_score = raw.raw_score
+            self.image_url = raw.image_url
+            self.image_path = raw.image_path
+            self.cached_summary = raw.cached_summary
+            self.source = source
+
+    candidates = [_Row(r, sources_by_id.get(r.source_id)) for r in rows]
+
+    boosted: list[tuple[float, _Row]] = []
     for entry in candidates:
         base = composite_scorer.score(entry, entry.source, profile)
         slug = composite_scorer.title_slug(entry.title)
         mult = composite_scorer.convergence_multiplier(conv.get(slug, 1))
         boosted.append((base * mult, entry))
 
-    boosted.sort(key=lambda pair: (pair[0], pair[1].published_at or dt.datetime.min.replace(tzinfo=dt.timezone.utc)), reverse=True)
+    boosted.sort(
+        key=lambda pair: (
+            pair[0],
+            pair[1].published_at or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        ),
+        reverse=True,
+    )
     top = boosted[:limit]
-    return [EntryOut.model_validate(e) for _score, e in top]
+    return [EntryListOut.model_validate(e) for _score, e in top]

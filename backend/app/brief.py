@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from collections import defaultdict
 from typing import Optional
 
 from sqlalchemy import desc, select
@@ -319,31 +318,14 @@ class BriefGenerator:
 
         # Convergence boost — same window as /api/foryou so brief
         # picks are consistent with the personal feed's notion of
-        # "trending right now". Counts use ``published_at`` (when the
-        # article was actually written) rather than ``fetched_at`` —
-        # that's what makes the convergence detector meaningful
-        # (Wikipedia's old entries shouldn't trip the cluster
-        # detector for today's news).
-        from app.scoring import composite as composite_scorer
+        # "trending right now". The shared convergence helper caches
+        # the result for 30s, so a brief generation happening in the
+        # same window as a /api/foryou poll is free.
+        from app.scoring import convergence as conv_helper
 
-        conv_window = settings.convergence_window_hours
-        conv_since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=conv_window)
-        conv_rows = (
-            await session.execute(
-                select(Entry.title, Source.name)
-                .join(Source, Entry.source_id == Source.id)
-                .where(Entry.published_at >= conv_since)
-            )
-        ).all()
-        slug_to_sources: dict[str, set[str]] = defaultdict(set)
-        for title, source_name in conv_rows:
-            slug = composite_scorer.title_slug(title)
-            if slug:
-                slug_to_sources[slug].add(source_name)
-        conv_counts = {
-            slug: len(srcs) for slug, srcs in slug_to_sources.items()
-            if len(srcs) > 1
-        }
+        conv_counts = await conv_helper.counts(
+            session, settings.convergence_window_hours,
+        )
 
         scored: list[tuple[float, Entry, Source]] = []
         for entry, source in filtered:

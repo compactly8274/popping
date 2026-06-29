@@ -312,11 +312,29 @@ export const api = {
     const q = params.toString()
     return jsonFetch<Brief[]>(`/api/brief/latest${q ? `?${q}` : ''}`)
   },
+  // Kick off a brief generation. Returns 202 + a job id; the card
+  // then polls ``briefJobStatus`` until the job reaches a terminal
+  // state. The previous synchronous version held the connection
+  // open across the LLM roundtrip (3-10 s on Ollama); the
+  // 202+ack path keeps the click→ack feedback fast.
   briefGenerate: (tone: string = 'terse') =>
-    jsonFetch<Brief>(
+    jsonFetch<{ job_id: string; tone: string }>(
       `/api/brief/generate${tone ? `?tone=${encodeURIComponent(tone)}` : ''}`,
       { method: 'POST' },
     ),
+  // Poll a generation job. ``status`` is
+  // ``running`` | ``completed`` | ``failed``. Once completed, the
+  // card swaps the brief in and stops polling. A 404 here means
+  // the job aged out of the in-memory ledger (process restart,
+  // ledger cap exceeded) — also treated as terminal.
+  briefJobStatus: (jobId: string) =>
+    jsonFetch<{
+      id: string
+      tone: string
+      status: 'running' | 'completed' | 'failed'
+      brief: Brief | null
+      error: string | null
+    }>(`/api/brief/jobs/${encodeURIComponent(jobId)}`),
   notificationStatus: () => jsonFetch<NotificationStatus>('/api/notifications/status'),
   llmStatus: () => jsonFetch<LLMStatus>('/api/llm/status'),
 

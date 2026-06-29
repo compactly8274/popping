@@ -153,11 +153,23 @@ round-trip through the IdP" — flip on local bypass:
 LOCAL_AUTH_BYPASS=true
 ```
 
-Any request from a private network address (loopback `127.0.0.0/8` /
-`::1`, RFC1918 `10/8` `172.16/12` `192.168/16`, IPv6 ULA `fc00::/7`, or
-link-local `169.254/16` / `fe80::/10`) is treated as authenticated with a
-synthetic `local-bypass` user. Every grant is logged at INFO
+Any request from a network address matching `LOCAL_BYPASS_ALLOWED_CIDRS`
+(default: loopback `127.0.0.0/8` / `::1`) is treated as authenticated
+with a synthetic `local-bypass` user. Every grant is logged at INFO
 (`local-auth-bypass grant: ip=…`) so you can audit who came in.
+
+The default is loopback-only — RFC1918 / link-local / ULA addresses
+(Docker bridge, k8s pod CIDRs, reverse-proxy peers on a private
+interface) are NOT auto-granted. To extend bypass to a private LAN,
+set:
+
+```bash
+LOCAL_AUTH_BYPASS=true
+LOCAL_BYPASS_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,::1/128
+```
+
+**Be aware that any host on the allow-listed networks can then
+authenticate without a password.**
 
 **Security note.** The IP is taken from the TCP peer only —
 `X-Forwarded-For` is deliberately ignored. A client can set that header

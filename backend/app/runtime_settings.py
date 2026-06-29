@@ -101,6 +101,21 @@ async def _db_get(key: str) -> Optional[str]:
         return row[0] if row else None
 
 
+async def _db_get_many(keys: list[str]) -> dict[str, str]:
+    """Bulk load values for ``keys`` in a single query. Only returns
+    rows for keys that exist AND have non-empty values — empty-string
+    is treated as "no value" to match ``_db_get`` semantics. Used by
+    the GET /api/settings endpoint to avoid N round-trips on the
+    picker hot path."""
+    if not keys:
+        return {}
+    async with SessionLocal() as session:
+        stmt = select(AppSetting.key, AppSetting.value).where(
+            AppSetting.key.in_(keys), AppSetting.value != ""
+        )
+        return {key: value for key, value in (await session.execute(stmt)).all()}
+
+
 async def _db_set(key: str, value: str) -> None:
     """Upsert a row. SQLAlchemy's ``merge`` keeps this single-statement
     (INSERT … ON CONFLICT) and avoids the read-modify-write dance.
@@ -161,6 +176,39 @@ async def get(key: str, *, default: Any = None) -> Any:
             return env_value
 
     return default
+
+
+async def get_many(keys: list[str]) -> dict[str, Optional[str]]:
+    """Bulk-read wrapper around ``get``. One DB round-trip for all
+    misses; cache hits served without I/O. Empty / unknown keys
+    return ``None`` rather than ``default`` so callers can tell
+    "key absent" from "key absent and no env fallback".
+    """
+    out: dict[str, Optional[str]] = {}
+    missing: list[str] = []
+    for key in keys:
+        cached = _cache_get(key)
+        if cached is not None:
+            out[key] = cached
+        else:
+            out[key] = None
+            missing.append(key)
+    # Bulk fetch only the keys we actually miss in cache. One query
+    # covers all of them. ``_db_get_many`` already filters empties.
+    if missing:
+        rows = await _db_get_many(missing)
+        for key, value in rows.items():
+            _cache_set(key, value)
+            out[key] = value
+    # Anything still None gets the env fallback (single getattr per key).
+    for key in missing:
+        if out[key] is not None:
+            continue
+        field = _SETTINGS_FIELDS.get(key, "")
+        if field:
+            env_value = getattr(settings, field, None) or None
+            out[key] = env_value
+    return out
 
 
 async def set(key: str, value: str) -> None:

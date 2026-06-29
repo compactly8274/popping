@@ -37,9 +37,19 @@ export default {
         // Cool-gray label colors. Replace the slate-300/400/500 mix
         // with neutral grays so text reads as "Apple" rather than
         // "Tailwind slate".
+        // Cool-gray label colors. Replace the slate-300/400/500 mix
+        // with neutral grays so text reads as "Apple" rather than
+        // "Tailwind slate".
+        //
+        // ``label-tertiary`` is the iOS .tertiaryLabel equivalent
+        // (used for grouped-list section headers, timestamps, and
+        // other secondary metadata). Apple's 0.3 fails WCAG AA on a
+        // black background for 13pt text — bump to 0.45 for
+        // readability while keeping the "muted" hierarchy below
+        // secondary.
         'label-primary':   '#ffffff',
         'label-secondary': 'rgba(235, 235, 245, 0.6)',  // iOS .secondaryLabel
-        'label-tertiary':  'rgba(235, 235, 245, 0.3)',  // iOS .tertiaryLabel
+        'label-tertiary':  'rgba(235, 235, 245, 0.45)',  // iOS .tertiaryLabel + WCAG
       },
       fontFamily: {
         // SF Pro on Apple platforms, fall back to system-ui so

@@ -87,16 +87,28 @@ async def decode(
         await db.delete(row)
         await db.commit()
         raise SessionError("session expired")
-    # Sliding refresh: bump last_used_at and extend expires_at.
-    await db.execute(
+    # Sliding refresh: bump last_used_at and extend expires_at. We
+    # use UPDATE … RETURNING id so the same query that updates also
+    # tells us whether the row still exists — without RETURNING, a
+    # concurrent purge_expired() (running every session_purge_interval
+    # from the scheduler) can DELETE the row between our SELECT and
+    # our UPDATE; the UPDATE then matches 0 rows and silently
+    # succeeds, leaving us authenticating a request whose backing
+    # row no longer exists. RETURNING gives us the invariant.
+    result = await db.execute(
         update(SessionRow)
-        .where(SessionRow.id == sid)
+        .where(
+            SessionRow.id == sid,
+            SessionRow.expires_at > now,
+        )
         .values(
             last_used_at=now,
             expires_at=now + dt.timedelta(seconds=_row_ttl(row)),
         )
+        .returning(SessionRow.id)
     )
-    await db.commit()
+    if result.scalar_one_or_none() is None:
+        raise SessionError("session expired")
     return {
         "sub": row.sub,
         "email": row.email or "",

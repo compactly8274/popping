@@ -25,9 +25,6 @@ class SourceOut(BaseModel):
     favicon_url: Optional[str] = None
     # Local path under /assets, e.g. "favicons/3.png".
     favicon_path: Optional[str] = None
-
-    # Local path under /assets, e.g. "favicons/3.png".
-    favicon_path: Optional[str] = None
     # Per-source HTTP header overrides merged on top of the defaults
     # at fetch time. NULL = use defaults. Most-common use is
     # ``{"User-Agent": "<browser UA>"}`` for CDNs that block our
@@ -144,6 +141,43 @@ class EntryOut(BaseModel):
     # Remote URL of the entry's thumbnail (parsed from the feed).
     image_url: Optional[str] = None
     # Local path under /assets, e.g. "thumbnails/1234.jpg".
+    image_path: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class EntryListOut(BaseModel):
+    """Slim subset of ``EntryOut`` for the list endpoints.
+
+    The list payload is the dominant bytes-on-wire shape — the
+    dashboard polls ``/api/entries`` every 60s and renders up to
+    200 rows. Including the full ``meta`` JSONB blob (~500B/row)
+    and the ``embedding`` vector (not modelled here, but in the row)
+    was ~100 KB of unused JSON per poll.
+
+    ``meta`` is fetched on demand by ``POST /api/entries/{id}/summary``
+    when the user expands a card. ``embedding`` is server-internal
+    and never returned by any list endpoint.
+
+    The full ``EntryOut`` is still used for endpoints that need the
+    meta — the per-card summary endpoint, etc.
+    """
+    id: int
+    source_id: int
+    title: str
+    url: str
+    published_at: Optional[dt.datetime]
+    fetched_at: Optional[dt.datetime] = None
+    composite_score: float
+    personal_score: float
+    raw_score: float
+    # Cached summary text — small, denormalised, and the only meta
+    # fragment the dashboard ever needs at list time. Saves a round-
+    # trip to /api/entries/{id}/summary on cards that have been
+    # expanded before.
+    cached_summary: Optional[str] = None
+    image_url: Optional[str] = None
     image_path: Optional[str] = None
 
     class Config:

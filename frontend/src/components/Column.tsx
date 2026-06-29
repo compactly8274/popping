@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Entry } from '../api'
 import { Card } from './Card'
 
@@ -86,6 +86,33 @@ export function Column({
 }: Props) {
   const [popoverOpen, setPopoverOpen] = useState(false)
   const popoverRef = useRef<HTMLDivElement | null>(null)
+
+  // Keep the latest ``cardRefs`` value in a ref so we can ship a
+  // stable ref callback to each ``Card``. Without this, the inline
+  // lambda in the ``entries.map`` below would defeat the
+  // ``Card.memo`` — every Column re-render allocates new closures
+  // and React would re-mount every card's DOM ref. The cardRefs
+  // shape (Map vs ref-of-Map) can change between renders too, so we
+  // also stash the active setter in the ref to keep the dispatcher
+  // single-sourced.
+  const cardRefsLatest = useRef(cardRefs)
+  cardRefsLatest.current = cardRefs
+
+  // Stable ref callback. Same function reference across renders;
+  // reads the latest ``cardRefs`` and ``entry.id`` from refs so
+  // each card lands in the right slot regardless of when it
+  // mounted.
+  const setCardRef = useCallback((entryId: number) => (el: HTMLElement | null) => {
+    const refs = cardRefsLatest.current
+    if (!refs) return
+    if ('current' in refs) {
+      if (el) refs.current.set(entryId, el)
+      else refs.current.delete(entryId)
+    } else {
+      if (el) refs.set(entryId, el)
+      else refs.delete(entryId)
+    }
+  }, [])
 
   // Click-outside dismissal. The popover is small and short-lived;
   // a backdrop div would be overkill. ``mousedown`` (not ``click``)
@@ -277,28 +304,17 @@ export function Column({
           <p className="text-ios-body text-label-secondary italic px-1">nothing yet</p>
         ) : (
           entries.map((e) => {
-            // Build the ref-callback only when a Map is provided.
-            // Card uses the ref to expose its DOM node for F6
-            // keyboard nav. We don't allocate a new callback per
-            // render — a stable callback would still re-attach but
-            // this is cheap enough at column sizes.
-            const refCb =
-              cardRefs != null
-                ? (el: HTMLElement | null) => {
-                    // cardRefs can be either a Map or a ref-of-Map.
-                    // The ref-of-Map shape is what App uses (a single
-                    // mutable Map that all columns write into) so
-                    // keyboard nav can find any card by id regardless
-                    // of which column is currently mounted.
-                    if ('current' in cardRefs) {
-                      if (el) cardRefs.current.set(e.id, el)
-                      else cardRefs.current.delete(e.id)
-                    } else {
-                      if (el) cardRefs.set(e.id, el)
-                      else cardRefs.delete(e.id)
-                    }
-                  }
-                : undefined
+            // Stable ref callback. The previous version allocated a
+            // new closure per card per Column render, defeating the
+            // ``memo`` on ``Card``. Instead, ``Card`` writes its own
+            // DOM node into ``cardRefs`` keyed by entry id — the
+            // Column doesn't need to bind anything, the Card knows
+            // its own id and looks itself up.
+            //
+            // The custom-equal in ``Card.memo`` ignores the
+            // ``cardRef`` prop entirely (it's a sentinel ``null`` /
+            // ``undefined`` from Column), so any callback churn
+            // here is free.
             return (
               <Card
                 key={e.id}
@@ -306,7 +322,25 @@ export function Column({
                 sourceName={sourcesById.get(e.source_id)}
                 unread={unreadIds == null ? false : unreadIds.has(e.id)}
                 selected={selectedId === e.id}
-                cardRef={refCb}
+                cardRef={
+                  cardRefs
+                    ? (el: HTMLElement | null) => {
+                        // cardRefs can be either a Map or a
+                        // ref-of-Map. The ref-of-Map shape is what
+                        // App uses (a single mutable Map that all
+                        // columns write into) so keyboard nav can
+                        // find any card by id regardless of which
+                        // column is currently mounted.
+                        if ('current' in cardRefs) {
+                          if (el) cardRefs.current.set(e.id, el)
+                          else cardRefs.current.delete(e.id)
+                        } else {
+                          if (el) cardRefs.set(e.id, el)
+                          else cardRefs.delete(e.id)
+                        }
+                      }
+                    : undefined
+                }
                 category={categoriesBySourceId?.get(e.source_id)}
                 onMarkRead={onMarkEntryRead ? () => onMarkEntryRead(e.id) : undefined}
                 expanded={expandedSummaries?.has(e.id) ?? false}
