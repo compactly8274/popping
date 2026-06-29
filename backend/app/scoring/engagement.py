@@ -169,8 +169,15 @@ def score(entry: Entry, source: Any = None) -> float:
     CISA, Wikipedia — none ship engagement today). That's a
     correct "we have no signal" answer, not a bug; the composite
     formula gives them no engagement boost, which is what we want.
-    """
-    meta = entry.meta if entry.meta else {}
+
+    ``meta`` is optional on ``entry`` — list endpoints (notably
+    ``/api/foryou``) build slim projections that exclude the JSONB
+    blob to save ~500 B / row. ``getattr(..., None)`` returns a
+    "no engagement" answer for those rows (the For You slim path
+    is read-side; engagement has already been folded into
+    ``composite_score`` at ingest, which is what the dashboard
+    actually ranks on)."""
+    meta = getattr(entry, "meta", None) or {}
 
     votes = _read_meta(meta, *ENGAGEMENT_VOTE_KEYS)
     comments = _read_meta(meta, *ENGAGEMENT_COMMENT_KEYS)

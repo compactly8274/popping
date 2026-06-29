@@ -87,8 +87,18 @@ def _category_multiplier(
 
 def score(entry: Entry, source: Source | None, profile: UserProfile | None) -> float:
     """Personal score for an entry given its source's category and the
-    user's profile. Returns a float in roughly [0, 100]."""
-    vec = _vector_score(entry.embedding, profile.preference_vector if profile else None)
+    user's profile. Returns a float in roughly [0, 100].
+
+    ``entry`` is typed as ``Entry`` for documentation but in practice
+    can be any object exposing ``embedding`` — a real ORM row, the
+    slim ``_Row`` shim built by ``/api/foryou``, etc. Use ``getattr``
+    with ``None`` so callers that explicitly exclude ``embedding``
+    from their SELECT (the For You slim projection does, to keep
+    ~3KB of vector data off every candidate row) still get the
+    documented "NULL embedding → neutral 50" behaviour instead of
+    an ``AttributeError`` that 500s the whole endpoint."""
+    embedding = getattr(entry, "embedding", None)
+    vec = _vector_score(embedding, profile.preference_vector if profile else None)
     cat_mult = _category_multiplier(
         source.category if source else None,
         profile.followed_categories if profile else None,

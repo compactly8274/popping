@@ -171,19 +171,26 @@ async def list_entries(
     # ``reddit_comment_count`` projects as text (JSONB ``->>`` always
     # returns text). The schema expects Optional[int]; coerce here so
     # pydantic doesn't reject the value with a 422.
+    #
+    # ``RowMapping`` (the type ``Result.mappings().all()`` yields in
+    # SA 2.0) is a read-only ``Mapping`` — no ``pop``, no
+    # ``__setitem__``. Copy to a fresh dict per row so we can rename
+    # the projected ``..._text`` column to the schema field name and
+    # coerce the type in place without fighting the immutable view.
     out: list[EntryListOut] = []
     for r in rows:
-        raw_count = r.pop("reddit_comment_count_text", None)
+        data = dict(r)
+        raw_count = data.pop("reddit_comment_count_text", None)
         if raw_count is not None:
             try:
-                r["reddit_comment_count"] = int(raw_count)
+                data["reddit_comment_count"] = int(raw_count)
             except (TypeError, ValueError):
                 # Defensive: the JSONB value should always parse as an
                 # int (the sweep writes ``int(...)``). If a manual SQL
                 # write or a bad migration left a non-int string,
                 # null it out rather than 422 the whole list.
-                r["reddit_comment_count"] = None
-        out.append(EntryListOut.model_validate(r))
+                data["reddit_comment_count"] = None
+        out.append(EntryListOut.model_validate(data))
     return out
 
 
