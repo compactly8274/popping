@@ -119,14 +119,26 @@ class Settings(BaseSettings):
     # through this server instead of hitting Reddit directly, and the
     # background cross-reference sweep in ``app.scheduler`` queries it for
     # "discussed on Reddit" footers on every other entry. Empty string =
-    # feature disabled (Reddit rows aren't created, recommendation rows
-    # are skipped, cross-ref sweep is a no-op).
+    # fall back to direct mode (see ``reddit_direct_disabled`` below).
     reddit_hydra_url: str = ""
     # Bearer token for the Hydra server. Empty = unauthenticated Hydra.
     # The token rides on every Hydra call via the shared httpx client
     # (``app.reddit_client``), never per-stream — keeps the credentials
     # scoped to a single client and out of the assets client.
     reddit_hydra_token: str = ""
+    # When ``reddit_hydra_url`` is empty, ``app.reddit_client`` falls
+    # back to scraping Reddit's public JSON endpoints directly from
+    # the backend container's IP (per-process token-bucket
+    # rate-limited, contact-stamped User-Agent). Set this to True
+    # to disable the direct path entirely — useful for deployments
+    # where the TrueNAS IP is on a residential ISP that Reddit
+    # throttles, or when the operator wants to enforce a strict
+    # "no Reddit traffic from this network" rule. Defaults to
+    # False so a fresh deploy works out of the box; an empty
+    # ``reddit_hydra_url`` + this set to True is the "feature
+    # fully off" state and surfaces as
+    # ``reddit_client: disabled`` at startup.
+    reddit_direct_disabled: bool = False
 
     # --- Notifications (phase 2+) -----------------------------------------
     pushover_user_key: str = ""

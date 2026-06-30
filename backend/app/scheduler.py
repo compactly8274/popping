@@ -679,7 +679,12 @@ async def _crossref_sweep() -> None:
     batches. Never raises — a Hydra outage just means no new stamps
     this tick; the next hour retries.
 
-    Disabled (no-op) when ``settings.reddit_hydra_url`` is empty.
+    Disabled (no-op) when the Reddit client is fully disabled
+    (no proxy AND ``reddit_direct_disabled`` is True). In direct
+    mode the sweep still runs — the polite in-process rate
+    limiter throttles the burst of search calls so a single
+    sweep tick spreads over several minutes rather than a tight
+    loop.
     """
     # Lazy import: keeps the startup hot path light when the feature
     # is off, and isolates the cross-ref path from the rest of the
@@ -687,8 +692,9 @@ async def _crossref_sweep() -> None:
     from app import reddit_client
     from app.models import Source as SourceModel
 
-    if not reddit_client.is_configured():
-        # Most common case on small deploys — silent skip.
+    if reddit_client.is_disabled():
+        # Fully off — no proxy and direct path explicitly disabled.
+        # Silent skip; the startup log already mentioned the posture.
         return
 
     try:

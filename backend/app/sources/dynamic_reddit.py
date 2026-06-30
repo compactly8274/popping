@@ -1,9 +1,20 @@
 """Row-driven Reddit per-subreddit plugin.
 
-Mirrors ``DynamicRssPlugin`` but routes its fetch through the user's
-Hydra Reddit client-server (see ``app.reddit_client``) instead of a
-direct Reddit call. Dispatched by the scheduler when a ``Source`` row
-has ``type="reddit"`` — i.e. one the user added via FeedManager's
+Mirrors ``DynamicRssPlugin``. Fetches are routed through
+``app.reddit_client``, which has two operational modes:
+
+  - **Proxy mode** (recommended): ``settings.reddit_hydra_url`` set
+    to a small Reddit JSON proxy on a VPS (e.g. ``popping-proxy``).
+    The TrueNAS IP never talks to Reddit directly — the proxy holds
+    the contact-stamped User-Agent and rate-limits requests.
+  - **Direct mode** (fallback): ``settings.reddit_hydra_url`` empty
+    and ``settings.reddit_direct_disabled`` False. Popping calls
+    Reddit's public ``.json`` endpoints directly with a polite
+    per-process token bucket (2 req/s sustained, 4 burst). Reddit's
+    anti-abuse may 403 / 429 this IP within hours of polling.
+
+Dispatched by the scheduler when a ``Source`` row has
+``type="reddit"`` — i.e. one the user added via FeedManager's
 ``Add custom → Subreddit`` tab.
 
 Why row-driven and not registered via ``@register_source``:
@@ -14,16 +25,18 @@ of each (HN top, BBC, etc.). Reddit subs are user content, so they
 live as ``Source`` rows the same way user-added RSS rows do.
 
 Failure modes follow the rest of the source plugins:
-  - Missing Hydra URL (``settings.reddit_hydra_url == ""``): the
-    underlying ``reddit_client.fetch_subreddit`` returns ``[]`` and
-    the scheduler's normal "nothing new" path takes over. The user
-    sees no Reddit row until they wire up Hydra.
+  - Feature off (no proxy URL AND ``reddit_direct_disabled`` True):
+    the underlying ``reddit_client.fetch_subreddit`` returns ``[]``
+    and the scheduler's normal "nothing new" path takes over. The
+    one-shot WARNING log on the first such row tells the operator
+    the feature is off.
   - Malformed subreddit slug (``r/foo/bar``, empty, weird chars):
     ``normalize_subreddit`` returns None and ``fetch`` short-circuits
     to ``[]`` so a bad row logs DEBUG and is skipped. Mirrors the
     "never raise" pattern of the other plugins.
-  - Hydra outage (Hydra VPS down, 5xx, timeouts): ``fetch_subreddit``
-    returns ``[]``; the next scheduled tick retries. No crashes.
+  - Proxy / Reddit outage (VPS down, 5xx, timeouts, 403, 429):
+    ``fetch_subreddit`` returns ``[]``; the next scheduled tick
+    retries. No crashes.
 
 The canonical engagement keys (``engagement_score`` /
 ``engagement_comments``) are stamped alongside the source-natural
@@ -97,23 +110,28 @@ class DynamicRedditPlugin(SourcePlugin):
                 self.name, self.url,
             )
             return []
-        # Surface the "Hydra not configured" failure at WARNING so an
+        # Surface the "feature off" failure at WARNING so an
         # operator scrolling the scheduler log sees it without
         # flipping to DEBUG. ``fetch_subreddit`` itself is silent
         # here (the per-call DEBUG line drowns in a busy log); the
         # one-shot WARNING per row is the right cadence. Without
-        # this, a user who registered 8 subreddits before pointing
-        # REDDIT_HYDRA_URL at their VPS sees 8 silently-empty
-        # feeds and has to guess why. The startup line in
-        # ``reddit_client.init_client`` already logs the feature-off
-        # state once; this is the per-row followup.
-        if not reddit_client.is_configured():
+        # this, a user who registered 8 subreddits while the
+        # feature is off (no proxy + REDDIT_DIRECT_DISABLED=1)
+        # sees 8 silently-empty feeds and has to guess why. The
+        # startup line in ``reddit_client.init_client`` already
+        # logs the feature-off state once; this is the per-row
+        # followup. In direct mode the call is going to work, so
+        # we don't warn — only ``is_disabled()`` triggers the
+        # log.
+        if reddit_client.is_disabled():
             if self.name not in _warned_disabled:
                 _warned_disabled.add(self.name)
                 logger.warning(
-                    "dynamic_reddit: row %r skipped — REDDIT_HYDRA_URL is "
-                    "not set; set it in the backend container env and "
-                    "restart to enable per-subreddit fetches",
+                    "dynamic_reddit: row %r skipped — Reddit client is "
+                    "disabled (no REDDIT_HYDRA_URL proxy and "
+                    "REDDIT_DIRECT_DISABLED=1); set REDDIT_HYDRA_URL "
+                    "to a proxy or unset REDDIT_DIRECT_DISABLED to "
+                    "enable per-subreddit fetches",
                     self.name,
                 )
             return []
