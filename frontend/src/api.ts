@@ -53,6 +53,12 @@ export interface Source {
   // Most common use is ``{"User-Agent": "<browser UA>"}`` for CDNs
   // that block our default ``Popping/0.2`` UA.
   custom_headers: Record<string, string> | null
+  // Backend-computed: true when ``active=false`` AND error_count has
+  // reached the scheduler's auto-disable threshold. Lets the UI
+  // distinguish an auto-disabled source (needs investigation before
+  // re-enabling) from a manually-paused one (routine user choice).
+  // See ``app.models.Source.auto_disabled``.
+  auto_disabled: boolean
 }
 
 export interface Health {

@@ -621,8 +621,29 @@ function SourceRow({
           {source.name}
         </span>
         <span className="text-label-tertiary shrink-0 text-[11px]">{source.category}</span>
-        {!source.active && (
-          <span className="text-ios-caption text-amber-400 shrink-0">paused</span>
+        {/* Auto-disabled chips take precedence over the plain
+            "paused" chip — the distinction matters: a paused source
+            is a user choice (no action needed); an auto-disabled
+            source has hit the scheduler's consecutive-failure
+            threshold and needs ``last_error`` review before a manual
+            re-enable is worthwhile. ``auto_disabled`` is computed on
+            the backend (``Source.auto_disabled``) so the frontend
+            doesn't have to know the threshold value. */}
+        {source.auto_disabled ? (
+          <span
+            className="text-ios-caption text-red-400 shrink-0"
+            title={
+              source.last_error
+                ? `auto-disabled after ${source.error_count} consecutive failures — last: ${source.last_error}`
+                : `auto-disabled after ${source.error_count} consecutive failures`
+            }
+          >
+            auto-disabled
+          </span>
+        ) : (
+          !source.active && (
+            <span className="text-ios-caption text-amber-400 shrink-0">paused</span>
+          )
         )}
         {/* Quantitative error chip. ``error_count > 1`` shows the
             number so the user can distinguish a chronic failure

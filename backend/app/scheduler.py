@@ -12,6 +12,8 @@ The scheduler owns:
     - Composite scoring at ingest (phase 2)
     - One-shot embedding backfill for entries with NULL embedding (phase 2)
     - Source-row bookkeeping (last_fetch_at, last_error, error_count)
+    - Auto-disabling sources after ``_AUTO_DISABLE_THRESHOLD``
+      consecutive failures (see comment on the constant)
     - Periodic purge of expired sessions (DB-backed auth)
     - Daily Brief generation (phase 4)
     - Periodic convergence-check + alert Brief (phase 4)
@@ -117,6 +119,21 @@ async def _embed_text(norm: dict) -> list[float] | None:
 # enough to recover from transient infra issues and short enough that
 # the user notices the favicon land within a typical work session.
 _FAVICON_RETRY_INTERVAL = dt.timedelta(hours=1)
+
+
+# After this many consecutive failed ingests, a source is auto-disabled
+# (``active=False``). 6 was chosen so a single transient incident
+# (CDN hiccup, brief outage, rate-limit window) doesn't disable a
+# feed — RSS feeds typically re-poll within minutes, so 6 failures
+# spans ~6× the refresh interval for a default-source RSS row.
+# Combined with the user's earlier observation that a permanently-
+# malformed feed (ap_top) keeps erroring forever, this caps the
+# damage: at most ~6 stuck rows in the dashboard before the user
+# notices, and each one carries a ``last_error`` tooltip explaining
+# why. Reactivating a row (FeedManager toggle) resets ``error_count``
+# so the user gets a clean retry slate rather than an immediate
+# re-disable on the first hiccup.
+_AUTO_DISABLE_THRESHOLD = 6
 
 
 def _should_retry_favicon(last_fetch_at: dt.datetime | None) -> bool:
@@ -301,6 +318,29 @@ async def _ingest(plugin_cls: Any) -> dict:
                 if source is not None:
                     source.last_error = summary["error"]
                     source.error_count = (source.error_count or 0) + 1
+                    # Auto-disable after _AUTO_DISABLE_THRESHOLD consecutive
+                    # failures. The next ingest pass sees ``active=False``
+                    # and skips (line ~206), so a permanently-broken feed
+                    # stops hammering the host AND stops accumulating log
+                    # noise within one failure-cycle. The user reactivates
+                    # via FeedManager (which resets error_count, so a
+                    # manual retry starts from zero rather than being
+                    # immediately re-disabled).
+                    #
+                    # Log at WARNING so the auto-disable is visible in
+                    # ``docker compose logs backend`` even when the user
+                    # only has INFO-level logs configured.
+                    if (
+                        source.active
+                        and source.error_count >= _AUTO_DISABLE_THRESHOLD
+                    ):
+                        source.active = False
+                        logger.warning(
+                            "scheduler: auto-disabling source %s after %d consecutive failures (last_error=%r)",
+                            plugin_cls.name,
+                            source.error_count,
+                            source.last_error,
+                        )
                     await session.commit()
         except Exception:
             logger.exception("could not record error for %s", plugin_cls.name)
@@ -1196,6 +1236,13 @@ async def update_source(
         row.refresh_interval_seconds = refresh
     if active is not None:
         row.active = active
+        # Reactivating a source gives it a clean error slate so the
+        # first transient hiccup after the user toggles it back on
+        # doesn't immediately re-cross ``_AUTO_DISABLE_THRESHOLD`` and
+        # flip it off again. The toggle is the user's explicit "I want
+        # this back" signal — count that as a reset.
+        if active and active_changed:
+            row.error_count = 0
     if category is not None:
         row.category = category
     if name is not None:

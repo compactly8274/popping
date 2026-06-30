@@ -31,6 +31,14 @@ class SourceOut(BaseModel):
     # default ``Popping/0.2`` UA. Validated at the route layer.
     custom_headers: Optional[dict] = None
 
+    # Computed property on the Source ORM model — see
+    # ``app.models.Source.auto_disabled`` for the derivation. Not a
+    # Pydantic ``@computed_field`` because we want it to read off the
+    # ORM object via ``from_attributes=True`` rather than be
+    # recomputed by the schema layer (avoids importing
+    # ``app.scheduler`` into ``app.schemas``).
+    auto_disabled: bool = False
+
     class Config:
         from_attributes = True
 

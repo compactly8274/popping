@@ -77,6 +77,27 @@ class Source(Base):
 
     entries: Mapped[list["Entry"]] = relationship(back_populates="source")
 
+    @property
+    def auto_disabled(self) -> bool:
+        """True if the source is currently inactive AND its error count
+        meets/exceeds the scheduler's auto-disable threshold. Used by
+        the FeedManager to label an auto-disabled row distinctly from
+        one the user paused manually — the former needs the user to
+        investigate ``last_error`` before re-enabling; the latter is a
+        routine user choice.
+
+        Defined as a computed property (rather than a persisted column)
+        because the threshold lives in ``app.scheduler``; promoting it
+        to a column would duplicate that value or require a runtime
+        lookup. Computing it on read keeps the schema in lock-step with
+        the scheduler's threshold by construction.
+        """
+        # Imported lazily to avoid a circular import at module load
+        # (models is imported by scheduler's plugin chain, and
+        # scheduler imports models).
+        from app.scheduler import _AUTO_DISABLE_THRESHOLD
+        return (not self.active) and (self.error_count or 0) >= _AUTO_DISABLE_THRESHOLD
+
 
 # ---------------------------------------------------------------------------
 # Entry: one ingested item (article, deal, CVE, video, podcast episode, ...).
