@@ -11,12 +11,13 @@ produced the session — they only see ``auth_method`` in the payload.
 
 from __future__ import annotations
 
+import hmac
 import logging
 from typing import Optional
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.session import create as session_create
@@ -34,9 +35,12 @@ router = APIRouter(tags=["auth"])
 # ---------------------------------------------------------------------------
 
 
+# Bounded so a hostile caller can't pin 256KB of password in a body
+# and force bcrypt to chew on it for many seconds. ``max_length`` on
+# the schema raises a 422 before we even start hashing.
 class LocalLoginIn(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +80,16 @@ def _verify_local_credentials(username: str, password: str) -> tuple[str, str, s
     except (ValueError, TypeError, UnicodeEncodeError):
         ok = False
 
-    if not ok or username != expected_user:
+    # Constant-time compare on the username so a "guess the local
+    # username" timing attack doesn't shorten the brute-force keyspace
+    # beyond bcrypt's own constant-time guarantee. ``hmac.
+    # compare_digest`` runs in time proportional to the *shorter*
+    # input — different-length usernames still take ~equal wall-clock
+    # because both paths are bcrypt-bound, which dominates the
+    # username compare by orders of magnitude.
+    user_match = hmac.compare_digest(username or "", expected_user or "")
+
+    if not ok or not user_match:
         raise _LocalAuthError("invalid credentials")
 
     sub = f"local:{username}"

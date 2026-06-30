@@ -12,6 +12,7 @@ identical downstream.
 
 from __future__ import annotations
 
+import hmac
 import logging
 from typing import Any
 from urllib.parse import urlparse
@@ -31,6 +32,12 @@ from app.db import get_session
 logger = logging.getLogger("popping.auth")
 
 router = APIRouter(tags=["auth"])
+
+# Cap on user-controlled string lengths from the IdP. The session row
+# is varchar(255) on sub/email/name; an IdP that ships a 1MB name would
+# crash the INSERT with a 500. Truncate at the boundary so a hostile /
+# buggy IdP can't take the app down.
+_OIDC_CLAIM_MAX = 255
 
 # Mount the local-auth routes (POST /auth/local, GET /auth/local/availability)
 # on the same auth router. The endpoints they expose are no-ops unless
@@ -143,7 +150,14 @@ async def callback(
     except OIDCError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    if state != st.get("state"):
+    # Constant-time compare so a guess-the-state timing attack doesn't
+    # give the attacker a side-channel on the cookie value. hmac.
+    # compare_digest requires equal-length strings; if the lengths
+    # differ the call still returns False (and runs in constant time
+    # relative to the *shorter* input) — which is exactly the
+    # behaviour we want: no early "state is clearly wrong" leak.
+    expected = st.get("state") or ""
+    if not hmac.compare_digest(state, expected):
         raise HTTPException(status_code=400, detail="login state mismatch")
     verifier = st["verifier"]
     return_to = st.get("return_to") or "/"
@@ -157,13 +171,27 @@ async def callback(
     sub = claims.get("sub")
     if not sub:
         raise HTTPException(status_code=502, detail="OIDC claims missing 'sub'")
-
+    # Truncate user-controlled claims at the schema boundary so a
+    # hostile / buggy IdP can't take down login with a 500 on a 1MB
+    # email field. ``sub`` is the primary key for sessions and must
+    # round-trip, so it's validated separately and rejected outright
+    # if oversized — that case almost certainly means the IdP is
+    # misconfigured and we don't want a truncated sub silently
+    # colliding with an existing session row.
+    if not isinstance(sub, str) or len(sub) > _OIDC_CLAIM_MAX:
+        logger.warning("OIDC 'sub' over %d bytes — rejecting", _OIDC_CLAIM_MAX)
+        raise HTTPException(status_code=502, detail="OIDC 'sub' too long")
+    sub = sub[:_OIDC_CLAIM_MAX]
     email = claims.get("email")
+    if isinstance(email, str):
+        email = email[:_OIDC_CLAIM_MAX] or None
     name = (
         claims.get("name")
         or claims.get("preferred_username")
         or claims.get("email")
     )
+    if isinstance(name, str):
+        name = name[:_OIDC_CLAIM_MAX] or None
 
     sid = await session_create(
         db,

@@ -26,6 +26,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -841,14 +842,46 @@ def _cvss_score(entry: Entry) -> float:
         return 0.0
 
 
+# Tags / entities we strip from CVE description text. CVE feeds
+# (NVD / CISA KEV) are JSON-typed, so the title is plain text, but
+# downstream notification backends (Discord / Slack / Telegram via
+# Apprise) sometimes interpret Markdown and HTML; an entry whose
+# title happens to contain "<script>…" or "```rm -rf ~```" is
+# uncomfortable at best, exploitable at worst. Strip aggressively.
+_TAG_RE = re.compile(r"<[^>]+>")
+_BB_RE = re.compile(r"```.*?```", re.DOTALL)
+# Visible whitespace collapse for the rare CVE feed that ships
+# embedded newlines.
+_WS_RE = re.compile(r"\s+")
+
+
+def _sanitize_cve_text(text: str) -> str:
+    """Strip HTML tags, code-fence blocks, and collapse whitespace.
+
+    Keeps the message human-readable while removing everything that
+    could trigger a Markdown / HTML interpretation in a downstream
+    notifier backend. We deliberately do NOT try to escape — a
+    missed escape rule becomes an XSS. Strip is safer."""
+    if not text:
+        return ""
+    out = _TAG_RE.sub("", text)
+    out = _BB_RE.sub("", out)
+    out = _WS_RE.sub(" ", out).strip()
+    return out
+
+
 def _format_cve(entry: Entry, source: Source) -> str:
     score = _cvss_score(entry)
-    title = (entry.title or entry.url or "").strip()
+    title = _sanitize_cve_text(entry.title or entry.url or "").strip()
     line = f"[{source.name}] {title}"
     if score:
         line += f" (CVSS {score:.1f})"
     if entry.url:
-        line += f"\n{entry.url}"
+        # URLs themselves are not stripped — they're not interpreted
+        # as HTML by the notifier, and the body is the user-readable
+        # copy. Length-cap so a pathological URL doesn't push the
+        # body past Pushover's 4KB cap.
+        line += f"\n{entry.url[:512]}"
     return line
 
 
