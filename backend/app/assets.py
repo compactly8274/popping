@@ -159,15 +159,28 @@ _LINK_ICON_RE = re.compile(
 _REL_ATTR_RE = re.compile(r"""\brel\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 
 
-def _ext_from_content_type(ct: str | None) -> str:
+def _ext_from_content_type(ct: str | None) -> Optional[str]:
+    """Map a Content-Type header to a file extension. Returns None for
+    content types we won't store — the /assets mount serves files
+    same-origin under the dashboard's origin, so a non-image
+    response saved as ``<id>.html`` would render as HTML in the
+    browser and execute embedded scripts (XSS via favicon cache).
+    Anything that isn't on the image allowlist returns None and the
+    caller aborts the download."""
     if not ct:
-        return "bin"
+        return None
     # Strip params: "image/png; charset=utf-8" → "image/png".
     bare = ct.split(";", 1)[0].strip().lower()
     if bare in _EXT_BY_CT:
         return _EXT_BY_CT[bare]
-    guess = mimetypes.guess_extension(bare)
-    return guess.lstrip(".") if guess else "bin"
+    # Reject anything that's not on the image allowlist — even
+    # ``mimetypes.guess_extension`` results. ``text/html`` would map
+    # to ``.html``, ``application/javascript`` to ``.js``, etc.;
+    # allowing those through the cache turns a benign asset fetch
+    # into a stored XSS vector. If a CDN serves a real favicon
+    # behind a generic content-type, it still fails the allowlist
+    # and the asset is skipped — a small loss vs. an XSS hole.
+    return None
 
 
 def _origin(url: str) -> Optional[str]:
@@ -335,11 +348,14 @@ async def _download(
                     )
                     return None
             ct = resp.headers.get("content-type")
-            # We accept any content-type here. The size cap is the
-            # real safety against abuse — many CDNs return
-            # application/octet-stream for .ico files so the content-
-            # type filter would reject legitimate favicons.
             ext = _ext_from_content_type(ct)
+            if ext is None:
+                # Reject anything that isn't on the image allowlist.
+                # The /assets mount serves same-origin; saving an
+                # HTML or JS response here would be a stored-XSS
+                # vector (see _ext_from_content_type for the why).
+                logger.debug("assets: %s rejected content-type %r", url, ct)
+                return None
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_name(dest.name + f".{ext}.part")
             tmp.parent.mkdir(parents=True, exist_ok=True)

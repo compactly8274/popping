@@ -26,6 +26,7 @@ import httpx
 
 from app.sources import register_source
 from app.sources.base import SourcePlugin
+from app.url_safety import check_url_safe
 
 logger = logging.getLogger("popping.sources.rss")
 
@@ -194,6 +195,27 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
             ) as client:
                 resp = await client.get(url, headers=merged_headers)
                 resp.raise_for_status()
+                # Re-check the FINAL URL after the redirect chain. The
+                # entry-time check in routes/sources.py validates the
+                # user-supplied URL, but ``follow_redirects=True`` lets
+                # a feed owner 3xx the request to a private / loopback
+                # address (e.g. ``public.example.com → 127.0.0.1:6379``
+                # or ``169.254.169.254/...``) that the entry check
+                # never saw. Without this guard, the response body
+                # lands in feedparser and any internal services
+                # reachable from the backend get a hit on every
+                # ingest. Same shape as the assets._download guard.
+                final_url = str(resp.url)
+                if final_url != url:
+                    final_safe, reason = check_url_safe(final_url)
+                    if not final_safe:
+                        logger.warning(
+                            "rss: %s redirected to denied host %s (%s)",
+                            url, final_url, reason,
+                        )
+                        raise ValueError(
+                            f"rss: {url} redirected to a denied host"
+                        )
             feed = feedparser.parse(resp.text)
             items: list[dict] = []
             for entry in feed.entries:

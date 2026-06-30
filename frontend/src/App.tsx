@@ -204,11 +204,38 @@ export function App() {
           try {
             status = await api.briefJobStatus(jobId)
           } catch {
+            // 404 here means the in-memory job ledger either
+            // forgot the job (process restart, ledger cap
+            // exceeded) or the backend never saw the POST. The
+            // brief itself is still in the DB on success — a
+            // single-process 5xx or a multi-pod fan-in could
+            // land it there even if this client lost the
+            // ledger reference. Try ``briefLatest`` for our
+            // tone before giving up; that's a single round-trip
+            // and surfaces a successfully-generated brief
+            // that the user would otherwise see as a
+            // misleading "no longer tracked" error.
+            try {
+              const latest = await api.briefLatest({ tone, limit: 1 })
+              if (latest.length > 0) {
+                setBrief(latest[0])
+                return
+              }
+            } catch {
+              // fall through to the error path
+            }
             onError?.('brief job no longer tracked — please try again')
             return
           }
           if (status.status === 'completed' && status.brief) {
             setBrief(status.brief)
+            // Clear any prior error banner — a fresh, successful
+            // brief means the previous error (if any) is no
+            // longer relevant. Without this, a previous
+            // failure stays red-flagged through the new
+            // success and the user has to wait for the next
+            // polling tick to dismiss it.
+            setError(null)
             return
           }
           if (status.status === 'failed') {

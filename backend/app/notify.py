@@ -144,7 +144,16 @@ class PushoverNotifier(Notifier):
             "message": body[:4000],
         }
         if url:
-            payload["url"] = url[:500]
+            # Strip control bytes (CR/LF/NUL/etc.) before the
+            # length cap. httpx form-encodes the field so a CRLF
+            # in the URL can't break out of the POST body itself,
+            # but Pushover's server-side URL rendering has been
+            # observed to interpret the *decoded* URL with newlines
+            # in unexpected ways (the URL appears intact in the
+            # notification but the in-app click handler falls open
+            # on an empty target). Defense-in-depth strip.
+            sanitized = "".join(c for c in url if 0x20 <= ord(c) < 0x7f)
+            payload["url"] = sanitized[:500]
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
                 resp = await client.post(self._ENDPOINT, data=payload)
