@@ -295,6 +295,24 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGen
     }
   }
 
+  // Parse the brief body into the section shape the render uses.
+  // Always called — even when ``brief`` is null (returns an empty
+  // Parsed) — so this hook sits in the unconditional sequence above
+  // the ``if (!brief) return`` early return. Calling a hook
+  // conditionally (e.g. only when ``brief`` is non-null) is the
+  // classic "Rendered more hooks than during the previous render"
+  // bug: when the brief transitions null → non-null the hook count
+  // changes, React's hook list diverges, and the whole tree
+  // unmounts (which is what surfaced as "spinner → quick view of
+  // UI → black" on every cold load).
+  const parsed = useMemo(
+    () =>
+      brief
+        ? parse(brief.content)
+        : { oneSentence: '', highlights: [], watch: [], remainder: '' },
+    [brief],
+  )
+
   if (!brief) {
     return (
       <section className="border-b border-hairline bg-bg-app">
@@ -354,8 +372,6 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGen
       </section>
     )
   }
-
-  const parsed = useMemo(() => parse(brief.content), [brief.content])
 
   return (
     <section className="border-b border-hairline bg-bg-app">
