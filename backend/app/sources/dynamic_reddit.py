@@ -45,6 +45,14 @@ from app.sources.reddit import normalize_subreddit
 
 logger = logging.getLogger("popping.sources.dynamic_reddit")
 
+# Track rows we've already complained about so a missing Hydra
+# config doesn't spam the scheduler log once per row per tick (a
+# user with 8 subs would otherwise produce 32 WARNING lines an
+# hour). The set is process-local; a process restart re-emits the
+# warning once, which is the right cadence for an operator who
+# hasn't fixed the config.
+_warned_disabled: set[str] = set()
+
 
 class DynamicRedditPlugin(SourcePlugin):
     """SourcePlugin bound to a single ``Source`` DB row of type ``reddit``.
@@ -88,6 +96,26 @@ class DynamicRedditPlugin(SourcePlugin):
                 "dynamic_reddit: row %r has unparseable subreddit url: %r",
                 self.name, self.url,
             )
+            return []
+        # Surface the "Hydra not configured" failure at WARNING so an
+        # operator scrolling the scheduler log sees it without
+        # flipping to DEBUG. ``fetch_subreddit`` itself is silent
+        # here (the per-call DEBUG line drowns in a busy log); the
+        # one-shot WARNING per row is the right cadence. Without
+        # this, a user who registered 8 subreddits before pointing
+        # REDDIT_HYDRA_URL at their VPS sees 8 silently-empty
+        # feeds and has to guess why. The startup line in
+        # ``reddit_client.init_client`` already logs the feature-off
+        # state once; this is the per-row followup.
+        if not reddit_client.is_configured():
+            if self.name not in _warned_disabled:
+                _warned_disabled.add(self.name)
+                logger.warning(
+                    "dynamic_reddit: row %r skipped — REDDIT_HYDRA_URL is "
+                    "not set; set it in the backend container env and "
+                    "restart to enable per-subreddit fetches",
+                    self.name,
+                )
             return []
         listings = await reddit_client.fetch_subreddit(sub, listing="hot", limit=50)
         if not listings:
