@@ -38,8 +38,27 @@ _DEFAULT_HEADERS = {
 }
 
 
-def _fallback_url(mm: str, dd: str) -> str:
-    return f"https://en.wikipedia.org/wiki/Wikipedia:Selected_anniversaries"
+def _fallback_url(mm: str, dd: str, slug: str) -> str:
+    """Build a fallback URL for an event whose linked page is missing.
+
+    Wikipedia's REST feed occasionally ships events with no
+    ``pages`` list (rare, but observed on the events-vs-selected
+    transition days). The historical code returned the same hard-
+    coded ``Wikipedia:Selected_anniversaries`` URL for every
+    fallback, which meant 10+ events with no pages collapsed into
+    a single dedup row in the entries table — the dashboard
+    showed one card for the day's "selected anniversaries" page
+    instead of one per event.
+
+    Append a ``#`` fragment derived from the event text so each
+    fallback is unique without breaking the URL's
+    in-page-anchor semantics. Wikipedia itself uses fragments
+    for in-page jumps; we just borrow the convention for
+    dedup, and the link is still usable if the user clicks
+    through (the fragment will scroll to / not find a match on
+    the destination page, but the article body loads fine).
+    """
+    return f"https://en.wikipedia.org/wiki/Wikipedia:Selected_anniversaries#{slug}"
 
 
 @register_source
@@ -113,7 +132,16 @@ class WikipediaOnThisDay(SourcePlugin):
                                 f"https://en.wikipedia.org/wiki/{normalized.replace(' ', '_')}"
                             )
                 if not page_url:
-                    page_url = _fallback_url(f"{now.month:02d}", f"{now.day:02d}")
+                    # Use a stable slug derived from the event text
+                    # so the fallback URL is unique per event. The
+                    # title is already a good differentiator ("1865:
+                    # Lincoln…") and is human-meaningful as a
+                    # fragment.
+                    slug = "".join(
+                        c.lower() if c.isalnum() else "-"
+                        for c in text[:64]
+                    ).strip("-") or "event"
+                    page_url = _fallback_url(f"{now.month:02d}", f"{now.day:02d}", slug)
                 title = f"{year}: {text}" if year else text
                 items.append(
                     {
