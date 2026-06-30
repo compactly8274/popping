@@ -18,7 +18,7 @@
 // visual treatment matches refresh failures — single, consistent
 // error surface across the dashboard.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { api, type Source } from '../api'
 import { SourceIcon } from './SourceIcon'
 
@@ -140,6 +140,13 @@ export function FeedManager({ sources, onRefresh, onError, onSourceRenamed }: Pr
   const [tab, setTab] = useState<Tab>('mine')
   const [editingInterval, setEditingInterval] = useState<number | null>(null)
   const [editingRowId, setEditingRowId] = useState<number | null>(null)
+  // Stable Set of source names. ``RecommendedTab``'s useEffect
+  // depends on this and would otherwise refire on every parent
+  // render (parent constructs ``new Set(...)`` inline today).
+  const existingNames = useMemo(
+    () => new Set(sources.map((s) => s.name)),
+    [sources],
+  )
 
   return (
     <div className="space-y-2">
@@ -169,7 +176,7 @@ export function FeedManager({ sources, onRefresh, onError, onSourceRenamed }: Pr
       )}
       {tab === 'recommended' && (
         <RecommendedTab
-          existingNames={new Set(sources.map((s) => s.name))}
+          existingNames={existingNames}
           onAdded={onRefresh}
           onError={onError}
         />

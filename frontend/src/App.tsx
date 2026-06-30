@@ -169,19 +169,37 @@ export function App() {
   // toast queue.
   const triggerBriefGenerate = useCallback(
     async (tone: 'terse' | 'narrative' | 'alert', onError?: (msg: string) => void) => {
+      // Local AbortController for this generation. When the user
+      // navigates away (BriefCard unmounts) or starts another
+      // generate, the previous loop's next tick sees the abort
+      // and returns cleanly. Without this, an unmounted
+      // BriefCard would keep firing setState calls — React
+      // tolerates them but the loop's settled ``setGeneratingBrief(false)``
+      // in the finally branch can clobber a *new* generation's
+      // loading state.
+      //
+      // Abort any previous loop first so a fast double-tap on
+      // Generate doesn't fan out into two concurrent polls.
+      generationAbortRef.current?.abort()
+      const ac = new AbortController()
+      generationAbortRef.current = ac
       setGeneratingBrief(true)
       try {
         const ack = await api.briefGenerate(tone)
+        // The user could have started another generation while the
+        // POST was in flight; if so, abandon this one.
+        if (ac.signal.aborted) return
         const jobId = ack.job_id
         const POLL_MS = 800
         const TIMEOUT_MS = 30_000
         const startedAt = Date.now()
-        while (true) {
+        while (!ac.signal.aborted) {
           if (Date.now() - startedAt > TIMEOUT_MS) {
             onError?.('brief generation timed out')
             return
           }
           await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS))
+          if (ac.signal.aborted) return
           let status: Awaited<ReturnType<typeof api.briefJobStatus>>
           try {
             status = await api.briefJobStatus(jobId)
@@ -201,7 +219,9 @@ export function App() {
       } catch (err) {
         onError?.((err as Error).message)
       } finally {
-        setGeneratingBrief(false)
+        if (generationAbortRef.current === ac) {
+          setGeneratingBrief(false)
+        }
       }
     },
     [],
@@ -268,6 +288,12 @@ export function App() {
   const seenEntryIdsRef = useRef<Set<number> | null>(null)
   // When the tab was last hidden. ``null`` while visible.
   const hiddenAtRef = useRef<number | null>(null)
+  // Latest in-flight brief generation's AbortController. Each
+  // generate call replaces the ref with a fresh controller so the
+  // previous loop sees the abort and exits; the unmount cleanup
+  // effect below aborts the still-pending one when the App goes
+  // away. See triggerBriefGenerate for the consumer.
+  const generationAbortRef = useRef<AbortController | null>(null)
   // Shared ref Maps for column and card DOM nodes. Keyboard nav and
   // jump-to-category both read from these — using a single shared
   // Map per axis (rather than per-component refs) means we can find
@@ -682,6 +708,19 @@ export function App() {
     safeSetItem(STORAGE_KEYS.lastViewed, JSON.stringify(lastViewed))
   }, [lastViewed])
 
+  // Cancel any in-flight brief-generation loop on unmount. Without
+  // this, navigating away mid-generation leaves the polling loop
+  // alive in the background; its eventual setState calls would
+  // hit an unmounted component (React tolerates but warns) and
+  // its ``setGeneratingBrief(false)`` in the finally branch
+  // would race a future mount of App.
+  useEffect(() => {
+    return () => {
+      generationAbortRef.current?.abort()
+      generationAbortRef.current = null
+    }
+  }, [])
+
   useEffect(() => {
     // Surface quota / private-mode failures the first time they
     // happen so the user knows their read marks won't persist. The
@@ -1064,12 +1103,16 @@ export function App() {
       // Matches the post-React splash's inline ``#000000`` so the
       // transition is one continuous black surface. Mirrors the
       // same fix as the splash (see comment block above) but on the
-      // destination side. ``minHeight: '100vh'`` is the CSS-pixel
-      // fallback for the frame where Tailwind's ``h-full`` (which
-      // resolves against ``#root { height: 100% }``) hasn't been
-      // laid out yet; once styles.css applies, both end up at the
-      // same height.
-      style={{ backgroundColor: '#000000', minHeight: '100vh' }}
+      // destination side. ``minHeight: '100dvh'`` is the dynamic-
+      // viewport fallback for iOS Safari, where ``100vh`` is the
+      // *layout* viewport (height *including* the area hidden by
+      // the address bar / bottom toolbar) and overshoots — the
+      // dashboard scrolls past where the user expects the bottom
+      // to be. ``100dvh`` is the small-viewport height that
+      // adjusts as the bars collapse, matching what the user sees.
+      // ``100vh`` is kept alongside as the fallback for browsers
+      // that don't understand ``dvh`` (older Android WebView).
+      style={{ backgroundColor: '#000000', minHeight: '100dvh' }}
       className="h-full flex flex-col"
     >
       {/* Large-title navigation bar. Mirrors Apple Mail / Music:
@@ -1387,6 +1430,8 @@ export function App() {
         onCategoryJump={jumpToCategory}
         briefTone={briefTone}
         onBriefToneChange={setBriefTone}
+        triggerGenerate={triggerBriefGenerate}
+        generating={generatingBrief}
         onError={setError}
         onSourceRenamed={onSourceRenamed}
         onResetLocalState={resetLocalState}

@@ -61,6 +61,20 @@ type Props = {
   // brief now" stays in sync with the BriefCard pills.
   briefTone: 'terse' | 'narrative' | 'alert'
   onBriefToneChange: (next: 'terse' | 'narrative' | 'alert') => void
+  // Lifted brief-generation trigger from App. The Drawer's
+  // "Generate brief now" button used to fire the POST inline and
+  // close, leaving the user with no visible feedback while the
+  // LLM roundtrip ran (3-10s on Ollama) and no surfaced error if
+  // it failed. Now Drawer delegates to the same trigger App's
+  // header uses, so both surfaces share the poll-until-done loop
+  // and the same error path. ``generating`` is exposed so the
+  // button label can show "Generating brief…" mid-flight without
+  // each surface spinning up its own loading state.
+  triggerGenerate: (
+    tone: 'terse' | 'narrative' | 'alert',
+    onError?: (msg: string) => void,
+  ) => Promise<void>
+  generating: boolean
   // Phase 5: FeedManager errors flow up to App's red banner for
   // a single, consistent error surface.
   onError: (msg: string) => void
@@ -107,6 +121,8 @@ export function Drawer({
   onCategoryJump,
   briefTone,
   onBriefToneChange,
+  triggerGenerate,
+  generating,
   onError,
   onSourceRenamed,
   // Reset hook. App wipes the namespaced localStorage keys and
@@ -122,14 +138,38 @@ export function Drawer({
   const [notifError, setNotifError] = useState<string | null>(null)
   const [llm, setLlm] = useState<LLMStatus | null>(null)
   const [llmError, setLlmError] = useState<string | null>(null)
-  const [generating, setGenerating] = useState(false)
+  // Brief-generation error string, surfaced in the Drawer chip.
+  // ``generating`` comes from props (lifted from App) so the chip
+  // stays in sync with the header / BriefCard surface.
   const [genError, setGenError] = useState<string | null>(null)
 
   // Each fetch function is its own retry-able handler. Storing them
   // as ``useCallback`` so the chip can call them directly on tap.
+  //
+  // Cancellation: a ref tracks whether the Drawer is still open
+  // for the most recent fetch. The ref is set on each fetch and
+  // cleared when the Drawer unmounts / closes; each .then
+  // bail-out check skips setState on a stale fetch. Without this,
+  // closing the Drawer mid-fetch leaves the promise in flight;
+  // the later .then calls hit an unmounted component and React
+  // logs a "state update on an unmounted component" warning.
+  const aliveRef = useRef(true)
+  useEffect(() => {
+    // Mark every (re)open as a fresh "alive" generation. The
+    // ref is updated synchronously on every render so the .then
+    // closures see the current value.
+    aliveRef.current = true
+    return () => {
+      aliveRef.current = false
+    }
+  })
   const refetchSources = (): Promise<void> => {
     setSourcesError(null)
-    return api.sources().then(setSources).catch((err) => {
+    return api.sources().then((rows) => {
+      if (!aliveRef.current) return
+      setSources(rows)
+    }).catch((err) => {
+      if (!aliveRef.current) return
       setSources([])
       setSourcesError((err as Error).message)
     })
@@ -138,10 +178,12 @@ export function Drawer({
     setNotifError(null)
     api
       .notificationStatus()
-      .then(setNotif)
+      .then((status) => {
+        if (!aliveRef.current) return
+        setNotif(status)
+      })
       .catch((err) => {
-        // Don't set a default ``notif`` — leaving it null and the
-        // chip renders the retry path.
+        if (!aliveRef.current) return
         setNotifError((err as Error).message)
       })
   }
@@ -149,8 +191,12 @@ export function Drawer({
     setLlmError(null)
     api
       .llmStatus()
-      .then(setLlm)
+      .then((status) => {
+        if (!aliveRef.current) return
+        setLlm(status)
+      })
       .catch((err) => {
+        if (!aliveRef.current) return
         setLlmError((err as Error).message)
       })
   }
@@ -435,17 +481,17 @@ export function Drawer({
             </div>
             <div className="px-4 pt-3">
               <button
-                onClick={async () => {
+                onClick={() => {
                   setGenError(null)
-                  setGenerating(true)
-                  try {
-                    await api.briefGenerate(briefTone)
-                    onClose()
-                  } catch (err) {
-                    setGenError((err as Error).message)
-                  } finally {
-                    setGenerating(false)
-                  }
+                  // Delegate to the lifted trigger. The poll loop
+                  // lives in App, so the Drawer button no longer
+                  // has to manage its own loading state. Close
+                  // the drawer after kicking off so the user
+                  // lands back on the dashboard and sees the
+                  // BriefCard's "thinking…" indicator — same
+                  // flow as the header button.
+                  void triggerGenerate(briefTone, (msg) => setGenError(msg))
+                  onClose()
                 }}
                 disabled={generating || (llm !== null && !llm.configured)}
                 className="w-full min-h-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white text-ios-body font-medium"
