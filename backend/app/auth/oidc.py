@@ -14,6 +14,7 @@ Flow:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -70,27 +71,70 @@ def _metadata_fresh(entry: tuple[float, dict]) -> bool:
     return (time.monotonic() - cached_at) < _METADATA_TTL_SECONDS
 
 
-def _discovery(cfg: OIDCConfig) -> dict:
-    entry = _metadata_cache.get(cfg.issuer)
-    if entry is not None and _metadata_fresh(entry):
-        return entry[1]
+def _fetch_discovery_sync(cfg: OIDCConfig) -> dict:
+    """Blocking GET to the IdP's discovery document.
+
+    Kept sync so we can run it via ``asyncio.to_thread`` from the
+    async wrapper below. We never want a blocking I/O call on the
+    event loop — the previous code used ``httpx.Client`` inline
+    inside an async route handler, blocking the loop for up to
+    10s on a slow IdP and starving every other request in
+    flight.
+    """
     try:
         with httpx.Client(timeout=10.0) as c:
             resp = c.get(f"{cfg.issuer}/.well-known/openid-configuration")
             resp.raise_for_status()
-            meta = resp.json()
+            return resp.json()
     except Exception as e:
         raise OIDCError(
             f"could not fetch OIDC discovery document from {cfg.issuer}: {e}"
         ) from e
-    for required in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
-        if required not in meta:
-            raise OIDCError(
-                f"OIDC discovery at {cfg.issuer} is missing {required!r}"
-            )
-    _metadata_cache[cfg.issuer] = (time.monotonic(), meta)
-    logger.info("OIDC discovery loaded from %s", cfg.issuer)
-    return meta
+
+
+# Per-issuer lock so two concurrent cache misses (a cold-start
+# stampede) don't fire two discovery requests. Held briefly — the
+# lock is only around the cache check + ``to_thread`` dispatch, not
+# the network roundtrip itself.
+_discovery_locks: dict[str, asyncio.Lock] = {}
+_discovery_locks_guard = asyncio.Lock()
+
+
+async def _get_discovery_lock(issuer: str) -> asyncio.Lock:
+    async with _discovery_locks_guard:
+        lock = _discovery_locks.get(issuer)
+        if lock is None:
+            lock = asyncio.Lock()
+            _discovery_locks[issuer] = lock
+        return lock
+
+
+async def _discovery(cfg: OIDCConfig) -> dict:
+    """Return the cached discovery document for ``cfg.issuer``,
+    fetching it on a cache miss.
+
+    Async so the underlying httpx.Client doesn't block the event
+    loop. The cache itself is a plain dict (single-writer per
+    issuer thanks to the lock above)."""
+    entry = _metadata_cache.get(cfg.issuer)
+    if entry is not None and _metadata_fresh(entry):
+        return entry[1]
+    lock = await _get_discovery_lock(cfg.issuer)
+    async with lock:
+        # Re-check after acquiring the lock — another coroutine
+        # may have just filled the cache.
+        entry = _metadata_cache.get(cfg.issuer)
+        if entry is not None and _metadata_fresh(entry):
+            return entry[1]
+        meta = await asyncio.to_thread(_fetch_discovery_sync, cfg)
+        for required in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+            if required not in meta:
+                raise OIDCError(
+                    f"OIDC discovery at {cfg.issuer} is missing {required!r}"
+                )
+        _metadata_cache[cfg.issuer] = (time.monotonic(), meta)
+        logger.info("OIDC discovery loaded from %s", cfg.issuer)
+        return meta
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +184,12 @@ def unpack_state(cfg: OIDCConfig, value: str) -> dict[str, Any]:
 # Build authorize URL
 # ---------------------------------------------------------------------------
 
-def build_authorize_url(cfg: OIDCConfig, return_to: str = "/") -> tuple[str, str]:
-    """Return (authorize_url, state_cookie_value)."""
-    meta = _discovery(cfg)
+async def build_authorize_url(cfg: OIDCConfig, return_to: str = "/") -> tuple[str, str]:
+    """Return (authorize_url, state_cookie_value).
+
+    Async because ``_discovery`` issues a network request on cache
+    miss and we never want a sync I/O call on the event loop."""
+    meta = await _discovery(cfg)
     state = secrets.token_urlsafe(32)
     verifier, challenge = _make_verifier()
     params = {
@@ -179,7 +226,7 @@ async def exchange_code(
     endpoint, set ``OIDC_SCOPES=openid email profile`` and switch this
     function to use ``parse_id_token`` with a nonce plumbed through.
     """
-    meta = _discovery(cfg)
+    meta = await _discovery(cfg)
     token_endpoint = meta["token_endpoint"]
     userinfo_endpoint = meta.get("userinfo_endpoint")
 

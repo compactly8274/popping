@@ -75,6 +75,14 @@ class _Job(BaseModel):
 _JOBS: dict[str, _Job] = {}
 _JOBS_LOCK = asyncio.Lock()
 
+# Strong references to in-flight generation tasks. ``asyncio.create_task``
+# returns a Task that is otherwise weakly-held by the event loop, so a
+# long-running generation can be garbage-collected mid-flight — the
+# caller would see a ``_run_job`` that never updates the ledger and
+# polls would 404 forever. The set retains the task until it completes;
+# ``_run_job`` itself removes the entry on its finally branch.
+_RUNNING_TASKS: set[asyncio.Task] = set()
+
 
 # Cap the in-memory ledger so a runaway script can't OOM us. Stale
 # completed/failed jobs from days-old sessions pile up if we never
@@ -103,34 +111,44 @@ async def _run_job(job_id: str, tone: str) -> None:
     useful instead of hanging forever."""
     notifier = current_notifier()
     gen = BriefGenerator(notifier)
-    async with SessionLocal() as session:
-        try:
-            brief = await gen.generate(session=session, tone=tone)
-            if brief is None:
-                # ``generate`` returns None for either "no provider" or
-                # "no entries" or "LLM returned empty". Surface the
-                # skip reason as the user-visible error message.
+    try:
+        async with SessionLocal() as session:
+            try:
+                brief = await gen.generate(session=session, tone=tone)
+                if brief is None:
+                    # ``generate`` returns None for either "no provider" or
+                    # "no entries" or "LLM returned empty". Surface the
+                    # skip reason as the user-visible error message.
+                    async with _JOBS_LOCK:
+                        job = _JOBS.get(job_id)
+                        if job is not None:
+                            job.status = "failed"
+                            job.error = BriefGenerator.skip_reason()
+                    return
+                await session.commit()
+                await session.refresh(brief)
+                async with _JOBS_LOCK:
+                    job = _JOBS.get(job_id)
+                    if job is not None:
+                        job.status = "completed"
+                        job.brief = BriefOut.model_validate(brief)
+                logger.info("brief job: completed id=%s tone=%s brief_id=%d", job_id, tone, brief.id)
+            except Exception:
+                logger.exception("brief job: failed id=%s", job_id)
                 async with _JOBS_LOCK:
                     job = _JOBS.get(job_id)
                     if job is not None:
                         job.status = "failed"
-                        job.error = BriefGenerator.skip_reason()
-                return
-            await session.commit()
-            await session.refresh(brief)
-            async with _JOBS_LOCK:
-                job = _JOBS.get(job_id)
-                if job is not None:
-                    job.status = "completed"
-                    job.brief = BriefOut.model_validate(brief)
-            logger.info("brief job: completed id=%s tone=%s brief_id=%d", job_id, tone, brief.id)
-        except Exception:
-            logger.exception("brief job: failed id=%s", job_id)
-            async with _JOBS_LOCK:
-                job = _JOBS.get(job_id)
-                if job is not None:
-                    job.status = "failed"
-                    job.error = "brief generation failed (see backend logs)"
+                        job.error = "brief generation failed (see backend logs)"
+    finally:
+        # Drop the strong reference regardless of outcome so a
+        # crashed job doesn't pin the task object forever. The
+        # weakref from create_task's add_done_callback would do
+        # this anyway, but doing it explicitly here makes the
+        # lifecycle obvious to anyone reading the code.
+        task = asyncio.current_task()
+        if task is not None:
+            _RUNNING_TASKS.discard(task)
 
 
 class BriefJobOut(BaseModel):
@@ -203,15 +221,26 @@ async def brief_generate(
         started_at=time.monotonic(),
     )
     await _record_job(job)
-    # Fire and forget. ``asyncio.create_task`` schedules on the
-    # running loop; the task self-updates the ledger as it
-    # progresses. If the loop is closing (process shutdown) the
-    # task gets cancelled — fine, the brief was never persisted.
-    asyncio.create_task(_run_job(job.id, tone))
+    # Fire and forget. ``asyncio.create_task`` returns a weakly-held
+    # Task — without a strong reference a long-running generation can
+    # be garbage-collected mid-flight. The ``_RUNNING_TASKS`` set
+    # pins the task; the finally branch in ``_run_job`` removes the
+    # entry on completion, so the set stays bounded.
+    task = asyncio.create_task(_run_job(job.id, tone))
+    _RUNNING_TASKS.add(task)
     return BriefGenerateAck(job_id=job.id, tone=tone)
 
 
-@router.get("/brief/jobs/{job_id}", response_model=BriefJobOut)
+@router.get(
+    "/brief/jobs/{job_id}",
+    response_model=BriefJobOut,
+    # Auth-gated to match the POST that creates the job. The brief
+    # content is a personalised digest of the user's curated entries,
+    # so an unauthenticated UUID lookup would leak reading habits /
+    # category weights. UUIDs are 128-bit so practical risk is low,
+    # but the endpoint is just as easy to lock as the write path.
+    dependencies=_route_deps,
+)
 async def brief_job_status(job_id: str) -> BriefJobOut:
     """Poll for a generation job's status. Returns 404 if the
     job isn't (or no longer is) in the ledger; ``status`` is

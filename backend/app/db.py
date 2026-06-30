@@ -13,6 +13,17 @@ engine = create_async_engine(
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
+    # Recycle connections after 30 min. PostgreSQL silently drops
+    # idle connections older than ``tcp_keepalives_idle`` (default
+    # 2h on Linux) but a pgbouncer / cloud-native proxy in front
+    # often sets the timeout to minutes. Without pool_recycle the
+    # pool hands out a stale connection on first use after the
+    # timeout, the query fails with ``OperationalError: server
+    # closed the connection unexpectedly``, and the request 500s.
+    # 30 min is well below the typical proxy timeout (10-60 min)
+    # and well above the median inter-request gap, so the
+    # recycling cost is negligible.
+    pool_recycle=1800,
 )
 
 SessionLocal = async_sessionmaker(

@@ -190,12 +190,18 @@ def _annotate_recommended(
 
 def _cache_get(
     provider: str, base_url: str, task: str
-) -> tuple[float, list[dict[str, Any]]] | None:
+) -> tuple[float, float, list[dict[str, Any]]] | None:
     hit = _cache.get((provider, base_url, task))
     if hit is None:
         return None
-    fetched_at, payload = hit
-    if (time.time() - fetched_at) > settings.llm_tags_cache_ttl_seconds:
+    mono_ts, wall_ts, payload = hit
+    # ``time.monotonic`` rather than ``time.time`` for the TTL check:
+    # a wall-clock step (NTP correction, daylight-savings, manual
+    # set) shouldn't invalidate a fresh entry nor keep a stale one
+    # alive forever. ``wall_ts`` is kept alongside so we can return
+    # a real ``cached_at`` to the API caller — monotonic has no
+    # epoch and ``fromtimestamp`` on it would explode.
+    if (time.monotonic() - mono_ts) > settings.llm_tags_cache_ttl_seconds:
         _cache.pop((provider, base_url, task), None)
         return None
     return hit
@@ -204,7 +210,11 @@ def _cache_get(
 def _cache_set(
     provider: str, base_url: str, task: str, payload: list[dict[str, Any]]
 ) -> None:
-    _cache[(provider, base_url, task)] = (time.time(), payload)
+    _cache[(provider, base_url, task)] = (
+        time.monotonic(),
+        time.time(),
+        payload,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -332,11 +342,11 @@ async def fetch_tags(
     if not force_refresh:
         hit = _cache_get(provider, base_url, task)
         if hit is not None:
-            fetched_at_ts, payload = hit
+            _, wall_ts, payload = hit
             return {
                 "models": payload,
                 "cached_at": dt.datetime.fromtimestamp(
-                    fetched_at_ts, tz=dt.timezone.utc
+                    wall_ts, tz=dt.timezone.utc
                 ),
                 "ttl_seconds": settings.llm_tags_cache_ttl_seconds,
             }
@@ -351,11 +361,11 @@ async def fetch_tags(
                 "tags: live fetch failed for %s/%s (%s) — returning stale cache",
                 provider, task, exc,
             )
-            fetched_at_ts, payload = stale
+            _, wall_ts, payload = stale
             return {
                 "models": payload,
                 "cached_at": dt.datetime.fromtimestamp(
-                    fetched_at_ts, tz=dt.timezone.utc
+                    wall_ts, tz=dt.timezone.utc
                 ),
                 "ttl_seconds": settings.llm_tags_cache_ttl_seconds,
                 "stale": True,

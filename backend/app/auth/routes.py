@@ -111,7 +111,7 @@ async def login(return_to: str = "/") -> Response:
     # user-supplied path (when safe) or ``/`` as a fallback.
     return_to = _safe_return_to(return_to)
     try:
-        authorize_url, state_cookie_value = build_authorize_url(cfg, return_to=return_to)
+        authorize_url, state_cookie_value = await build_authorize_url(cfg, return_to=return_to)
     except OIDCError as e:
         logger.error("OIDC discovery failed: %s", e)
         raise HTTPException(status_code=503, detail=f"OIDC not available: {e}") from e

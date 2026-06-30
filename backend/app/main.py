@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app import assets
 from app.config import settings
-from app.embeddings import embedder
+from app.embeddings import close_embedder, embedder
 from app.notify import build_notifier
 from app import reddit_client
 from app.request_state import set_notifier
@@ -124,13 +124,16 @@ async def lifespan(app: FastAPI):
     finally:
         # Teardown order: scheduler first (so no in-flight fetches
         # race the closes), then the shared asset client, the Hydra
-        # Reddit client (same idempotent shape), the Redis pool, and
+        # Reddit client (same idempotent shape), the Redis pool, the
+        # embedder's ThreadPoolExecutor (otherwise the worker
+        # threads leak across ``uvicorn --reload`` cycles), and
         # finally the SQLAlchemy engine. Each close is idempotent —
         # a missing/broken subsystem just no-ops.
         await stop_scheduler()
         await assets.close_client()
         await reddit_client.close_client()
         await close_redis()
+        await close_embedder()
         await dispose_engine()
         logger.info("popping stopped")
 
@@ -174,4 +177,27 @@ if settings.oidc_enabled:
 # Cached asset files (favicons + thumbnails). Mounted last so the API
 # routers above always win for /api/* paths. The browser loads these
 # as same-origin <img> tags — no third-party referer leak, no CORS.
+# ``X-Content-Type-Options: nosniff`` is set on /assets/* responses by
+# the middleware below so the browser can't reinterpret an
+# attacker-served file (e.g. an SVG that contains a script) as a
+# different MIME type. Combined with the allowlist-only content-type
+# check in assets._download, this is the second line of defence
+# against the "HTML-as-favicon" stored-XSS class of bug.
 app.mount("/assets", StaticFiles(directory=settings.assets_dir), name="assets")
+
+
+@app.middleware("http")
+async def _assets_security_headers(request, call_next):
+    """Add ``X-Content-Type-Options: nosniff`` to /assets/* responses.
+
+    StaticFiles sets its own content-type from the file extension
+    (which is derived from a strict image allowlist in
+    ``assets._download``), but ``nosniff`` is a belt-and-suspenders
+    against any future content-type path that might serve a
+    same-origin file the browser could reinterpret. Doesn't touch
+    the API surface (those responses are JSON; nosniff is harmless
+    there)."""
+    response = await call_next(request)
+    if request.url.path.startswith("/assets/"):
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response

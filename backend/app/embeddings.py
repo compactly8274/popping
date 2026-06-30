@@ -153,3 +153,39 @@ class Embedder:
             show_progress_bar=False,
         )
         return [v.tolist() for v in result]
+
+    async def close(self) -> None:
+        """Shut the thread pool down so the worker threads exit cleanly.
+
+        Called from ``app.main``'s lifespan teardown. The previous
+        code never called ``executor.shutdown`` — the worker threads
+        held a reference to the loaded model and (more importantly)
+        to the GIL-free numpy buffers, so a ``uvicorn --reload`` cycle
+        leaked ~``_DEFAULT_WORKERS`` threads per restart. After a few
+        edits you could see hundreds of sleeping ``embed`` threads
+        in ``ps``. Idempotent — safe to call when the executor was
+        never created (e.g. embeddings were disabled)."""
+        if self._executor is not None:
+            # ``wait=False`` so a hung encode doesn't block process
+            # shutdown for tens of seconds. The worker threads
+            # abandon their current call and exit when the loop
+            # unblocks; we accept that on a clean SIGTERM the
+            # in-flight embed may return ``None`` to its caller,
+            # which the embed() path already handles.
+            self._executor.shutdown(wait=False)
+            self._executor = None
+        self._model = None
+        self._loaded = False
+
+
+def close_embedder() -> None:
+    """Module-level helper: close the singleton's executor.
+
+    Safe to call when no embedder was ever created (test suites
+    that never touched ``embedder()``). Returns a coroutine so the
+    lifespan can ``await`` it consistently with the other close
+    hooks."""
+    global _embedder
+    if _embedder is None:
+        return None
+    return _embedder.close()

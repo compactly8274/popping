@@ -34,6 +34,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import assets
@@ -731,9 +732,22 @@ async def _crossref_sweep() -> None:
             logger.info("crossref sweep: %d entries to check", len(to_check))
 
             stamped = 0
+            # ``to_check`` is already truncated to ``_CROSSREF_BATCH``
+            # (the slice below). We sleep per-entry rather than
+            # per-batch because the in-batch cost is dominated by
+            # the per-entry ``search_thread_by_url`` roundtrip —
+            # 100ms between *batches* would bunch all 50 requests
+            # into a single 0.5s wall, while 100ms *per entry*
+            # spreads the same 5 seconds across the tick and gives
+            # Hydra's per-connection throughput a breather.
             for entry_id, entry_url in to_check[:_CROSSREF_BATCH]:
                 match = await reddit_client.search_thread_by_url(entry_url)
                 if match is None:
+                    # Still pause so a Hydra outage doesn't let us
+                    # spin through 50 entries in 0ms on the
+                    # failure path — same wall-clock cap as a
+                    # healthy tick.
+                    await asyncio.sleep(_CROSSREF_BATCH_SLEEP)
                     continue
                 thread_url = f"https://www.reddit.com{match['permalink']}"
                 # jsonb || jsonb merge — preserves any other meta
@@ -755,6 +769,7 @@ async def _crossref_sweep() -> None:
                     },
                 )
                 stamped += 1
+                await asyncio.sleep(_CROSSREF_BATCH_SLEEP)
             if stamped:
                 await session.commit()
                 logger.info(
@@ -1174,6 +1189,15 @@ async def add_source(
     The scheduler is a module-level singleton; if it isn't running
     (e.g. during tests) the row is still created and will be picked
     up on the next ``start_scheduler`` walk.
+
+    Concurrency: two callers racing on the same name used to TOCTOU
+    past the existence check and both reach ``INSERT``, with the
+    second crashing on the unique constraint. We catch that and
+    re-fetch the row the winner wrote. The race window is the
+    roundtrip between ``SELECT`` and ``INSERT`` — vanishingly small
+    in practice, but worth closing because the resulting 500 is
+    user-facing and easy to trigger by double-clicking the
+    Add-source button.
     """
     existing = await session.scalar(select(Source).where(Source.name == name))
     if existing is not None:
@@ -1188,7 +1212,21 @@ async def add_source(
         custom_headers=custom_headers,
     )
     session.add(row)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Lost the race — the unique constraint on ``name`` fired.
+        # Roll back, refetch the row the winner wrote, return it.
+        # ``expire_all`` drops the now-stale cached state so the
+        # subsequent ``refresh`` issues a fresh SELECT.
+        await session.rollback()
+        winner = await session.scalar(select(Source).where(Source.name == name))
+        if winner is None:
+            # Should not happen — constraint fired but row vanished?
+            # Re-raise as the IntegrityError so the caller can
+            # surface a real error rather than a silent miss.
+            raise
+        return winner
     await session.refresh(row)
     if _scheduler is not None:
         _add_or_replace_dynamic_job(_scheduler, row)
