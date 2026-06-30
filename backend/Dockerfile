@@ -25,6 +25,22 @@ COPY . .
 
 EXPOSE 8000
 
-# uvicorn with reload for dev; alembic upgrade head runs once at startup so
-# a fresh pgdata volume is auto-initialized.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
+# Stable production CMD — no auto-reload. alembic upgrade head runs
+# once at startup so a fresh pgdata volume is auto-initialized. Local
+# dev with hot-reload is opted into via docker-compose.override.yml's
+# `command:` override (see docker-compose.override.yml.example), which
+# replaces this CMD with the --reload variant. Keeping --reload out of
+# the production image avoids two failure modes this codebase has hit:
+#
+# 1. ``watchfiles`` triggers on any file mutation inside /app — runtime
+#    artefacts (cached thumbnails under /app/assets/thumbs, alembic's
+#    WAL writes, etc.) cause spurious restarts. Each restart briefly
+#    disconnects the Vite proxy on the frontend container, surfacing
+#    as ECONNREFUSED on /api/* and a blank dashboard for the duration
+#    of the reload (~1-2 s).
+#
+# 2. Pinning to a specific image SHA loses the "edit-and-reload" loop
+#    users expect from dev mode but gains the user-visible stability
+#    they expect from prod. The override gives both modes their own
+#    command without diverging Dockerfiles.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
