@@ -14,3 +14,33 @@
      Safari renders the system-default (white) viewport shell
      during the brief window before the body's bg-bg-app kicks in. */
 }
+
+/* ``@keyframes popping-spin`` for the React-level splash spinner
+   (rendered in App.tsx while the /api/me probe resolves). The same
+   keyframes are defined inline in index.html for the pre-React
+   splash — they need to live here too because once React mounts
+   the index.html <style> block is no longer "live" for newly
+   rendered elements (in some browsers the inline keyframes stop
+   being associated with elements that appear after parse).
+   Without this declaration, the React splash ring renders static
+   (no spin) which reads as a non-loading state and shows a
+   "frozen" feel during the auth probe.
+   Matches index.html's @keyframes popping-spin exactly so the
+   visual rhythm is identical between the pre-React and React
+   splashes. */
+@keyframes popping-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Respect users who've asked the OS to reduce motion. Tailwind's
+   ``motion-safe:`` prefix handles most of this, but the React
+   splash uses inline ``animation:`` so it doesn't go through
+   Tailwind's variant machinery — kill the spin here directly.
+   The ring's border-top-color reverts to the muted track colour
+   so it doesn't read as a stuck-state spinner. */
+@media (prefers-reduced-motion: reduce) {
+  [data-spinner="popping"] {
+    animation: none !important;
+    border-top-color: rgba(255, 255, 255, 0.08) !important;
+  }
+}

@@ -1018,6 +1018,13 @@ export function App() {
         }}
       >
         <div
+          // ``data-spinner="popping"`` lets the styles.css
+          // ``@media (prefers-reduced-motion: reduce)`` rule kill
+          // the animation — Tailwind's ``motion-safe:`` variant
+          // doesn't apply to inline ``animation:`` declarations
+          // (it only gates Tailwind utility classes). The data
+          // attribute is the cleanest cross-handle.
+          data-spinner="popping"
           style={{
             width: 32,
             height: 32,
