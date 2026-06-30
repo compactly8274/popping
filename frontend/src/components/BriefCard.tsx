@@ -72,6 +72,93 @@ function stripInlineEmphasis(text: string): string {
     .replace(INLINE_CODE_RE, '$1')
 }
 
+// Heuristics for "this line is not a brief item, it's noise the model
+// leaked." Used as a second line of defence on top of the backend
+// prompt and stop sequences. The brief format is structured; the
+// parser should drop anything that doesn't fit, not render it.
+//
+// ``isTemplateEchoLine`` matches the specific phrases the model was
+// observed echoing back from the prompt or its own instructions in
+// the leak the user reported:
+//   - ``[topic A] — [why it matters in one sentence]`` and friends
+//     (square-bracketed placeholders copied from the format example)
+//   - ``(3 to 5 bulleted lines)`` / ``(1 to 3 bulleted lines)``
+//     (parens-wrapped counts copied from the format directive)
+//   - ``No preamble, no analysis, no labels, no bold, no italic, no
+//     markdown. Just the literal lines.`` (the format directive
+//     echoed verbatim)
+//
+// ``isReasoningLine`` matches the chain-of-thought patterns the
+// thinking-style models on Ollama Cloud were leaking as text:
+//   - "Let's pick the most important facts:"
+//   - "Wait, the instructions say…"
+//   - "I need to" / "I should"
+//   - "Looking at the entries…"
+//   - "First, " / "Now, " / "Also, " (sentence-initial connectives
+//     that the model used to start paragraphs of CoT)
+//
+// These are not bullet items, so the parser already had to decide
+// what to do with them. The previous behaviour was to push them to
+// the watch list, which is how a brief ended up rendering "Watch:
+// [a lower-priority item to keep an eye on] / (1 to 3 bulleted
+// lines) / No preamble, no analysis…" — clearly not what the user
+// wanted. The new behaviour is to drop them.
+const TEMPLATE_ECHO_PATTERNS: readonly RegExp[] = [
+  // Square-bracketed placeholders from the example block.
+  /^\s*\[\s*topic\s+[a-z]\s*\]/i,
+  /^\s*\[\s*why it matters/i,
+  /^\s*\[\s*a lower-priority item/i,
+  // Parens-wrapped count descriptions.
+  /^\s*\(\s*\d+\s+to\s+\d+\s+bulleted lines?\s*\)\s*$/i,
+  /^\s*\(\s*\d+\s+bulleted lines?\s*\)\s*$/i,
+  // Verbatim format-directive echo.
+  /^\s*no preamble,?\s*no analysis/i,
+  /^\s*just the literal lines\s*\.?\s*$/i,
+  // "Watch" / "HIGHLIGHTS" header that didn't render as a header
+  // because it was on a line with content ("Watch the Fed's
+  // decision" or similar — a real watch item, not a section header).
+  // We don't try to split that here; the section-header regex
+  // already handled the bare "Watch" case. This matches an explicit
+  // "Watch this:" lead-in that the model was producing as a thinking
+  // artifact.
+  /^\s*watch (this|for|as|the)\b/i,
+]
+function isTemplateEchoLine(line: string): boolean {
+  return TEMPLATE_ECHO_PATTERNS.some((re) => re.test(line))
+}
+
+const REASONING_PREFIXES: readonly RegExp[] = [
+  /^\s*let's\b/i,
+  /^\s*let me\b/i,
+  /^\s*wait,?\b/i,
+  /^\s*actually,?\b/i,
+  /^\s*okay,?\b/i,
+  /^\s*so,?\b/i,
+  /^\s*first,?\b/i,
+  /^\s*now,?\b/i,
+  /^\s*also,?\b/i,
+  /^\s*i need to\b/i,
+  /^\s*i should\b/i,
+  /^\s*looking at\b/i,
+  /^\s*picking\b/i,
+  /^\s*the instructions say\b/i,
+  /^\s*based on (the |these )?entries\b/i,
+  /^\s*based on (the |this )?prompt\b/i,
+  /^\s*in summary,?\b/i,
+  /^\s*to summarise,?\b/i,
+  /^\s*my approach\b/i,
+]
+function isReasoningLine(line: string): boolean {
+  return REASONING_PREFIXES.some((re) => re.test(line))
+}
+
+// A "bullet-ish" line is one whose stripped form starts with ``-``
+// after we trim it. Used by the parser to decide whether to push a
+// line into a list or treat it as a header / noise.
+function isBulletLine(line: string): boolean {
+  return line.startsWith('-')
+}
+
 type Parsed = {
   oneSentence: string
   highlights: string[]
@@ -88,13 +175,23 @@ function parse(content: string): Parsed {
   }
   // Defense in depth: even with stop sequences on the backend, a
   // future model or edge case might still emit the prompt-template
-  // example (``<one sentence capturing the single most important
-  // development>``) or a numbered analysis block before/after the
-  // real brief. Truncate the content to the region between the
-  // first ``TODAY IN ONE SENTENCE`` header and the end of the last
-  // bullet section (``HIGHLIGHTS`` / ``WATCH``). Anything before the
-  // first header is prompt-echo noise; anything after a non-bullet
-  // line in the WATCH bucket is too.
+  // example (``[topic A] — [why it matters in one sentence]``) or
+  // a numbered analysis block before/after the real brief. We:
+  //
+  //   1. Truncate to the region starting at the first
+  //      ``TODAY IN ONE SENTENCE`` header (fall back to the start
+  //      of the content if the model skipped the header entirely —
+  //      better to render the brief than to throw it away).
+  //   2. Treat every non-bullet line inside a HIGHLIGHTS or WATCH
+  //      bucket as noise and DROP it (was: push to the list as a
+  //      "fallback" item, which is what surfaced the template
+  //      placeholders as a Watch list). The previous behaviour was
+  //      defensive in the sense that it preserved content; the new
+  //      behaviour is defensive in the sense that it preserves
+  //      shape — a malformed brief section renders as empty
+  //      rather than as garbage.
+  //   3. Drop template-echo and reasoning lines (``isTemplateEchoLine``,
+  //      ``isReasoningLine``) outright, regardless of bucket.
   const lines = content.split(/\r?\n/)
   // Find the first ``TODAY IN ONE SENTENCE`` line. If we don't find
   // one, the parser already handles it gracefully (everything falls
@@ -102,7 +199,7 @@ function parse(content: string): Parsed {
   let startIdx = lines.findIndex((l) => /^TODAY IN ONE SENTENCE\s*$/i.test(l.trim()))
   if (startIdx === -1) startIdx = 0
 
-  let bucket: 'none' | 'one' | 'high' | 'watch' | 'rest' = 'none'
+  let bucket: 'none' | 'one' | 'rest' | 'high' | 'watch' = 'none'
   for (const raw of lines.slice(startIdx)) {
     // Strip leading/trailing markdown emphasis chars so ``**TODAY IN
     // ONE SENTENCE**`` and ``# TODAY IN ONE SENTENCE`` still match the
@@ -120,6 +217,10 @@ function parse(content: string): Parsed {
       continue
     }
     if (/^WATCH/i.test(line)) {
+      // Match both ``WATCH`` (the literal section header the prompt
+      // asks for) and ``Watch`` (lowercase — the model was producing
+      // this when it was leaking the example block). Either way
+      // it's a section transition.
       bucket = 'watch'
       continue
     }
@@ -127,19 +228,33 @@ function parse(content: string): Parsed {
       // Blank line — keep bucket, skip.
       continue
     }
+    // Drop template echoes and reasoning lines regardless of
+    // bucket. The whole point of the format is that the model
+    // writes ONE sentence + bullets; anything else is noise.
+    if (isTemplateEchoLine(line) || isReasoningLine(line)) {
+      continue
+    }
     if (bucket === 'one') {
       out.oneSentence = (out.oneSentence ? out.oneSentence + ' ' : '') + line
       bucket = 'rest'
-    } else if (bucket === 'high' && line.startsWith('-')) {
-      out.highlights.push(stripInlineEmphasis(line.slice(1).trim()))
-    } else if (bucket === 'watch' && line.startsWith('-')) {
-      out.watch.push(stripInlineEmphasis(line.slice(1).trim()))
-    } else if (bucket === 'high' || bucket === 'watch') {
-      // Section header detected but no dash — keep accumulating into the
-      // first matching list.
-      if (bucket === 'high') out.highlights.push(stripInlineEmphasis(line))
-      else out.watch.push(stripInlineEmphasis(line))
+    } else if (bucket === 'high') {
+      if (isBulletLine(line)) {
+        out.highlights.push(stripInlineEmphasis(line.slice(1).trim()))
+      }
+      // Non-bullet line inside HIGHLIGHTS is dropped silently. The
+      // previous "append as a non-dash item" behaviour was the
+      // exact path the template-echo leak took to reach the user.
+    } else if (bucket === 'watch') {
+      if (isBulletLine(line)) {
+        out.watch.push(stripInlineEmphasis(line.slice(1).trim()))
+      }
+      // Non-bullet line inside WATCH is dropped, same reason.
     } else {
+      // Outside any section. Accumulate into ``remainder`` for
+      // potential debugging surfacing, but the render never shows
+      // it. Kept for parity with the previous parser — a future
+      // signal-based surface (e.g. a "raw brief" expander) can
+      // still read it.
       out.remainder = out.remainder ? out.remainder + '\n' + line : line
     }
   }

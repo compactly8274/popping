@@ -418,31 +418,33 @@ class BriefGenerator:
             ),
         }.get(tone, "")
 
-        # Prompt design notes (after the previous BAD-vs-GOOD example
-        # turned out to backfire — verbose models copied the BAD
-        # example's "1. **Role:** / 2. **Select:**" structure into the
-        # output, producing exactly the analysis we were trying to
-        # prevent):
+        # Prompt design notes — this is the third pass on the brief
+        # prompt. Each pass was driven by a specific leak the user
+        # pasted back. The current shape was tuned against:
         #
-        #   1. Don't show the model what NOT to do. Telling it "don't
-        #      produce analysis" while giving an analysis-shaped BAD
-        #      example still primes the analysis shape. The example
-        #      block now only shows the GOOD format, with no annotations.
-        #   2. Don't label the entries as "Source Material:" or number
-        #      the constraints. The previous "1. Constraint / 2. Format"
-        #      header structure was being mirrored by the model.
-        #   3. Don't show the model any markdown emphasis characters
-        #      in the prompt. ``**bold**``, ``*italic*``, ``# header``
-        #      all taught it to bold the section labels.
-        #   4. The example uses placeholder names like "topic A"
-        #      rather than real-world examples that the model might
-        #      echo verbatim (the previous ``<one sentence capturing
-        #      the single most important development>`` placeholder
-        #      was being copied straight into the output).
+        #   1. The verbose-model "1. **Role:** / 2. **Select:**" leak
+        #      (c510f57). Fixed by removing numbered constraint
+        #      headers and the BAD-vs-GOOD example block.
+        #   2. The "**Analyze the Request:**" leak (2672d15). Fixed
+        #      by dropping markdown emphasis from the prompt and
+        #      adding stop sequences on ``\n**``.
+        #   3. The CURRENT leak: the minimal GOOD example block
+        #      (``- topic A — why it matters in one sentence``, the
+        #      ``(3 to 5 bulleted lines)`` parenthetical from the
+        #      format_directive, and the words "Watch" + "Let's pick
+        #      the most important facts:") was being echoed back
+        #      verbatim. The model literally reproduced the format
+        #      example as the highlights/watch sections, then dumped
+        #      its reasoning ("Wait, the instructions say...") after.
         #
-        # The accompanying Ollama-side mitigation (stop sequences +
-        # reduced max_tokens) lives in the ollama providers; the prompt
-        # alone wouldn't be enough against the more verbose models.
+        # Fix for the current leak: the prompt no longer contains
+        # any example text the model could echo. The format_directive
+        # is the only place the format is described, and an explicit
+        # "no echo" clause sits between the directive and the entries
+        # to tell the model its output should be the brief itself,
+        # not a description of the brief. The frontend parser also
+        # gains defense-in-depth (see
+        # ``frontend/src/components/BriefCard.tsx``).
 
         # Editing guidance. Tells the model to read the description
         # AFTER the em-dash and summarize from there, not to parrot
@@ -457,32 +459,41 @@ class BriefGenerator:
             "the plain factual version. Lead with the fact."
         )
 
+        # Format directive. Describes the shape in prose; no example
+        # text the model could copy. The bullet count is given as a
+        # range ("between three and five") rather than the literal
+        # string "3 to 5" — the previous parenthetical was being
+        # echoed as ``(3 to 5 bulleted lines)`` in the output.
         format_directive = (
-            "Reply with the brief only. No preamble. No analysis, no reasoning, "
-            "no explanations, no labels, no headers, no bold, no italic, no "
-            "markdown of any kind. Begin your reply with the literal line "
-            "TODAY IN ONE SENTENCE on its own line, then a single sentence, "
-            "then a blank line, then HIGHLIGHTS on its own line, then 3 to 5 "
-            "bulleted lines each starting with a hyphen, then a blank line, "
-            "then WATCH on its own line, then 1 to 3 bulleted lines starting "
-            "with a hyphen. No other text."
+            "Reply with the brief only. Output shape, in this exact "
+            "order: first, a line that is literally TODAY IN ONE SENTENCE "
+            "on its own. Next, one sentence summarising the single most "
+            "important development. Then a blank line. Then a line that "
+            "is literally HIGHLIGHTS on its own. Then between three and "
+            "five bulleted lines, each starting with a hyphen. Then a "
+            "blank line. Then a line that is literally WATCH on its own. "
+            "Then between one and three bulleted lines, each starting "
+            "with a hyphen. Nothing else in the reply — no preamble, no "
+            "analysis, no reasoning, no explanations, no labels, no "
+            "headers, no bold, no italic, no markdown of any kind."
         )
 
-        # The example deliberately uses generic, non-echoable language
-        # ("topic A", "a recent event") so the model doesn't have
-        # specific phrases to copy. ``-`` is the only special character
-        # and it's just bullet syntax.
-        format_example = (
-            "TODAY IN ONE SENTENCE\n"
-            "A one-sentence statement of the single most important development.\n"
-            "\n"
-            "HIGHLIGHTS\n"
-            "- topic A — why it matters in one sentence\n"
-            "- topic B — why it matters in one sentence\n"
-            "- topic C — why it matters in one sentence\n"
-            "\n"
-            "WATCH\n"
-            "- a lower-priority item to keep an eye on"
+        # Anti-echo clause. Some models (notably the thinking-style
+        # ones on Ollama Cloud) treat the prompt as a checklist and
+        # write back a paraphrase of the instructions before the
+        # actual content. The leaked output we fixed had the model
+        # reproducing the format example AND a stream-of-thought
+        # preamble ("Let's pick the most important facts:"). This
+        # clause tells the model its output is the brief itself, not
+        # a description of how to write the brief. Sits between the
+        # directive and the entries so the model reads it as a
+        # constraint on the OUTPUT, not a directive to narrate.
+        no_echo_clause = (
+            "Do not paraphrase, echo, restate, or summarise the "
+            "instructions above in your reply. The reply is the brief "
+            "itself, not a description of the brief. Do not include any "
+            "reasoning, plan, checklist, or meta-commentary before or "
+            "after the brief."
         )
 
         scope_clause = (
@@ -492,15 +503,16 @@ class BriefGenerator:
             "not candidates for the brief."
         )
 
-        # No numbered headers, no role label, no markdown, no example
-        # of what NOT to do. Just the constraints and the entries.
+        # No example block, no numbered headers, no role label, no
+        # markdown, no "Source Material:" label. The directive
+        # describes the format in prose; the model has to write the
+        # content from the entries.
         return (
             f"You are the editor of a personal intelligence brief. Tone: {tone}. "
             f"{tone_blurb}\n\n"
             f"{editing_guidance}\n\n"
             f"{format_directive}\n\n"
-            f"Example of the exact shape to produce:\n"
-            f"{format_example}\n\n"
+            f"{no_echo_clause}\n\n"
             f"{scope_clause}\n\n"
             f"Candidate entries:\n\n"
             f"{BriefGenerator._format_entries(entries)}\n"
