@@ -8,7 +8,19 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libpq-dev curl \
+    && apt-get install -y --no-install-recommends \
+        # ca-certificates: python:3.12-slim's OpenSSL ships without a
+        # CA bundle, so httpx's default verify=True fails on any
+        # source whose chain isn't in the (empty) system store. The
+        # resulting SSL: CERTIFICATE_VERIFY_FAILED shows up in
+        # scheduler logs as a single-source ingest failure, but the
+        # more pernicious effect is that a couple of CDNs (BBC iChef
+        # thumbnails, some news feeds) intermittently 502 when the
+        # chain rotates and the new root isn't covered. Installing
+        # ca-certificates pulls in the standard Mozilla bundle and
+        # makes ``httpx.Client(verify=True)`` actually work end-to-end.
+        ca-certificates \
+        gcc libpq-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
