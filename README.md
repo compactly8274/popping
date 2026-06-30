@@ -29,6 +29,17 @@ auth in front of OIDC. Enable OIDC (see below) before exposing on a LAN.
 
 The first boot runs `alembic upgrade head` against a fresh postgres volume, so the schema is created automatically. The scheduler then fires one immediate fetch per plugin and re-fetches every `refresh_interval_seconds`.
 
+**Updating to a new release:**
+
+`POPPING_IMAGE_TAG=latest` (the default) tracks `main` — every push to `main` rebuilds both backend and frontend images and rolls the `latest` tag forward. To pick up a new release:
+
+```bash
+docker compose pull        # fetch the rotated :latest from GHCR
+docker compose up -d       # recreate containers with the new image
+```
+
+`pull_policy` defaults to `always`, so a plain `docker compose up -d` already pulls when the digest moved; the explicit `pull` step is only needed if you've set `POPPING_PULL_POLICY=missing` or `=never` in your `.env` (intentional opt-out for change-windowed deployments — see `.env.example` for the trade-off).
+
 **Local dev with hot-reload (build from source):**
 
 ```bash
@@ -43,10 +54,10 @@ The override is auto-loaded by `docker compose up` and only adds `build:` + bind
 
 ```bash
 # In .env:
-POPPING_IMAGE_TAG=sha-50af121    # exact commit
+POPPING_IMAGE_TAG=sha-50af121    # exact commit (immutable)
 # or
 POPPING_IMAGE_TAG=pr-3           # test a PR
-POPPING_PULL_POLICY=always       # force a fresh pull
+POPPING_PULL_POLICY=never        # don't auto-update a pinned tag
 ```
 
 ## Architecture

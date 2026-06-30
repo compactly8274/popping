@@ -4,6 +4,16 @@ name: popping
 # Tag is controlled by POPPING_IMAGE_TAG (default: latest).
 # Registry owner is controlled by POPPING_IMAGE_OWNER (default: compactly8274).
 #
+# Update flow (tracks main):
+#   docker compose pull        # fetches new :latest from GHCR if digest moved
+#   docker compose up -d       # recreates containers with the new image
+#
+# ``pull_policy`` defaults to ``always`` (also overridable via
+# POPPING_PULL_POLICY in .env) so a plain ``docker compose up -d``
+# will already pull a rotated :latest — the explicit ``pull`` step
+# above is only needed if you override the policy to ``missing`` /
+# ``never``. See .env.example for the trade-offs.
+#
 # Port surface:
 #   - frontend:   the only published port. LAN-reachable by default on
 #                 0.0.0.0:14789 (set POPPING_FRONTEND_PORT to override;
