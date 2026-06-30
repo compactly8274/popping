@@ -1049,7 +1049,22 @@ export function App() {
   const showSearchView = searchQuery.trim().length > 0
 
   return (
-    <div className="h-full flex flex-col">
+    <div
+      // Inline-styled black background on the dashboard root so the
+      // splash→dashboard swap doesn't expose a transparent frame in
+      // the brief window where ``h-full`` (Tailwind class) hasn't
+      // computed yet because ``styles.css`` is still being parsed.
+      // Matches the post-React splash's inline ``#000000`` so the
+      // transition is one continuous black surface. Mirrors the
+      // same fix as the splash (see comment block above) but on the
+      // destination side. ``minHeight: '100vh'`` is the CSS-pixel
+      // fallback for the frame where Tailwind's ``h-full`` (which
+      // resolves against ``#root { height: 100% }``) hasn't been
+      // laid out yet; once styles.css applies, both end up at the
+      // same height.
+      style={{ backgroundColor: '#000000', minHeight: '100vh' }}
+      className="h-full flex flex-col"
+    >
       {/* Large-title navigation bar. Mirrors Apple Mail / Music:
           the title is large (34pt, iOS ``largeTitle`` weight) when the
           bar is at the top of the scroll, and the row beneath it
