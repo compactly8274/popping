@@ -493,7 +493,8 @@ export function Drawer({
                 <p className="mt-2 text-ios-caption text-red-400 break-words">
                   {genError}
                 </p>
-            )}
+              )}
+            </div>
           </GroupedSection>
           )}
 
