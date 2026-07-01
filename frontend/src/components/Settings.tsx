@@ -98,6 +98,9 @@ export function Settings({
   generating,
   onSourceRenamed,
   onResetLocalState,
+  hiddenEntries,
+  onRestoreHidden,
+  onRestoreAllHidden,
 }: Props) {
   // Live data fetched when the overlay opens. The Feeds tab reuses
   // the ``sources`` prop (App owns it), but the LLM and
@@ -332,30 +335,39 @@ export function Settings({
             </div>
           )}
           {tab === 'hidden' && (
-            <GroupedSection label="Hidden entries">
-              {hiddenEntries.length === 0 ? (
-                <GroupedRow
-                  title="No hidden entries"
-                  subtitle="Right-click a card → Hide this entry to dismiss it. Hidden entries stay in the database but don't show on the dashboard."
-                />
-              ) : (
-                <>
-                  <GroupedRow
-                    title={`${hiddenEntries.length} hidden ${hiddenEntries.length === 1 ? 'entry' : 'entries'}`}
-                    subtitle="Tap Restore to show on the dashboard again. Restore all clears the entire list."
-                    action={
-                      <button
-                        onClick={onRestoreAllHidden}
-                        className="text-ios-body text-accent active:opacity-60"
-                        aria-label="restore all hidden entries"
-                      >
-                        Restore all
-                      </button>
-                    }
-                  />
-                </>
-              )}
-            </GroupedSection>
+            // No GroupedSection/GroupedRow in this file â the
+            // primitives live in Drawer.tsx and we don't import them
+            // (the Settings overlay's iOS look is a flat list, not
+            // the grouped-cards style of the Drawer). Inline the
+            // markup that fits the surrounding sections (rounded
+            // card, label-uppercase header, row dividers).
+            <div className="pt-4 px-4 space-y-3">
+              <div className="rounded-ios bg-bg-surface border border-hairline p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-ios-body text-label-primary">
+                      {hiddenEntries.length === 0
+                        ? 'No hidden entries'
+                        : `${hiddenEntries.length} hidden ${hiddenEntries.length === 1 ? 'entry' : 'entries'}`}
+                    </div>
+                    <div className="text-ios-caption text-label-secondary mt-0.5">
+                      {hiddenEntries.length === 0
+                        ? 'Right-click a card â Hide this entry to dismiss it. Hidden entries stay in the database but donât show on the dashboard.'
+                        : 'Tap Restore to show on the dashboard again.'}
+                    </div>
+                  </div>
+                  {hiddenEntries.length > 0 && (
+                    <button
+                      onClick={onRestoreAllHidden}
+                      className="text-ios-body text-accent active:opacity-60 shrink-0"
+                      aria-label="restore all hidden entries"
+                    >
+                      Restore all
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
           )}
 
           {tab === 'reset' && (
@@ -685,5 +697,6 @@ function LLMSection({
     </div>
   )
 }
+
 
 
