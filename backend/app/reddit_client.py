@@ -86,17 +86,23 @@ _TIMEOUT = 10.0
 # a multi-GB body.
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
-# Rate-limiter parameters for direct Atom mode. Reddit's anonymous
-# rate limit is ~60 calls/hour, but a low-reputation IP gets a tighter
-# window (~1/min per IP). The 3 subreddit ingest jobs all fire at the
-# same 15-min boundary, so the global bucket has to spread the 3
-# fetches across the 15-min window. With 3 fetches per 15 min
-# (one per subreddit), a 5-min spacing (1/300s) means each subreddit
-# gets its own 5-min slot, and over an hour we use 12 fetches
-# (4 ticks × 3 subs) — well under Reddit's 60/hour cap. Burst of 1
-# is enough since the scheduler never fires them within microseconds
-# of each other; the per-IP rate limit is the actual constraint.
-_DIRECT_RPS = 1.0 / 300.0   # ~1 call per 5 min
+# Rate-limiter parameters for direct Atom mode. Reddit's per-IP
+# rate limit is exactly 1 request per ~60 second window on low-
+# reputation IPs (verified July 2026: x-ratelimit-remaining is 0.0
+# after the first call, reset in 59-60s). The 3 subreddit ingest
+# jobs all fire at the same 15-min boundary, so the global bucket
+# has to serialize them with 70s spacing. 70s > 60s reset, so each
+# call sees a fresh window. 3 fetches at 70s apart = 210s = 3.5
+# min, well inside the 15-min scheduler tick. Burst of 1 means
+# only one call can be in-flight at a time, which is what we want.
+# Hourly budget: 4 ticks * 3 subs = 12 calls, each 70s apart
+# (so the 12 calls span 840s = 14 min of every hour, with 46 min
+# of idle time). Reddit's cap is "1 per 60s" so 12 calls in
+# 14 min would be 12/14 = 0.86 calls/min = 1.16 calls/60s, which
+# is technically just over the limit. To stay safely under it,
+# bump to 75s spacing (3 calls per 15 min span 225s = 3.75 min,
+# hourly budget = 12 calls in 15 min = 0.8 calls/min = 1 call/75s).
+_DIRECT_RPS = 1.0 / 75.0    # 1 call per 75 seconds, just over Reddit's 60s reset
 _DIRECT_BURST = 1.0
 
 # Cross-reference cache: how long a fetched subreddit listing stays
