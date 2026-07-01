@@ -1396,12 +1396,7 @@ async def update_source(
 
 async def delete_source(session: AsyncSession, source_id: int) -> bool:
     """Drop a Source row and its scheduler job. Returns True if a
-    row was deleted.
-
-    Class-driven sources (BBC etc.) should not reach here — the
-    route layer rejects DELETE for those with a 400 before calling.
-    We double-check the registry so a future caller that bypasses
-    the route can't accidentally nuke a built-in row.
+    row was deleted. Works for both built-in and dynamic rows.
 
     Entries belonging to this source are deleted in the SAME
     transaction. The FK is declared ``ON DELETE CASCADE`` so the DB
@@ -1416,12 +1411,15 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
     row = await session.get(Source, source_id)
     if row is None:
         return False
-    name = row.name
-    registered_names = set(list_sources().keys())
-    if name in registered_names:
-        # Defensive: refuse here too. The route's 400 is the
-        # user-facing check; this guard catches programmatic callers.
-        raise ValueError(f"refusing to delete built-in source {name!r}")
+    # Built-in sources (BBC, HN, etc.) ARE deletable now. The
+    # row goes away, the scheduler job is removed, the
+    # dashboard stops showing the source. The plugin class
+    # stays registered in memory until the next backend
+    # restart — at which point it re-registers itself as a
+    # fresh row. The proper "permanent soft-delete across
+    # restarts" fix is a ``deleted_at`` column on Source;
+    # for now this matches the user's stated intent with
+    # the simplest possible code change.
     # Delete child rows first. ``Entry.interactions`` also has an
     # ON DELETE CASCADE FK, so dropping entries drops their
     # interactions transparently — no need to fan out further.
@@ -1437,3 +1435,4 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
         except Exception:
             pass
     return True
+
