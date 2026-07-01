@@ -9,8 +9,11 @@ it's on.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from urllib.parse import urlparse
+
+import httpx
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -22,7 +25,14 @@ from app.config import settings
 from app.db import get_session
 from app.feed_recommendations import recommendations_for, recommendations_for_user
 from app.models import Source
-from app.schemas import FeedRecommendation, SourceCreate, SourceOut, SourceUpdate
+from app.schemas import (
+    FeedRecommendation,
+    SourceCreate,
+    SourceOut,
+    SourceTestRequest,
+    SourceTestResult,
+    SourceUpdate,
+)
 from app.sources import list_sources as registered_plugin_names
 from app.sources.reddit import normalize_subreddit
 from app.url_safety import check_url_safe
@@ -456,6 +466,213 @@ async def delete_source_endpoint(
         raise HTTPException(status_code=400, detail=str(exc))
     if not deleted:
         raise HTTPException(status_code=404, detail="source not found")
+
+
+# --- Test source (no persist) ------------------------------------------
+
+
+async def _test_source_impl(
+    body: SourceTestRequest,
+    session: AsyncSession,
+) -> SourceTestResult:
+    """Shared implementation for ``POST /api/sources/test``.
+
+    Validates the request shape the same way ``create_source_endpoint``
+    does (so the test result reflects exactly what the Add call will
+    accept), then dispatches the fetch to the same plugin the live
+    source would use. Catches the failures ``httpx`` and the parsers
+    raise and maps them to ``error_kind`` strings the frontend
+    branches on.
+
+    ``name`` is optional. If provided, it must pass the same regex
+    and uniqueness checks the Add flow uses — a name_conflict error
+    lets the user fix the name before they Add (the form would have
+    surfaced a 409 on Add, but the test catches it earlier so the
+    user doesn't have to look at the Add button to learn it's
+    rejected).
+
+    ``custom_headers`` is honored for the test fetch so the user can
+    see "this feed works with a browser UA" without first adding the
+    source.
+    """
+    # Reject unsupported types up front — same set Add accepts. The
+    # validation here is intentionally a subset of the create flow's
+    # (no DB write, no scheduler registration) so a Test never has
+    # side effects beyond the upstream fetch.
+    if body.type not in ("rss", "reddit"):
+        return SourceTestResult(
+            ok=False,
+            error_kind="unsupported_type",
+            error=f"unsupported type {body.type!r} (only 'rss' and 'reddit' are accepted)",
+        )
+
+    # Name is optional on Test, but if provided it must be valid AND
+    # not collide with an existing source or built-in. We deliberately
+    # do this BEFORE the URL fetch so a name conflict doesn't waste
+    # an upstream roundtrip.
+    if body.name is not None and body.name.strip():
+        try:
+            _validate_name(body.name)
+        except HTTPException as exc:
+            return SourceTestResult(
+                ok=False,
+                error_kind="invalid_url",  # closest match; user sees the message
+                error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+            )
+        # Reserved-name guard — same set ``create_source_endpoint`` enforces.
+        if body.name in registered_plugin_names():
+            return SourceTestResult(
+                ok=False,
+                error_kind="name_conflict",
+                error=f"name {body.name!r} is reserved for a built-in source",
+            )
+        # Live-row collision check.
+        existing = await session.execute(
+            select(Source).where(Source.name == body.name)
+        )
+        if existing.scalar_one_or_none() is not None:
+            return SourceTestResult(
+                ok=False,
+                error_kind="name_conflict",
+                error=f"a source named {body.name!r} already exists",
+            )
+
+    # URL validation. Same path Add uses; on failure, surface the
+    # validation error verbatim (e.g. "url must start with http(s)://")
+    # so the user knows what to fix.
+    if body.type == "reddit":
+        try:
+            url = _validate_reddit_url(body.url)
+        except HTTPException as exc:
+            return SourceTestResult(
+                ok=False,
+                error_kind="invalid_url",
+                error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+            )
+    else:
+        try:
+            _validate_url(body.url)
+        except HTTPException as exc:
+            return SourceTestResult(
+                ok=False,
+                error_kind="invalid_url",
+                error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+            )
+        url = body.url
+
+    # URL safety check — SSRF guard runs here too. ``check_url_safe``
+    # raises on private/loopback addresses. We catch and report as
+    # invalid_url so the user understands the URL was rejected, not
+    # the network.
+    try:
+        check_url_safe(url)
+    except ValueError as exc:
+        return SourceTestResult(
+            ok=False,
+            error_kind="invalid_url",
+            error=str(exc),
+        )
+
+    # Validate custom_headers the same way Add does, but only if
+    # provided. None or empty map → use defaults.
+    try:
+        headers = (
+            _validate_custom_headers(body.custom_headers)
+            if body.custom_headers is not None
+            else None
+        )
+    except HTTPException as exc:
+        return SourceTestResult(
+            ok=False,
+            error_kind="unknown",
+            error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+        )
+
+    # Fetch. We dispatch through the same plugin classes the
+    # scheduler uses, but instantiate a transient plugin here so we
+    # don't need a DB row. This means the test path uses exactly the
+    # same parse + normalize logic the live ingest uses — a
+    # "works on test" result is a true "Add will work" signal.
+    try:
+        if body.type == "rss":
+            from app.sources.rss import fetch_rss
+            items = await fetch_rss(url, headers=headers)
+        else:  # "reddit"
+            from app.sources.reddit import fetch_subreddit
+            items = await fetch_subreddit(url, headers=headers)
+    except httpx.TimeoutException as exc:
+        return SourceTestResult(
+            ok=False,
+            error_kind="timeout",
+            error=f"feed took too long to respond ({exc})",
+        )
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code if exc.response is not None else None
+        kind = (
+            "not_found" if code in (404, 410)
+            else "forbidden" if code in (401, 403)
+            else "unknown"
+        )
+        return SourceTestResult(
+            ok=False,
+            status_code=code,
+            error_kind=kind,
+            error=f"upstream returned HTTP {code}",
+        )
+    except httpx.HTTPError as exc:
+        # Connection refused, DNS failure, TLS, etc.
+        return SourceTestResult(
+            ok=False,
+            error_kind="network_error",
+            error=str(exc),
+        )
+    except asyncio.TimeoutError:
+        return SourceTestResult(
+            ok=False,
+            error_kind="timeout",
+            error="feed took too long to respond",
+        )
+    except Exception as exc:
+        # Parse errors, schema validation, anything else. The plugin
+        # contract is "return a list of dicts"; if it raises, the
+        # response wasn't a feed.
+        msg = str(exc)
+        kind = "parse_error" if "parse" in msg.lower() or "missing" in msg.lower() else "unknown"
+        return SourceTestResult(
+            ok=False,
+            error_kind=kind,
+            error=msg or exc.__class__.__name__,
+        )
+
+    # The plugin returned items — success. ``items`` is a list of
+    # raw dicts (no normalization at this layer; the Add flow would
+    # do that on the way into the DB). We just want a count and a
+    # few titles for the UI.
+    return SourceTestResult(
+        ok=True,
+        item_count=len(items),
+        sample_titles=[str(it.get("title", ""))[:120] for it in items[:3]],
+    )
+
+
+@router.post(
+    "/sources/test",
+    response_model=SourceTestResult,
+    dependencies=_write_deps,
+)
+async def test_source_endpoint(
+    body: SourceTestRequest,
+    session: AsyncSession = Depends(get_session),
+) -> SourceTestResult:
+    """Probe a URL with the same plugin Add would use, no DB write.
+
+    Returns ``ok=True`` with a small item count + sample titles on
+    success, or ``ok=False`` with an ``error_kind`` enum the
+    frontend maps to a friendly message. The full ``error`` string
+    is included so power users can see the underlying exception
+    without re-running with curl.
+    """
+    return await _test_source_impl(body, session)
 
 
 # --- Recommendations (Phase 5) -------------------------------------------

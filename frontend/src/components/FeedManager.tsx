@@ -14,13 +14,23 @@
 //     the source of truth on errors and returns 422 with field-level
 //     details.
 //
-// Errors flow up to App's red error banner via `onError` so the
+// Errors flow up to App's red banner via `onError` so the
 // visual treatment matches refresh failures — single, consistent
 // error surface across the dashboard.
+//
+// Add Custom has a "Test" button next to "Add feed" so the user
+// can probe the URL with the same plugin Add would use, no DB
+// write. The result is shown inline: green "Looks good (42
+// items)" with sample titles, or red "Site blocks automated
+// access" with the raw error. The Add flow always succeeds
+// against URLs that pass Test (modulo name conflicts that show
+// up at Add time). The Test step is non-destructive and
+// reversible — tapping it doesn't change the form state.
 
 import { useEffect, useMemo, useState } from 'react'
 import { api, type Source } from '../api'
 import { SourceIcon } from './SourceIcon'
+import { toast } from './Toast'
 
 type Props = {
   sources: Source[]
@@ -120,6 +130,39 @@ function isStale(source: Source): boolean {
   if (!source.last_fetch_at) return true
   const ageMs = Date.now() - new Date(source.last_fetch_at).getTime()
   return ageMs > source.refresh_interval_seconds * 2 * 1000
+}
+
+// Friendly message lookup for the Test step. Maps the backend's
+// ``error_kind`` enum (see ``SourceTestResult`` in api.ts and
+// ``SourceTestResult`` in backend/app/schemas.py) to user-facing
+// copy. The ``name`` slot in name_conflict / invalid_url messages
+// is interpolated by the caller via the raw ``error`` string when
+// it adds info beyond the kind.
+function friendlyTestError(
+  kind: string | null,
+  raw: string | null,
+): string {
+  switch (kind) {
+    case 'not_found':
+      return "Couldn't find a feed at that URL. Double-check the address."
+    case 'forbidden':
+      return 'This site blocks automated access. Try adding a User-Agent header (Advanced → Custom headers).'
+    case 'timeout':
+      return 'Feed took too long to respond. The site may be slow or down.'
+    case 'parse_error':
+      return "Got a response but it didn't look like a feed. Is this a valid RSS/Atom URL?"
+    case 'name_conflict':
+      return raw ? `Name conflict — ${raw}` : 'A source with this name already exists.'
+    case 'invalid_url':
+      return raw ? `Invalid URL — ${raw}` : "That URL isn't valid."
+    case 'unsupported_type':
+      return raw ? `Unsupported type — ${raw}` : "This feed type isn't supported yet."
+    case 'network_error':
+      return "Couldn't reach the URL. Check your network or the site's status."
+    case 'unknown':
+    default:
+      return raw ? `Something went wrong — ${raw}` : 'Something went wrong. Try again.'
+  }
 }
 
 function parseApiError(err: unknown, fallback: string): string {
@@ -740,6 +783,42 @@ function SourceRow({
             cancel
           </button>
         )}
+        {/* Fetch-now button. Power-user affordance: force an
+            immediate ingest without waiting for the next scheduler
+            tick. The backend's POST /api/ingest/{name} endpoint
+            returns the same ``IngestResult`` shape, so we surface
+            the row + inserted counts in a toast. We sit the button
+            to the LEFT of the delete button (which is ``ml-auto``)
+            so the destructive action stays at the far right. */}
+        {!builtIn && !confirmingDelete && (
+          <button
+            onClick={async () => {
+              setBusy(true)
+              try {
+                const r = await api.ingest(source.name)
+                if (r.error) {
+                  toast(`${source.name}: ${r.error}`, 'error')
+                } else {
+                  toast(
+                    `Fetched ${r.fetched} from ${r.source}` +
+                      (r.inserted > 0 ? ` (${r.inserted} new)` : ''),
+                    'info',
+                  )
+                }
+                await onRefresh()
+              } catch (err) {
+                onError(parseApiError(err, 'fetch failed'))
+              } finally {
+                setBusy(false)
+              }
+            }}
+            disabled={busy}
+            className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
+            aria-label={`fetch ${source.name} now`}
+          >
+            fetch
+          </button>
+        )}
         {!builtIn && !confirmingDelete && (
           <button
             onClick={() => setConfirmingDelete(true)}
@@ -936,48 +1015,87 @@ function AddCustomTab({
   // the field reaches ``POST /api/sources`` as ``type``.
   const [sourceType, setSourceType] = useState<'rss' | 'reddit'>('rss')
   const [submitting, setSubmitting] = useState(false)
+  // Test step. ``testing`` is true while the request is in flight;
+  // ``testResult`` holds the last result so the user can see
+  // "Looks good (42 items)" until they edit the form again. The
+  // result auto-clears on any form change so the user doesn't
+  // accidentally trust a stale result after editing the URL.
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<{
+    kind: 'ok' | 'err'
+    message: string
+    itemCount?: number
+    sampleTitles?: string[]
+  } | null>(null)
+  // Inline validation state mirrors the submit validator. ``urlError``
+  // and ``nameError`` show why Test / Add are disabled; they clear
+  // as soon as the form is fixed.
+  const [urlError, setUrlError] = useState<string | null>(null)
+  const [nameError, setNameError] = useState<string | null>(null)
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault()
+  // Shared validator. Returns ``null`` on success, an error
+  // string on failure. ``validateForm`` is called by both
+  // ``submit`` and ``test`` so the form's "Add" and "Test" buttons
+  // share the same input rules.
+  const validateForm = (): string | null => {
     const trimmedName = name.trim().toLowerCase()
     const trimmedUrl = url.trim()
-    if (!trimmedName) {
-      onError('name is required')
-      return
-    }
+    if (!trimmedName) return 'name is required'
     if (!/^[a-z0-9_]{1,120}$/.test(trimmedName)) {
-      onError('name must be lowercase letters, digits, or underscore (1-120 chars)')
-      return
+      return 'name must be lowercase letters, digits, or underscore (1-120 chars)'
     }
-    if (!trimmedUrl) {
-      onError('url is required')
-      return
-    }
+    if (!trimmedUrl) return 'url is required'
     if (sourceType === 'rss') {
-      // Only run the URL constructor when the subtype expects an
-      // http(s) URL. Reddit accepts ``r/python`` shorthand which
-      // isn't a parseable URL, so we let the backend
-      // ``normalize_subreddit`` handle it instead.
       try {
         new URL(trimmedUrl)
       } catch {
-        onError('url is not a valid URL')
-        return
+        return 'url is not a valid URL'
       }
     } else if (sourceType === 'reddit') {
-      // Light client-side sanity: reject obviously-empty / wrong-shape
-      // inputs so the user gets immediate feedback. Full validation
-      // (subreddit regex, lowercasing) happens backend-side; we just
-      // guard against the common "I typed `reddit.com/r/python`
-      // without a scheme" footgun by accepting it (the backend
-      // handles scheme-less inputs via ``normalize_subreddit``).
       if (trimmedUrl.length < 3) {
-        onError('enter a subreddit like r/python or a full reddit.com/r/python URL')
-        return
+        return 'enter a subreddit like r/python or a full reddit.com/r/python URL'
       }
+    }
+    return null
+  }
+
+  // Re-validate on every form change so the Add / Test buttons
+  // reflect whether the form is submittable. Errors are surfaced
+  // inline below the field (not via toast) — toasts are for
+  // action confirmations, not "this field is empty."
+  useEffect(() => {
+    setNameError(name.trim() ? null : 'name is required')
+    const trimmedUrl = url.trim()
+    if (!trimmedUrl) {
+      setUrlError('url is required')
+    } else if (sourceType === 'rss') {
+      try {
+        new URL(trimmedUrl)
+        setUrlError(null)
+      } catch {
+        setUrlError('url is not a valid URL')
+      }
+    } else if (sourceType === 'reddit') {
+      setUrlError(trimmedUrl.length < 3 ? 'enter a subreddit like r/python' : null)
+    } else {
+      setUrlError(null)
+    }
+    // Clear stale test result on any form change so the user
+    // doesn't trust the old "Looks good" status after editing.
+    setTestResult(null)
+  }, [name, url, sourceType])
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const err = validateForm()
+    if (err) {
+      onError(err)
+      return
     }
     setSubmitting(true)
     try {
+      const trimmedName = name.trim().toLowerCase()
+      const trimmedUrl = url.trim()
       await api.createSource({
         name: trimmedName,
         type: sourceType,
@@ -985,13 +1103,63 @@ function AddCustomTab({
         url: trimmedUrl,
         refresh_interval_seconds: refresh,
       })
+      // Success — celebrate with a toast. The toast stays for the
+      // standard 1.5s but the user can keep typing / closing the
+      // Settings overlay; the toast is purely confirmatory.
+      toast(`Feed Added: ${trimmedName}`, 'info')
       setName('')
       setUrl('')
+      setTestResult(null)
       await onAdded()
     } catch (err) {
       onError(parseApiError(err, 'failed to add source'))
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  // Test the URL via the new ``POST /api/sources/test`` endpoint.
+  // Reuses ``validateForm`` for client-side checks; the backend
+  // does the real fetch + parse. Result is shown inline; no DB
+  // write happens regardless of outcome.
+  const test = async () => {
+    const err = validateForm()
+    if (err) {
+      setTestResult({ kind: 'err', message: err })
+      return
+    }
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const result = await api.testSource({
+        name: name.trim().toLowerCase() || undefined,
+        type: sourceType,
+        category,
+        url: url.trim(),
+      })
+      if (result.ok) {
+        setTestResult({
+          kind: 'ok',
+          message: `Looks good — ${result.item_count ?? 0} items found`,
+          itemCount: result.item_count ?? 0,
+          sampleTitles: result.sample_titles,
+        })
+      } else {
+        setTestResult({
+          kind: 'err',
+          message: friendlyTestError(result.error_kind, result.error),
+        })
+      }
+    } catch (err) {
+      // The endpoint returned 4xx/5xx (auth, network) — the
+      // jsonFetch helper throws. Map to a friendly message.
+      const raw = (err as Error).message
+      setTestResult({
+        kind: 'err',
+        message: `Couldn't test the feed — ${raw}`,
+      })
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -1092,13 +1260,57 @@ function AddCustomTab({
           </select>
         </div>
       </div>
-      <button
-        type="submit"
-        disabled={submitting}
-        className="w-full min-h-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white"
-      >
-        {submitting ? 'adding…' : 'Add feed'}
-      </button>
+      {/* Test result inline. ``data-test-result`` is the
+          hook a future test could use to assert on the UI; not
+          load-bearing for production. The block is conditionally
+          rendered — no visual change when there's no result. The
+          44px min-height keeps the layout from jumping when a
+          result appears (3 lines of sample titles + a single
+          status line still fits in 44px at body text size). */}
+      {testResult && (
+        <div
+          data-test-result={testResult.kind}
+          className={`rounded-ios p-3 text-ios-body ${
+            testResult.kind === 'ok'
+              ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-200'
+              : 'bg-red-500/15 border border-red-500/40 text-red-200'
+          }`}
+        >
+          <div className="font-medium">
+            {testResult.kind === 'ok' ? '✓ ' : '✗ '}
+            {testResult.message}
+          </div>
+          {testResult.kind === 'ok' && testResult.sampleTitles && testResult.sampleTitles.length > 0 && (
+            <ul className="mt-2 space-y-0.5 text-ios-caption text-emerald-200/80">
+              {testResult.sampleTitles.map((t, i) => (
+                <li key={i} className="truncate">· {t}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      {/* Two-button row: Test (left) + Add (right). Test is the
+          ``secondary`` visual — outlined instead of filled — so
+          the primary "Add" still reads as the default action.
+          Both disabled while a request is in flight; the disabled
+          state keeps the user from firing parallel requests. */}
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={() => void test()}
+          disabled={testing || submitting || !!(nameError || urlError)}
+          className="flex-1 min-h-[44px] rounded-ios border border-accent text-accent active:opacity-60 disabled:opacity-40"
+        >
+          {testing ? 'Testing…' : 'Test'}
+        </button>
+        <button
+          type="submit"
+          disabled={submitting || testing || !!(nameError || urlError)}
+          className="flex-1 min-h-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white"
+        >
+          {submitting ? 'adding…' : 'Add feed'}
+        </button>
+      </div>
     </form>
   )
 }

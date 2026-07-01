@@ -28,6 +28,7 @@ import { SearchResults } from './components/SearchResults'
 import { ShortcutsSheet } from './components/ShortcutsSheet'
 import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
+import { Settings, type SettingsTab } from './components/Settings'
 import { recordImmediate } from './lib/interactions'
 import { STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
 
@@ -148,6 +149,50 @@ export function App() {
   const [sources, setSources] = useState<Source[]>([])
   const [health, setHealth] = useState<Health | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
+  // Settings overlay state. Driven by the URL so the back button
+  // and refresh both behave correctly. ``?view=settings`` opens it;
+  // ``?view=settings&tab=feeds|llm|notifications|reset`` picks the
+  // tab. ``null`` = closed.
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('feeds')
+
+  // Read the URL on every render. We listen for ``popstate`` and
+  // our own custom events (the Settings tab buttons fire a popstate
+  // after ``replaceState``) so the active tab stays in sync.
+  useEffect(() => {
+    const sync = () => {
+      const u = new URL(window.location.href)
+      const view = u.searchParams.get('view')
+      if (view === 'settings') {
+        setSettingsOpen(true)
+        const t = u.searchParams.get('tab')
+        if (t === 'llm' || t === 'notifications' || t === 'reset' || t === 'feeds') {
+          setSettingsTab(t)
+        }
+      } else {
+        setSettingsOpen(false)
+      }
+    }
+    sync()
+    window.addEventListener('popstate', sync)
+    return () => window.removeEventListener('popstate', sync)
+  }, [])
+
+  const openSettings = (tab: SettingsTab = 'feeds') => {
+    const u = new URL(window.location.href)
+    u.searchParams.set('view', 'settings')
+    u.searchParams.set('tab', tab)
+    window.history.pushState(null, '', u.toString())
+    setSettingsTab(tab)
+    setSettingsOpen(true)
+  }
+  const closeSettings = () => {
+    const u = new URL(window.location.href)
+    u.searchParams.delete('view')
+    u.searchParams.delete('tab')
+    window.history.pushState(null, '', u.toString())
+    setSettingsOpen(false)
+  }
   const [mobileCol, setMobileCol] = useState<number>(loadMobileCol)
   const [error, setError] = useState<string | null>(null)
   const [user, setUser] = useState<CurrentUser | null>(null)
@@ -255,6 +300,15 @@ export function App() {
   )
   // Refresh in-flight state — drives the Refresh button's disabled
   // state so a second tap doesn't fire a parallel fetch.
+  const [, setTimeTick] = useState(0)
+  // Re-render the dashboard every 30s so relative timestamps
+  // ("5m ago") stay fresh without manual refresh. Lightweight:
+  // just flips a state value, the rest of the tree re-renders via
+  // existing memoization.
+  useEffect(() => {
+    const id = window.setInterval(() => setTimeTick((n) => n + 1), 30_000)
+    return () => window.clearInterval(id)
+  }, [])
   const [refreshing, setRefreshing] = useState(false)
   // Per-column last-viewed timestamps.
   const [lastViewed, setLastViewed] = useState<Record<string, string>>(loadLastViewed)
@@ -749,14 +803,24 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    // Trim each column's read-set on write so a power user with
+    // hundreds of reads across 20 columns doesn't silently grow
+    // the JSON past the 5MB localStorage quota. The mirror in
+    // ``markEntryRead`` does the same trim on the add path; the
+    // write-path trim handles the case where ``readEntries`` was
+    // restored from storage already over the cap (old builds
+    // pre-trim, or a manual edit).
+    const trimmed: Record<string, number[]> = {}
+    for (const [k, v] of Object.entries(readEntries)) {
+      if (Array.isArray(v) && v.length > 0) {
+        trimmed[k] = v.slice(-MAX_PER_COLUMN)
+      }
+    }
     // Surface quota / private-mode failures the first time they
-    // happen so the user knows their read marks won't persist. The
-    // bug sweep found silent quota rejection was the trigger for
-    // data loss across months of use — every other localStorage
-    // write below follows the same pattern.
+    // happen so the user knows their read marks won't persist.
     const ok = safeSetItem(
       STORAGE_KEYS.readEntries,
-      JSON.stringify(readEntries),
+      JSON.stringify(trimmed),
     )
     if (!ok && !quotaWarnedRef.current) {
       quotaWarnedRef.current = true
@@ -978,8 +1042,16 @@ export function App() {
   }
 
   const markColumnRead = (columnName: string) => {
-    const col = columns.find((c) => c.name === columnName)
+    // Atomic: update both the user-visible lastViewed and the
+    // in-memory seen-set in the same render cycle. Doing them in
+    // two separate setState calls (as the old code did) could let
+    // a re-render between them see the new seen-set but the old
+    // lastViewed, briefly flashing the "N new" chip. The
+    // seenEntryIdsRef mutation isn't reactive so we still update
+    // the ref directly, but the lastViewed setState now batches
+    // correctly with React 18's automatic batching.
     setLastViewed((prev) => ({ ...prev, [columnName]: new Date().toISOString() }))
+    const col = columns.find((c) => c.name === columnName)
     if (col && seenEntryIdsRef.current != null) {
       const merged = new Set(seenEntryIdsRef.current)
       for (const e of col.entries) merged.add(e.id)
@@ -1238,6 +1310,34 @@ export function App() {
             >
               <RefreshIcon className={`w-5 h-5 ${refreshing ? 'animate-spin' : ''}`} />
             </button>
+            {/* Settings gear. Opens the Settings overlay (a
+                full-page sheet with tabs for feeds / LLM /
+                notifications / reset). Lives to the LEFT of the
+                hamburger so the hamburger keeps its right-edge
+                position; the two together read as "more menu
+                options → main menu." */}
+            <button
+              type="button"
+              onClick={() => openSettings('feeds')}
+              aria-label="open settings"
+              data-settings-gear
+              className="w-11 h-11 flex items-center justify-center rounded-full text-label-primary active:bg-bg-elevated"
+            >
+              <svg
+                width="22"
+                height="22"
+                viewBox="0 0 22 22"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.5}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="11" cy="11" r="3" />
+                <path d="M11 2v2M11 18v2M2 11h2M18 11h2M4.93 4.93l1.41 1.41M15.66 15.66l1.41 1.41M4.93 17.07l1.41-1.41M15.66 6.34l1.41-1.41" />
+              </svg>
+            </button>
             {/* Hamburger lives next to the search/refresh affordances
                 — each is a 44×44 tappable target that matches iOS
                 nav-bar icon-button conventions. */}
@@ -1306,8 +1406,15 @@ export function App() {
       )}
 
       {error && (
-        <div className="px-4 py-2 bg-red-500/15 border-b border-red-500/40 text-ios-caption text-red-200">
-          {error}
+        <div className="sticky top-0 z-15 px-4 py-2 bg-red-500/15 border-b border-red-500/40 text-ios-caption text-red-200 flex items-center justify-between gap-2">
+          <span className="break-words">{error}</span>
+          <button
+            onClick={() => setError(null)}
+            className="shrink-0 text-red-200/80 active:text-red-200"
+            aria-label="dismiss error"
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -1460,6 +1567,21 @@ export function App() {
         triggerGenerate={triggerBriefGenerate}
         generating={generatingBrief}
         onError={setError}
+        onSourceRenamed={onSourceRenamed}
+        onResetLocalState={resetLocalState}
+        onOpenSettings={() => openSettings('feeds')}
+      />
+      <Settings
+        open={settingsOpen}
+        tab={settingsTab}
+        sources={sources}
+        onRefreshSources={async () => { void refresh() }}
+        onError={setError}
+        onClose={closeSettings}
+        briefTone={briefTone}
+        onBriefToneChange={setBriefTone}
+        triggerGenerate={triggerBriefGenerate}
+        generating={generatingBrief}
         onSourceRenamed={onSourceRenamed}
         onResetLocalState={resetLocalState}
       />

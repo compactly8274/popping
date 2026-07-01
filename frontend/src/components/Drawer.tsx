@@ -1,34 +1,31 @@
 // iOS-style full-screen grouped-list Drawer.
 //
-// On mobile (<md) the Drawer is a bottom sheet that slides up to fill
-// the viewport, mimicking the iOS Settings app navigation. On
-// desktop (md+) it slides in from the left as a 360px sidebar, like
-// Apple Mail's column-show/hide popover or the menu pane in Music on
-// macOS. The dual treatment comes from one component: the same
-// ``<nav>`` renders inside different sized containers, with a
-// different backdrop opacity and slide-in direction per breakpoint.
+// On every viewport the Drawer is a right-side panel that slides in
+// from the right edge: on mobile (<md) it fills the viewport from
+// the right at near-full height (88vh), on desktop (md+) it's a
+// 360px right sidebar. Anchoring to the right matches the position
+// of the hamburger button in the top bar so tapping the hamburger
+// makes the panel grow from beneath the tap target — no eye-jump
+// from one side of the screen to the other.
 //
-// The body is five iOS-style grouped sections:
+// Swipe-to-dismiss on mobile: touch begins anywhere inside the
+// drawer, drags leftward, releases past 100px → drawer closes.
+// Mirrors the iOS right-edge gesture (Mail, Settings, Music).
 //
-//   1. NOTIFICATIONS          — backend status + retry
-//   2. LLM                    — provider/model + tone + Generate now
-//   3. CATEGORIES             — jump-to-column buttons
-//   4. FEEDS                  — dynamic-source CRUD (FeedManager)
-//   5. SOURCES                — multi-select filter (tap-to-filter)
+// The body is three iOS-style grouped sections:
+//
+//   1. QUICK SETTINGS         — link to the full Settings overlay
+//   2. JUMP TO COLUMN         — by-category navigation
+//   3. SOURCES                — multi-select filter (tap-to-filter)
 //
 // Each section has a small uppercase ``UPPERCASE LABEL`` header in
 // ``text-ios-caption text-label-tertiary`` (the iOS "section header"
 // treatment). Rows are 44px tall, the iOS HIG minimum tap target.
 //
-// The Drawer surfaces three categories of "failed to load" state:
-//   - sources list (rendered with a retry button)
-//   - notifications status chip (renders red, tap to retry)
-//   - LLM status chip (renders red, tap to retry)
-//
-// The old code silently coerced all fetch failures into
-// "{ configured: false }" which made a 401 look the same as a
-// missing env var. Now each failure shows the actual error message
-// and offers to retry.
+// Feeds / LLM / Notifications / Reset are no longer in the Drawer —
+// they moved to the Settings overlay (see ``Settings.tsx``). The
+// Drawer stays slim so it's a quick filter panel, not a settings
+// pile. Tap "All settings…" to open the full Settings.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -39,7 +36,6 @@ import {
   type SettingsOut,
   type Source,
 } from '../api'
-import { FeedManager } from './FeedManager'
 import { SourceIcon } from './SourceIcon'
 
 type Props = {
@@ -86,8 +82,13 @@ type Props = {
   onSourceRenamed?: (oldName: string, newName: string) => void
   // Wipe namespaced localStorage keys + reload. App owns the
   // actual reset so the source of truth (App's ``useState``
-  // mirrors) resets in lockstep.
-  onResetLocalState: () => void
+  // mirrors) resets in lockstep. No longer used by the Drawer
+  // itself (the action moved to Settings) but kept in the
+  // signature so legacy callers don't fail to compile.
+  onResetLocalState?: () => void
+  // Open the full Settings overlay. Wired by App. The Drawer
+  // uses this in its "All settings…" quick-action row.
+  onOpenSettings?: () => void
 }
 
 // Whitelist mirrors backend ``_VALID_PROVIDERS``. Includes a sentinel
@@ -122,15 +123,13 @@ export function Drawer({
   briefTone,
   onBriefToneChange,
   triggerGenerate,
-  generating,
   onError,
   onSourceRenamed,
-  // Reset hook. App wipes the namespaced localStorage keys and
-  // reloads the page so every component picks up the cleared state.
-  // Wired through a prop rather than reaching into storage
-  // directly so the Drawer doesn't grow a dependency on App's
-  // state shape.
-  onResetLocalState,
+  // Reset hook. No longer used inside the Drawer (the action
+  // moved to Settings) but kept in the destructuring so the
+  // function signature stays aligned with the Props type.
+  onResetLocalState: _onResetLocalState,
+  onOpenSettings,
 }: Props) {
   const [sources, setSources] = useState<Source[]>([])
   const [sourcesError, setSourcesError] = useState<string | null>(null)
@@ -138,10 +137,9 @@ export function Drawer({
   const [notifError, setNotifError] = useState<string | null>(null)
   const [llm, setLlm] = useState<LLMStatus | null>(null)
   const [llmError, setLlmError] = useState<string | null>(null)
-  // Brief-generation error string, surfaced in the Drawer chip.
-  // ``generating`` comes from props (lifted from App) so the chip
-  // stays in sync with the header / BriefCard surface.
-  const [genError, setGenError] = useState<string | null>(null)
+  // The brief-generation error and notifications / LLM state have
+  // been moved to the Settings overlay. The Drawer is now slim —
+  // Sources filter, Jump to column, and a link to Settings.
 
   // Each fetch function is its own retry-able handler. Storing them
   // as ``useCallback`` so the chip can call them directly on tap.
@@ -227,42 +225,41 @@ export function Drawer({
     return () => window.removeEventListener('keydown', onKey, true)
   }, [open, onClose])
 
-  // Swipe-down dismiss on mobile. Mirrors the iOS sheet gesture:
-  // touch begins in the drawer's top ~60px (the grabber zone),
-  // drags downward, and releases past a 100px threshold → drawer
-  // closes. Set up via addEventListener (not JSX onTouch*) so we
-  // can pass ``{ passive: false }`` and ``preventDefault`` — JSX
-  // touch handlers default to passive on touchmove for scroll
-  // performance. Without ``preventDefault`` the page scrolls
-  // underneath the drawer mid-gesture, which feels broken.
-  const SWIPE_ARM_HEIGHT_PX = 60
+  // Swipe-left dismiss on mobile. Mirrors the iOS right-edge
+  // gesture (Mail, Settings, Music): touch begins anywhere inside
+  // the drawer's body, drags leftward, releases past a 100px
+  // threshold → drawer closes. Set up via addEventListener (not
+  // JSX onTouch*) so we can pass ``{ passive: false }`` and
+  // ``preventDefault`` — JSX touch handlers default to passive on
+  // touchmove for scroll performance. Without ``preventDefault`` the
+  // page scrolls underneath the drawer mid-gesture, which feels
+  // broken.
+  //
+  // ``SWIPE_DISMISS_PX`` is the drag distance (px) past which a
+  // release fires the close. ``SWIPE_DIRECTION`` is the sign of
+  // the delta we care about — negative for leftward swipes. The
+  // reverse direction (rightward) is intentionally not handled
+  // because the drawer is anchored to the right edge; pulling it
+  // back toward the right doesn't make semantic sense.
   const SWIPE_DISMISS_PX = 100
   useEffect(() => {
     if (!open) return
     const drawer = drawerRef.current
     if (!drawer) return
 
-    let startY = 0
+    let startX = 0
     let armed = false
 
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length !== 1) return
-      const touch = e.touches[0]
-      const rect = drawer.getBoundingClientRect()
-      // Arm only if the touch starts within the grabber zone at
-      // the top of the drawer. Touches that begin lower are
-      // probably scroll gestures on the drawer's body content —
-      // leave them alone.
-      const touchYInDrawer = touch.clientY - rect.top
-      if (touchYInDrawer < 0 || touchYInDrawer > SWIPE_ARM_HEIGHT_PX) return
-      startY = touch.clientY
+      startX = e.touches[0].clientX
       armed = true
     }
     const onTouchMove = (e: TouchEvent) => {
       if (!armed) return
-      const dy = e.touches[0].clientY - startY
-      if (dy > 10) {
-        // First non-trivial downward motion — block the underlying
+      const dx = e.touches[0].clientX - startX
+      if (dx < -10) {
+        // First non-trivial leftward motion — block the underlying
         // page scroll from kicking in.
         e.preventDefault()
       }
@@ -273,8 +270,8 @@ export function Drawer({
       // ``changedTouches`` (not ``touches``) because the gesture
       // ended and the finger is no longer on screen.
       const touch = e.changedTouches[0]
-      const dy = touch.clientY - startY
-      if (dy > SWIPE_DISMISS_PX) onClose()
+      const dx = touch.clientX - startX
+      if (dx < -SWIPE_DISMISS_PX) onClose()
     }
     const onTouchCancel = () => {
       armed = false
@@ -377,42 +374,43 @@ export function Drawer({
         aria-modal="true"
         aria-label="menu"
         className={`fixed z-40 bg-bg-app shadow-2xl flex flex-col
-                    inset-x-0 bottom-0 top-auto h-[90vh] rounded-t-ios-lg
-                    md:inset-y-0 md:left-0 md:top-0 md:right-auto md:h-full md:w-[360px] md:rounded-none
+                    inset-y-0 right-0 top-0 left-auto h-full w-[88vw] max-w-[420px] rounded-l-ios-lg
+                    md:w-[360px] md:rounded-none
                     transition-transform duration-300 ease-out
-                    md:translate-x-0
                     ${open
-                      ? 'translate-y-0 md:translate-x-0'
-                      : 'translate-y-full md:-translate-x-full'
+                      ? 'translate-x-0'
+                      : 'translate-x-full'
                     }`}
       >
-        {/* Grabber on mobile — the small horizontal line at the top
-            of an iOS sheet. ``md:hidden`` because desktop drawers
-            don't show a grabber. The element is not interactive; it
-            just signals "this is a sheet you can dismiss by swiping
-            down" (a future iteration could add the swipe-down
-            dismiss gesture — for now we rely on tapping the
-            backdrop). */}
+        {/* Vertical grabber on mobile — the small vertical line at
+            the top-LEFT of the drawer, mirroring the iOS right-edge
+            sheet's affordance. ``md:hidden`` because desktop drawers
+            don't need a grabber (they have a visible edge against
+            the dimmed backdrop). The element is not interactive; it
+            just signals "this is a panel you can dismiss by
+            swiping left." */}
         <div
           aria-hidden="true"
-          className="md:hidden mx-auto mt-2 mb-1 h-1 w-10 rounded-full bg-label-tertiary"
+          className="md:hidden absolute top-3 left-2 h-10 w-1 rounded-full bg-label-tertiary"
         />
-        {/* Header row — large title "Settings" on mobile (Apple
-            convention), or a smaller "Menu" on desktop where the
-            large-title header is already in App. Trailing Done button
-            mirrors iOS sheet dismissal. The hairlines at the bottom
-            is the standard iOS grouped-list section break. */}
+        {/* Header row — large title "Menu" on the right (matches
+            the right-anchored panel), Done button on the left. The
+            hairlines at the bottom is the standard iOS grouped-list
+            section break. We use ``flex-row-reverse``-equivalent
+            ordering by simply swapping the children: Done first,
+            then the title. ``pl-10 md:pl-4`` on the Done button
+            leaves room for the vertical grabber on mobile. */}
         <div className="flex items-center justify-between px-4 pt-3 pb-3 md:pt-5 md:pb-4 border-b border-hairline shrink-0">
-          <h2 className="text-2xl md:text-ios-large-title font-bold text-label-primary tracking-tight">
-            Menu
-          </h2>
           <button
             onClick={onClose}
             aria-label="close menu"
-            className="min-h-[32px] min-w-[32px] flex items-center justify-center rounded-ios text-accent active:bg-bg-elevated"
+            className="min-h-[32px] min-w-[32px] flex items-center justify-center rounded-ios text-accent active:bg-bg-elevated pl-10 md:pl-0"
           >
             <span className="text-ios-body font-normal">Done</span>
           </button>
+          <h2 className="text-2xl md:text-ios-large-title font-bold text-label-primary tracking-tight">
+            Menu
+          </h2>
         </div>
 
         {/* Body. ``min-h-0`` lets the nav actually shrink below its
@@ -423,31 +421,24 @@ export function Drawer({
             right margins. Background ``bg-bg-app`` keeps the section
             gaps from showing the sheet's underlying surface. */}
         <nav className="flex-1 min-h-0 overflow-y-auto bg-bg-app pb-8">
-          <GroupedSection label="Notifications">
-            {notifError ? (
-              <GroupedRow
-                onClick={refetchNotif}
-                title="Couldn't check status"
-                subtitle={`tap to retry — ${notifError}`}
-                tone="destructive"
-              />
-            ) : notif === null ? (
-              <GroupedRow title="Notifications" subtitle="checking…" />
-            ) : notif.configured ? (
-              <GroupedRow
-                title="Configured"
-                subtitle={`${notif.backend} · ${notif.scheme}`}
-                tone="success"
-              />
-            ) : (
-              <GroupedRow
-                title="Not configured"
-                subtitle="set APPRISE_URL or PUSHOVER_* in .env"
-                tone="warning"
-              />
-            )}
+          <GroupedSection label="Quick settings">
+            <GroupedRow
+              onClick={() => {
+                // The Settings overlay is owned by App. The Drawer
+                // tells App to open it via the callback the parent
+                // wires up; we close the Drawer so the user lands
+                // on the Settings overlay immediately. This
+                // pattern matches the column-jump row above.
+                onOpenSettings?.()
+                onClose()
+              }}
+              title="All settings…"
+              subtitle="feeds · LLM · notifications · reset"
+              showChevron
+            />
           </GroupedSection>
 
+          {false && (
           <GroupedSection label="LLM">
             <LLMSection
               llm={llm}
@@ -502,9 +493,9 @@ export function Drawer({
                 <p className="mt-2 text-ios-caption text-red-400 break-words">
                   {genError}
                 </p>
-              )}
-            </div>
+            )}
           </GroupedSection>
+          )}
 
           {categories.length > 0 && (
             <GroupedSection label="Jump to column">
@@ -523,15 +514,6 @@ export function Drawer({
               ))}
             </GroupedSection>
           )}
-
-          <GroupedSection label="Feeds">
-            <FeedManager
-              sources={sources}
-              onRefresh={refetchSources}
-              onError={onError}
-              onSourceRenamed={onSourceRenamed}
-            />
-          </GroupedSection>
 
           <GroupedSection
             label="Sources"
@@ -607,31 +589,6 @@ export function Drawer({
             )}
           </GroupedSection>
 
-          {/* Danger zone — local state reset. Wipes all client-side
-              state (lastViewed, columnPrefs, readEntries, mobileCol,
-              briefCollapsed) so the dashboard renders as a fresh
-              install. Source-side data (entries, sources, briefs)
-              lives in the backend and is untouched. The button is
-              red and labelled "Clear local state" so the cost is
-              obvious. ``window.confirm`` keeps this one-click
-              cheap; an inline modal would be nicer UX but the
-              consequence is reversible (a refresh re-fetches
-              everything) so the simpler path is fine. */}
-          <GroupedSection label="Reset">
-            <button
-              onClick={() => {
-                if (typeof window === 'undefined') return
-                const ok = window.confirm(
-                  'Clear all local state (read marks, column prefs, last-viewed timestamps)?',
-                )
-                if (!ok) return
-                onResetLocalState()
-              }}
-              className="w-full text-left px-4 min-h-[44px] flex items-center gap-3 active:bg-bg-elevated"
-            >
-              <span className="text-ios-body text-red-400">Clear local state</span>
-            </button>
-          </GroupedSection>
         </nav>
       </aside>
     </>
@@ -1187,3 +1144,5 @@ function LLMSection({
     </>
   )
 }
+
+

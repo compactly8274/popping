@@ -97,6 +97,65 @@ class SourceUpdate(BaseModel):
     custom_headers: Optional[dict] = None
 
 
+class SourceTestRequest(BaseModel):
+    """Body for ``POST /api/sources/test``. Same shape as
+    ``SourceCreate`` but ``name`` is optional and the endpoint
+    never persists — it just dispatches the fetch to the same
+    plugin the live source would use and returns the result.
+
+    The frontend uses this for the Add-Custom "Test" button: the
+    user types a URL, hits Test, and gets a friendly
+    "Looks good (42 items)" or "Site blocks automated access"
+    before committing the row. Without this the user would have
+    to add, refresh, look at the column, and delete on failure —
+    3 clicks and 30+ seconds for the common case.
+    """
+    name: Optional[str] = None
+    type: str = "rss"
+    category: str = "news"
+    url: str
+    custom_headers: Optional[dict] = None
+
+
+class SourceTestResult(BaseModel):
+    """Body of ``POST /api/sources/test``.
+
+    ``ok`` is the only field the UI branches on. ``status_code``
+    is the upstream HTTP status (or None for parse / network
+    failures). ``item_count`` is the number of items the plugin
+    successfully extracted. ``sample_titles`` is a small list of
+    the first 3 titles — useful so the user can tell the
+    response was the right feed (e.g. a Hacker News mirror
+    looks identical to the real one in the URL field).
+
+    ``error_kind`` is a short enum string the frontend uses to
+    pick a friendly message. ``error`` is the underlying
+    technical message (httpx exception, parser complaint, etc.)
+    — included in the response so power users can debug without
+    re-running the test against curl.
+
+    ``error_kind`` enum:
+      - ``not_found``        upstream returned 404 / 410
+      - ``forbidden``        upstream returned 401 / 403
+      - ``timeout``          request took longer than the budget
+      - ``parse_error``      response was received but didn't look
+                             like a feed
+      - ``name_conflict``    ``name`` was provided and collides
+                             with an existing source or built-in
+      - ``invalid_url``      URL failed the http/https / subreddit
+                             validator
+      - ``unsupported_type`` ``type`` is not in the accepted set
+      - ``network_error``    connection refused, DNS, TLS, etc.
+      - ``unknown``          catch-all
+    """
+    ok: bool
+    status_code: Optional[int] = None
+    item_count: Optional[int] = None
+    sample_titles: list[str] = []
+    error_kind: Optional[str] = None
+    error: Optional[str] = None
+
+
 class FeedRecommendation(BaseModel):
     """One row of ``GET /api/feed-recommendations``. The frontend
     renders the ``name`` + ``blurb`` and shows the ``url`` only on
