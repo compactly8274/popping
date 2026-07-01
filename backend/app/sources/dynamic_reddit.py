@@ -154,14 +154,21 @@ class DynamicRedditPlugin(SourcePlugin):
                     continue
             # ``created_utc`` is a unix-seconds float. Reddit's API
             # uses float (sub-second precision), so we round-to-int
-            # before fromtimestamp to keep datetime pure.
+            # before fromtimestamp. The downstream ``recency.score``
+            # scorer expects a real ``datetime`` with ``tzinfo`` set,
+            # not an ISO string — every other source plugin
+            # (rss.py, hn.py, github_releases.py, nvd.py) returns
+            # a datetime here. The previous .isoformat() coercion
+            # was a latent bug that only surfaced when the
+            # reddit_client started returning real data again
+            # (the .json path was 403-ing so the bug never ran).
             created_raw = listing.get("created_utc")
             try:
                 created_ts = int(float(created_raw)) if created_raw is not None else None
             except (TypeError, ValueError):
                 created_ts = None
             published_at = (
-                dt.datetime.fromtimestamp(created_ts, tz=dt.timezone.utc).isoformat()
+                dt.datetime.fromtimestamp(created_ts, tz=dt.timezone.utc)
                 if created_ts
                 else None
             )
