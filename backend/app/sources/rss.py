@@ -75,6 +75,57 @@ _IMG_SRC_RE = re.compile(
 )
 
 
+def _entry_url(entry: Any) -> str:
+    """Best-effort article URL for a feedparser entry.
+
+    Standard ``entry.link`` is the shorthand feedparser sets when
+    an item has a single ``<link>`` element. When an item has
+    multiple ``<link>`` children (Sportsnet ships 2-3 per item:
+    the article URL, a media:enclosure for the thumbnail, and a
+    ``type="app-deep-link-field"`` URL for the iOS app), the
+    shorthand is empty and the real URL is in ``entry.links[]``.
+
+    Selection priority:
+      1. ``entry.link`` if non-empty (the common case — single
+         ``<link>`` feeds).
+      2. ``entry.links[i].href`` where the link is
+         ``rel="alternate"`` and ``type="text/html"`` (the
+         canonical web URL per the Atom spec, which Sportsnet
+         honours).
+      3. Any link with ``rel="alternate"`` regardless of type
+         (catches the edge case of a feed that uses a
+         non-text/html alternate).
+      4. First non-empty ``href`` in ``entry.links`` (last
+         resort — picks something, even if it's the wrong thing,
+         over returning '' which silently kills the row).
+
+    The 4-level fallback matters: a feed that ships ONLY a
+    single ``<link rel="alternate" type="application/pdf">`` (rare
+    but real) lands in step 3, while a feed with three unrelated
+    ``<link>`` children lands in step 4. Both should produce a
+    usable URL rather than an empty string.
+    """
+    direct = entry.get("link") or ""
+    if direct:
+        return direct
+    links = entry.get("links") or []
+    # Step 2: rel="alternate" + type="text/html"
+    for L in links:
+        if (L.get("rel") == "alternate" and
+                (L.get("type") or "").startswith("text/html") and
+                L.get("href")):
+            return L["href"]
+    # Step 3: any rel="alternate"
+    for L in links:
+        if L.get("rel") == "alternate" and L.get("href"):
+            return L["href"]
+    # Step 4: first non-empty href
+    for L in links:
+        if L.get("href"):
+            return L["href"]
+    return ""
+
+
 def _pick_image_url(entry: Any) -> str | None:
     """Best thumbnail URL from a feedparser entry, or None.
 
@@ -125,7 +176,7 @@ def _pick_image_url(entry: Any) -> str | None:
     if summary:
         m = _IMG_SRC_RE.search(summary)
         if m:
-            entry_url = entry.get("link") or ""
+            entry_url = _entry_url(entry)
             return urljoin(entry_url, m.group(1)) if entry_url else m.group(1)
     return None
 
@@ -223,7 +274,7 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
                 items.append(
                     {
                         "title": entry.get("title", ""),
-                        "url": entry.get("link", ""),
+                        "url": _entry_url(entry),
                         "published_at": _parse_published(entry),
                         "summary": entry.get("summary", ""),
                         # Top-level so the ingest pipeline can pop it out of
