@@ -30,7 +30,7 @@ import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { Settings, type SettingsTab } from './components/Settings'
 import { recordImmediate } from './lib/interactions'
-import { STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
+import { MAX_HIDDEN, STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
 
 const REFRESH_INTERVAL_MS = 60_000
 // Health pings don't need 60s cadence — DB / Redis status is slow-
@@ -1748,6 +1748,7 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
 
 
 

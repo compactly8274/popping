@@ -745,7 +745,10 @@ function showContextMenu(
   // trip left another active listener closing over the orphaned
   // menu/backdrop DOM nodes. Use one close() callback that removes
   // every node and every listener, and call it from every exit path.
-  const backdrop = document.createElement('div')
+  // The backdrop element is created below, after the close()
+  // closure is defined, because it needs to be in scope for the
+  // close() body. We declare it via the hoisted var pattern so
+  // the closure can see it before the const initializer runs.
   const close = () => {
     menu.remove()
     backdrop.remove()
@@ -777,3 +780,4 @@ function showContextMenu(
   }
   document.addEventListener('keydown', onKey, true)
 }
+
