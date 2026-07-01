@@ -32,10 +32,25 @@ export const STORAGE_KEYS = {
   // reloads without persisting across the source's natural refresh
   // window. JSON map ``{ [colName: string]: number[] }``.
   readEntries: `${NAMESPACE}.${SCHEMA}.col.readEntries`,
+  // Per-user "hide this entry" set. The user dismisses an entry
+  // via the card's context menu (right-click / long-press). The
+  // ids are flattened into a single number[] (rather than the
+  // per-column shape ``readEntries`` uses) because "hide" is
+  // entry-global: once an entry is hidden it shouldn't surface
+  // in any column or in the For You row, regardless of which
+  // column currently shows it. JSON array of numbers, trimmed
+  // to ``MAX_HIDDEN`` to prevent unbounded growth.
+  hiddenEntries: `${NAMESPACE}.${SCHEMA}.hidden.entries`,
   // BriefCard collapse preference. Boolean stored as '0' / '1' to
   // match the rest of the codebase's storage convention.
   briefCollapsed: `${NAMESPACE}.${SCHEMA}.brief.collapsed`,
 } as const
+
+// Same trim cap as ``readEntries``: keep the most-recent decisions
+// (the oldest hides are also the ones the user is least likely to
+// care about remembering). 1000 entries × ~6 bytes per id = ~6 KB,
+// comfortably under the 5 MB localStorage quota.
+export const MAX_HIDDEN = 1000
 
 export function safeGetItem(key: string): string | null {
   try {

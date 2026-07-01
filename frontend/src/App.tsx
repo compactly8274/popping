@@ -133,6 +133,20 @@ function loadReadEntries(): Record<string, number[]> {
   }
 }
 
+function loadHiddenEntries(): number[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = safeGetItem(STORAGE_KEYS.hiddenEntries)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    // Filter to numbers; tolerate a stale shape that stored strings.
+    return parsed.filter((x): x is number => typeof x === 'number').slice(-MAX_HIDDEN)
+  } catch {
+    return []
+  }
+}
+
 // Per-column upper bound on manually-marked read entries. Chosen
 // to fit comfortably in localStorage across all columns combined:
 // 8 active columns × 200 entries × ~12 bytes JSON each ≈ 19 KB,
@@ -317,6 +331,14 @@ export function App() {
   // ``Set`` in the merged view (below) but stored as an array so
   // JSON.stringify/parse keeps element order stable.
   const [readEntries, setReadEntries] = useState<Record<string, number[]>>(loadReadEntries)
+  // Per-user "hidden" entry ids. The user dismisses an entry via
+  // the card context menu (right-click / long-press) — ``mark
+  // read`` is the lighter action ("I read this"), ``hide`` is the
+  // heavier one ("don't show this to me again, ever"). ``hide``
+  // is entry-global (not per-column like ``readEntries``) because
+  // the user's "I never want to see this" intent applies across
+  // every column view, not just the one where the card appeared.
+  const [hiddenEntries, setHiddenEntries] = useState<number[]>(loadHiddenEntries)
   // Per-column sort/filter preferences.
   const [columnPrefs, setColumnPrefs] = useState<Record<string, ColumnPrefs>>(loadColumnPrefs)
   // Search state. ``searchInput`` is the controlled input value;
@@ -417,6 +439,25 @@ export function App() {
 
   const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
 
+  // Build a Set for O(1) hidden-entry lookup. We recompute on
+  // every render where ``hiddenEntries`` changes (the underlying
+  // Set is cheap to construct; the entries render path is the
+  // hot loop, not this memo).
+  const hiddenSet = useMemo(() => new Set(hiddenEntries), [hiddenEntries])
+
+  // Filtered entry views. The original ``entries`` and ``forYou``
+  // arrays are still kept (the ranker still sees the full set so
+  // hiding an entry doesn't penalize its source), but the
+  // dashboard renders the filtered versions.
+  const visibleEntries = useMemo(
+    () => entries.filter((e) => !hiddenSet.has(e.id)),
+    [entries, hiddenSet],
+  )
+  const visibleForYou = useMemo(
+    () => forYou.filter((e) => !hiddenSet.has(e.id)),
+    [forYou, hiddenSet],
+  )
+
   // Apollo-style 3-surface model:
   //   1. For You     — top row on the dashboard, the personal front page.
   //   2. All Subs    — by-category grid (desktop) / single-column swipe (mobile).
@@ -436,7 +477,7 @@ export function App() {
   // row, in a single-column swipe.
   const allSubsColumns = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
     const out: Array<{ name: string; entries: Entry[] }> = []
-    if (forYou.length > 0) out.push({ name: 'For You', entries: forYou })
+    if (visibleForYou.length > 0) out.push({ name: 'For You', entries: visibleForYou })
     for (const cat of categories) {
       out.push({ name: cat, entries: byCategory.get(cat) ?? [] })
     }
@@ -449,7 +490,7 @@ export function App() {
   // ``entries`` directly — the backend already filtered by source when
   // ``activeSources`` was non-empty at fetch time.
   const multisubColumn = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
-    return [{ name: 'Filtering', entries }]
+    return [{ name: 'Filtering', entries: visibleEntries }]
   }, [entries])
 
   const baseColumns = viewKind === 'multisub' ? multisubColumn : allSubsColumns
@@ -835,6 +876,16 @@ export function App() {
     safeSetItem(STORAGE_KEYS.columnPrefs, JSON.stringify(columnPrefs))
   }, [columnPrefs])
 
+  // Persist hidden entries. Trim on write so the stored list
+  // can't grow unboundedly across many hide actions (matches the
+  // trim-on-write pattern used for ``readEntries``). A failure
+  // here is non-fatal — the in-memory state stays the source of
+  // truth for the current session.
+  useEffect(() => {
+    const trimmed = hiddenEntries.slice(-MAX_HIDDEN)
+    safeSetItem(STORAGE_KEYS.hiddenEntries, JSON.stringify(trimmed))
+  }, [hiddenEntries])
+
   // Debounced search. 300ms — standard "feels live but doesn't fire
   // on every keystroke". The mirror into ``searchQuery`` happens
   // inside the timeout so the actual fetch effect only re-runs on
@@ -910,6 +961,21 @@ export function App() {
       // the column's view anyway).
       const next = [...cur, entryId].slice(-MAX_PER_COLUMN)
       return { ...prev, [columnName]: next }
+    })
+  }, [])
+
+  // Hide an entry from every column + the For You row. The
+  // entry stays in the DB; it just gets filtered out of the
+  // dashboard until the user clears the hidden set (a future
+  // "show hidden" affordance in Settings). Records a ``never``
+  // engagement event so the ranker can also learn the user's
+  // dismissal signal — same pattern as ``markEntryRead``'s
+  // ``view`` event for the "I read this" signal.
+  const hideEntry = useCallback((entryId: number) => {
+    setHiddenEntries((prev) => {
+      if (prev.includes(entryId)) return prev
+      const next = [...prev, entryId].slice(-MAX_HIDDEN)
+      return next
     })
   }, [])
 
@@ -1488,6 +1554,10 @@ export function App() {
                     cardRefs={cardRefs}
                     onMarkRead={() => markColumnRead(col.name)}
                     onMarkEntryRead={(entryId) => markEntryRead(col.name, entryId)}
+                    onHideEntry={(entryId) => {
+                      hideEntry(entryId)
+                      toast('Entry hidden. Restore from Settings.', 'info')
+                    }}
                     prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
                     onPrefsChange={(next) => setPrefsFor(col.name, next)}
                     totalCount={col.totalCount}
@@ -1518,6 +1588,10 @@ export function App() {
               onMarkEntryRead={(entryId) =>
                 markEntryRead(columns[mobileCol]?.name ?? '', entryId)
               }
+              onHideEntry={(entryId) => {
+                hideEntry(entryId)
+                toast('Entry hidden. Restore from Settings.', 'info')
+              }}
               prefs={
                 columns[mobileCol]
                   ? columnPrefs[columns[mobileCol].name] ?? DEFAULT_PREFS
@@ -1584,6 +1658,15 @@ export function App() {
         generating={generatingBrief}
         onSourceRenamed={onSourceRenamed}
         onResetLocalState={resetLocalState}
+        hiddenEntries={hiddenEntries}
+        onRestoreHidden={(entryId) => {
+          setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
+        }}
+        onRestoreAllHidden={() => {
+          if (hiddenEntries.length === 0) return
+          setHiddenEntries([])
+          toast('All hidden entries restored.', 'info')
+        }}
       />
 
       <ShortcutsSheet
@@ -1665,3 +1748,6 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
+
+
