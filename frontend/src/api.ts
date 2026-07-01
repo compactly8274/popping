@@ -50,7 +50,16 @@ export interface Source {
   // Local path under /assets, e.g. "favicons/3.ico".
   favicon_path: string | null
   // Per-source HTTP header overrides. NULL = use defaults.
-  // Most common use is ``{"User-Agent": "<browser UA>"}
+  // Most common use is ``{"User-Agent": "<browser UA>"}`` for CDNs
+  // that block our default ``Popping/0.2`` UA.
+  custom_headers: Record<string, string> | null
+  // Backend-computed: true when ``active=false`` AND error_count has
+  // reached the scheduler's auto-disable threshold. Lets the UI
+  // distinguish an auto-disabled source (needs investigation before
+  // re-enabling) from a manually-paused one (routine user choice).
+  // See ``app.models.Source.auto_disabled``.
+  auto_disabled: boolean
+}
 
 /** Result of ``POST /api/sources/test``. ``ok`` is the only field the
  * UI branches on; the rest are diagnostic. ``error_kind`` is a short
@@ -73,15 +82,6 @@ export interface SourceTestResult {
     | 'unknown'
     | null
   error: string | null
-}`` for CDNs
-  // that block our default ``Popping/0.2`` UA.
-  custom_headers: Record<string, string> | null
-  // Backend-computed: true when ``active=false`` AND error_count has
-  // reached the scheduler's auto-disable threshold. Lets the UI
-  // distinguish an auto-disabled source (needs investigation before
-  // re-enabling) from a manually-paused one (routine user choice).
-  // See ``app.models.Source.auto_disabled``.
-  auto_disabled: boolean
 }
 
 export interface Health {
@@ -457,3 +457,4 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
 }
+
