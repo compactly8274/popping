@@ -65,6 +65,11 @@ type Props = {
   // them and the cards render with summaries permanently collapsed.
   expandedSummaries?: Set<number>
   onToggleSummary?: (entryId: number) => void
+  // Per-card "hide this entry" action. When present, each card's
+  // context menu gets a "Hide this entry" item. App wires this
+  // to the localStorage-backed hidden set; the entry disappears
+  // from every column + the For You row immediately.
+  onHideEntry?: (entryId: number) => void
 }
 
 export function Column({
@@ -83,6 +88,7 @@ export function Column({
   categoriesBySourceId,
   expandedSummaries,
   onToggleSummary,
+  onHideEntry,
 }: Props) {
   const [popoverOpen, setPopoverOpen] = useState(false)
   const popoverRef = useRef<HTMLDivElement | null>(null)
@@ -345,6 +351,7 @@ export function Column({
                 onMarkRead={onMarkEntryRead ? () => onMarkEntryRead(e.id) : undefined}
                 expanded={expandedSummaries?.has(e.id) ?? false}
                 onToggleSummary={onToggleSummary ? () => onToggleSummary(e.id) : undefined}
+                onHide={onHideEntry ? () => onHideEntry(e.id) : undefined}
               />
             )
           })

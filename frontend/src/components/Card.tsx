@@ -33,11 +33,24 @@ type Props = {
   // absent the card just renders without a stripe. The Column passes
   // it through from ``sourcesByMeta``.
   category?: string
-  // Per-card mark-read. When present, an inline ✓ button renders on
-  // the card so the user can dim one entry without nuking the
-  // column. Hides itself once the card is read (tapping ✓ on an
-  // already-dim card is a no-op up at App.markEntryRead).
+  // Per-card mark-read. When present, an inline ✓ button renders
+  // on the card so the user can dim one entry without nuking the
+  // column. Tapping ✓ on an already-dim card is a no-op up at
+  // App.markEntryRead.
+  //
+  // The button is ALWAYS visible (not hover-only) so the user
+  // can see at a glance that "I can mark this as read" is an
+  // option — the hover-only treatment hid the affordance from
+  // anyone who didn't already know it existed, which defeated
+  // the point of having a per-card action.
   onMarkRead?: () => void
+  // Per-card "hide" action. When present, the context menu
+  // (right-click / long-press) gets a "Hide this entry" item
+  // that adds the entry to the user's hidden set. The card
+  // immediately disappears from every column + the For You
+  // row. The action is reversible only by clearing the hidden
+  // set (a future "show hidden" affordance in Settings).
+  onHide?: () => void
   // Per-card inline summary. When ``expanded`` is true the card
   // fetches the cached summary once and renders it under the
   // title. ``onToggleSummary`` flips the expanded bit. Independent
@@ -94,7 +107,7 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
-export function _CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary }: Props) {
+export function _CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   // Touch tracking for long-press → copy URL.
@@ -243,15 +256,40 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
   }
 
   // Right-click → small context menu. Native context menu is
-  // suppressed so we can offer "copy link" + "open in new tab" without
-  // a third-party library.
+  // suppressed so we can offer "mark as read" + "hide" + "copy
+  // link" + "open in new tab" without a third-party library.
+  //
+  // Actions are conditionally included: ``mark as read`` only
+  // when ``onMarkRead`` is wired AND the card is still unread
+  // (no point offering the action on a card that's already
+  // dim), ``hide`` only when ``onHide`` is wired. Copy/open are
+  // always available.
   const onContextMenu = (e: MouseEvent<HTMLElement>) => {
     e.preventDefault()
-    // Build a tiny inline menu at the cursor. After the user picks
-    // (or dismisses) the menu, dispose. Kept inline rather than a
-    // portal because the click-outside dismissal is the only thing
-    // we need and a fixed-positioned div with a backdrop handles it.
-    showContextMenu(e.clientX, e.clientY, entry.url)
+    const actions: Array<{ label: string; onClick: () => void }> = []
+    if (onMarkRead && unread) {
+      actions.push({
+        label: 'Mark as read',
+        onClick: () => {
+          recordImmediate({ entry_id: entry.id, type: 'view' })
+          onMarkRead()
+        },
+      })
+    }
+    if (onHide) {
+      actions.push({
+        label: 'Hide this entry',
+        onClick: () => onHide(),
+      })
+    }
+    actions.push({ label: 'Copy link', onClick: () => copyUrl(entry.url) })
+    actions.push({
+      label: 'Open in new tab',
+      onClick: () => {
+        window.open(entry.url, '_blank', 'noopener,noreferrer')
+      },
+    })
+    showContextMenu(e.clientX, e.clientY, actions)
   }
 
   // Visual state for unread vs selected. Read cards stay at 100%
@@ -386,23 +424,40 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
             paths. Fires ``view`` so the ranker sees the same signal
             it sees for headline and thumbnail clicks. */}
         {onMarkRead && (
+          // The ✓ is ALWAYS visible so the user can see at a
+          // glance that the action is available. The previous
+          // hover-only treatment (“opacity-0 group-hover:opacity-100”)
+          // hid the affordance from anyone who didn't already
+          // know it existed. The visual weight is still muted
+          // (text-label-secondary for unread, text-accent for
+          // read) so it doesn't compete with the title. On read
+          // cards the checkmark is filled so the user can tell
+          // at a glance which cards are dimmed and which still
+          // need attention.
           <button
             type="button"
             data-card-interactive
+            data-mark-read
             onMouseDown={(e) => e.stopPropagation()}
             onTouchStart={(e) => e.stopPropagation()}
             onClick={(e) => {
               e.preventDefault()
               e.stopPropagation()
+              // "view" + manual read flip. The ranker sees the
+              // same signal it sees for headline and thumbnail
+              // clicks; the column sees the manual readEntries
+              // flip that dims the card.
               recordImmediate({ entry_id: entry.id, type: 'view' })
               onMarkRead()
             }}
             aria-label="mark this card as read"
+            aria-pressed={!unread}
             title="mark as read (m)"
-            className={`w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
-                        ${onToggleSummary ? '' : 'ml-auto'} opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100`}
+            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
+                        ${onToggleSummary ? '' : 'ml-auto'}
+                        ${unread ? 'text-label-secondary' : 'text-accent'}`}
           >
-            <CheckIcon className="w-4 h-4" />
+            <CheckIcon className="w-4 h-4" filled={!unread} />
           </button>
         )}
       </div>
@@ -500,19 +555,29 @@ export const Card = memo(_CardInner, _cardPropsEqual) as typeof _CardInner
 // iOS-style checkmark. Used for the per-card mark-read ✓. 2px stroke
 // is heavier than the 1.75 the header icons use — the ✓ is the
 // primary affordance on its button so it should be assertive.
-function CheckIcon({ className }: { className?: string }) {
+// ``filled`` toggles a solid filled circle (like a completed
+// checkbox) so the user can tell at a glance which cards are
+// already dimmed and which still need attention. The fill
+// colour is ``currentColor`` so the button's text-label-
+// secondary (unread) vs text-accent (read) recolour logic
+// drives both the icon and its background.
+function CheckIcon({ className, filled = false }: { className?: string; filled?: boolean }) {
   return (
     <svg
       viewBox="0 0 24 24"
-      fill="none"
+      fill={filled ? 'currentColor' : 'none'}
       stroke="currentColor"
-      strokeWidth={2}
+      strokeWidth={filled ? 0 : 2}
       strokeLinecap="round"
       strokeLinejoin="round"
       className={className}
       aria-hidden="true"
     >
-      <polyline points="4 12 10 18 20 6" />
+      {filled ? (
+        <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.2 14.4l-4.2-4.2 1.4-1.4 2.8 2.8 5.6-5.6 1.4 1.4-7 7z" />
+      ) : (
+        <polyline points="4 12 10 18 20 6" />
+      )}
     </svg>
   )
 }
@@ -654,7 +719,11 @@ function copyUrl(url: string) {
   }
 }
 
-function showContextMenu(x: number, y: number, url: string) {
+function showContextMenu(
+  x: number,
+  y: number,
+  actions: Array<{ label: string; onClick: () => void }>,
+) {
   // Dismiss any existing menu. There's only ever one, but a fast
   // double right-click on the same card would otherwise stack them.
   document.getElementById('card-context-menu')?.remove()
@@ -676,21 +745,13 @@ function showContextMenu(x: number, y: number, url: string) {
   // trip left another active listener closing over the orphaned
   // menu/backdrop DOM nodes. Use one close() callback that removes
   // every node and every listener, and call it from every exit path.
+  const backdrop = document.createElement('div')
   const close = () => {
     menu.remove()
     backdrop.remove()
     document.removeEventListener('keydown', onKey, true)
   }
-  const items: Array<{ label: string; onClick: () => void }> = [
-    { label: 'Copy link', onClick: () => copyUrl(url) },
-    {
-      label: 'Open in new tab',
-      onClick: () => {
-        window.open(url, '_blank', 'noopener,noreferrer')
-      },
-    },
-  ]
-  for (const item of items) {
+  for (const item of actions) {
     const btn = document.createElement('button')
     btn.type = 'button'
     btn.className =

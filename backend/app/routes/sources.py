@@ -444,25 +444,25 @@ async def delete_source_endpoint(
     source_id: int,
     session: AsyncSession = Depends(get_session),
 ) -> None:
-    """Drop a dynamic source. Built-in sources (BBC, HN, etc.) are
-    rejected with a 400 — they're managed by the plugin registry, not
-    the DB, and the user has no UI affordance to recreate them. Use
-    ``active=false`` to silence a built-in instead."""
+    """Drop a source row and its scheduler job.
+
+    Works for both dynamic and built-in rows. For built-ins (BBC,
+    HN, etc.) the plugin class stays registered in memory until
+    the backend restarts — at which point the plugin
+    re-registers itself as a fresh row. The 400-on-built-in
+    guard that used to live here was removed so the user can
+    actually silence a built-in they don't want (the old
+    workaround was to set ``active=false``, which kept the
+    scheduler job and the row but stopped fetches — a poor
+    substitute for actual removal).
+    """
     row = await session.get(Source, source_id)
     if row is None:
         raise HTTPException(status_code=404, detail="source not found")
-    if row.name in registered_plugin_names():
-        raise HTTPException(
-            status_code=400,
-            detail=f"built-in source {row.name!r} cannot be deleted via the API",
-        )
     try:
         deleted = await scheduler.delete_source(session, source_id)
     except ValueError as exc:
-        # Defensive guard from ``scheduler.delete_source`` — should
-        # never reach here because the route-layer check above
-        # already filters out built-ins, but a programmatic caller
-        # could bypass it.
+        # Defensive guard from ``scheduler.delete_source``.
         raise HTTPException(status_code=400, detail=str(exc))
     if not deleted:
         raise HTTPException(status_code=404, detail="source not found")
@@ -698,3 +698,4 @@ async def feed_recommendations_endpoint(
         return [FeedRecommendation(**r) for r in recommendations_for(active)]
     recs = await recommendations_for_user(session, active, user["sub"])
     return [FeedRecommendation(**r) for r in recs]
+

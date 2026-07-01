@@ -35,7 +35,7 @@ import {
 import { FeedManager } from './FeedManager'
 import { toast } from './Toast'
 
-export type SettingsTab = 'feeds' | 'llm' | 'notifications' | 'reset'
+export type SettingsTab = 'feeds' | 'llm' | 'notifications' | 'hidden' | 'reset'
 
 type Props = {
   open: boolean
@@ -68,12 +68,20 @@ type Props = {
   // Reset hooks. Wipes local namespaced keys; App owns the
   // reload so every component's state mirrors reset in lockstep.
   onResetLocalState: () => void
+  // List of currently-hidden entry ids. Shown on the Hidden tab
+  // so the user can review and restore.
+  hiddenEntries: number[]
+  // Restore a single hidden entry (or all of them with
+  // ``onRestoreAllHidden``).
+  onRestoreHidden: (entryId: number) => void
+  onRestoreAllHidden: () => void
 }
 
 const TAB_META: Record<SettingsTab, { label: string; icon: string }> = {
   feeds: { label: 'Feeds', icon: 'feeds' },
   llm: { label: 'LLM', icon: 'llm' },
   notifications: { label: 'Notifications', icon: 'bell' },
+  hidden: { label: 'Hidden', icon: 'eye-off' },
   reset: { label: 'Reset', icon: 'reset' },
 }
 
@@ -178,7 +186,7 @@ export function Settings({
             primary. ``role="tablist"`` so screen readers
             announce it as a tab group. */}
         <div className="flex gap-1 mx-4 mt-3 rounded-ios overflow-hidden border border-hairline" role="tablist">
-          {(['feeds', 'llm', 'notifications', 'reset'] as SettingsTab[]).map((t) => {
+          {(['feeds', 'llm', 'notifications', 'hidden', 'reset'] as SettingsTab[]).map((t) => {
             const active = t === tab
             return (
               <button
@@ -323,6 +331,33 @@ export function Settings({
               </p>
             </div>
           )}
+          {tab === 'hidden' && (
+            <GroupedSection label="Hidden entries">
+              {hiddenEntries.length === 0 ? (
+                <GroupedRow
+                  title="No hidden entries"
+                  subtitle="Right-click a card → Hide this entry to dismiss it. Hidden entries stay in the database but don't show on the dashboard."
+                />
+              ) : (
+                <>
+                  <GroupedRow
+                    title={`${hiddenEntries.length} hidden ${hiddenEntries.length === 1 ? 'entry' : 'entries'}`}
+                    subtitle="Tap Restore to show on the dashboard again. Restore all clears the entire list."
+                    action={
+                      <button
+                        onClick={onRestoreAllHidden}
+                        className="text-ios-body text-accent active:opacity-60"
+                        aria-label="restore all hidden entries"
+                      >
+                        Restore all
+                      </button>
+                    }
+                  />
+                </>
+              )}
+            </GroupedSection>
+          )}
+
           {tab === 'reset' && (
             <div className="pt-4 px-4 space-y-3">
               <div className="rounded-ios bg-bg-surface border border-hairline p-3">
@@ -384,6 +419,15 @@ function TabIcon({ name, active }: { name: string; active: boolean }) {
         <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="M3 10a7 7 0 1 1 2.05 4.95" />
           <polyline points="3 5 3 10 8 10" />
+        </svg>
+      )
+    case 'eye-off':
+      // Lucide-style "eye-off" tab icon. Open eye shape with a
+      // diagonal strike through it â the standard "hidden" affordance.
+      return (
+        <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M2 10s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z" />
+          <line x1="3" y1="3" x2="17" y2="17" />
         </svg>
       )
     default:
@@ -641,3 +685,5 @@ function LLMSection({
     </div>
   )
 }
+
+

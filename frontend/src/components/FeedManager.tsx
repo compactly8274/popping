@@ -2,8 +2,12 @@
 // removing dynamic RSS feeds. Three tabs:
 //
 //   • My feeds — the existing source list, with per-row actions:
-//     toggle active, edit refresh interval, delete (dynamic rows
-//     only). Plugin-backed rows show the actions disabled / hidden.
+//     toggle active, edit metadata, edit refresh interval, delete
+//     (works for both dynamic and built-in rows). Plugin-backed
+//     rows have url/name fields locked (the plugin owns them) but
+//     can still be deleted — the row goes away and the scheduler
+//     job is removed; the plugin re-registers itself on the next
+//     backend restart.
 //
 //   • Recommended — curated list from GET /api/feed-recommendations,
 //     minus anything the user already has. Tap "Add" to fire
@@ -790,7 +794,7 @@ function SourceRow({
             the row + inserted counts in a toast. We sit the button
             to the LEFT of the delete button (which is ``ml-auto``)
             so the destructive action stays at the far right. */}
-        {!builtIn && !confirmingDelete && (
+        {!confirmingDelete && (
           <button
             onClick={async () => {
               setBusy(true)
@@ -819,7 +823,7 @@ function SourceRow({
             fetch
           </button>
         )}
-        {!builtIn && !confirmingDelete && (
+        {!confirmingDelete && (
           <button
             onClick={() => setConfirmingDelete(true)}
             disabled={busy}
@@ -829,7 +833,7 @@ function SourceRow({
             delete
           </button>
         )}
-        {!builtIn && confirmingDelete && (
+        {confirmingDelete && (
           <>
             <button
               onClick={onDelete}
@@ -849,10 +853,10 @@ function SourceRow({
             </button>
           </>
         )}
-        {builtIn && (
+        {builtIn && !confirmingDelete && (
           <span
-            className="ml-auto text-ios-caption text-label-tertiary"
-            title="built-in source — managed by the scheduler at startup"
+            className="text-ios-caption text-label-tertiary"
+            title="built-in source — managed by the scheduler at startup. Will re-appear after a backend restart unless the plugin is also removed."
           >
             built-in
           </span>
@@ -1314,3 +1318,4 @@ function AddCustomTab({
     </form>
   )
 }
+
