@@ -50,7 +50,30 @@ export interface Source {
   // Local path under /assets, e.g. "favicons/3.ico".
   favicon_path: string | null
   // Per-source HTTP header overrides. NULL = use defaults.
-  // Most common use is ``{"User-Agent": "<browser UA>"}`` for CDNs
+  // Most common use is ``{"User-Agent": "<browser UA>"}
+
+/** Result of ``POST /api/sources/test``. ``ok`` is the only field the
+ * UI branches on; the rest are diagnostic. ``error_kind`` is a short
+ * enum the frontend maps to a friendly message — see
+ * ``friendlyTestError`` in the AddCustomTab code for the lookup. */
+export interface SourceTestResult {
+  ok: boolean
+  status_code: number | null
+  item_count: number | null
+  sample_titles: string[]
+  error_kind:
+    | 'not_found'
+    | 'forbidden'
+    | 'timeout'
+    | 'parse_error'
+    | 'name_conflict'
+    | 'invalid_url'
+    | 'unsupported_type'
+    | 'network_error'
+    | 'unknown'
+    | null
+  error: string | null
+}`` for CDNs
   // that block our default ``Popping/0.2`` UA.
   custom_headers: Record<string, string> | null
   // Backend-computed: true when ``active=false`` AND error_count has
@@ -190,6 +213,25 @@ export const api = {
     custom_headers?: Record<string, string> | null
   }) =>
     jsonFetch<Source>('/api/sources', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  /** Probe a URL with the same plugin Add would use, no DB write.
+   *
+   * Returns ``ok=true`` with a small item count + sample titles on
+   * success, or ``ok=false`` with an ``error_kind`` enum the UI maps
+   * to a friendly message. The full ``error`` string is included so
+   * power users can see the underlying exception without
+   * re-running with curl. */
+  testSource: (body: {
+    name?: string
+    type?: 'rss' | 'reddit'
+    category?: string
+    url: string
+    custom_headers?: Record<string, string> | null
+  }) =>
+    jsonFetch<SourceTestResult>('/api/sources/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
