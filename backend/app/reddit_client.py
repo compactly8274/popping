@@ -88,12 +88,16 @@ _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 # Rate-limiter parameters for direct Atom mode. Reddit's anonymous
 # rate limit is ~60 calls/hour, but a low-reputation IP gets a tighter
-# window (~1/min per IP). The in-process token bucket shapes the
-# outgoing traffic to 1 call / 65 s sustained, with a small initial
-# burst of 2 calls (so a startup that needs to fetch 2-3 subreddit
-# listings can do them in a few seconds rather than over 3 minutes).
-_DIRECT_RPS = 1.0 / 65.0   # ~1 call per 65 s
-_DIRECT_BURST = 2.0
+# window (~1/min per IP). The 3 subreddit ingest jobs all fire at the
+# same 15-min boundary, so the global bucket has to spread the 3
+# fetches across the 15-min window. With 3 fetches per 15 min
+# (one per subreddit), a 5-min spacing (1/300s) means each subreddit
+# gets its own 5-min slot, and over an hour we use 12 fetches
+# (4 ticks × 3 subs) — well under Reddit's 60/hour cap. Burst of 1
+# is enough since the scheduler never fires them within microseconds
+# of each other; the per-IP rate limit is the actual constraint.
+_DIRECT_RPS = 1.0 / 300.0   # ~1 call per 5 min
+_DIRECT_BURST = 1.0
 
 # Cross-reference cache: how long a fetched subreddit listing stays
 # in memory. The cross-ref sweep scans this cache to answer
