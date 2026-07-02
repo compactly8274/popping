@@ -1393,7 +1393,7 @@ export function App() {
         // current section (typically History because we
         // marked it read on the original hide).
         setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
-        toast('Entry unhidden.', 'info')
+        toast('Entry unhidden.', 'info')  // no Undo: the act of un-hiding IS the undo
       } else {
         // Hide: add to hidden set AND mark read so the
         // entry moves to the column's History section.
@@ -1403,10 +1403,16 @@ export function App() {
           return next
         })
         markEntryRead(columnName, entryId)
-        toast('Entry moved to history.', 'info')
+        toast('Entry moved to history.', {
+          kind: 'info',
+          action: {
+            label: 'Undo',
+            onClick: () => restoreHiddenEntry(entryId),
+          },
+        })
       }
     },
-    [hiddenSet, markEntryRead],
+    [hiddenSet, markEntryRead, restoreHiddenEntry],
   )
 
   // Star / unstar an entry. Stars are a long-term save-for-later
@@ -1569,11 +1575,17 @@ export function App() {
         const wasStarred = starredSet.has(selectedCardId)
         toggleStarEntry(selectedCardId)
         toast(
-          wasStarred
-            ? 'Removed from Saved.'
-            : 'Saved for later — see the Saved column.',
-          'info',
-        )
+                          wasStarred
+                            ? 'Removed from Saved.'
+                            : 'Saved for later — see the Saved column.',
+                          {
+                            kind: 'info',
+                            action: {
+                              label: 'Undo',
+                              onClick: () => toggleStarEntry(selectedCardId),
+                            },
+                          },
+                        )
       } else if (e.key === 'h' && selectedCardId != null) {
         // Toggle the eye button (hide) on the selected card.
         // ``h`` for hide is the natural mirror of ``m``
@@ -1642,6 +1654,7 @@ export function App() {
     // growing unbounded if the user has a habit of
     // tapping the column header.
     const col = columns.find((c) => c.name === columnName)
+    const addedIds: number[] = []
     setLastViewed((prev) => ({ ...prev, [columnName]: new Date().toISOString() }))
     if (col) {
       setReadEntries((prev) => {
@@ -1656,6 +1669,7 @@ export function App() {
           if (!curSet.has(e.id)) toAdd.push(e.id)
         }
         if (toAdd.length === 0) return prev
+        addedIds.push(...toAdd)
         const next = [...cur, ...toAdd].slice(-MAX_PER_COLUMN)
         return { ...prev, [columnName]: next }
       })
@@ -1665,7 +1679,88 @@ export function App() {
         seenEntryIdsRef.current = merged
       }
     }
+    // Surface the action as an Undo-able toast.
+    // The user can tap Undo to restore the column
+    // to its pre-mark state. We capture
+    // ``addedIds`` by reference (mutated by the
+    // setReadEntries updater) and the column name;
+    // the Undo handler unmarks them in lockstep.
+    if (addedIds.length > 0) {
+      toast(`Marked ${addedIds.length} ${addedIds.length === 1 ? 'entry' : 'entries'} as read`, {
+        kind: 'info',
+        action: {
+          label: 'Undo',
+          onClick: () => {
+            unmarkColumnRead(columnName, addedIds)
+            toast('Column restored.', 'info')
+          },
+        },
+      })
+    }
   }
+
+  // Reverse of ``markColumnRead``: remove a set
+  // of ids from ``readEntries[col]`` and clear
+  // ``lastViewed[col]``. Used by the column-mark-read
+  // Undo action. The cleared lastViewed means the
+  // "N new" chip will repopulate on the next
+  // refresh.
+  const unmarkColumnRead = useCallback(
+    (columnName: string, ids: number[]) => {
+      if (ids.length === 0) return
+      const idSet = new Set(ids)
+      setReadEntries((prev) => {
+        const cur = prev[columnName] ?? []
+        const next = cur.filter((id) => !idSet.has(id))
+        if (next.length === cur.length) return prev
+        return { ...prev, [columnName]: next }
+      })
+      setLastViewed((prev) => {
+        const next = { ...prev }
+        delete next[columnName]
+        return next
+      })
+      if (seenEntryIdsRef.current != null) {
+        const merged = new Set(seenEntryIdsRef.current)
+        for (const id of ids) merged.delete(id)
+        seenEntryIdsRef.current = merged
+      }
+    },
+    [],
+  )
+
+  // Reverse of ``markEntryRead``: remove the id
+  // from ``readEntries[col]`` so the entry moves
+  // back to the Fresh section. Used by the
+  // mark-read Undo action on the per-card check
+  // click.
+  const unmarkEntryRead = useCallback(
+    (columnName: string, entryId: number) => {
+      setReadEntries((prev) => {
+        const cur = prev[columnName] ?? []
+        const next = cur.filter((id) => id !== entryId)
+        if (next.length === cur.length) return prev
+        return { ...prev, [columnName]: next }
+      })
+    },
+    [],
+  )
+
+  // Reverse of ``hideEntry`` / ``toggleHideEntry``
+  // (hide branch): remove the id from
+  // ``hiddenEntries`` so the entry surfaces in
+  // the dashboard again. Used by the hide Undo
+  // action on both the per-card eye button and
+  // the context-menu "Hide this entry" item.
+  // Note: this does NOT reverse the
+  // ``markEntryRead`` that ``toggleHideEntry``
+  // also fires. The user has to tap check Undo
+  // separately to restore the Fresh/History
+  // split. This matches the prior
+  // one-step-at-a-time model.
+  const restoreHiddenEntry = useCallback((entryId: number) => {
+    setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
+  }, [])
 
   const toggleSource = (name: string) => {
     setActiveSources((prev) => {
@@ -2147,10 +2242,25 @@ export function App() {
                       unread={!isRead}
                       expanded={expandedSummaries.has(e.id)}
                       onToggleSummary={() => toggleSummary(e.id)}
-                      onMarkRead={() => markEntryRead('For You', e.id)}
+                      onMarkRead={() => {
+                        markEntryRead('For You', e.id)
+                        toast('Marked as read', {
+                          kind: 'info',
+                          action: {
+                            label: 'Undo',
+                            onClick: () => unmarkEntryRead('For You', e.id),
+                          },
+                        })
+                      }}
                       onHide={() => {
                         hideEntry(e.id)
-                        toast('Entry hidden. Restore from Settings.', 'info')
+                        toast('Entry hidden.', {
+                          kind: 'info',
+                          action: {
+                            label: 'Undo',
+                            onClick: () => restoreHiddenEntry(e.id),
+                          },
+                        })
                       }}
                       onHideToggle={() => toggleHideEntry('For You', e.id)}
                       hidden={hiddenSet.has(e.id)}
@@ -2161,7 +2271,13 @@ export function App() {
                           wasStarred
                             ? 'Removed from Saved.'
                             : 'Saved for later — see the Saved column.',
-                          'info',
+                          {
+                            kind: 'info',
+                            action: {
+                              label: 'Undo',
+                              onClick: () => toggleStarEntry(entryId),
+                            },
+                          },
                         )
                       }}
                       starred={starredSet.has(e.id)}
@@ -2185,10 +2301,25 @@ export function App() {
                     selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
                     cardRefs={cardRefs}
                     onMarkRead={() => markColumnRead(col.name)}
-                    onMarkEntryRead={(entryId) => markEntryRead(col.name, entryId)}
+                    onMarkEntryRead={(entryId) => {
+                      markEntryRead(col.name, entryId)
+                      toast('Marked as read', {
+                        kind: 'info',
+                        action: {
+                          label: 'Undo',
+                          onClick: () => unmarkEntryRead(col.name, entryId),
+                        },
+                      })
+                    }}
                     onHideEntry={(entryId) => {
                       hideEntry(entryId)
-                      toast('Entry hidden. Restore from Settings.', 'info')
+                      toast('Entry hidden.', {
+                        kind: 'info',
+                        action: {
+                          label: 'Undo',
+                          onClick: () => restoreHiddenEntry(entryId),
+                        },
+                      })
                     }}
                     onHideToggle={(entryId) => toggleHideEntry(col.name, entryId)}
                     hiddenSet={hiddenSet}
@@ -2196,11 +2327,17 @@ export function App() {
                       const wasStarred = starredSet.has(entryId)
                       toggleStarEntry(entryId)
                       toast(
-                        wasStarred
-                          ? 'Removed from Saved.'
-                          : 'Saved for later — see the Saved column.',
-                        'info',
-                      )
+                          wasStarred
+                            ? 'Removed from Saved.'
+                            : 'Saved for later — see the Saved column.',
+                          {
+                            kind: 'info',
+                            action: {
+                              label: 'Undo',
+                              onClick: () => toggleStarEntry(entryId),
+                            },
+                          },
+                        )
                     }}
                     starredSet={starredSet}
                     prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
@@ -2234,12 +2371,26 @@ export function App() {
               }
               cardRefs={cardRefs}
               onMarkRead={() => markColumnRead(columns[mobileCol]?.name ?? '')}
-              onMarkEntryRead={(entryId) =>
-                markEntryRead(columns[mobileCol]?.name ?? '', entryId)
-              }
+              onMarkEntryRead={(entryId) => {
+                const col = columns[mobileCol]?.name ?? ''
+                markEntryRead(col, entryId)
+                toast('Marked as read', {
+                  kind: 'info',
+                  action: {
+                    label: 'Undo',
+                    onClick: () => unmarkEntryRead(col, entryId),
+                  },
+                })
+              }}
               onHideEntry={(entryId) => {
                 hideEntry(entryId)
-                toast('Entry hidden. Restore from Settings.', 'info')
+                toast('Entry hidden.', {
+                  kind: 'info',
+                  action: {
+                    label: 'Undo',
+                    onClick: () => restoreHiddenEntry(entryId),
+                  },
+                })
               }}
               onHideToggle={(entryId) => toggleHideEntry(columns[mobileCol]?.name ?? '', entryId)}
               hiddenSet={hiddenSet}
@@ -2247,11 +2398,17 @@ export function App() {
                 const wasStarred = starredSet.has(entryId)
                 toggleStarEntry(entryId)
                 toast(
-                  wasStarred
-                    ? 'Removed from Saved.'
-                    : 'Saved for later — see the Saved column.',
-                  'info',
-                )
+                          wasStarred
+                            ? 'Removed from Saved.'
+                            : 'Saved for later — see the Saved column.',
+                          {
+                            kind: 'info',
+                            action: {
+                              label: 'Undo',
+                              onClick: () => toggleStarEntry(entryId),
+                            },
+                          },
+                        )
               }}
               starredSet={starredSet}
               prefs={
