@@ -53,6 +53,13 @@ type Props = {
   // Triggered when the user taps the column header. App uses this
   // to mark the column read in localStorage.
   onMarkRead?: () => void
+  // Triggered when the user taps the +N new chip. App uses this
+  // to re-fetch the column's entries (same as the global refresh
+  // button). When absent, the chip stays a non-interactive badge
+  // (preserves the prior visual for callers that don't pass the
+  // prop). The chip stops click propagation so the header's
+  // mark-read handler doesn't also fire.
+  onRefresh?: () => void
   // Per-card mark-read. App flips the entry's read state via this —
   // see ``markEntryRead`` in App.tsx. The Column just forwards the
   // clicked entry id up so the keyboard ``m`` shortcut and the
@@ -123,6 +130,7 @@ export function Column({
   selectedId,
   cardRefs,
   onMarkRead,
+  onRefresh,
   onMarkEntryRead,
   prefs,
   onPrefsChange,
@@ -251,13 +259,33 @@ export function Column({
               color rather than an animation, matching the iOS
               "badge" pattern. */}
           {newCount != null && newCount > 0 && (
-            <span
-              data-new-chip
-              className="shrink-0 rounded-full bg-accent px-2 py-0.5 text-ios-caption font-semibold uppercase tracking-wide text-white"
-              title={`${newCount} new since last visit`}
-            >
-              +{newCount} new
-            </span>
+            onRefresh ? (
+              <button
+                type="button"
+                data-new-chip
+                onClick={(e) => {
+                  // Stop the click from bubbling to the
+                  // header (which would also call
+                  // onMarkRead). The chip is a refresh
+                  // affordance, not a mark-read one.
+                  e.stopPropagation()
+                  onRefresh()
+                }}
+                className="shrink-0 rounded-full bg-accent px-2 py-0.5 text-ios-caption font-semibold uppercase tracking-wide text-white active:opacity-60 cursor-pointer"
+                title={`${newCount} new since last visit — tap to refresh`}
+                aria-label={`${newCount} new since last visit. Tap to refresh the column.`}
+              >
+                +{newCount} new
+              </button>
+            ) : (
+              <span
+                data-new-chip
+                className="shrink-0 rounded-full bg-accent px-2 py-0.5 text-ios-caption font-semibold uppercase tracking-wide text-white"
+                title={`${newCount} new since last visit`}
+              >
+                +{newCount} new
+              </span>
+            )
           )}
           {/* Entry count. "X of Y" when filters are hiding some,
               plain "X" otherwise. text-label-secondary to keep it
@@ -658,6 +686,7 @@ function ChevronIcon({ className, collapsed }: { className?: string; collapsed?:
     </svg>
   )
 }
+
 
 
 
