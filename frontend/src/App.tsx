@@ -1291,6 +1291,49 @@ export function App() {
     })
   }, [])
 
+  // Toggle the eye-button hidden state. When transitioning
+  // from visible -> hidden, ALSO mark the entry read so it
+  // moves to the column's History section. The user can
+  // still scroll the column to find it; the eye button
+  // effectively combines "I read this" + "I never want to
+  // see it in the For You row again".
+  //
+  // The context menu's "Hide this entry" item uses the
+  // bare ``hideEntry`` (above) and is the stronger
+  // "permanently dismiss" affordance — the entry
+  // disappears from every column, surfaces only in
+  // Settings/Hidden.
+  //
+  // The column lookup here uses the currently-selected
+  // column's lastViewed for the mark-read. The user's
+  // exact current column is best-effort (we use
+  // selectedColumnIndex or 0) because the mark-read flip
+  // is per-column, not per-entry.
+  const toggleHideEntry = useCallback(
+    (columnName: string, entryId: number) => {
+      const isHidden = hiddenSet.has(entryId)
+      if (isHidden) {
+        // Unhide: just remove from the hidden set. Don't
+        // touch readEntries — the entry stays in its
+        // current section (typically History because we
+        // marked it read on the original hide).
+        setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
+        toast('Entry unhidden.', 'info')
+      } else {
+        // Hide: add to hidden set AND mark read so the
+        // entry moves to the column's History section.
+        setHiddenEntries((prev) => {
+          if (prev.includes(entryId)) return prev
+          const next = [...prev, entryId].slice(-MAX_HIDDEN)
+          return next
+        })
+        markEntryRead(columnName, entryId)
+        toast('Entry moved to history.', 'info')
+      }
+    },
+    [hiddenSet, markEntryRead],
+  )
+
   // Star / unstar an entry. Stars are a long-term save-for-later
   // set: starred items surface in a dedicated "Saved" column at
   // the top of the dashboard, in the For You row, and in the
@@ -1456,6 +1499,21 @@ export function App() {
             : 'Saved for later — see the Saved column.',
           'info',
         )
+      } else if (e.key === 'h' && selectedCardId != null) {
+        // Toggle the eye button (hide) on the selected card.
+        // ``h`` for hide is the natural mirror of ``m``
+        // (mark read) and ``b`` (bookmark). It conflicts
+        // with browser-level shortcuts less often than
+        // ``e`` (which is "find previous" in some
+        // browsers). Same modifier guards as the other
+        // single-key shortcuts so Cmd+H (Hide App on
+        // macOS) still works when the dashboard has
+        // focus.
+        if (e.metaKey || e.ctrlKey || e.altKey) return
+        e.preventDefault()
+        const col = columns[selectedColumnIndex]
+        if (!col) return
+        toggleHideEntry(col.name, selectedCardId)
       } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey && !e.altKey) {
         // Refresh the dashboard. Bare ``r``; Cmd+R / Ctrl+R
         // already triggers the browser reload so we don't fight
@@ -1466,7 +1524,16 @@ export function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [columns, selectedColumnIndex, selectedCardId, searchQuery, markEntryRead, toggleSummary, refresh])
+  }, [
+    columns,
+    selectedColumnIndex,
+    selectedCardId,
+    searchQuery,
+    markEntryRead,
+    toggleSummary,
+    refresh,
+    toggleHideEntry,
+  ])
 
   // Scroll the keyboard-selected card into view.
   useEffect(() => {
@@ -1978,6 +2045,8 @@ export function App() {
                       hideEntry(entryId)
                       toast('Entry hidden. Restore from Settings.', 'info')
                     }}
+                    onHideToggle={(entryId) => toggleHideEntry(col.name, entryId)}
+                    hiddenSet={hiddenSet}
                     onStarEntry={(entryId) => {
                       const wasStarred = starredSet.has(entryId)
                       toggleStarEntry(entryId)
@@ -2026,6 +2095,8 @@ export function App() {
                 hideEntry(entryId)
                 toast('Entry hidden. Restore from Settings.', 'info')
               }}
+              onHideToggle={(entryId) => toggleHideEntry(columns[mobileCol]?.name ?? '', entryId)}
+              hiddenSet={hiddenSet}
               onStarEntry={(entryId) => {
                 const wasStarred = starredSet.has(entryId)
                 toggleStarEntry(entryId)
@@ -2201,6 +2272,7 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
 
 
 

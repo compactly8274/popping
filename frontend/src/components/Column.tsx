@@ -93,6 +93,18 @@ type Props = {
   // passes a Set so each card render is an O(1) check rather
   // than a linear search.
   starredSet?: Set<number>
+  // Per-card "hide" / "unhide" action for the eye button.
+  // When present, each card gets an eye button next to the
+  // mark-read checkmark and the star. App wires this to a
+  // callback that ALSO marks the entry read so the entry
+  // moves to the column's History section. Different from
+  // ``onHideEntry`` (above) which is the context-menu's
+  // "permanently dismiss" affordance.
+  onHideToggle?: (entryId: number) => void
+  // Per-card "is this entry currently hidden" lookup. App
+  // passes the same Set the eye button uses for its
+  // open/closed state.
+  hiddenSet?: Set<number>
   // Per-section collapse state (Miniflux-style). When a section
   // is collapsed, only its header renders — the cards are
   // unmounted. Persisted in localStorage by App, keyed by column
@@ -121,6 +133,8 @@ export function Column({
   onHideEntry,
   onStarEntry,
   starredSet,
+  onHideToggle,
+  hiddenSet,
   sectionsCollapsed,
   onToggleSection,
 }: Props) {
@@ -377,6 +391,8 @@ export function Column({
                 expandedSummaries={expandedSummaries}
                 onToggleSummary={onToggleSummary}
                 onHideEntry={onHideEntry}
+                onHideToggle={onHideToggle}
+                hiddenSet={hiddenSet}
                 onStarEntry={onStarEntry}
                 starredSet={starredSet}
               />
@@ -410,6 +426,8 @@ export function Column({
                 expandedSummaries={expandedSummaries}
                 onToggleSummary={onToggleSummary}
                 onHideEntry={onHideEntry}
+                onHideToggle={onHideToggle}
+                hiddenSet={hiddenSet}
                 onStarEntry={onStarEntry}
                 starredSet={starredSet}
               />
@@ -446,6 +464,8 @@ type SectionProps = {
   expandedSummaries: Set<number> | undefined
   onToggleSummary: ((entryId: number) => void) | undefined
   onHideEntry: ((entryId: number) => void) | undefined
+  onHideToggle: ((entryId: number) => void) | undefined
+  hiddenSet: Set<number> | undefined
   onStarEntry: ((entryId: number) => void) | undefined
   starredSet: Set<number> | undefined
 }
@@ -465,6 +485,8 @@ function ColumnSection({
   expandedSummaries,
   onToggleSummary,
   onHideEntry,
+  onHideToggle,
+  hiddenSet,
   onStarEntry,
   starredSet,
 }: SectionProps) {
@@ -542,6 +564,8 @@ function ColumnSection({
                 expanded={expandedSummaries?.has(e.id) ?? false}
                 onToggleSummary={onToggleSummary ? () => onToggleSummary(e.id) : undefined}
                 onHide={onHideEntry ? () => onHideEntry(e.id) : undefined}
+                onHideToggle={onHideToggle ? () => onHideToggle(e.id) : undefined}
+                hidden={hiddenSet?.has(e.id) ?? false}
                 onStar={onStarEntry ? () => onStarEntry(e.id) : undefined}
                 starred={starredSet?.has(e.id) ?? false}
               />
@@ -593,4 +617,5 @@ function ChevronIcon({ className, collapsed }: { className?: string; collapsed?:
     </svg>
   )
 }
+
 
