@@ -50,6 +50,14 @@ export const STORAGE_KEYS = {
   // ``MAX_STARRED``) but in practice users keep 50-200 starred
   // items long-term, so 1000 is plenty of headroom.
   starredEntries: `${NAMESPACE}.${SCHEMA}.starred.entries`,
+  // User-saved filter presets. Each preset captures a complete
+  // "view" of the dashboard: which sources are filtered, what
+  // per-column sort/min-score/max-age the user prefers. The
+  // user can save a preset from the Drawer ("Save current as
+  // preset") and re-apply with a single click. Distinct from
+  // ``readEntries`` (per-card) and ``starredEntries`` (per-entry);
+  // presets are a dashboard-shape concern.
+  filterPresets: `${NAMESPACE}.${SCHEMA}.presets.list`,
   // BriefCard collapse preference. Boolean stored as '0' / '1' to
   // match the rest of the codebase's storage convention.
   briefCollapsed: `${NAMESPACE}.${SCHEMA}.brief.collapsed`,
@@ -69,6 +77,12 @@ export const MAX_HIDDEN = 1000
 // — which is the right semantics because the user's most
 // recent saves are the ones they care about most.
 export const MAX_STARRED = 1000
+
+// ``MAX_PRESETS`` is intentionally small: a power user with 50
+// named filter views is using presets as a content-curation
+// tool, not a quick-access list. We trim on write (oldest first)
+// to prevent abuse. The trim is rare in practice.
+export const MAX_PRESETS = 50
 
 export function safeGetItem(key: string): string | null {
   try {
@@ -98,4 +112,5 @@ export function safeRemoveItem(key: string): void {
     // See safeGetItem — best effort.
   }
 }
+
 

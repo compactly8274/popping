@@ -148,6 +148,16 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
   const [summary, setSummary] = useState<string | null>(null)
   const [summaryError, setSummaryError] = useState(false)
 
+  // Mount timestamp. Reset on every mount via useEffect so the
+  // dwell counter starts at 0 for each card instance (not for
+  // each unique entry id \u2014 a re-mount on the same entry after a
+  // filter toggle is a fresh "dwell" interval from the user's
+  // perspective).
+  const mountTime = useRef<number>(Date.now())
+  useEffect(() => {
+    mountTime.current = Date.now()
+  }, [entry.id])
+
   useEffect(() => {
     if (!expanded) return
     // Skip when the card is already showing a summary or when an
@@ -471,11 +481,22 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
             onClick={(e) => {
               e.preventDefault()
               e.stopPropagation()
-              // "view" + manual read flip. The ranker sees the
-              // same signal it sees for headline and thumbnail
-              // clicks; the column sees the manual readEntries
-              // flip that dims the card.
+              // "view" + manual read flip + dwell. Three signals
+              // in one click:
+              //   - "view": the ranker sees the same signal it
+              //     sees for headline and thumbnail clicks.
+              //   - "dwell": explicit read-time signal. The value
+              //     is capped at 5 minutes \u2014 a card on screen
+              //     for hours is no longer "dwell", just a
+              //     backgrounded tab. The 5-min cap matches the
+              //     typical per-card attention span and prevents
+              //     one abandoned tab from dominating the
+              //     ranker's read-time average.
+              //   - onMarkRead: flips the manual readEntries set
+              //     so the card dims.
+              const dwellMs = Math.min(Date.now() - mountTime.current, 5 * 60 * 1000)
               recordImmediate({ entry_id: entry.id, type: 'view' })
+              recordBatched({ entry_id: entry.id, type: 'dwell', value: dwellMs })
               onMarkRead()
             }}
             aria-label="mark this card as read"
@@ -871,5 +892,6 @@ function showContextMenu(
   }
   document.addEventListener('keydown', onKey, true)
 }
+
 
 

@@ -30,7 +30,7 @@ import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { Settings, type SettingsTab } from './components/Settings'
 import { recordImmediate } from './lib/interactions'
-import { MAX_HIDDEN, MAX_STARRED, STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
+import { MAX_HIDDEN, MAX_PRESETS, MAX_STARRED, STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
 
 const REFRESH_INTERVAL_MS = 60_000
 // Health pings don't need 60s cadence — DB / Redis status is slow-
@@ -141,6 +141,44 @@ function loadStarredEntries(): number[] {
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
     return parsed.filter((x): x is number => typeof x === 'number')
+  } catch {
+    return []
+  }
+}
+
+export type FilterPreset = {
+  id: string
+  name: string
+  activeSources: string[]
+  columnPrefs: Record<string, ColumnPrefs>
+}
+
+function loadFilterPresets(): FilterPreset[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = safeGetItem(STORAGE_KEYS.filterPresets)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((p): p is FilterPreset => {
+        return (
+          typeof p === 'object' &&
+          p !== null &&
+          typeof p.id === 'string' &&
+          typeof p.name === 'string' &&
+          Array.isArray(p.activeSources)
+        )
+      })
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        activeSources: p.activeSources.filter((s) => typeof s === 'string'),
+        columnPrefs:
+          typeof p.columnPrefs === 'object' && p.columnPrefs !== null
+            ? p.columnPrefs
+            : {},
+      }))
   } catch {
     return []
   }
@@ -374,6 +412,12 @@ export function App() {
   // tab. The user can star / unstar from the card context menu
   // ("Save for later") or via the keyboard ``s`` shortcut.
   const [starredEntries, setStarredEntries] = useState<number[]>(loadStarredEntries)
+  // User-saved filter presets. Each preset is a complete "view"
+  // of the dashboard (active sources + per-column prefs) that
+  // the user can save and re-apply with one click. Persisted to
+  // localStorage; the in-memory state is the source of truth
+  // for the current session.
+  const [filterPresets, setFilterPresets] = useState<FilterPreset[]>(loadFilterPresets)
   // Per-column sort/filter preferences.
   const [columnPrefs, setColumnPrefs] = useState<Record<string, ColumnPrefs>>(loadColumnPrefs)
   // Search state. ``searchInput`` is the controlled input value;
@@ -961,6 +1005,13 @@ export function App() {
     const trimmed = starredEntries.slice(-MAX_STARRED)
     safeSetItem(STORAGE_KEYS.starredEntries, JSON.stringify(trimmed))
   }, [starredEntries])
+  // Persist filter presets. Cap on write at ``MAX_PRESETS`` to
+  // prevent abuse (a script saving 1000s of presets). Same
+  // pattern as the other write-trimmed sets.
+  useEffect(() => {
+    const trimmed = filterPresets.slice(-MAX_PRESETS)
+    safeSetItem(STORAGE_KEYS.filterPresets, JSON.stringify(trimmed))
+  }, [filterPresets])
 
   // Debounced search. 300ms — standard "feels live but doesn't fire
   // on every keystroke". The mirror into ``searchQuery`` happens
@@ -1071,6 +1122,38 @@ export function App() {
       }
       return [...prev, entryId].slice(-MAX_STARRED)
     })
+  }, [])
+
+  // Apply a saved preset: replace the active sources filter and
+  // per-column prefs with the preset’s values. A no-op when the
+  // preset’s data is empty (matches "all sources" / "default
+  // prefs" semantically).
+  const applyPreset = useCallback((preset: FilterPreset) => {
+    setActiveSources(new Set(preset.activeSources))
+    setColumnPrefs(preset.columnPrefs)
+  }, [])
+
+  // Save the current view as a preset. Returns the new preset
+  // id so the caller can show a "Saved" toast.
+  const savePreset = useCallback(
+    (name: string): string => {
+      const id = `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+      const preset: FilterPreset = {
+        id,
+        name: name.trim() || 'Untitled preset',
+        activeSources: Array.from(activeSources),
+        columnPrefs,
+      }
+      setFilterPresets((prev) => [...prev, preset].slice(-MAX_PRESETS))
+      return id
+    },
+    [activeSources, columnPrefs],
+  )
+
+  // Delete a preset by id. The chip strip handles its own
+  // long-press -> delete flow.
+  const deletePreset = useCallback((id: string) => {
+    setFilterPresets((prev) => prev.filter((p) => p.id !== id))
   }, [])
 
   // Toggle the inline-summary panel for an entry. Independent of
@@ -1488,7 +1571,94 @@ export function App() {
             >
               <RefreshIcon className={`w-5 h-5 ${refreshing ? 'animate-spin' : ''}`} />
             </button>
-            {/* Settings gear. Opens the Settings overlay (a
+// Saved-preset chip strip. Renders the user’s saved filter
+// presets as horizontal chips above the column grid. Click a
+// chip to apply the preset; right-click to delete (with a
+// two-tap confirm). Hidden when the user has no presets —
+// a first-time user doesn’t see this affordance until
+// they save one.
+function PresetChips({
+  presets,
+  onApply,
+  onDelete,
+}: {
+  presets: FilterPreset[]
+  onApply: (preset: FilterPreset) => void
+  onDelete: (id: string) => void
+}) {
+  if (presets.length === 0) return null
+  return (
+    <div
+      className="flex gap-1.5 overflow-x-auto px-4 sm:px-6 py-2 border-b border-hairline bg-bg-app"
+      role="toolbar"
+      aria-label="saved filter presets"
+    >
+      <span
+        className="shrink-0 text-ios-caption uppercase tracking-wide text-label-tertiary self-center mr-1"
+        aria-hidden="true"
+      >
+        Saved
+      </span>
+      {presets.map((p) => (
+        <PresetChip
+          key={p.id}
+          preset={p}
+          onApply={() => onApply(p)}
+          onDelete={() => onDelete(p.id)}
+        />
+      ))}
+    </div>
+  )
+}
+
+function PresetChip({
+  preset,
+  onApply,
+  onDelete,
+}: {
+  preset: FilterPreset
+  onApply: () => void
+  onDelete: () => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  return (
+    <div className="shrink-0 flex items-center">
+      {confirming ? (
+        <div className="flex items-center gap-1.5 rounded-full bg-red-500/10 border border-red-500/30 pl-2.5 pr-1 py-0.5">
+          <span className="text-ios-caption text-red-400">Delete?</span>
+          <button
+            onClick={onDelete}
+            className="text-ios-caption text-red-400 active:opacity-60 font-semibold"
+            aria-label={`confirm delete preset ${preset.name}`}
+          >
+            Yes
+          </button>
+          <button
+            onClick={() => setConfirming(false)}
+            className="text-ios-caption text-label-secondary active:opacity-60"
+            aria-label={`cancel delete preset ${preset.name}`}
+          >
+            No
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={onApply}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            setConfirming(true)
+          }}
+          title={`Apply preset "${preset.name}". Right-click to delete.`}
+          className="shrink-0 rounded-full bg-accent-soft text-accent border border-accent-soft hover:bg-accent-soft/80 active:opacity-60 px-3 py-0.5 text-ios-caption font-medium"
+        >
+          {preset.name}
+        </button>
+      )}
+    </div>
+  )
+}
+
+// Settings gear. Opens the Settings overlay (a
                 full-page sheet with tabs for feeds / LLM /
                 notifications / reset). Lives to the LEFT of the
                 hamburger so the hamburger keeps its right-edge
@@ -1602,6 +1772,12 @@ export function App() {
         tone={briefTone}
         onToneChange={setBriefTone}
         triggerGenerate={triggerBriefGenerate}
+      />
+
+      <PresetChips
+        presets={filterPresets}
+        onApply={applyPreset}
+        onDelete={deletePreset}
       />
 
       {showSearchView ? (
@@ -1888,6 +2064,7 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
 
 
 
