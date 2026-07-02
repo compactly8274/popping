@@ -83,6 +83,12 @@ type Props = {
   // Open the full Settings overlay. Wired by App. The Drawer
   // uses this in its "All settings…" quick-action row.
   onOpenSettings?: (tab?: SettingsTab) => void
+  // Save the current source filter + column prefs as a
+  // named preset. The Drawer collects the name via a
+  // native prompt and calls the callback with the
+  // trimmed name. Caller is responsible for actually
+  // writing the preset to localStorage.
+  onSavePreset?: () => void
 }
 
 
@@ -381,6 +387,30 @@ export function Drawer({
               subtitle="review your reads · hides · saves"
               showChevron
             />
+            {/* 'Save current view' row. The user can
+                capture the current source filter +
+                per-column prefs as a named preset. The
+                chip strip above the dashboard shows the
+                saved presets; tapping a chip applies
+                the saved view. Long-press a chip to
+                delete. Without this row the user has no
+                way to create a preset \u2014 the
+                ``savePreset`` callback in App was dead
+                code before this row was added.
+                The Drawer closes after the prompt so
+                the user sees the new chip on the
+                strip immediately. */}
+            {onSavePreset && (
+              <GroupedRow
+                onClick={() => {
+                  onSavePreset()
+                  onClose()
+                }}
+                title="Save current view"
+                subtitle="capture the current filter + per-column prefs as a named preset"
+                showChevron
+              />
+            )}
             <GroupedRow
               onClick={() => {
                 // The Settings overlay is owned by App. The Drawer
@@ -626,4 +656,6 @@ function ChevronRight({ className }: { className?: string }) {
     </svg>
   )
 }
+
+
 

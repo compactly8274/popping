@@ -311,13 +311,37 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
         },
       })
     }
-    if (onHide) {
-      // Context-menu hide is the "permanently dismiss"
-      // affordance \u2014 stronger than the eye button. The
-      // entry disappears from every column and the For
-      // You row; it surfaces only in Settings/Hidden.
-      // The eye button is the lighter "mark read and
-      // exclude from suggestions" action (see above).
+    if (onHideToggle) {
+      // Context-menu hide uses the SAME handler as the
+      // eye button: hides + marks read. The entry
+      // moves from Fresh to History in the same
+      // column, so the user can still see it (faded)
+      // and the column stays populated. The label
+      // flips based on the current state so the menu
+      // tells the user what the action will do.
+      //
+      // (The previous implementation used a separate
+      // onHide callback that hid-only, which made the
+      // column go empty after a hide. That
+      // inconsistency between the eye button and
+      // the context menu caused "Nothing showing in
+      // feeds" after a few hides. Now both paths
+      // produce the same outcome.)
+      actions.push({
+        label: hidden ? 'Unhide this entry' : 'Hide this entry',
+        onClick: () => {
+          if (!hidden) {
+            recordImmediate({ entry_id: entry.id, type: 'never' })
+          }
+          onHideToggle()
+        },
+      })
+    } else if (onHide) {
+      // Fallback: if onHideToggle is not wired (e.g.
+      // a custom Card instance that has not been
+      // migrated yet) fall back to the legacy onHide
+      // path. This preserves backward compatibility
+      // for any external consumers.
       actions.push({
         label: 'Hide this entry',
         onClick: () => onHide(),
@@ -1039,6 +1063,7 @@ function showContextMenu(
   }
   document.addEventListener('keydown', onKey, true)
 }
+
 
 
 

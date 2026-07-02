@@ -330,9 +330,21 @@ export function Column({
                 max={100}
                 step={5}
                 value={prefs.minScore}
-                onChange={(e) =>
-                  onPrefsChange({ ...prefs, minScore: Number(e.target.value) })
-                }
+                onChange={(e) => {
+                  // ``type=range`` always returns a
+                  // finite number, but the
+                  // ``Number(...)`` wrapper on
+                  // arbitrary strings can produce
+                  // NaN. Defensive clamp + isFinite
+                  // so a future code path can't put
+                  // a bad value in localStorage and
+                  // silently empty the column.
+                  const n = Number(e.target.value)
+                  const safe = Number.isFinite(n)
+                    ? Math.max(0, Math.min(100, n))
+                    : 0
+                  onPrefsChange({ ...prefs, minScore: safe })
+                }}
                 className="w-full accent-accent"
               />
             </div>
@@ -646,6 +658,7 @@ function ChevronIcon({ className, collapsed }: { className?: string; collapsed?:
     </svg>
   )
 }
+
 
 
 

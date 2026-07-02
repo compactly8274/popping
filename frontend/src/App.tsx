@@ -73,9 +73,41 @@ function loadColumnPrefs(): Record<string, ColumnPrefs> {
     if (typeof parsed !== 'object' || parsed === null) return {}
     const out: Record<string, ColumnPrefs> = {}
     for (const [k, v] of Object.entries(parsed)) {
-      if (v && typeof v === 'object' && 'sort' in v) {
-        out[k] = { ...DEFAULT_PREFS, ...(v as Partial<ColumnPrefs>) }
+      if (!v || typeof v !== 'object' || !('sort' in v)) continue
+      const obj = v as Record<string, unknown>
+      // Defensive: a corrupt localStorage value (NaN,
+      // Infinity, missing fields) could put a bad
+      // ``minScore`` or ``maxAgeHours`` in state. The
+      // minScore filter compares ``e.composite_score
+      // >= minScore`` — a NaN comparison is always
+      // false, so every entry would be silently
+      // excluded. Validate each field before the
+      // spread so a bad value falls back to the
+      // default instead of overriding it.
+      //
+      // ``Number.isFinite`` rejects NaN + Infinity.
+      // Clamp minScore to [0, 100] (the slider's
+      // range) and maxAgeHours to positive integers.
+      const validSort = (s: unknown): ColumnPrefs['sort'] =>
+        s === 'top' || s === 'newest' || s === 'oldest' ? s : 'top'
+      const rawMin = obj.minScore
+      const minScore =
+        typeof rawMin === 'number' && Number.isFinite(rawMin)
+          ? Math.max(0, Math.min(100, rawMin))
+          : DEFAULT_PREFS.minScore
+      let maxAgeHours: number | null
+      if (obj.maxAgeHours === null) {
+        maxAgeHours = null
+      } else if (
+        typeof obj.maxAgeHours === 'number' &&
+        Number.isFinite(obj.maxAgeHours) &&
+        obj.maxAgeHours > 0
+      ) {
+        maxAgeHours = obj.maxAgeHours
+      } else {
+        maxAgeHours = DEFAULT_PREFS.maxAgeHours
       }
+      out[k] = { sort: validSort(obj.sort), minScore, maxAgeHours }
     }
     return out
   } catch {
@@ -744,6 +776,18 @@ export function App() {
   // not in the map (e.g. a source that was deleted) are
   // excluded — safer than including them and showing the user
   // "ghost" entries.
+  // Build a human-readable column name from the active
+  // sources. ``[...activeSources]`` is sorted
+  // alphabetically so the same set of sources always
+  // produces the same name (stable display).
+  const multisubColumnName = useMemo(() => {
+    const names = Array.from(activeSources).sort()
+    if (names.length === 0) return 'Filtering'
+    if (names.length === 1) return names[0]
+    if (names.length === 2) return `${names[0]} + 1`
+    return `${names[0]} + ${names.length - 1} more`
+  }, [activeSources])
+
   const multisubColumn = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
     if (activeSources.size === 0) {
       // Defensive: this branch shouldn't be reached because
@@ -751,14 +795,14 @@ export function App() {
       // is empty, but we keep the empty case explicit so
       // a stale memo doesn't accidentally render a
       // unfiltered column.
-      return [{ name: 'Filtering', entries: [] }]
+      return [{ name: multisubColumnName, entries: [] }]
     }
     const filtered = visibleEntries.filter((e) => {
       const name = sourcesById.get(e.source_id)
       return name != null && activeSources.has(name)
     })
-    return [{ name: 'Filtering', entries: filtered }]
-  }, [visibleEntries, activeSources, sourcesById])
+    return [{ name: multisubColumnName, entries: filtered }]
+  }, [visibleEntries, activeSources, sourcesById, multisubColumnName])
 
   const baseColumns = viewKind === 'multisub' ? multisubColumn : allSubsColumns
 
@@ -1586,20 +1630,40 @@ export function App() {
   }
 
   const markColumnRead = (columnName: string) => {
-    // Atomic: update both the user-visible lastViewed and the
-    // in-memory seen-set in the same render cycle. Doing them in
-    // two separate setState calls (as the old code did) could let
-    // a re-render between them see the new seen-set but the old
-    // lastViewed, briefly flashing the "N new" chip. The
-    // seenEntryIdsRef mutation isn't reactive so we still update
-    // the ref directly, but the lastViewed setState now batches
-    // correctly with React 18's automatic batching.
-    setLastViewed((prev) => ({ ...prev, [columnName]: new Date().toISOString() }))
+    // Three updates in one render cycle:
+    //   1. lastViewed[columnName] = now  (chips to 0)
+    //   2. readEntries[columnName] += all current entry ids
+    //      (moves every entry from Fresh to History)
+    //   3. seenEntryIdsRef adds them  (next-refresh delta
+    //      doesn't re-flag them as "new since refresh")
+    //
+    // The ``setReadEntries`` updater trims to
+    // ``MAX_PER_COLUMN`` to prevent localStorage from
+    // growing unbounded if the user has a habit of
+    // tapping the column header.
     const col = columns.find((c) => c.name === columnName)
-    if (col && seenEntryIdsRef.current != null) {
-      const merged = new Set(seenEntryIdsRef.current)
-      for (const e of col.entries) merged.add(e.id)
-      seenEntryIdsRef.current = merged
+    setLastViewed((prev) => ({ ...prev, [columnName]: new Date().toISOString() }))
+    if (col) {
+      setReadEntries((prev) => {
+        const cur = prev[columnName] ?? []
+        // Add only ids not already in the set. The
+        // dedup happens in O(n + m) where n is the
+        // column's entry count and m is the existing
+        // set size.
+        const curSet = new Set(cur)
+        const toAdd: number[] = []
+        for (const e of col.entries) {
+          if (!curSet.has(e.id)) toAdd.push(e.id)
+        }
+        if (toAdd.length === 0) return prev
+        const next = [...cur, ...toAdd].slice(-MAX_PER_COLUMN)
+        return { ...prev, [columnName]: next }
+      })
+      if (seenEntryIdsRef.current != null) {
+        const merged = new Set(seenEntryIdsRef.current)
+        for (const e of col.entries) merged.add(e.id)
+        seenEntryIdsRef.current = merged
+      }
     }
   }
 
@@ -2045,16 +2109,65 @@ export function App() {
                 </span>
               </header>
               <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                {forYou.map((e) => (
-                  <Card
-                    key={e.id}
-                    entry={e}
-                    sourceName={sourcesById.get(e.source_id)}
-                    category={categoriesBySourceId.get(e.source_id)}
-                    expanded={expandedSummaries.has(e.id)}
-                    onToggleSummary={() => toggleSummary(e.id)}
-                  />
-                ))}
+                {forYou.map((e) => {
+                  // Per-card engagement props. The For You
+                  // row was previously read-only — no
+                  // mark-read, no hide, no star. The user
+                  // could see the personal feed but
+                  // couldn't engage with it. Now every
+                  // card has the full set of per-card
+                  // actions wired to App-level callbacks
+                  // so the user can mark-read, hide, or
+                  // star a For You card the same way
+                  // they would in a category column.
+                  //
+                  // ``unread`` is ``true`` for every For
+                  // You card on first render — the
+                  // ``readEntries['For You']`` set is the
+                  // user's read state in this row, and
+                  // the dim kicks in when they tap ✓.
+                  // The per-column lastViewed isn't
+                  // used here (the For You has no column
+                  // header with a "mark all read"
+                  // button).
+                  //
+                  // ``selected`` / ``onActivate`` /
+                  // ``cardRef`` are not passed because
+                  // keyboard nav is per-column, not
+                  // per-row, and the For You row is
+                  // not a "column" the user can scroll
+                  // into.
+                  const isRead = (readEntries['For You'] ?? []).includes(e.id)
+                  return (
+                    <Card
+                      key={e.id}
+                      entry={e}
+                      sourceName={sourcesById.get(e.source_id)}
+                      category={categoriesBySourceId.get(e.source_id)}
+                      unread={!isRead}
+                      expanded={expandedSummaries.has(e.id)}
+                      onToggleSummary={() => toggleSummary(e.id)}
+                      onMarkRead={() => markEntryRead('For You', e.id)}
+                      onHide={() => {
+                        hideEntry(e.id)
+                        toast('Entry hidden. Restore from Settings.', 'info')
+                      }}
+                      onHideToggle={() => toggleHideEntry('For You', e.id)}
+                      hidden={hiddenSet.has(e.id)}
+                      onStar={() => {
+                        const wasStarred = starredSet.has(e.id)
+                        toggleStarEntry(e.id)
+                        toast(
+                          wasStarred
+                            ? 'Removed from Saved.'
+                            : 'Saved for later — see the Saved column.',
+                          'info',
+                        )
+                      }}
+                      starred={starredSet.has(e.id)}
+                    />
+                  )
+                })}
               </div>
             </section>
           )}
@@ -2193,6 +2306,27 @@ export function App() {
         onSourceRenamed={onSourceRenamed}
         onResetLocalState={resetLocalState}
         onOpenSettings={(tab) => openSettings(tab ?? 'feeds')}
+        onSavePreset={() => {
+          // Use a native prompt for the preset name.
+          // Simple, no extra state, no overlay. A
+          // custom modal would be 80 lines of code
+          // and not noticeably better UX. The
+          // savePreset callback returns the new
+          // preset id; we just toast the name.
+          //
+          // ``window.prompt`` returns ``null`` when
+          // the user dismisses (Esc / Cancel) —
+          // skip the save in that case. An empty
+          // string falls through to the default
+          // "Untitled preset" label that savePreset
+          // already provides.
+          const name = window.prompt(
+            'Name this view (e.g. “AI safety”, “Hockey + deals”, “muted everything”)',
+          )
+          if (name === null) return
+          savePreset(name)
+          toast(`Saved view “${name.trim() || 'Untitled preset'}”`, 'info')
+        }}
       />
       <Settings
         open={settingsOpen}
@@ -2303,6 +2437,11 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
+
+
+
+
 
 
 
