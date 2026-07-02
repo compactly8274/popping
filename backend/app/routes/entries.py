@@ -275,6 +275,8 @@ async def entries_by_ids(
                 published_at=entry.published_at,
                 fetched_at=entry.fetched_at,
                 composite_score=entry.composite_score,
+                personal_score=entry.personal_score,
+                raw_score=entry.raw_score,
                 meta=entry.meta or {},
             )
         )

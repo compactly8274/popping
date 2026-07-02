@@ -64,26 +64,48 @@ logger = logging.getLogger("popping.routes.interactions")
 router = APIRouter(tags=["interactions"])
 
 
-def _require_user_id(user: dict | None) -> str:
-    """Return the user's sub (user_id) or raise 401.
+# Synthetic user_id for engagement events when
+# there's no resolved user. Used by the
+# /api/interactions endpoints as a fallback so
+# events from cookie-less / non-bypassed
+# requests still land in the DB. In a multi-user
+# deployment, every cookie-less event would land
+# under this single id — the History view would
+# show "anonymous" clicks. In a single-user
+# deployment, this is the only user_id anyway.
+_ANONYMOUS_USER_ID = "anonymous"
+
+
+def _resolve_user_id(user: dict | None) -> str:
+    """Return a stable user_id for the engagement
+    event.
 
     The interactions endpoints are soft-auth (use
     ``current_user`` not ``require_user``) so a
     user with no cookie can still browse the
-    dashboard. Engagement events, however, need a
-    stable user_id to attribute the event to. If
+    dashboard. Engagement events need a stable
+    user_id to attribute the event to. When
     there's no user (no cookie + no bypass), we
-    raise 401. The frontend treats this as a no-op
-    (the engagement buffer is best-effort; see
-    ``recordImmediate`` in
-    ``frontend/src/lib/interactions.ts``).
+    fall back to a synthetic "anonymous" id
+    rather than 401. The events still land in the
+    DB; in a multi-user deployment the
+    unattributed events are visible only to
+    developers reading the raw rows (the History
+    view filters by the current user's sub, so
+    "anonymous" events don't pollute the user's
+    review feed).
+
+    The previous behavior was 401 in this case,
+    which silently dropped every engagement event
+    fired by a cookie-less dashboard (the
+    frontend's ``recordImmediate`` only
+    console.warns in dev). Result: empty History
+    tab + no ranking signal. The fallback
+    restores the engagement pipeline.
     """
-    if user is None or "sub" not in user:
-        raise HTTPException(
-            status_code=401,
-            detail="login required to record engagement events",
-        )
-    return user["sub"]
+    if user is not None and "sub" in user:
+        return user["sub"]
+    return _ANONYMOUS_USER_ID
 
 
 async def _commit_unique(session: AsyncSession, event: Interaction) -> int | None:
@@ -113,7 +135,7 @@ async def post_interaction(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Record one engagement event. Returns the inserted row id."""
-    user_id = _require_user_id(user)
+    user_id = _resolve_user_id(user)
     row = Interaction(
         entry_id=body.entry_id,
         user_id=user_id,
@@ -182,7 +204,7 @@ async def post_interactions_batch(
         )
     entry_ids = list({e.entry_id for e in body.events})
     valid_ids = await _existing_entry_ids(session, entry_ids)
-    user_id = _require_user_id(user)
+    user_id = _resolve_user_id(user)
     inserted = 0
     for evt in body.events:
         if evt.entry_id not in valid_ids:
@@ -252,7 +274,7 @@ async def get_recent_interactions(
     multi-user deployments don't conflate their history.
     Mirrors the write path's user_id handling.
     """
-    user_id = _require_user_id(user)
+    user_id = _resolve_user_id(user)
     # Parse the types filter. Empty = all types (omit WHERE
     # filter on type). The split is forgiving: an empty
     # string, a string of commas, or whitespace is treated
