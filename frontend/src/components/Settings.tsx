@@ -87,6 +87,8 @@ type Props = {
   // Saved tab so the user can review and bulk-unsave.
   starredEntries: number[]
   onUnstarAll: () => void
+  // Per-row actions for the list view.
+  onUnstarEntry: (entryId: number) => void
 }
 
 const TAB_META: Record<SettingsTab, { label: string; icon: string }> = {
@@ -117,6 +119,7 @@ export function Settings({
   onRestoreAllHidden,
   starredEntries,
   onUnstarAll,
+  onUnstarEntry,
 }: Props) {
   // Live data fetched when the overlay opens. The Feeds tab reuses
   // the ``sources`` prop (App owns it), but the LLM and
@@ -351,74 +354,19 @@ export function Settings({
             </div>
           )}
           {tab === 'hidden' && (
-            // No GroupedSection/GroupedRow in this file â the
-            // primitives live in Drawer.tsx and we don't import them
-            // (the Settings overlay's iOS look is a flat list, not
-            // the grouped-cards style of the Drawer). Inline the
-            // markup that fits the surrounding sections (rounded
-            // card, label-uppercase header, row dividers).
-            <div className="pt-4 px-4 space-y-3">
-              <div className="rounded-ios bg-bg-surface border border-hairline p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-ios-body text-label-primary">
-                      {hiddenEntries.length === 0
-                        ? 'No hidden entries'
-                        : `${hiddenEntries.length} hidden ${hiddenEntries.length === 1 ? 'entry' : 'entries'}`}
-                    </div>
-                    <div className="text-ios-caption text-label-secondary mt-0.5">
-                      {hiddenEntries.length === 0
-                        ? 'Right-click a card â Hide this entry to dismiss it. Hidden entries stay in the database but donât show on the dashboard.'
-                        : 'Tap Restore to show on the dashboard again.'}
-                    </div>
-                  </div>
-                  {hiddenEntries.length > 0 && (
-                    <button
-                      onClick={onRestoreAllHidden}
-                      className="text-ios-body text-accent active:opacity-60 shrink-0"
-                      aria-label="restore all hidden entries"
-                    >
-                      Restore all
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
+            <HiddenTabContent
+              ids={hiddenEntries}
+              onRestore={onRestoreHidden}
+              onRestoreAll={onRestoreAllHidden}
+            />
           )}
 
           {tab === 'starred' && (
-            // No GroupedSection/GroupedRow in this file — same
-            // inlined-markup pattern as the hidden tab. Future
-            // improvement: per-entry title display so the user
-            // can see what they saved (would need an entries
-            // fetch keyed by id).
-            <div className="pt-4 px-4 space-y-3">
-              <div className="rounded-ios bg-bg-surface border border-hairline p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-ios-body text-label-primary">
-                      {starredEntries.length === 0
-                        ? 'No saved entries'
-                        : `${starredEntries.length} saved ${starredEntries.length === 1 ? 'entry' : 'entries'}`}
-                    </div>
-                    <div className="text-ios-caption text-label-secondary mt-0.5">
-                      {starredEntries.length === 0
-                        ? 'Right-click a card → Save for later (or press s) to bookmark an entry. Saved items surface in the Saved column at the top of the dashboard.'
-                        : 'The Saved column at the top of the dashboard shows your bookmarks, most recent first. Clear all removes every star.'}
-                    </div>
-                  </div>
-                  {starredEntries.length > 0 && (
-                    <button
-                      onClick={onUnstarAll}
-                      className="text-ios-body text-red-400 active:opacity-60 shrink-0"
-                      aria-label="clear all saved entries"
-                    >
-                      Clear all
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
+            <StarredTabContent
+              ids={starredEntries}
+              onUnstar={onUnstarEntry}
+              onClearAll={onUnstarAll}
+            />
           )}
 
           {tab === 'history' && <HistoryTabContent onError={onError} />}
@@ -1173,4 +1121,273 @@ function timeAgo(iso: string): string {
 }
 
 
+
+
+
+// =============================================================================
+// Hidden + Starred list components
+// =============================================================================
+//
+// Both tabs show a list of entries (looked up by id from
+// the backend) with a per-row action button. The
+// shared shape keeps the two tabs visually consistent:
+//   - Header card with count + bulk action
+//   - List of rows below, each with title, source
+//     name, time-ago timestamp, and a per-row action
+//   - Empty state with hint text
+//
+// The fetch is keyed by the join of ids so a stable
+// id set (re-rendering) doesn't re-fetch. Different
+// id sets (tab switch with new hides / stars) trigger
+// a new fetch. The fetch is also called on the
+// overlay open (via the parent's effect that mounts
+// these components).
+
+interface EntryIdListContentProps {
+  // Action label shown on the per-row button.
+  actionLabel: string
+  // Header card subtitle. Shown when the list is
+  // empty.
+  emptyHint: string
+  // Header card subtitle. Shown when the list has
+  // entries.
+  populatedHint: string
+  // Bulk action label (the button in the header).
+  bulkLabel: string
+  onBulkAction: () => void
+  // Per-row action.
+  onRowAction: (entryId: number) => void
+  // Singular / plural noun for the entry count.
+  countNoun: string
+  // Loaded entries from the backend.
+  loaded: Array<{
+    id: number
+    title: string
+    url: string
+    source_name: string
+    published_at: string | null
+  }>
+  loading: boolean
+  loadError: string | null
+}
+
+function EntryIdListContent({
+  actionLabel,
+  emptyHint,
+  populatedHint,
+  bulkLabel,
+  onBulkAction,
+  onRowAction,
+  countNoun,
+  loaded,
+  loading,
+  loadError,
+}: EntryIdListContentProps) {
+  return (
+    <div className="pt-4 px-4 space-y-3">
+      <div className="rounded-ios bg-bg-surface border border-hairline p-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-ios-body text-label-primary">
+              {loaded.length === 0 && !loading
+                ? `No ${countNoun}`
+                : `${loaded.length} ${countNoun}`}
+            </div>
+            <div className="text-ios-caption text-label-secondary mt-0.5">
+              {loaded.length === 0 && !loading ? emptyHint : populatedHint}
+            </div>
+          </div>
+          {loaded.length > 0 && (
+            <button
+              onClick={onBulkAction}
+              className="text-ios-body text-accent active:opacity-60 shrink-0"
+              aria-label={bulkLabel}
+            >
+              {bulkLabel}
+            </button>
+          )}
+        </div>
+      </div>
+      {loadError && (
+        <div className="rounded-ios bg-red-500/10 border border-red-500/30 p-3 text-ios-caption text-red-400">
+          Couldn’t load the list: {loadError}
+        </div>
+      )}
+      {loading && loaded.length === 0 && (
+        <div className="rounded-ios bg-bg-surface border border-hairline p-3 text-ios-caption text-label-secondary">
+          Loading…
+        </div>
+      )}
+      {loaded.length > 0 && (
+        <div className="rounded-ios bg-bg-surface border border-hairline divide-y divide-hairline">
+          {loaded.map((e) => (
+            <div
+              key={e.id}
+              className="flex items-start gap-3 p-3"
+            >
+              <div className="flex-1 min-w-0">
+                <a
+                  href={e.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block text-ios-body text-label-primary active:opacity-60 truncate"
+                  title={e.title}
+                >
+                  {e.title}
+                </a>
+                <div className="text-ios-caption text-label-tertiary mt-0.5 truncate">
+                  {e.source_name}
+                  {e.published_at && (
+                    <> · {timeAgo(e.published_at)}</>
+                  )}
+                </div>
+              </div>
+              <button
+                onClick={() => onRowAction(e.id)}
+                className="text-ios-caption text-accent active:opacity-60 shrink-0 self-center"
+                aria-label={`${actionLabel}: ${e.title}`}
+              >
+                {actionLabel}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Thin wrapper for the Hidden tab. Fetches the
+// hidden entries by id, then delegates the
+// rendering to EntryIdListContent.
+function HiddenTabContent({
+  ids,
+  onRestore,
+  onRestoreAll,
+}: {
+  ids: number[]
+  onRestore: (entryId: number) => void
+  onRestoreAll: () => void
+}) {
+  const [loaded, setLoaded] = useState<EntryIdListContentProps['loaded']>([])
+  const [loading, setLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  useEffect(() => {
+    if (ids.length === 0) {
+      setLoaded([])
+      setLoading(false)
+      setLoadError(null)
+      return
+    }
+    let alive = true
+    setLoading(true)
+    setLoadError(null)
+    api
+      .entriesByIds(ids)
+      .then((rows) => {
+        if (!alive) return
+        setLoaded(
+          rows.map((r) => ({
+            id: r.id,
+            title: r.title,
+            url: r.url,
+            source_name: r.source_name,
+            published_at: r.published_at,
+          })),
+        )
+      })
+      .catch((e: Error) => {
+        if (!alive) return
+        setLoadError(e.message)
+      })
+      .finally(() => {
+        if (!alive) return
+        setLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [ids.join(',')])
+  return (
+    <EntryIdListContent
+      actionLabel="Restore"
+      emptyHint="Right-click a card → Hide this entry (or press h) to dismiss it. Hidden entries stay in the database but don’t show on the dashboard."
+      populatedHint="Tap Restore to show an entry on the dashboard again."
+      bulkLabel="Restore all"
+      onBulkAction={onRestoreAll}
+      onRowAction={onRestore}
+      countNoun={ids.length === 1 ? 'hidden entry' : 'hidden entries'}
+      loaded={loaded}
+      loading={loading}
+      loadError={loadError}
+    />
+  )
+}
+
+// Thin wrapper for the Starred tab. Same shape as
+// HiddenTabContent, different copy and a destructive
+// (red) row action label.
+function StarredTabContent({
+  ids,
+  onUnstar,
+  onClearAll,
+}: {
+  ids: number[]
+  onUnstar: (entryId: number) => void
+  onClearAll: () => void
+}) {
+  const [loaded, setLoaded] = useState<EntryIdListContentProps['loaded']>([])
+  const [loading, setLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  useEffect(() => {
+    if (ids.length === 0) {
+      setLoaded([])
+      setLoading(false)
+      setLoadError(null)
+      return
+    }
+    let alive = true
+    setLoading(true)
+    setLoadError(null)
+    api
+      .entriesByIds(ids)
+      .then((rows) => {
+        if (!alive) return
+        setLoaded(
+          rows.map((r) => ({
+            id: r.id,
+            title: r.title,
+            url: r.url,
+            source_name: r.source_name,
+            published_at: r.published_at,
+          })),
+        )
+      })
+      .catch((e: Error) => {
+        if (!alive) return
+        setLoadError(e.message)
+      })
+      .finally(() => {
+        if (!alive) return
+        setLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [ids.join(',')])
+  return (
+    <EntryIdListContent
+      actionLabel="Remove"
+      emptyHint="Right-click a card → Save for later (or press b) to bookmark an entry. Saved items surface in the Saved column at the top of the dashboard."
+      populatedHint="The Saved column at the top of the dashboard shows your bookmarks, most recent first. Remove drops one star; Clear all drops every star."
+      bulkLabel="Clear all"
+      onBulkAction={onClearAll}
+      onRowAction={onUnstar}
+      countNoun={ids.length === 1 ? 'saved entry' : 'saved entries'}
+      loaded={loaded}
+      loading={loading}
+      loadError={loadError}
+    />
+  )
+}
 

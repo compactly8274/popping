@@ -2356,6 +2356,17 @@ export function App() {
           setStarredEntries([])
           toast('All saved entries cleared.', 'info')
         }}
+        onUnstarEntry={(entryId) => {
+          // Per-row unstar from the Settings → Saved
+          // tab list. Mirrors the card's star
+          // button + the per-card context-menu
+          // "Unsave" action. The id is the entry
+          // id; we just remove it from the
+          // starredEntries set in localStorage
+          // (the Saved column re-renders without
+          // it on the next refresh).
+          setStarredEntries((prev) => prev.filter((id) => id !== entryId))
+        }}
       />
 
       <ShortcutsSheet

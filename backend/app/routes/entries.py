@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import Entry, Source
-from app.schemas import EntryListOut, EntrySummaryOut
+from app.schemas import EntryListOut, EntryOut, EntrySummaryOut
 
 router = APIRouter(tags=["entries"])
 
@@ -194,6 +194,93 @@ async def list_entries(
     return out
 
 
+
+@router.get("/entries/by-ids", response_model=list[EntryOut])
+async def entries_by_ids(
+    session: AsyncSession = Depends(get_session),
+    ids: str = Query(
+        default="",
+        description="Comma-separated entry ids to fetch (max 200).",
+    ),
+) -> list[EntryOut]:
+    """Resolve a list of entry ids to full EntryOut
+    rows, joined with source name.
+
+    Used by the Settings overlay's Hidden and
+    Starred tabs to render a list of the entries
+    the user has hidden or starred (the ids are
+    in localStorage; the dashboard's `entries`
+    state doesn't include hidden entries).
+
+    The endpoint is unauth'd — same pattern as
+    ``/api/entries``. In a homelab / single-user
+    deployment, the bypass covers the common
+    case; in an OIDC deployment, the row-level
+    data isn't sensitive (no PII, just article
+    metadata).
+
+    Cap at 200 ids so a careless client can't
+    turn this into a full-table scan.
+
+    Returns the entries in the same order as
+    the input ids. Ids that don't match a row
+    are dropped silently (a deleted entry
+    shouldn't cause the whole call to fail).
+    """
+    if not ids.strip():
+        return []
+    # Parse + validate ids. The pydantic model
+    # will reject non-numeric strings; we use
+    # ``int(v)`` inside a list comprehension so
+    # a single bad value doesn't fail the whole
+    # call (the entry is just dropped).
+    raw_ids = [s.strip() for s in ids.split(",") if s.strip()]
+    parsed: list[int] = []
+    for v in raw_ids:
+        try:
+            parsed.append(int(v))
+        except ValueError:
+            continue
+    if not parsed:
+        return []
+    # Cap the count to prevent abuse.
+    if len(parsed) > 200:
+        parsed = parsed[:200]
+    # Query: select entries by id, join source for
+    # the name. Same column projection as the
+    # list_entries endpoint (no meta JSONB).
+    stmt = (
+        select(Entry, Source.name)
+        .join(Source, Entry.source_id == Source.id)
+        .where(Entry.id.in_(parsed))
+    )
+    result = await session.execute(stmt)
+    rows = result.all()
+    # Build a map for O(1) lookup, then return in
+    # the input order (preserves the user's
+    # localStorage ordering, which is recency).
+    by_id = {row[0].id: (row[0], row[1]) for row in rows}
+    out: list[EntryOut] = []
+    for eid in parsed:
+        if eid not in by_id:
+            continue
+        entry, source_name = by_id[eid]
+        out.append(
+            EntryOut(
+                id=entry.id,
+                source_id=entry.source_id,
+                source_name=source_name,
+                title=entry.title,
+                url=entry.url,
+                published_at=entry.published_at,
+                fetched_at=entry.fetched_at,
+                composite_score=entry.composite_score,
+                meta=entry.meta or {},
+            )
+        )
+    return out
+
+
 @router.post(
     "/entries/{entry_id}/summary",
     response_model=EntrySummaryOut,
@@ -271,3 +358,4 @@ async def entry_summary_endpoint(
     await session.commit()
 
     return EntrySummaryOut(summary=cleaned, cached=False)
+
