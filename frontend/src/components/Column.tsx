@@ -21,17 +21,29 @@ export const DEFAULT_PREFS: ColumnPrefs = {
 
 type Props = {
   name: string
-  entries: Entry[]
+  // Pre-split entry lists. App owns the "what's new" semantics
+  // (derived from per-column lastViewed timestamps + the manual
+  // readEntries set), and ships the two slices down pre-sorted
+  // newest-first. The Column only renders — the split and the
+  // sort are data-layer concerns, not visual ones.
+  //
+  // When a slice is empty, its section (header + divider) is
+  // omitted entirely. So a column with no new entries just shows
+  // its History section under the column header with no divider.
+  sections: {
+    new: Entry[]
+    history: Entry[]
+  }
   sourcesById: Map<number, string>
   // Number of entries in this column that are "new since the user's
   // last visit to this column". Rendered as a chip in the header so
   // the user knows to come look. ``undefined`` means we haven't
-  // computed it yet (initial mount) and we show nothing.
+  // computed it yet (initial mount) and we show nothing. The
+  // chip count and the New section count may differ (e.g. when a
+  // minScore filter hides some new entries) — that's intentional:
+  // the chip is the feed-level signal, the section is the
+  // post-filter view.
   newCount?: number
-  // Set of entry IDs that are unread. The Card dims itself when its
-  // id is not in this set. App derives this from per-column
-  // lastViewedAt timestamps so it survives reloads.
-  unreadIds?: Set<number>
   // The id of the currently keyboard-selected entry in this column.
   // Only the matching Card renders the blue focus ring. ``-1``
   // (or undefined) means no selection in this column.
@@ -81,14 +93,21 @@ type Props = {
   // passes a Set so each card render is an O(1) check rather
   // than a linear search.
   starredSet?: Set<number>
+  // Per-section collapse state (Miniflux-style). When a section
+  // is collapsed, only its header renders — the cards are
+  // unmounted. Persisted in localStorage by App, keyed by column
+  // name, so the user's preference survives reloads.
+  sectionsCollapsed?: { new: boolean; history: boolean }
+  // Toggle callback for a section header click. App flips the
+  // appropriate bit in the per-column storage record.
+  onToggleSection?: (key: 'new' | 'history') => void
 }
 
 export function Column({
   name,
-  entries,
+  sections,
   sourcesById,
   newCount,
-  unreadIds,
   selectedId,
   cardRefs,
   onMarkRead,
@@ -102,6 +121,8 @@ export function Column({
   onHideEntry,
   onStarEntry,
   starredSet,
+  sectionsCollapsed,
+  onToggleSection,
 }: Props) {
   const [popoverOpen, setPopoverOpen] = useState(false)
   const popoverRef = useRef<HTMLDivElement | null>(null)
@@ -178,8 +199,15 @@ export function Column({
     }
   }
 
-  const visible = totalCount ?? entries.length
-  const showTotal = totalCount != null && totalCount !== entries.length
+  // Pre-split count: total entries across both sections. Used for
+  // the "X of Y" header count, where Y is the pre-filter total
+  // (passed via ``totalCount``). Naming this ``entryCount`` instead
+  // of ``entries`` to avoid shadowing the prop shape — the
+  // sections-based model means we no longer have an ``entries``
+  // prop to refer to here.
+  const entryCount = sections.new.length + sections.history.length
+  const visible = totalCount ?? entryCount
+  const showTotal = totalCount != null && totalCount !== entryCount
 
   return (
     <section className="flex flex-col h-full overflow-visible">
@@ -221,7 +249,7 @@ export function Column({
               plain "X" otherwise. text-label-secondary to keep it
               secondary to the new chip. */}
           <span className="text-ios-caption text-label-secondary">
-            {showTotal ? `${entries.length} of ${visible}` : visible}
+            {showTotal ? `${entryCount} of ${visible}` : visible}
           </span>
         </div>
 
@@ -319,10 +347,159 @@ export function Column({
         )}
       </header>
       <div className="flex-1 overflow-y-auto space-y-2 pr-1">
-        {entries.length === 0 ? (
+        {entryCount === 0 ? (
           <p className="text-ios-body text-label-secondary italic px-1">nothing yet</p>
         ) : (
-          entries.map((e) => {
+          <>
+            {/* New section. Rendered first (Miniflux convention).
+                Omitted entirely when the new slice is empty — no
+                header, no divider, no "NEW (0)" line. The collapsed
+                flag unmounts the cards but keeps the header visible
+                so the user can re-expand. */}
+            {sections.new.length > 0 && (
+              <ColumnSection
+                label="New"
+                count={sections.new.length}
+                collapsed={sectionsCollapsed?.new ?? false}
+                onToggle={onToggleSection ? () => onToggleSection('new') : undefined}
+                entries={sections.new}
+                // All entries in the New section are unread by
+                // construction — that's the membership predicate
+                // App uses to build the slice. Pass ``unread=true``
+                // uniformly so every card in this section gets the
+                // thin accent ring.
+                unreadForCard={() => true}
+                sourcesById={sourcesById}
+                selectedId={selectedId}
+                cardRefs={cardRefs}
+                categoriesBySourceId={categoriesBySourceId}
+                onMarkEntryRead={onMarkEntryRead}
+                expandedSummaries={expandedSummaries}
+                onToggleSummary={onToggleSummary}
+                onHideEntry={onHideEntry}
+                onStarEntry={onStarEntry}
+                starredSet={starredSet}
+              />
+            )}
+            {/* Divider between sections. Only renders when both
+                sections are non-empty (otherwise the section it's
+                separating isn't there). iOS-style 1px hairline
+                inset from the column edge to feel like part of the
+                column's content rhythm, not a hard page break. */}
+            {sections.new.length > 0 && sections.history.length > 0 && (
+              <div aria-hidden="true" className="h-px bg-hairline mx-1 my-1" />
+            )}
+            {sections.history.length > 0 && (
+              <ColumnSection
+                label="History"
+                count={sections.history.length}
+                collapsed={sectionsCollapsed?.history ?? false}
+                onToggle={onToggleSection ? () => onToggleSection('history') : undefined}
+                entries={sections.history}
+                // All entries in the History section are read by
+                // construction — they were sorted OUT of the new
+                // set by the existing unread logic, which means
+                // they're either manually marked read or older
+                // than ``lastViewed``. No ring on history cards.
+                unreadForCard={() => false}
+                sourcesById={sourcesById}
+                selectedId={selectedId}
+                cardRefs={cardRefs}
+                categoriesBySourceId={categoriesBySourceId}
+                onMarkEntryRead={onMarkEntryRead}
+                expandedSummaries={expandedSummaries}
+                onToggleSummary={onToggleSummary}
+                onHideEntry={onHideEntry}
+                onStarEntry={onStarEntry}
+                starredSet={starredSet}
+              />
+            )}
+          </>
+        )}
+      </div>
+    </section>
+  )
+}
+
+// One New/History section: clickable header + (when expanded) the
+// list of cards. ``unreadForCard`` is a per-card lookup that returns
+// true for every card in the New section and false for every card
+// in the History section — by construction, the slices App passes
+// in are uniform. (The function shape is reused so we can extend to
+// mixed slices later, e.g. for a "stale but unread" indicator on
+// the History section without restructuring.)
+type SectionProps = {
+  label: string
+  count: number
+  collapsed: boolean
+  onToggle?: () => void
+  entries: Entry[]
+  unreadForCard: (e: Entry) => boolean
+  sourcesById: Map<number, string>
+  selectedId: number | undefined
+  cardRefs:
+    | Map<number, HTMLElement | null>
+    | React.MutableRefObject<Map<number, HTMLElement | null>>
+    | undefined
+  categoriesBySourceId: Map<number, string> | undefined
+  onMarkEntryRead: ((entryId: number) => void) | undefined
+  expandedSummaries: Set<number> | undefined
+  onToggleSummary: ((entryId: number) => void) | undefined
+  onHideEntry: ((entryId: number) => void) | undefined
+  onStarEntry: ((entryId: number) => void) | undefined
+  starredSet: Set<number> | undefined
+}
+
+function ColumnSection({
+  label,
+  count,
+  collapsed,
+  onToggle,
+  entries,
+  unreadForCard,
+  sourcesById,
+  selectedId,
+  cardRefs,
+  categoriesBySourceId,
+  onMarkEntryRead,
+  expandedSummaries,
+  onToggleSummary,
+  onHideEntry,
+  onStarEntry,
+  starredSet,
+}: SectionProps) {
+  return (
+    <div>
+      {/* Section header. Click anywhere on the row to collapse /
+          expand. The chevron rotates 90° on expand so the user
+          gets a directional cue (right = collapsed, down =
+          expanded). text-ios-caption + uppercase matches the
+          column-header typography so the two read as the same
+          scale. */}
+      <button
+        type="button"
+        onClick={onToggle}
+        disabled={!onToggle}
+        aria-expanded={!collapsed}
+        data-section-header={label.toLowerCase()}
+        className="w-full flex items-center gap-1.5 px-1 py-1.5 min-h-[28px]
+                   text-ios-caption uppercase tracking-wide text-label-tertiary
+                   hover:text-label-secondary active:text-label-primary
+                   transition-colors select-none
+                   disabled:cursor-default disabled:hover:text-label-tertiary"
+      >
+        <ChevronIcon className="w-3 h-3" collapsed={collapsed} />
+        <span>{label}</span>
+        <span className="text-label-secondary font-semibold">({count})</span>
+      </button>
+      {/* Cards. Unmounted when collapsed (no animation, just a
+          snap — matches BriefCard's collapse behavior and keeps
+          the section cheap to re-open). The list keys are stable
+          (entry.id) so React re-uses Card instances on re-expand
+          instead of remounting. */}
+      {!collapsed && (
+        <div className="space-y-2">
+          {entries.map((e) => {
             // Stable ref callback. The previous version allocated a
             // new closure per card per Column render, defeating the
             // ``memo`` on ``Card``. Instead, ``Card`` writes its own
@@ -339,7 +516,7 @@ export function Column({
                 key={e.id}
                 entry={e}
                 sourceName={sourcesById.get(e.source_id)}
-                unread={unreadIds == null ? false : unreadIds.has(e.id)}
+                unread={unreadForCard(e)}
                 selected={selectedId === e.id}
                 cardRef={
                   cardRefs
@@ -369,10 +546,10 @@ export function Column({
                 starred={starredSet?.has(e.id) ?? false}
               />
             )
-          })
-        )}
-      </div>
-    </section>
+          })}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -390,6 +567,29 @@ function MoreIcon({ className }: { className?: string }) {
       <circle cx="6"  cy="12" r="1.75" />
       <circle cx="12" cy="12" r="1.75" />
       <circle cx="18" cy="12" r="1.75" />
+    </svg>
+  )
+}
+
+// Right-pointing chevron used for the New/History section header
+// disclosure. Rotates 90° (so it points down) when the section is
+// expanded. Single CSS transform, GPU-driven — no JS animation
+// loop, no reflow. The ``aria-hidden`` chevron is paired with the
+// surrounding button's ``aria-expanded`` so the disclosure state
+// is announced correctly.
+function ChevronIcon({ className, collapsed }: { className?: string; collapsed?: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`${className ?? ''} transition-transform duration-200 ${collapsed ? '' : 'rotate-90'}`}
+      aria-hidden="true"
+    >
+      <polyline points="9 6 15 12 9 18" />
     </svg>
   )
 }
