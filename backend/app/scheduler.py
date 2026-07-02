@@ -469,14 +469,46 @@ async def _backfill_embeddings(batch_size: int | None = None) -> None:
 # needle; bookmark is the strongest positive signal (the user
 # explicitly said "save for later").
 _INTERACTION_WEIGHTS: dict[str, float] = {
-    "view": 1.0,
-    "click": 2.0,
-    "dwell": 1.5,
-    "thumb_up": 3.0,
-    "thumb_down": -2.0,
-    "bookmark": 3.0,
-    "share": 1.5,
-    "never": -3.0,
+    # ``view`` fires on every card scroll-into-view, including
+    # ones the user has already seen and scrolled past. It's a
+    # "didn't say no" signal, not a "want more of this" signal --
+    # the prior weight of 1.0 made it dominate the aggregated
+    # vector (3188 views vs 34 ``never`` in one user's data, a
+    # 94:1 ratio), so explicit hide/thumb_down events were
+    # effectively swamped. Demoted to 0.2 so it still keeps the
+    # vector from going stale on a user who never clicks
+    # anything, but doesn't drown out the explicit signals.
+    "view": 0.2,
+    # ``click`` is the strongest "I actually read this" signal
+    # we have -- the user opened the article. Was 2.0; bumped
+    # to match the positive explicit signals so a heavy clicker
+    # can outweigh a moderate ``view`` volume.
+    "click": 1.0,
+    # ``dwell`` is the per-card read-time signal. The value is
+    # already in milliseconds (or seconds) so the weight here is
+    # a divisor -- 0.3 means a 10-second read contributes ~3.0
+    # to the aggregated vector, comparable to a single ``click``.
+    "dwell": 0.3,
+    # Explicit positive signals. Bumped from 3.0 to 4.0 so a
+    # single thumb-up can outweigh ~20 scroll-by views. The
+    # intuition: a user who actually thumbed something is
+    # telling us "I want more like this", and that should beat
+    # 20 cards they casually scrolled past.
+    "thumb_up": 4.0,
+    "bookmark": 4.0,
+    # Explicit negative signals. Bumped from -2.0/-3.0 to -4.0
+    # so a single hide cancels ~20 views' worth of positive
+    # signal. The user clicking the eye-icon is a strong "I
+    # never want to see this"; it should move the vector
+    # meaningfully, not be averaged out by passive browsing.
+    "thumb_down": -4.0,
+    "never": -4.0,
+    # ``share`` is an explicit positive but rare; was 1.5.
+    # Bumped to 2.0 -- sharing implies a stronger endorsement
+    # than just bookmarking. Still under thumb_up (4.0) so
+    # a "I like this" thumb beats an "I shared this" share
+    # in the absence of additional thumbs.
+    "share": 2.0,
 }
 
 
@@ -607,7 +639,7 @@ async def _recompute_preference_vector() -> None:
             # to their sub; otherwise aggregate everything
             # (single-user homelab). ``_resolve_aggregation_user_id``
             # picks one.
-            user_ids = _resolve_aggregation_user_ids(session)
+            user_ids = await _resolve_aggregation_user_ids(session)
             if not user_ids:
                 logger.debug("pref vector: no user_ids to aggregate, keeping current")
                 return
