@@ -368,6 +368,51 @@ export const api = {
       body: JSON.stringify({ events }),
     }),
 
+  /** Fetch the user's recent engagement events for the History
+   * view in the Drawer. Returns the events with joined entry
+   * + source metadata so the frontend can render the
+   * "what I read" / "what I hid" / "what I starred" list
+   * in one round-trip.
+   *
+   * ``types`` filters the event types to include; empty /
+   * undefined returns all types (excluding ``dwell`` which
+   * is a per-card read-time signal, not a user-meaningful
+   * event worth surfacing in the History list).
+   *
+   * ``limit`` defaults to 50, max 200. ``offset`` for
+   * pagination.
+   *
+   * The History view in the Drawer fetches this on every
+   * Drawer open. The query is cheap (a single index seek
+   * on ``(user_id, created_at DESC)`` plus a 3-way join)
+   * and the result is small (50 rows); no caching needed
+   * for the MVP. */
+  listRecentInteractions: (opts?: { types?: string[]; limit?: number; offset?: number }) => {
+    const params = new URLSearchParams()
+    if (opts?.types && opts.types.length > 0) {
+      params.set('types', opts.types.join(','))
+    }
+    if (opts?.limit != null) params.set('limit', String(opts.limit))
+    if (opts?.offset != null) params.set('offset', String(opts.offset))
+    const qs = params.toString()
+    return jsonFetch<{
+      items: Array<{
+        id: number
+        type: string
+        value: number
+        created_at: string
+        entry_id: number
+        entry_title: string
+        entry_url: string
+        entry_published_at: string | null
+        source_id: number
+        source_name: string
+      }>
+      total: number
+      has_more: boolean
+    }>(`/api/interactions/recent${qs ? '?' + qs : ''}`)
+  },
+
   // ---- The Brief (phase 4) ----
   briefLatest: (opts?: { tone?: string; limit?: number }) => {
     const params = new URLSearchParams()

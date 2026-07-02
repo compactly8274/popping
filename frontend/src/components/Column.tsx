@@ -362,62 +362,41 @@ export function Column({
       </header>
       <div className="flex-1 overflow-y-auto space-y-2 pr-1">
         {entryCount === 0 ? (
-          <p className="text-ios-body text-label-secondary italic px-1">nothing yet</p>
+          <p className="text-ios-body text-label-secondary italic px-1">no fresh entries yet \u2014 the scheduler will fetch the first batch shortly</p>
         ) : (
           <>
-            {/* New section. Rendered first (Miniflux convention).
-                Omitted entirely when the new slice is empty — no
-                header, no divider, no "NEW (0)" line. The collapsed
-                flag unmounts the cards but keeps the header visible
-                so the user can re-expand. */}
+            {/* Fresh section. Rendered first (the only section
+                now \u2014 the History sub-section moved to the
+                Drawer). Omitted entirely when the fresh slice
+                is empty \u2014 no header, no "FRESH (0)" line. The
+                collapsed flag unmounts the cards but keeps
+                the header visible so the user can re-expand. */}
+            {/* Fresh section \u2014 the column's primary view. Apollo
+                terminology: "Fresh" is what the user hasn't
+                acted on yet, ordered by recency (newest first
+                via App's byNewest comparator). The user can
+                collapse the section but the per-column History
+                sub-section was removed \u2014 history now lives in
+                the Drawer's "History" tab where the user can
+                review past reads + hides + stars with full
+                context (entry title, source, timestamp,
+                polarity). Keeping history out of the column
+                makes the column read as a focused "what's
+                new" feed rather than a mixed bag of
+                unread / read. */}
             {sections.new.length > 0 && (
               <ColumnSection
-                label="New"
+                label="Fresh"
                 count={sections.new.length}
                 collapsed={sectionsCollapsed?.new ?? false}
                 onToggle={onToggleSection ? () => onToggleSection('new') : undefined}
                 entries={sections.new}
-                // All entries in the New section are unread by
-                // construction — that's the membership predicate
-                // App uses to build the slice. Pass ``unread=true``
-                // uniformly so every card in this section gets the
-                // thin accent ring.
+                // All entries in the Fresh section are unread
+                // by construction \u2014 that's the membership
+                // predicate App uses to build the slice. Pass
+                // ``unread=true`` uniformly so every card gets
+                // the thin accent ring.
                 unreadForCard={() => true}
-                sourcesById={sourcesById}
-                selectedId={selectedId}
-                cardRefs={cardRefs}
-                categoriesBySourceId={categoriesBySourceId}
-                onMarkEntryRead={onMarkEntryRead}
-                expandedSummaries={expandedSummaries}
-                onToggleSummary={onToggleSummary}
-                onHideEntry={onHideEntry}
-                onHideToggle={onHideToggle}
-                hiddenSet={hiddenSet}
-                onStarEntry={onStarEntry}
-                starredSet={starredSet}
-              />
-            )}
-            {/* Divider between sections. Only renders when both
-                sections are non-empty (otherwise the section it's
-                separating isn't there). iOS-style 1px hairline
-                inset from the column edge to feel like part of the
-                column's content rhythm, not a hard page break. */}
-            {sections.new.length > 0 && sections.history.length > 0 && (
-              <div aria-hidden="true" className="h-px bg-hairline mx-1 my-1" />
-            )}
-            {sections.history.length > 0 && (
-              <ColumnSection
-                label="History"
-                count={sections.history.length}
-                collapsed={sectionsCollapsed?.history ?? false}
-                onToggle={onToggleSection ? () => onToggleSection('history') : undefined}
-                entries={sections.history}
-                // All entries in the History section are read by
-                // construction — they were sorted OUT of the new
-                // set by the existing unread logic, which means
-                // they're either manually marked read or older
-                // than ``lastViewed``. No ring on history cards.
-                unreadForCard={() => false}
                 sourcesById={sourcesById}
                 selectedId={selectedId}
                 cardRefs={cardRefs}
@@ -617,5 +596,6 @@ function ChevronIcon({ className, collapsed }: { className?: string; collapsed?:
     </svg>
   )
 }
+
 
 

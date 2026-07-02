@@ -30,6 +30,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, type Source } from '../api'
 import { SourceIcon } from './SourceIcon'
+import type { SettingsTab } from './Settings'
 
 type Props = {
   open: boolean
@@ -81,7 +82,7 @@ type Props = {
   onResetLocalState?: () => void
   // Open the full Settings overlay. Wired by App. The Drawer
   // uses this in its "All settings…" quick-action row.
-  onOpenSettings?: () => void
+  onOpenSettings?: (tab?: SettingsTab) => void
 }
 
 
@@ -364,6 +365,22 @@ export function Drawer({
             gaps from showing the sheet's underlying surface. */}
         <nav className="flex-1 min-h-0 overflow-y-auto bg-bg-app pb-8">
           <GroupedSection label="Quick settings">
+            <GroupedRow
+              onClick={() => {
+                // Open the History tab in the Settings overlay.
+                // The Settings overlay is owned by App; the Drawer
+                // routes to the right tab via ``onOpenSettings``
+                // which App wires to ``openSettings('history')``.
+                // Close the Drawer so the user lands on the
+                // History view immediately. Same pattern as the
+                // "All settings..." link below.
+                onOpenSettings?.('history')
+                onClose()
+              }}
+              title="History"
+              subtitle="review your reads · hides · saves"
+              showChevron
+            />
             <GroupedRow
               onClick={() => {
                 // The Settings overlay is owned by App. The Drawer
