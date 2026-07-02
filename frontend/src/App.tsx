@@ -2181,6 +2181,7 @@ export function App() {
                     sections={sectionsByColumn.get(col.name) ?? { new: [], history: [] }}
                     sourcesById={sourcesById}
                     newCount={newCountByColumn.get(col.name)}
+                    onRefresh={refresh}
                     selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
                     cardRefs={cardRefs}
                     onMarkRead={() => markColumnRead(col.name)}
@@ -2227,6 +2228,7 @@ export function App() {
               }
               sourcesById={sourcesById}
               newCount={newCountByColumn.get(columns[mobileCol]?.name ?? '')}
+              onRefresh={refresh}
               selectedId={
                 mobileCol === selectedColumnIndex ? selectedCardId ?? undefined : undefined
               }
