@@ -484,3 +484,60 @@ class InteractionBatchIn(BaseModel):
     """
     events: list[InteractionIn]
 
+
+
+# ---------------------------------------------------------------------------
+# User preferences.
+#
+# Read state, last-viewed timestamps, and column sort/filter prefs are
+# all per-user opaque JSONB values keyed by ``(user_id, key)``. The
+# frontend uses namespaced keys (``read_entries:<source_id>`` etc.)
+# but the server treats the key as opaque -- new preference types
+# land without a schema change.
+# ---------------------------------------------------------------------------
+
+
+class UserPreferenceOut(BaseModel):
+    """One row from ``user_preferences`` -- a single (key, value) pair.
+
+    Returned both as part of the bulk ``GET /api/preferences`` response
+    and as the body of ``GET /api/preferences/{key}``.
+
+    ``updated_at`` is the server's record of when the row was last
+    written. The frontend doesn't currently use it (PUT is unconditional
+    upsert; the client owns the "did this change" logic) but it's
+    surfaced for future diff-based sync and for debugging "when did
+    my read state last change?".
+    """
+
+    key: str
+    # The value column is JSONB; pass through whatever the caller
+    # stored. ``value: Any`` in pydantic is a deliberate ``Any`` --
+    # we'd rather validate per-preference-type at the route layer
+    # (where the key is known) than enforce one shape at the schema
+    # layer and reject all the others.
+    value: Optional[object] = None
+    updated_at: dt.datetime
+
+
+class UserPreferenceListOut(BaseModel):
+    """Body of ``GET /api/preferences``. Returns every (key, value) row
+    the caller has, in arbitrary order. The frontend rebuilds its
+    in-memory state from this on first load (one round-trip, all keys).
+    """
+
+    items: list[UserPreferenceOut]
+
+
+class UserPreferenceIn(BaseModel):
+    """Body of ``PUT /api/preferences/{key}``. The key is in the URL
+    (not the body) so the frontend can hit a single endpoint per
+    key and the route can validate "this URL key matches what the
+    caller is writing".
+
+    ``value`` is opaque; the route passes it through to the
+    JSONB column without coercion. The frontend's TS types are the
+    source of truth for what shape each key holds.
+    """
+
+    value: Optional[object] = None

@@ -311,4 +311,36 @@ class NotificationDedup(Base):
     key: Mapped[str] = mapped_column(Text, primary_key=True)
     last_notified_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )# ---------------------------------------------------------------------------
+# UserPreference: per-user, per-key JSONB value store.
+#
+# Replaces the dashboard's localStorage for read-state, last-viewed
+# timestamps, and column sort/filter preferences so all devices on
+# the same LAN (sharing the bypass user_id) see the same state.
+# See alembic/versions/0015_user_preferences.py for the full design
+# rationale; the short version is that user_profiles is a single-row
+# fixed-schema table built for the personalization model, and these
+# preferences need a typed-by-(user,key) shape instead.
+#
+# Writes are point-upserts (PUT /api/preferences/{key} -> ON CONFLICT
+# DO UPDATE). Reads are either point (GET /api/preferences/{key}) or
+# all-keys-for-this-user (GET /api/preferences). The composite PK
+# gives the point paths for free; the prefix index covers the all-keys
+# path.
+# ---------------------------------------------------------------------------
+
+
+class UserPreference(Base):
+    __tablename__ = "user_preferences"
+
+    user_id: Mapped[str] = mapped_column(String(60), primary_key=True)
+    key: Mapped[str] = mapped_column(String(60), primary_key=True)
+    # JSONB; null means "explicitly deleted" (vs. the row being
+    # absent). The frontend never writes null in practice -- it
+    # would call DELETE on the key instead -- but the column is
+    # nullable so a future feature that wants to mark "unset"
+    # without a row delete has a slot.
+    value: Mapped[Optional[dict]] = mapped_column(postgresql.JSONB, nullable=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

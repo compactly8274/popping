@@ -532,5 +532,47 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     }),
+
+  // ---- Per-user preferences (read state, sort/filter, hides, etc.) ----
+  // See ``lib/preferences.tsx`` for the React context that wraps
+  // these. The endpoints are the low-level transport; the
+  // provider does debouncing, optimistic updates, and the
+  // localStorage-seed-on-first-launch.
+  //
+  // The server treats the key as an opaque string. The frontend
+  // uses namespaced keys (``read_entries:<columnId>`` etc.);
+  // the backend just stores whatever JSONB you give it under
+  // that key.
+
+  /** Fetch all of the caller's preferences in one round-trip.
+   *  Returned as a flat list of (key, value) rows; the provider
+   *  decodes this into the typed ``PreferencesState`` shape. */
+  getPreferences: () =>
+    jsonFetch<{ items: Array<{ key: string; value: unknown; updated_at: string }> }>(
+      '/api/preferences',
+    ),
+
+  /** Upsert one preference. Idempotent -- the server is
+   *  "latest-value-wins" on the (user_id, key) primary key. The
+   *  value is opaque; pass any JSON-serializable shape. */
+  setPreference: (key: string, value: unknown) =>
+    jsonFetch<{ key: string; value: unknown; updated_at: string }>(
+      `/api/preferences/${encodeURIComponent(key)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      },
+    ),
+
+  /** Delete one preference. Idempotent -- 204 whether or not
+   *  the row existed. Not currently called by the frontend;
+   *  included for completeness (e.g. a future "reset all
+   *  preferences" button). */
+  deletePreference: (key: string) =>
+    fetch(`/api/preferences/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    }),
 }
 
