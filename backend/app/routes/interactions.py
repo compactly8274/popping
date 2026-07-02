@@ -42,7 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.deps import require_user
+from app.auth.deps import current_user
 from app.config import settings
 from app.db import get_session
 from app.models import Entry, Interaction
@@ -50,9 +50,40 @@ from app.schemas import InteractionBatchIn, InteractionIn, InteractionListOut, I
 
 logger = logging.getLogger("popping.routes.interactions")
 
-_route_deps = [Depends(require_user)] if settings.oidc_enabled else []
+# Soft auth on the interactions routes. The
+# ``current_user`` dependency returns ``None`` when
+# there's no cookie and the bypass doesn't apply,
+# so the handlers below must null-check. This is
+# the same pattern ``/api/entries`` and ``/api/foryou``
+# use, and it's the right one for engagement
+# events: in a homelab / single-user deployment
+# the bypass covers the common case (the user is
+# on the LAN, not necessarily logged in via OIDC);
+# in an OIDC deployment the cookie carries the
+# real user_id so per-user data is preserved.
+router = APIRouter(tags=["interactions"])
 
-router = APIRouter(tags=["interactions"], dependencies=_route_deps)
+
+def _require_user_id(user: dict | None) -> str:
+    """Return the user's sub (user_id) or raise 401.
+
+    The interactions endpoints are soft-auth (use
+    ``current_user`` not ``require_user``) so a
+    user with no cookie can still browse the
+    dashboard. Engagement events, however, need a
+    stable user_id to attribute the event to. If
+    there's no user (no cookie + no bypass), we
+    raise 401. The frontend treats this as a no-op
+    (the engagement buffer is best-effort; see
+    ``recordImmediate`` in
+    ``frontend/src/lib/interactions.ts``).
+    """
+    if user is None or "sub" not in user:
+        raise HTTPException(
+            status_code=401,
+            detail="login required to record engagement events",
+        )
+    return user["sub"]
 
 
 async def _commit_unique(session: AsyncSession, event: Interaction) -> int | None:
@@ -78,11 +109,11 @@ async def _commit_unique(session: AsyncSession, event: Interaction) -> int | Non
 @router.post("/interactions", status_code=201)
 async def post_interaction(
     body: InteractionIn,
-    user: dict = Depends(require_user),
+    user: dict | None = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Record one engagement event. Returns the inserted row id."""
-    user_id = user["sub"]
+    user_id = _require_user_id(user)
     row = Interaction(
         entry_id=body.entry_id,
         user_id=user_id,
@@ -130,7 +161,7 @@ async def _existing_entry_ids(
 @router.post("/interactions/batch", status_code=201)
 async def post_interactions_batch(
     body: InteractionBatchIn,
-    user: dict = Depends(require_user),
+    user: dict | None = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Record a batch of engagement events. The single response field
@@ -151,7 +182,7 @@ async def post_interactions_batch(
         )
     entry_ids = list({e.entry_id for e in body.events})
     valid_ids = await _existing_entry_ids(session, entry_ids)
-    user_id = user["sub"]
+    user_id = _require_user_id(user)
     inserted = 0
     for evt in body.events:
         if evt.entry_id not in valid_ids:
@@ -182,7 +213,7 @@ async def get_recent_interactions(
     limit: int = 50,
     offset: int = 0,
     group_by: str = "none",
-    user: dict = Depends(require_user),
+    user: dict | None = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> InteractionListOut:
     """Return the user's recent engagement events with entry
@@ -221,7 +252,7 @@ async def get_recent_interactions(
     multi-user deployments don't conflate their history.
     Mirrors the write path's user_id handling.
     """
-    user_id = user["sub"]
+    user_id = _require_user_id(user)
     # Parse the types filter. Empty = all types (omit WHERE
     # filter on type). The split is forgiving: an empty
     # string, a string of commas, or whitespace is treated
@@ -338,5 +369,6 @@ async def get_recent_interactions(
         total=total,
         has_more=(offset + len(items)) < total,
     )
+
 
 
