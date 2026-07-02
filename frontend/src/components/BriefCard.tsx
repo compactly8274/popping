@@ -322,14 +322,21 @@ function TonePicker({
 export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGenerate }: Props) {
   const [generating, setGenerating] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // Collapse state. Default open; persists per-browser via localStorage
-  // so the user doesn't have to re-collapse on every refresh. SSR-safe
-  // — the fallback covers the case where window/localStorage isn't
+  // Collapse state. Default CLOSED — the brief is a low-frequency
+  // surface (the user usually wants to scan entries, not read a
+  // long-form brief) and shouldn't dominate the dashboard on
+  // first load. State persists per-browser via localStorage so
+  // the user's choice sticks across reloads. SSR-safe: the
+  // fallback covers the case where window/localStorage isn't
   // available (e.g. an early mount in a future SSR build).
+  //
+  // The inversion of the default is a behaviour change for
+  // existing users: anyone who set the storage to ``'1'``
+  // (collapsed) keeps their preference; anyone who set it to
+  // ``'0'`` or never set it now starts collapsed. The brief is
+  // one tap away — the header is still rendered, just compact.
   const [collapsed, setCollapsed] = useState<boolean>(
-    () =>
-      typeof window !== 'undefined' &&
-      safeGetItem(STORAGE_KEYS.briefCollapsed) === '1',
+    () => typeof window === 'undefined' || safeGetItem(STORAGE_KEYS.briefCollapsed) !== '0',
   )
   const bodyId = useId()
 
@@ -431,56 +438,96 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGen
   if (!brief) {
     return (
       <section className="border-b border-hairline bg-bg-app">
-        <div
-          role="button"
-          tabIndex={0}
-          aria-expanded={!collapsed}
-          aria-controls={bodyId}
-          onClick={onHeaderClick}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault()
-              toggleCollapsed()
-            }
-          }}
-          className="px-4 py-3 flex items-center gap-3 cursor-pointer select-none min-h-[44px]"
-        >
-          <span
-            aria-hidden="true"
-            className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded-ios text-accent active:bg-bg-elevated"
+        {collapsed ? (
+          // Compact single-row strip. Brief surface is identical
+          // in shape to the with-brief branch — only the
+          // trailing chip differs (no timestamp because there's
+          // no brief to timestamp).
+          <div
+            role="button"
+            tabIndex={0}
+            aria-expanded={false}
+            aria-controls={bodyId}
+            onClick={onHeaderClick}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                toggleCollapsed()
+              }
+            }}
+            className="px-4 min-h-[44px] flex items-center gap-3 cursor-pointer select-none"
           >
-            <ChevronIcon className="w-4 h-4" collapsed={collapsed} />
-          </span>
-          <div className="flex-1 min-w-0">
-            <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
-              The Brief
-            </h2>
-            {!collapsed && (
+            <span
+              aria-hidden="true"
+              className="shrink-0 -ml-2 flex items-center justify-center w-9 h-9 rounded-ios text-accent active:bg-bg-elevated"
+            >
+              <ChevronIcon className="w-4 h-4" collapsed={true} />
+            </span>
+            <div className="flex-1 min-w-0 flex items-center gap-2">
+              <h2 className="text-ios-body font-medium text-label-primary shrink-0">
+                Brief
+              </h2>
+              <span className="text-ios-caption text-label-secondary truncate">
+                No brief generated yet
+              </span>
+            </div>
+            <button
+              data-brief-action="generate-compact"
+              onClick={(e) => {
+                e.stopPropagation()
+                onGenerate()
+              }}
+              disabled={generating}
+              className="shrink-0 min-h-[36px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
+              aria-label="generate brief"
+            >
+              {generating ? '…' : "Generate"}
+            </button>
+          </div>
+        ) : (
+          <div
+            role="button"
+            tabIndex={0}
+            aria-expanded={true}
+            aria-controls={bodyId}
+            onClick={onHeaderClick}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                toggleCollapsed()
+              }
+            }}
+            className="px-4 py-3 flex items-center gap-3 cursor-pointer select-none min-h-[44px]"
+          >
+            <span
+              aria-hidden="true"
+              className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded-ios text-accent active:bg-bg-elevated"
+            >
+              <ChevronIcon className="w-4 h-4" collapsed={false} />
+            </span>
+            <div className="flex-1 min-w-0">
+              <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
+                The Brief
+              </h2>
               <p className="text-ios-body text-label-secondary mt-0.5">
                 No brief generated yet for today.
               </p>
-            )}
+            </div>
+            <TonePicker
+              tone={tone}
+              onToneChange={onToneChange}
+              disabled={generating}
+            />
+            <button
+              data-brief-action="generate"
+              onClick={onGenerate}
+              disabled={generating}
+              className="shrink-0 min-h-[44px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
+            >
+              {generating ? '…' : "Generate"}
+            </button>
           </div>
-          {/* Tone picker — drives the next generate. Visible on
-              both states (with / without brief) so the user can
-              pre-pick a tone before clicking Generate. */}
-          <TonePicker
-            tone={tone}
-            onToneChange={onToneChange}
-            disabled={generating}
-          />
-          {/* Generate button — independent action, marked so the
-              header click handler ignores taps on it. min-h-[44px]
-              keeps the touch target large enough for a thumb. */}
-          <button
-            data-brief-action="generate"
-            onClick={onGenerate}
-            disabled={generating}
-            className="shrink-0 min-h-[44px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
-          >
-            {generating ? '…' : "Generate"}
-          </button>
-        </div>
+        )}
         {!collapsed && error && (
           <p className="px-4 pb-3 text-ios-caption text-red-400">{error}</p>
         )}
@@ -490,13 +537,69 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGen
 
   return (
     <section className="border-b border-hairline bg-bg-app">
+      {collapsed ? (
+        // Compact single-row strip. The brief exists in a
+        // recognisable spot at the top of the dashboard but
+        // takes only 44px instead of the 80-100px the full
+        // header used to claim. The Regenerate button is
+        // duplicated so the user can fire a fresh brief
+        // without expanding — useful when the user just
+        // wants the latest summary-of-summaries.
+        <div
+          role="button"
+          tabIndex={0}
+          aria-expanded={false}
+          aria-controls={bodyId}
+          onClick={onHeaderClick}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              toggleCollapsed()
+            }
+          }}
+          className="px-4 min-h-[44px] flex items-center gap-3 cursor-pointer select-none"
+        >
+          <span
+            aria-hidden="true"
+            className="shrink-0 -ml-2 flex items-center justify-center w-9 h-9 rounded-ios text-accent active:bg-bg-elevated"
+          >
+            <ChevronIcon className="w-4 h-4" collapsed={true} />
+          </span>
+          <div className="flex-1 min-w-0 flex items-center gap-2">
+            <h2 className="text-ios-body font-medium text-label-primary shrink-0">
+              Brief
+            </h2>
+            {brief && (
+              <span
+                title={brief.generated_at}
+                className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-ios-caption text-accent shrink-0"
+              >
+                <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-accent" />
+                {timeAgo(brief.generated_at)}
+              </span>
+            )}
+          </div>
+          <button
+            data-brief-action="regenerate-compact"
+            onClick={(e) => {
+              e.stopPropagation()
+              onGenerate()
+            }}
+            disabled={generating}
+            className="shrink-0 min-h-[36px] rounded-ios px-3 text-ios-body text-accent active:bg-bg-elevated disabled:opacity-40"
+            aria-label={generating ? 'generating brief' : 'regenerate brief'}
+          >
+            {generating ? '…' : 'Regenerate'}
+          </button>
+        </div>
+      ) : (
       {/* Header row. The whole element is the toggle target — chevron,
           title, tone badge, timestamp — but Regenerate is a child
           marked ``data-brief-action`` so it bypasses the toggle. */}
       <header
         role="button"
         tabIndex={0}
-        aria-expanded={!collapsed}
+        aria-expanded={true}
         aria-controls={bodyId}
         onClick={onHeaderClick}
         onKeyDown={(e) => {
@@ -511,7 +614,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGen
           aria-hidden="true"
           className="shrink-0 -ml-2 flex items-center justify-center w-11 h-11 rounded-ios text-accent active:bg-bg-elevated"
         >
-          <ChevronIcon className="w-4 h-4" collapsed={collapsed} />
+          <ChevronIcon className="w-4 h-4" collapsed={false} />
         </span>
         <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary shrink-0">
           The Brief
@@ -562,6 +665,7 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGen
           </button>
         </div>
       </header>
+      )}
       {!collapsed && (
         <div id={bodyId} className="px-4 pb-3 space-y-2">
           {/* One-sentence hero. Larger than the original body text

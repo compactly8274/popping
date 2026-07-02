@@ -165,8 +165,8 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   // Settings overlay state. Driven by the URL so the back button
   // and refresh both behave correctly. ``?view=settings`` opens it;
-  // ``?view=settings&tab=feeds|llm|notifications|reset`` picks the
-  // tab. ``null`` = closed.
+  // ``?view=settings&tab=feeds|llm|notifications|hidden|reset``
+  // picks the tab. ``null`` = closed.
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('feeds')
 
@@ -180,7 +180,21 @@ export function App() {
       if (view === 'settings') {
         setSettingsOpen(true)
         const t = u.searchParams.get('tab')
-        if (t === 'llm' || t === 'notifications' || t === 'reset' || t === 'feeds') {
+        // SettingsTab union: feeds | llm | notifications | hidden | reset.
+        // The Settings overlay renders a tab strip across the top;
+        // any value in the union is valid, anything else falls
+        // through to the default ``feeds`` tab. Keeping the
+        // explicit allow-list here (vs ``as SettingsTab``) makes
+        // the URL surface area narrow and avoids a typo'd
+        // ``?tab=feed`` (singular) silently rendering a blank
+        // overlay with no tab active.
+        if (
+          t === 'feeds' ||
+          t === 'llm' ||
+          t === 'notifications' ||
+          t === 'hidden' ||
+          t === 'reset'
+        ) {
           setSettingsTab(t)
         }
       } else {
@@ -1748,6 +1762,7 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
 
 
 
