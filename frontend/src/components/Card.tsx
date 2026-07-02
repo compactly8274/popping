@@ -62,6 +62,20 @@ type Props = {
   // label toggle. Optional — when absent the star button
   // renders in its empty (unstarred) state.
   starred?: boolean
+  // Per-card "hide" / "unhide" action. When present, the
+  // card gets a visible eye button next to the mark-read
+  // checkmark. Open eye = visible, closed eye = hidden. The
+  // button's state is driven by the ``hidden`` prop and the
+  // click toggles via ``onHide``. The same handler is used
+  // for the context menu's "Hide this entry" / "Unhide"
+  // item, so both entry points stay in sync.
+  onHideToggle?: () => void
+  // True if this entry is currently hidden. Drives the
+  // eye-button icon (open vs closed) and the context menu
+  // label toggle. Optional — when absent the eye button
+  // renders in its "visible" state (open eye) and the
+  // context menu shows the hide action unconditionally.
+  hidden?: boolean
   // Per-card inline summary. When ``expanded`` is true the card
   // fetches the cached summary once and renders it under the
   // title. ``onToggleSummary`` flips the expanded bit. Independent
@@ -118,7 +132,7 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
-export function _CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred }: Props) {
+export function _CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred, onHideToggle, hidden }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   // Touch tracking for long-press → copy URL.
@@ -298,6 +312,12 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
       })
     }
     if (onHide) {
+      // Context-menu hide is the "permanently dismiss"
+      // affordance \u2014 stronger than the eye button. The
+      // entry disappears from every column and the For
+      // You row; it surfaces only in Settings/Hidden.
+      // The eye button is the lighter "mark read and
+      // exclude from suggestions" action (see above).
       actions.push({
         label: 'Hide this entry',
         onClick: () => onHide(),
@@ -549,6 +569,57 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
           </button>
         )}
       </div>
+        {/* Per-card hide (eye) button. Sits next to the
+            mark-read checkmark and the star, completing the
+            iOS-style three-button meta row. The button's
+            state reflects the entry's current ``hidden``
+            prop: open eye = visible, closed eye = hidden.
+
+            Click toggles via ``onHideToggle`` (App wires
+            this to a callback that ALSO marks the entry
+            read when hiding, so the entry moves to the
+            column's History section instead of just
+            disappearing). The keyboard ``h`` shortcut
+            can target this button via document.querySelector
+            + ``data-eye`` for the currently-selected card.
+
+            Always visible (same as check + star) so the
+            user can see the affordance and the current
+            state at a glance. The hidden state uses
+            ``text-accent`` (matching the star) so the
+            three meta-row buttons all recolour in the
+            same family. */}
+        {onHideToggle && (
+          <button
+            type="button"
+            data-card-interactive
+            data-eye
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              // ``never`` is the engagement type for
+              // "I never want to see this again" \u2014 a
+              // stronger signal than the ``view`` mark-read
+              // fires. The ranker treats it as a category
+              // penalty; future per-user ML models can
+              // subtract it from the user's preference
+              // for the entry's source / topic.
+              if (!hidden) {
+                recordImmediate({ entry_id: entry.id, type: 'never' })
+              }
+              onHideToggle()
+            }}
+            aria-label={hidden ? 'unhide' : 'hide'}
+            aria-pressed={!!hidden}
+            title="hide (h)"
+            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
+                        ${hidden ? 'text-accent' : 'text-label-secondary'}`}
+          >
+            <EyeIcon className="w-4 h-4" closed={!!hidden} />
+          </button>
+        )}
       {/* Reddit cross-reference footer. Rendered between the meta row
           and the summary block so it reads as "extra metadata about
           the article", not "extra metadata about the source". Only
@@ -666,6 +737,68 @@ function CheckIcon({ className, filled = false }: { className?: string; filled?:
       ) : (
         <polyline points="4 12 10 18 20 6" />
       )}
+    </svg>
+  )
+}
+
+// iOS-style eye. The "hide" / "unhide" affordance. Open
+// eye (outline) = the entry is currently visible to the
+// user; clicking the button will hide it. Closed eye
+// (filled, with a stroke through it) = the entry is
+// hidden; clicking will unhide it. The fill / stroke
+// distinction matches the star button's pattern so the
+// three meta-row buttons (check / star / eye) all read
+// as the same scale.
+//
+// We use two separate SVG paths and switch between them
+// rather than a single path with a stroke. Single-path
+// + stroke-through-line works in some viewers but the
+// closed-eye stroke needs to be visually heavier than
+// the open-eye outline so the two states are
+// unambiguous; the dedicated filled-with-line path
+// achieves that without tuning the stroke width.
+function EyeIcon({
+  className,
+  closed = false,
+}: {
+  className?: string
+  closed?: boolean
+}) {
+  return closed ? (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      {/* Almond outline. Same as the open-eye path so the
+          silhouette stays recognizable. */}
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+      {/* Pupil. Filled so the closed-eye state reads as
+          "sealed" rather than "empty". */}
+      <circle cx="12" cy="12" r="3" fill="currentColor" />
+      {/* Diagonal strike-through — the standard "hidden"
+          affordance, mirrors the eye-off icon used in the
+          Settings tab strip. */}
+      <line x1="3" y1="3" x2="21" y2="21" />
+    </svg>
+  ) : (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+      <circle cx="12" cy="12" r="3" />
     </svg>
   )
 }
@@ -893,6 +1026,7 @@ function showContextMenu(
   }
   document.addEventListener('keydown', onKey, true)
 }
+
 
 
 
