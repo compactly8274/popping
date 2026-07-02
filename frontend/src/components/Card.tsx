@@ -51,6 +51,17 @@ type Props = {
   // row. The action is reversible only by clearing the hidden
   // set (a future "show hidden" affordance in Settings).
   onHide?: () => void
+  // Per-card "star" / "unstar" action. When present, the
+  // context menu gets "Save for later" / "Unsave" items, and
+  // a star button renders on the card next to the mark-read
+  // checkmark. The card's starred state is reflected in the
+  // button's filled/outline styling.
+  onStar?: () => void
+  // True if this entry is currently starred. Drives the
+  // star-button fill (filled = starred) and the context menu
+  // label toggle. Optional — when absent the star button
+  // renders in its empty (unstarred) state.
+  starred?: boolean
   // Per-card inline summary. When ``expanded`` is true the card
   // fetches the cached summary once and renders it under the
   // title. ``onToggleSummary`` flips the expanded bit. Independent
@@ -107,7 +118,7 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
-export function _CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide }: Props) {
+export function _CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   // Touch tracking for long-press → copy URL.
@@ -280,6 +291,23 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
       actions.push({
         label: 'Hide this entry',
         onClick: () => onHide(),
+      })
+    }
+    if (onStar) {
+      // Toggle label based on current starred state. The verb
+      // flips so the menu tells the user what the action will
+      // DO (not just the current state) — "Save for later" /
+      // "Unsave" reads more clearly than "Starred" / "Not
+      // starred" as a button label.
+      actions.push({
+        label: starred ? 'Unsave' : 'Save for later',
+        onClick: () => {
+          // Same engagement type as the star button — keeps
+          // the ranker signal consistent regardless of input
+          // path (button vs. context menu vs. keyboard ``s``).
+          recordImmediate({ entry_id: entry.id, type: 'bookmark' })
+          onStar()
+        },
       })
     }
     actions.push({ label: 'Copy link', onClick: () => copyUrl(entry.url) })
@@ -460,6 +488,44 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
             <CheckIcon className="w-4 h-4" filled={!unread} />
           </button>
         )}
+        {/* Per-card star. Sits next to the mark-read checkmark
+            so both meta-row actions are visually grouped. Always
+            visible (same as the checkmark) so the user can see
+            the affordance and its current state at a glance.
+            ``data-star`` so the keyboard ``s`` shortcut in App
+            can target the button via document.querySelector
+            for the currently-selected card. The star icon
+            flips between outline (unstarred) and filled
+            (starred). The label is a verb in the present
+            tense — "Save" when unstarred, "Unsave" when
+            starred — so the action is unambiguous. */}
+        {onStar && (
+          <button
+            type="button"
+            data-card-interactive
+            data-star
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              // ``bookmark`` is the engagement_events type that
+              // matches the ranker's existing "save" signal. The
+              // ranker treats it as a strong positive signal for
+              // the entry's source and topic; future per-user
+              // ML models can use it directly.
+              recordImmediate({ entry_id: entry.id, type: 'bookmark' })
+              onStar()
+            }}
+            aria-label={starred ? 'remove from saved' : 'save for later'}
+            aria-pressed={!!starred}
+            title="save for later (s)"
+            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
+                        ${starred ? 'text-accent' : 'text-label-secondary'}`}
+          >
+            <StarIcon className="w-4 h-4" filled={!!starred} />
+          </button>
+        )}
       </div>
       {/* Reddit cross-reference footer. Rendered between the meta row
           and the summary block so it reads as "extra metadata about
@@ -578,6 +644,31 @@ function CheckIcon({ className, filled = false }: { className?: string; filled?:
       ) : (
         <polyline points="4 12 10 18 20 6" />
       )}
+    </svg>
+  )
+}
+
+// iOS-style star. The same outline-vs-filled pattern as
+// CheckIcon — outline when unstarred (the user hasn't saved
+// this yet), filled when starred (the user has saved this
+// and the visual should make that immediately obvious). The
+// filled state uses ``currentColor`` so the button's
+// ``text-label-secondary`` (unstarred) vs ``text-accent``
+// (starred) recolour logic drives both the icon and any
+// surrounding halo.
+function StarIcon({ className, filled = false }: { className?: string; filled?: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill={filled ? 'currentColor' : 'none'}
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <polygon points="12 2 15 9 22 9.5 17 14.5 18.5 22 12 18 5.5 22 7 14.5 2 9.5 9 9 12 2" />
     </svg>
   )
 }
@@ -780,4 +871,5 @@ function showContextMenu(
   }
   document.addEventListener('keydown', onKey, true)
 }
+
 

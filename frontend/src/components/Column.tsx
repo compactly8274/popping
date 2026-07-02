@@ -70,6 +70,17 @@ type Props = {
   // to the localStorage-backed hidden set; the entry disappears
   // from every column + the For You row immediately.
   onHideEntry?: (entryId: number) => void
+  // Per-card "star" / "unstar" action. When present, each card
+  // gets a star button next to the mark-read checkmark, and
+  // the context menu gets a "Save for later" / "Unsave" item.
+  // App wires this to the localStorage-backed starred set; the
+  // entry surfaces in the dedicated "Saved" column at the top
+  // of the dashboard.
+  onStarEntry?: (entryId: number) => void
+  // Per-card "is this entry currently starred" lookup. App
+  // passes a Set so each card render is an O(1) check rather
+  // than a linear search.
+  starredSet?: Set<number>
 }
 
 export function Column({
@@ -89,6 +100,8 @@ export function Column({
   expandedSummaries,
   onToggleSummary,
   onHideEntry,
+  onStarEntry,
+  starredSet,
 }: Props) {
   const [popoverOpen, setPopoverOpen] = useState(false)
   const popoverRef = useRef<HTMLDivElement | null>(null)
@@ -352,6 +365,8 @@ export function Column({
                 expanded={expandedSummaries?.has(e.id) ?? false}
                 onToggleSummary={onToggleSummary ? () => onToggleSummary(e.id) : undefined}
                 onHide={onHideEntry ? () => onHideEntry(e.id) : undefined}
+                onStar={onStarEntry ? () => onStarEntry(e.id) : undefined}
+                starred={starredSet?.has(e.id) ?? false}
               />
             )
           })
@@ -378,3 +393,4 @@ function MoreIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
