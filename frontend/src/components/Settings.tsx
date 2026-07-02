@@ -34,7 +34,7 @@ import {
 } from '../api'
 import { FeedManager } from './FeedManager'
 import { toast } from './Toast'
-import { safeGetItem, safeSetItem, STORAGE_KEYS } from '../lib/storage'
+import { usePreferences, type HistoryGroupByValue } from '../lib/preferences'
 
 export type SettingsTab =
   | 'feeds'
@@ -753,28 +753,13 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
   // param. The total count follows the same dedup so the
   // "Showing N of M" count is consistent.
   //
-  // Persisted to localStorage so the user's preferred
-  // grouping survives reloads. The lazy initializer reads
-  // the stored value on first render; the useEffect below
-  // writes on change. Forgiving loader: any non-matching
-  // value (including a corrupted localStorage record or a
-  // future value we don't recognize) falls back to the
-  // default 'entry'. The default itself is the more useful
-  // one for a power user with many interactions (one row
-  // per article, not 200 individual read events).
-  const [groupBy, setGroupBy] = useState<'none' | 'entry'>(() => {
-    if (typeof window === 'undefined') return 'entry'
-    const stored = safeGetItem(STORAGE_KEYS.historyGroupBy)
-    return stored === 'none' ? 'none' : 'entry'
-  })
-
-  // Persist the toggle on change. The useState's lazy
-  // initializer reads on first render; this effect writes
-  // on every change. Same pattern as the other
-  // write-on-change hooks in the codebase.
-  useEffect(() => {
-    safeSetItem(STORAGE_KEYS.historyGroupBy, groupBy)
-  }, [groupBy])
+  // Server-backed via the preferences provider. The
+  // provider's ``historyGroupBy`` is the source of truth
+  // across all of the user's devices; a phone and a
+  // laptop both see the same grouping choice.
+  const { state: prefsState, setHistoryGroupBy } = usePreferences()
+  const groupBy: HistoryGroupByValue = prefsState.historyGroupBy
+  const setGroupBy = setHistoryGroupBy
 
   // The full list of items accumulated from paginated
   // fetches. Appends in place when the user hits "Show

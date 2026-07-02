@@ -30,7 +30,30 @@ import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { Settings, type SettingsTab } from './components/Settings'
 import { recordImmediate } from './lib/interactions'
-import { MAX_HIDDEN, MAX_PRESETS, MAX_STARRED, STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
+// Per-user server-backed preferences. Replaces the 8 localStorage
+// keys the dashboard used to write (readEntries, lastViewed,
+// columnPrefs, columnSections, hiddenEntries, starredEntries,
+// filterPresets, historyGroupBy). The localStorage versions
+// were per-device, so a phone and a laptop saw different read
+// state, different "+N new" counts, and different sort
+// orders. The server-backed store keys by user_id, so all
+// devices on the same LAN (sharing the bypass user_id) see
+// the same state. See ``lib/preferences.tsx`` for the
+// provider, the debounced sync, and the one-time
+// localStorage seed that runs on first launch.
+import {
+  PREFERENCE_KEYS,
+  usePreferences,
+  type ColumnPrefsValue,
+  type ColumnSectionsValue,
+  type FilterPresetValue,
+  type HistoryGroupByValue,
+  type ReadEntriesValue,
+  MAX_HIDDEN,
+  MAX_STARRED,
+  MAX_PRESETS,
+} from './lib/preferences'
+import { STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
 
 const REFRESH_INTERVAL_MS = 60_000
 // Health pings don't need 60s cadence — DB / Redis status is slow-
@@ -45,75 +68,11 @@ const HEALTH_INTERVAL_MS = 5 * 60_000
 const HIDDEN_RESET_MS = 2 * 60 * 1000
 
 // localStorage keys live in ``lib/storage.ts`` so feature
-// modules share one namespaced key registry. Per-card manual-read
-// state is persisted so a refresh mid-day doesn't re-flag entries
-// the user explicitly dismissed; separate from
-// ``STORAGE_KEYS.lastViewed`` (column-level "I've seen the
-// column") because the per-card flip is granular and shouldn't
-// reset the column chip.
-
-function loadLastViewed(): Record<string, string> {
-  if (typeof window === 'undefined') return {}
-  try {
-    const raw = safeGetItem(STORAGE_KEYS.lastViewed)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw)
-    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, string>) : {}
-  } catch {
-    return {}
-  }
-}
-
-function loadColumnPrefs(): Record<string, ColumnPrefs> {
-  if (typeof window === 'undefined') return {}
-  try {
-    const raw = safeGetItem(STORAGE_KEYS.columnPrefs)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null) return {}
-    const out: Record<string, ColumnPrefs> = {}
-    for (const [k, v] of Object.entries(parsed)) {
-      if (!v || typeof v !== 'object' || !('sort' in v)) continue
-      const obj = v as Record<string, unknown>
-      // Defensive: a corrupt localStorage value (NaN,
-      // Infinity, missing fields) could put a bad
-      // ``minScore`` or ``maxAgeHours`` in state. The
-      // minScore filter compares ``e.composite_score
-      // >= minScore`` — a NaN comparison is always
-      // false, so every entry would be silently
-      // excluded. Validate each field before the
-      // spread so a bad value falls back to the
-      // default instead of overriding it.
-      //
-      // ``Number.isFinite`` rejects NaN + Infinity.
-      // Clamp minScore to [0, 100] (the slider's
-      // range) and maxAgeHours to positive integers.
-      const validSort = (s: unknown): ColumnPrefs['sort'] =>
-        s === 'top' || s === 'newest' || s === 'oldest' ? s : 'top'
-      const rawMin = obj.minScore
-      const minScore =
-        typeof rawMin === 'number' && Number.isFinite(rawMin)
-          ? Math.max(0, Math.min(100, rawMin))
-          : DEFAULT_PREFS.minScore
-      let maxAgeHours: number | null
-      if (obj.maxAgeHours === null) {
-        maxAgeHours = null
-      } else if (
-        typeof obj.maxAgeHours === 'number' &&
-        Number.isFinite(obj.maxAgeHours) &&
-        obj.maxAgeHours > 0
-      ) {
-        maxAgeHours = obj.maxAgeHours
-      } else {
-        maxAgeHours = DEFAULT_PREFS.maxAgeHours
-      }
-      out[k] = { sort: validSort(obj.sort), minScore, maxAgeHours }
-    }
-    return out
-  } catch {
-    return {}
-  }
-}
+// modules share one namespaced key registry. Only two keys
+// remain there (mobileColLast, briefCollapsed) -- the rest
+// moved to the server-backed ``user_preferences`` store
+// (``lib/preferences.tsx``) so all of a user's devices see
+// the same state.
 
 function loadMobileCol(): number {
   if (typeof window === 'undefined') return 0
@@ -143,124 +102,7 @@ function loadMobileCol(): number {
 // we keep the LAST ``MAX_PER_COLUMN`` ids (newest reads win; the
 // oldest "I marked this read" decisions are also the ones most
 // likely to have been rotated out of the column's fetch window).
-function loadReadEntries(): Record<string, number[]> {
-  if (typeof window === 'undefined') return {}
-  try {
-    const raw = safeGetItem(STORAGE_KEYS.readEntries)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null) return {}
-    const out: Record<string, number[]> = {}
-    for (const [k, v] of Object.entries(parsed)) {
-      if (Array.isArray(v) && v.every((x) => typeof x === 'number')) {
-        // Trim on load: the list may have been written before
-        // ``MAX_PER_COLUMN`` existed. Slice keeps the most-recent
-        // N entries (appended in chronological order).
-        out[k] = v.slice(-MAX_PER_COLUMN)
-      }
-    }
-    return out
-  } catch {
-    return {}
-  }
-}
 
-// Per-column "New" / "History" section collapse state. Stored as
-// ``{ [colName: string]: { newCollapsed: boolean; historyCollapsed: boolean } }``.
-// The shape is forgiving on read: a missing column name, a
-// missing field, or a non-boolean value silently falls back to
-// "expanded" so a future shape change can't strand the user with
-// permanently-collapsed sections.
-type SectionCollapse = { newCollapsed: boolean; historyCollapsed: boolean }
-type ColumnSections = Record<string, SectionCollapse>
-function loadColumnSections(): ColumnSections {
-  if (typeof window === 'undefined') return {}
-  try {
-    const raw = safeGetItem(STORAGE_KEYS.columnSections)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null) return {}
-    const out: ColumnSections = {}
-    for (const [k, v] of Object.entries(parsed)) {
-      if (v && typeof v === 'object') {
-        const o = v as Partial<SectionCollapse>
-        out[k] = {
-          newCollapsed: typeof o.newCollapsed === 'boolean' ? o.newCollapsed : false,
-          historyCollapsed:
-            typeof o.historyCollapsed === 'boolean' ? o.historyCollapsed : false,
-        }
-      }
-    }
-    return out
-  } catch {
-    return {}
-  }
-}
-
-function loadStarredEntries(): number[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const raw = safeGetItem(STORAGE_KEYS.starredEntries)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((x): x is number => typeof x === 'number')
-  } catch {
-    return []
-  }
-}
-
-export type FilterPreset = {
-  id: string
-  name: string
-  activeSources: string[]
-  columnPrefs: Record<string, ColumnPrefs>
-}
-
-function loadFilterPresets(): FilterPreset[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const raw = safeGetItem(STORAGE_KEYS.filterPresets)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter((p): p is FilterPreset => {
-        return (
-          typeof p === 'object' &&
-          p !== null &&
-          typeof p.id === 'string' &&
-          typeof p.name === 'string' &&
-          Array.isArray(p.activeSources)
-        )
-      })
-      .map((p) => ({
-        id: p.id,
-        name: p.name,
-        activeSources: p.activeSources.filter((s) => typeof s === 'string'),
-        columnPrefs:
-          typeof p.columnPrefs === 'object' && p.columnPrefs !== null
-            ? p.columnPrefs
-            : {},
-      }))
-  } catch {
-    return []
-  }
-}
-
-function loadHiddenEntries(): number[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const raw = safeGetItem(STORAGE_KEYS.hiddenEntries)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    // Filter to numbers; tolerate a stale shape that stored strings.
-    return parsed.filter((x): x is number => typeof x === 'number').slice(-MAX_HIDDEN)
-  } catch {
-    return []
-  }
-}
 
 // Per-column upper bound on manually-marked read entries. Chosen
 // to fit comfortably in localStorage across all columns combined:
@@ -271,6 +113,27 @@ function loadHiddenEntries(): number[] {
 // marks are dropped — which is fine, because those entries have
 // long since aged out of the column's view.
 const MAX_PER_COLUMN = 200
+
+
+// Per-column Fresh/History section collapse state. The
+// shape is forgiving on read: a missing column name, a
+// missing field, or a non-boolean value silently falls back to
+// "expanded" so a future shape change can't strand the user with
+// permanently-collapsed sections.
+type SectionCollapse = { newCollapsed: boolean; historyCollapsed: boolean }
+type ColumnSections = Record<string, SectionCollapse>
+
+// User-saved filter preset. Captures a complete dashboard
+// view: which sources are filtered, and the per-column
+// sort/min-score/max-age. The shape is stable across
+// versions -- existing presets on disk can be loaded into
+// a newer build without migration.
+export type FilterPreset = {
+  id: string
+  name: string
+  activeSources: string[]
+  columnPrefs: Record<string, ColumnPrefs>
+}
 
 
 // Saved-preset chip strip. Renders the user’s saved filter
@@ -543,43 +406,91 @@ export function App() {
     return () => window.clearInterval(id)
   }, [])
   const [refreshing, setRefreshing] = useState(false)
-  // Per-column last-viewed timestamps.
-  const [lastViewed, setLastViewed] = useState<Record<string, string>>(loadLastViewed)
-  // Per-card manual-read state. Init from localStorage (entries the
-  // user explicitly marked read at any prior session). Live as a
-  // ``Set`` in the merged view (below) but stored as an array so
-  // JSON.stringify/parse keeps element order stable.
-  const [readEntries, setReadEntries] = useState<Record<string, number[]>>(loadReadEntries)
-  // Per-user "hidden" entry ids. The user dismisses an entry via
-  // the card context menu (right-click / long-press) — ``mark
-  // read`` is the lighter action ("I read this"), ``hide`` is the
-  // heavier one ("don't show this to me again, ever"). ``hide``
-  // is entry-global (not per-column like ``readEntries``) because
-  // the user's "I never want to see this" intent applies across
-  // every column view, not just the one where the card appeared.
-  const [hiddenEntries, setHiddenEntries] = useState<number[]>(loadHiddenEntries)
-  // Per-user "starred" (saved) entry ids. Long-term save-for-later
-  // set, distinct from ``readEntries`` (dim) and ``hiddenEntries``
-  // (dismiss). Surfaced in a dedicated "Saved" column at the top
-  // of the dashboard, in the For You row, and in the Settings/Starred
-  // tab. The user can star / unstar from the card context menu
-  // ("Save for later") or via the keyboard ``s`` shortcut.
-  const [starredEntries, setStarredEntries] = useState<number[]>(loadStarredEntries)
-  // User-saved filter presets. Each preset is a complete "view"
-  // of the dashboard (active sources + per-column prefs) that
-  // the user can save and re-apply with one click. Persisted to
-  // localStorage; the in-memory state is the source of truth
-  // for the current session.
-  const [filterPresets, setFilterPresets] = useState<FilterPreset[]>(loadFilterPresets)
-  // Per-column sort/filter preferences.
-  const [columnPrefs, setColumnPrefs] = useState<Record<string, ColumnPrefs>>(loadColumnPrefs)
-  // Per-column New/History section collapse state. The split is
-  // always on (every column has a New and a History section) but
-  // the user can collapse either section to keep the column
-  // scannable. Persisted per-column so the choice survives reloads
-  // and per-device settings sync (if the user signs in on another
-  // device, they get the same view).
-  const [columnSections, setColumnSections] = useState<ColumnSections>(loadColumnSections)
+  // Per-user server-backed preferences. The localStorage that
+  // used to back these has moved to ``lib/preferences.tsx``'s
+  // provider; the setters here debounce the PUTs to the server.
+  // On first mount the provider seeds from the old localStorage
+  // values, so the migration is invisible to the user.
+  const prefs = usePreferences()
+  const readEntries = prefs.state.readEntries
+  const lastViewed = prefs.state.lastViewed
+  const columnPrefs = prefs.state.columnPrefs as Record<string, ColumnPrefs>
+  const columnSections = prefs.state.columnSections as ColumnSections
+  const hiddenEntries = prefs.state.hiddenEntries
+  const starredEntries = prefs.state.starredEntries
+  const filterPresets = prefs.state.filterPresets as FilterPreset[]
+  const historyGroupBy = prefs.state.historyGroupBy
+  // Stable references to the typed setters. Aliased locally so
+  // the existing handlers can call ``setReadEntries(...)`` etc.
+  // without renaming every call site. The provider's setters
+  // are the only writers; the local ``useState`` versions are
+  // gone (the in-memory state lives in the provider now).
+  const setReadEntries: (
+    columnId: string,
+    ids: ReadEntriesValue,
+  ) => void = prefs.setReadEntries
+  const setLastViewed: (
+    columnId: string,
+    iso: string,
+  ) => void = prefs.setLastViewed
+  const clearLastViewed: (columnId: string) => void = prefs.clearLastViewed
+  const setColumnPrefs: (
+    columnId: string,
+    prefs: ColumnPrefsValue,
+  ) => void = prefs.setColumnPrefs
+  const setColumnSections: (
+    columnId: string,
+    sections: ColumnSectionsValue,
+  ) => void = prefs.setColumnSections
+  const setHiddenEntries: (ids: number[]) => void = prefs.setHiddenEntries
+  const setStarredEntries: (ids: number[]) => void = prefs.setStarredEntries
+  const setFilterPresets: (presets: FilterPresetValue[]) => void =
+    prefs.setFilterPresets
+  const setHistoryGroupBy: (mode: HistoryGroupByValue) => void =
+    prefs.setHistoryGroupBy
+  // Mirror the 8 preference values into refs so handlers can
+  // read the latest value without stale-closure bugs. Without
+  // this, a handler that did
+  //   ``setReadEntries(col, [...readEntries[col], id])``
+  // would read the ``readEntries`` snapshot from the render
+  // that captured the closure, not the value after a previous
+  // handler's update. Two ``setX`` calls in the same tick
+  // (e.g. ``markEntryRead`` and a follow-up
+  // ``restoreHiddenEntry``) would lose the second write.
+  // The pattern: a tiny useEffect keeps the ref in sync with
+  // the state on every render; the handlers read the ref.
+  const readEntriesRef = useRef(readEntries)
+  const lastViewedRef = useRef(lastViewed)
+  const columnPrefsRef = useRef(columnPrefs)
+  const columnSectionsRef = useRef(columnSections)
+  const hiddenEntriesRef = useRef(hiddenEntries)
+  const starredEntriesRef = useRef(starredEntries)
+  const filterPresetsRef = useRef(filterPresets)
+  const historyGroupByRef = useRef(historyGroupBy)
+  useEffect(() => {
+    readEntriesRef.current = readEntries
+  }, [readEntries])
+  useEffect(() => {
+    lastViewedRef.current = lastViewed
+  }, [lastViewed])
+  useEffect(() => {
+    columnPrefsRef.current = columnPrefs
+  }, [columnPrefs])
+  useEffect(() => {
+    columnSectionsRef.current = columnSections
+  }, [columnSections])
+  useEffect(() => {
+    hiddenEntriesRef.current = hiddenEntries
+  }, [hiddenEntries])
+  useEffect(() => {
+    starredEntriesRef.current = starredEntries
+  }, [starredEntries])
+  useEffect(() => {
+    filterPresetsRef.current = filterPresets
+  }, [filterPresets])
+  useEffect(() => {
+    historyGroupByRef.current = historyGroupBy
+  }, [historyGroupBy])
   // Search state. ``searchInput`` is the controlled input value;
   // ``searchQuery`` is the debounced value used for the fetch.
   const [searchInput, setSearchInput] = useState('')
@@ -614,13 +525,6 @@ export function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
 
   const touchStartX = useRef<number | null>(null)
-  // Tracks whether the user has already been informed that localStorage
-  // writes are being rejected. When ``true``, subsequent
-  // ``safeSetItem`` failures stay silent — otherwise every refresh
-  // would re-fire the same toast and overwhelm the ToastHost. Reset to
-  // ``false`` if the user clears the issue (manual ``localStorage.clear``
-  // in DevTools, reduced browser quota, etc.).
-  const quotaWarnedRef = useRef(false)
   // Set of entry ids observed on the previous successful refresh.
   // Used to compute "new since last refresh" — entries whose id is
   // not in this set are flagged. ``null`` means "haven't completed a
@@ -1030,8 +934,53 @@ export function App() {
       // Quota / private-mode — best effort; the reload still
       // happens and re-fetches everything.
     }
-    window.location.reload()
-  }, [])
+    // Server-backed preferences need an explicit reset too --
+    // the localStorage wipe above only affects what's still
+    // on this device. We DELETE every per-user preference
+    // key, then reload. The next mount's GET will see an
+    // empty server and the provider initializes to defaults.
+    // The eight singleton + per-column keys cover every
+    // preference the provider exposes. ``Promise.allSettled``
+    // so a single failure doesn't block the rest of the
+    // reset (the reload happens regardless).
+    const allKeys: string[] = [
+      PREFERENCE_KEYS.hiddenEntries,
+      PREFERENCE_KEYS.starredEntries,
+      PREFERENCE_KEYS.filterPresets,
+      PREFERENCE_KEYS.historyGroupBy,
+    ]
+    // Per-column keys: the keys we know about from the
+    // current state plus the four per-column kinds.
+    const perColumnKinds = [
+      PREFERENCE_KEYS.readEntries,
+      PREFERENCE_KEYS.lastViewed,
+      PREFERENCE_KEYS.columnPrefs,
+      PREFERENCE_KEYS.columnSections,
+    ]
+    const columnIds = new Set<string>()
+    for (const k of perColumnKinds) {
+      const m = prefs.state
+      if (k === PREFERENCE_KEYS.readEntries) {
+        for (const id of Object.keys(m.readEntries)) columnIds.add(id)
+      } else if (k === PREFERENCE_KEYS.lastViewed) {
+        for (const id of Object.keys(m.lastViewed)) columnIds.add(id)
+      } else if (k === PREFERENCE_KEYS.columnPrefs) {
+        for (const id of Object.keys(m.columnPrefs)) columnIds.add(id)
+      } else if (k === PREFERENCE_KEYS.columnSections) {
+        for (const id of Object.keys(m.columnSections)) columnIds.add(id)
+      }
+    }
+    for (const id of columnIds) {
+      for (const k of perColumnKinds) {
+        allKeys.push(`${k}:${id}`)
+      }
+    }
+    void Promise.allSettled(
+      allKeys.map((k) => api.deletePreference(k)),
+    ).finally(() => {
+      window.location.reload()
+    })
+  }, [prefs.state])
 
   // Probe auth state once on mount.
   useEffect(() => {
@@ -1192,13 +1141,13 @@ export function App() {
     }
   }, [columns.length, mobileCol])
 
-  useEffect(() => {
-    safeSetItem(STORAGE_KEYS.lastViewed, JSON.stringify(lastViewed))
-  }, [lastViewed])
-
-  useEffect(() => {
-    safeSetItem(STORAGE_KEYS.columnSections, JSON.stringify(columnSections))
-  }, [columnSections])
+  // Note: readEntries, lastViewed, columnPrefs, columnSections,
+  // hiddenEntries, starredEntries, filterPresets, and
+  // historyGroupBy used to be persisted to localStorage via
+  // useEffect blocks here. They are now server-backed
+  // (``lib/preferences.tsx``); the provider debounces the PUTs
+  // and the in-memory state lives in the context. No
+  // per-key useEffect needed.
 
   // Cancel any in-flight brief-generation loop on unmount. Without
   // this, navigating away mid-generation leaves the polling loop
@@ -1212,66 +1161,6 @@ export function App() {
       generationAbortRef.current = null
     }
   }, [])
-
-  useEffect(() => {
-    // Trim each column's read-set on write so a power user with
-    // hundreds of reads across 20 columns doesn't silently grow
-    // the JSON past the 5MB localStorage quota. The mirror in
-    // ``markEntryRead`` does the same trim on the add path; the
-    // write-path trim handles the case where ``readEntries`` was
-    // restored from storage already over the cap (old builds
-    // pre-trim, or a manual edit).
-    const trimmed: Record<string, number[]> = {}
-    for (const [k, v] of Object.entries(readEntries)) {
-      if (Array.isArray(v) && v.length > 0) {
-        trimmed[k] = v.slice(-MAX_PER_COLUMN)
-      }
-    }
-    // Surface quota / private-mode failures the first time they
-    // happen so the user knows their read marks won't persist.
-    const ok = safeSetItem(
-      STORAGE_KEYS.readEntries,
-      JSON.stringify(trimmed),
-    )
-    if (!ok && !quotaWarnedRef.current) {
-      quotaWarnedRef.current = true
-      toast(
-        "browser storage is full — your read marks won't persist across reloads",
-        'error',
-      )
-    }
-  }, [readEntries])
-
-  useEffect(() => {
-    safeSetItem(STORAGE_KEYS.columnPrefs, JSON.stringify(columnPrefs))
-  }, [columnPrefs])
-
-  // Persist hidden entries. Trim on write so the stored list
-  // can't grow unboundedly across many hide actions (matches the
-  // trim-on-write pattern used for ``readEntries``). A failure
-  // here is non-fatal — the in-memory state stays the source of
-  // truth for the current session.
-  useEffect(() => {
-    const trimmed = hiddenEntries.slice(-MAX_HIDDEN)
-    safeSetItem(STORAGE_KEYS.hiddenEntries, JSON.stringify(trimmed))
-  }, [hiddenEntries])
-
-  // Persist starred entries. No trim on read (the user's
-  // intentional saves are valuable — we never silently evict
-  // a star) but cap on write at ``MAX_STARRED`` to prevent
-  // abuse. A failure here is non-fatal — same pattern as
-  // ``readEntries`` and ``hiddenEntries``.
-  useEffect(() => {
-    const trimmed = starredEntries.slice(-MAX_STARRED)
-    safeSetItem(STORAGE_KEYS.starredEntries, JSON.stringify(trimmed))
-  }, [starredEntries])
-  // Persist filter presets. Cap on write at ``MAX_PRESETS`` to
-  // prevent abuse (a script saving 1000s of presets). Same
-  // pattern as the other write-trimmed sets.
-  useEffect(() => {
-    const trimmed = filterPresets.slice(-MAX_PRESETS)
-    safeSetItem(STORAGE_KEYS.filterPresets, JSON.stringify(trimmed))
-  }, [filterPresets])
 
   // Debounced search. 300ms — standard "feels live but doesn't fire
   // on every keystroke". The mirror into ``searchQuery`` happens
@@ -1349,24 +1238,28 @@ export function App() {
     (columnName: string, ids: number[]) => {
       if (ids.length === 0) return
       const idSet = new Set(ids)
-      setReadEntries((prev) => {
-        const cur = prev[columnName] ?? []
-        const next = cur.filter((id) => !idSet.has(id))
-        if (next.length === cur.length) return prev
-        return { ...prev, [columnName]: next }
-      })
-      setLastViewed((prev) => {
-        const next = { ...prev }
-        delete next[columnName]
-        return next
-      })
+      // Read latest from the ref -- not the closed-over
+      // ``readEntries`` -- so a previous unmark in the same
+      // tick (e.g. an Undo chain) is reflected here.
+      const cur = readEntriesRef.current[columnName] ?? []
+      const next = cur.filter((id) => !idSet.has(id))
+      if (next.length !== cur.length) {
+        setReadEntries(columnName, next)
+      }
+      // Clear lastViewed for this column so the "N new" chip
+      // repopulates on the next refresh. The provider issues
+      // a DELETE on the server (not a sentinel PUT) so the
+      // row is actually gone.
+      if (columnName in lastViewedRef.current) {
+        clearLastViewed(columnName)
+      }
       if (seenEntryIdsRef.current != null) {
         const merged = new Set(seenEntryIdsRef.current)
         for (const id of ids) merged.delete(id)
         seenEntryIdsRef.current = merged
       }
     },
-    [],
+    [setReadEntries, clearLastViewed],
   )
 
   // Reverse of ``markEntryRead``: remove the id
@@ -1376,14 +1269,13 @@ export function App() {
   // click.
   const unmarkEntryRead = useCallback(
     (columnName: string, entryId: number) => {
-      setReadEntries((prev) => {
-        const cur = prev[columnName] ?? []
-        const next = cur.filter((id) => id !== entryId)
-        if (next.length === cur.length) return prev
-        return { ...prev, [columnName]: next }
-      })
+      const cur = readEntriesRef.current[columnName] ?? []
+      const next = cur.filter((id) => id !== entryId)
+      if (next.length !== cur.length) {
+        setReadEntries(columnName, next)
+      }
     },
-    [],
+    [setReadEntries],
   )
 
   // Reverse of ``hideEntry`` / ``toggleHideEntry``
@@ -1399,22 +1291,21 @@ export function App() {
   // split. This matches the prior
   // one-step-at-a-time model.
   const restoreHiddenEntry = useCallback((entryId: number) => {
-    setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
-  }, [])
+    const next = hiddenEntriesRef.current.filter((id) => id !== entryId)
+    if (next.length !== hiddenEntriesRef.current.length) {
+      setHiddenEntries(next)
+    }
+  }, [setHiddenEntries])
 
   const markEntryRead = useCallback((columnName: string, entryId: number) => {
-    setReadEntries((prev) => {
-      const cur = prev[columnName] ?? []
-      if (cur.includes(entryId)) return prev
-      // Trim on write too — without this, every mark-read between
-      // sessions would re-grow the list and eventually blow past the
-      // 5 MB localStorage quota. ``slice(-MAX_PER_COLUMN)`` keeps the
-      // newest reads (older ones are most likely already aged out of
-      // the column's view anyway).
-      const next = [...cur, entryId].slice(-MAX_PER_COLUMN)
-      return { ...prev, [columnName]: next }
-    })
-  }, [])
+    const cur = readEntriesRef.current[columnName] ?? []
+    if (cur.includes(entryId)) return
+    // Trim on write so the list doesn't grow unboundedly
+    // across many mark-reads. ``slice(-MAX_PER_COLUMN)``
+    // keeps the newest reads.
+    const next = [...cur, entryId].slice(-MAX_PER_COLUMN)
+    setReadEntries(columnName, next)
+  }, [setReadEntries])
 
   // Hide an entry from every column + the For You row. The
   // entry stays in the DB; it just gets filtered out of the
@@ -1424,12 +1315,11 @@ export function App() {
   // dismissal signal — same pattern as ``markEntryRead``'s
   // ``view`` event for the "I read this" signal.
   const hideEntry = useCallback((entryId: number) => {
-    setHiddenEntries((prev) => {
-      if (prev.includes(entryId)) return prev
-      const next = [...prev, entryId].slice(-MAX_HIDDEN)
-      return next
-    })
-  }, [])
+    const cur = hiddenEntriesRef.current
+    if (cur.includes(entryId)) return
+    const next = [...cur, entryId].slice(-MAX_HIDDEN)
+    setHiddenEntries(next)
+  }, [setHiddenEntries])
 
   // Toggle the eye-button hidden state. When transitioning
   // from visible -> hidden, ALSO mark the entry read so it
@@ -1457,16 +1347,18 @@ export function App() {
         // touch readEntries — the entry stays in its
         // current section (typically History because we
         // marked it read on the original hide).
-        setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
+        const next = hiddenEntriesRef.current.filter((id) => id !== entryId)
+        if (next.length !== hiddenEntriesRef.current.length) {
+          setHiddenEntries(next)
+        }
         toast('Entry unhidden.', 'info')  // no Undo: the act of un-hiding IS the undo
       } else {
         // Hide: add to hidden set AND mark read so the
         // entry moves to the column's History section.
-        setHiddenEntries((prev) => {
-          if (prev.includes(entryId)) return prev
-          const next = [...prev, entryId].slice(-MAX_HIDDEN)
-          return next
-        })
+        const cur = hiddenEntriesRef.current
+        if (!cur.includes(entryId)) {
+          setHiddenEntries([...cur, entryId].slice(-MAX_HIDDEN))
+        }
         markEntryRead(columnName, entryId)
         toast('Entry moved to history.', {
           kind: 'info',
@@ -1477,7 +1369,7 @@ export function App() {
         })
       }
     },
-    [hiddenSet, markEntryRead, restoreHiddenEntry],
+    [hiddenSet, markEntryRead, restoreHiddenEntry, setHiddenEntries],
   )
 
   // Star / unstar an entry. Stars are a long-term save-for-later
@@ -1487,25 +1379,40 @@ export function App() {
   // so the ranker can use stars as a positive signal (the
   // opposite of ``hide``'s ``never``).
   const toggleStarEntry = useCallback((entryId: number) => {
-    setStarredEntries((prev) => {
-      if (prev.includes(entryId)) {
-        // Unstar. Filter out, don't trim — the user's removal
-        // is intentional and we don't want a subsequent star to
-        // bring it back.
-        return prev.filter((id) => id !== entryId)
-      }
-      return [...prev, entryId].slice(-MAX_STARRED)
-    })
-  }, [])
+    const cur = starredEntriesRef.current
+    if (cur.includes(entryId)) {
+      // Unstar. Filter out, don't trim — the user's removal
+      // is intentional and we don't want a subsequent star to
+      // bring it back.
+      setStarredEntries(cur.filter((id) => id !== entryId))
+    } else {
+      setStarredEntries([...cur, entryId].slice(-MAX_STARRED))
+    }
+  }, [setStarredEntries])
 
   // Apply a saved preset: replace the active sources filter and
-  // per-column prefs with the preset’s values. A no-op when the
-  // preset’s data is empty (matches "all sources" / "default
+  // per-column prefs with the preset's values. A no-op when the
+  // preset's data is empty (matches "all sources" / "default
   // prefs" semantically).
+  //
+  // ``columnPrefs`` is a per-column map keyed by source id; the
+  // provider's setter is per-column, so we apply each one. (The
+  // number of columns a preset touches is small -- typically
+  // 1-5 -- so the per-column PUTs are a non-issue.)
   const applyPreset = useCallback((preset: FilterPreset) => {
     setActiveSources(new Set(preset.activeSources))
-    setColumnPrefs(preset.columnPrefs)
-  }, [])
+    // ``preset.columnPrefs`` round-trips through JSON; the
+    // object is structurally a ``ColumnPrefs`` but the
+    // server can't enforce that. Cast through ``unknown``
+    // so the structural shape lands in
+    // ``ColumnPrefsValue`` without an extra validator
+    // (the values are still validated by ``applyPreset``'s
+    // own consumer -- the Column component's prefs popover
+    // -- and a malformed value just becomes a no-op).
+    for (const [columnId, prefs] of Object.entries(preset.columnPrefs)) {
+      setColumnPrefs(columnId, prefs as unknown as ColumnPrefsValue)
+    }
+  }, [setColumnPrefs])
 
   // Save the current view as a preset. Returns the new preset
   // id so the caller can show a "Saved" toast.
@@ -1518,17 +1425,21 @@ export function App() {
         activeSources: Array.from(activeSources),
         columnPrefs,
       }
-      setFilterPresets((prev) => [...prev, preset].slice(-MAX_PRESETS))
+      setFilterPresets(
+        [...filterPresetsRef.current, preset].slice(-MAX_PRESETS),
+      )
       return id
     },
-    [activeSources, columnPrefs],
+    [activeSources, columnPrefs, setFilterPresets],
   )
 
   // Delete a preset by id. The chip strip handles its own
   // long-press -> delete flow.
   const deletePreset = useCallback((id: string) => {
-    setFilterPresets((prev) => prev.filter((p) => p.id !== id))
-  }, [])
+    setFilterPresets(
+      filterPresetsRef.current.filter((p) => p.id !== id),
+    )
+  }, [setFilterPresets])
 
   // Toggle the inline-summary panel for an entry. Independent of
   // mark-read — expanding a card doesn't mark it, and marking a
@@ -1714,30 +1625,30 @@ export function App() {
     //   3. seenEntryIdsRef adds them  (next-refresh delta
     //      doesn't re-flag them as "new since refresh")
     //
-    // The ``setReadEntries`` updater trims to
-    // ``MAX_PER_COLUMN`` to prevent localStorage from
-    // growing unbounded if the user has a habit of
-    // tapping the column header.
+    // We read from the refs (not the closed-over state) so
+    // two markColumnRead calls in the same tick don't lose
+    // each other's writes. The debounced sync on the
+    // provider coalesces the resulting server PUTs.
     const col = columns.find((c) => c.name === columnName)
+    setLastViewed(columnName, new Date().toISOString())
     const addedIds: number[] = []
-    setLastViewed((prev) => ({ ...prev, [columnName]: new Date().toISOString() }))
     if (col) {
-      setReadEntries((prev) => {
-        const cur = prev[columnName] ?? []
-        // Add only ids not already in the set. The
-        // dedup happens in O(n + m) where n is the
-        // column's entry count and m is the existing
-        // set size.
-        const curSet = new Set(cur)
-        const toAdd: number[] = []
-        for (const e of col.entries) {
-          if (!curSet.has(e.id)) toAdd.push(e.id)
-        }
-        if (toAdd.length === 0) return prev
+      const cur = readEntriesRef.current[columnName] ?? []
+      // Add only ids not already in the set. The
+      // dedup happens in O(n + m) where n is the
+      // column's entry count and m is the existing
+      // set size.
+      const curSet = new Set(cur)
+      const toAdd: number[] = []
+      for (const e of col.entries) {
+        if (!curSet.has(e.id)) toAdd.push(e.id)
+      }
+      if (toAdd.length > 0) {
         addedIds.push(...toAdd)
-        const next = [...cur, ...toAdd].slice(-MAX_PER_COLUMN)
-        return { ...prev, [columnName]: next }
-      })
+        // ``MAX_PER_COLUMN`` cap mirrors the old
+        // localStorage version.
+        setReadEntries(columnName, [...cur, ...toAdd].slice(-MAX_PER_COLUMN))
+      }
       if (seenEntryIdsRef.current != null) {
         const merged = new Set(seenEntryIdsRef.current)
         for (const e of col.entries) merged.add(e.id)
@@ -1816,7 +1727,7 @@ export function App() {
   }
 
   const setPrefsFor = (columnName: string, prefs: ColumnPrefs) => {
-    setColumnPrefs((prev) => ({ ...prev, [columnName]: prefs }))
+    setColumnPrefs(columnName, prefs as ColumnPrefsValue)
   }
 
   // Toggle a single section's collapsed bit for a column. Lazily
@@ -1825,21 +1736,25 @@ export function App() {
   // don't take up a key at all). The default is "expanded" — we
   // only ever write when the user explicitly flips the bit, so
   // the next mount picks up the right state.
+  //
+  // The server-backed store has the same "drop the key when
+  // both bits are false" behavior. The provider's
+  // ``setColumnSections`` replaces the per-column value, so
+  // we just compute the next value (or the empty marker) and
+  // hand it off.
   const setColumnSection = (columnName: string, key: 'new' | 'history') => {
-    setColumnSections((prev) => {
-      const cur = prev[columnName] ?? { newCollapsed: false, historyCollapsed: false }
-      const flag = key === 'new' ? 'newCollapsed' : 'historyCollapsed'
-      const next: SectionCollapse = { ...cur, [flag]: !cur[flag] }
-      // If both bits are back to false, drop the column's entry
-      // entirely so the localStorage record stays compact. The
-      // loader treats a missing entry as "both expanded" so
-      // dropping is round-trip-safe.
-      if (!next.newCollapsed && !next.historyCollapsed) {
-        const { [columnName]: _drop, ...rest } = prev
-        return rest
-      }
-      return { ...prev, [columnName]: next }
-    })
+    const cur = columnSectionsRef.current[columnName] ?? { newCollapsed: false, historyCollapsed: false }
+    const flag = key === 'new' ? 'newCollapsed' : 'historyCollapsed'
+    const next: SectionCollapse = { ...cur, [flag]: !cur[flag] }
+    if (!next.newCollapsed && !next.historyCollapsed) {
+      // Both bits are back to false. Persist an empty
+      // object so the loader treats the column as
+      // "both expanded" (it ignores extra keys but
+      // bails on missing ones).
+      setColumnSections(columnName, {} as ColumnSectionsValue)
+    } else {
+      setColumnSections(columnName, next as ColumnSectionsValue)
+    }
   }
 
   // Defaulting lookup for the per-column collapse state. Missing
@@ -2504,16 +2419,19 @@ export function App() {
         onResetLocalState={resetLocalState}
         hiddenEntries={hiddenEntries}
         onRestoreHidden={(entryId) => {
-          setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
+          const next = hiddenEntriesRef.current.filter((id) => id !== entryId)
+          if (next.length !== hiddenEntriesRef.current.length) {
+            setHiddenEntries(next)
+          }
         }}
         onRestoreAllHidden={() => {
-          if (hiddenEntries.length === 0) return
+          if (hiddenEntriesRef.current.length === 0) return
           setHiddenEntries([])
           toast('All hidden entries restored.', 'info')
         }}
         starredEntries={starredEntries}
         onUnstarAll={() => {
-          if (starredEntries.length === 0) return
+          if (starredEntriesRef.current.length === 0) return
           setStarredEntries([])
           toast('All saved entries cleared.', 'info')
         }}
@@ -2521,12 +2439,10 @@ export function App() {
           // Per-row unstar from the Settings → Saved
           // tab list. Mirrors the card's star
           // button + the per-card context-menu
-          // "Unsave" action. The id is the entry
-          // id; we just remove it from the
-          // starredEntries set in localStorage
-          // (the Saved column re-renders without
-          // it on the next refresh).
-          setStarredEntries((prev) => prev.filter((id) => id !== entryId))
+          // "Unsave" action.
+          setStarredEntries(
+            starredEntriesRef.current.filter((id) => id !== entryId),
+          )
         }}
       />
 

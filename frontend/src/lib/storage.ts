@@ -1,101 +1,59 @@
-// Namespaced localStorage keys. The ``popping.`` prefix avoids
-// collisions with anything else on the same origin (a private dashboard
-// host may also be running other apps), and keeps DevTools storage
-// filtering clean. The schema version (``v1``) lets us bump the
-// namespace once without crashing older browsers — bump it whenever a
-// stored shape changes in an incompatible way.
+// Namespaced localStorage keys for the small set of device-local
+// UI-state values that aren't worth syncing to the server.
 //
-// Public constants:
-//   - ``STORAGE_KEYS`` — record mapping logical name → fully-qualified key.
-//   - ``safeGetItem`` / ``safeSetItem`` / ``safeRemoveItem`` — wrappers
-//     that tolerate SSR / private-mode / quota errors. ``setItem``
-//     returns ``true`` on success, ``false`` if the write was
-//     rejected (callers log / ignore — the in-memory state is the
-//     source of truth for the current session).
+// What lives here now
+// -------------------
+//
+// Only two keys remain in localStorage as of the server-side
+// preferences migration (2026-07-02):
+//
+//   - ``mobileColLast`` -- the column index the user was last
+//     viewing on the mobile swipe layout. Per-device because
+//     "the column the user is currently looking at" has no
+//     meaning when shared across two devices.
+//
+//   - ``briefCollapsed`` -- whether the BriefCard is collapsed
+//     in the drawer. Same argument: a screen position, not
+//     data.
+//
+// What moved off localStorage
+// ---------------------------
+//
+// Eight per-user, per-device keys used to live here. They all
+// moved to the server-backed ``user_preferences`` store
+// (``lib/preferences.tsx``). The migration is one-way: the
+// first launch after the deploy POSTs the old localStorage
+// values to the server, then deletes the localStorage entries
+// (gated by a ``popping.v1.preferences.seeded`` flag so the
+// seed runs at most once per browser). The keys that moved:
+//
+//   - lastViewed      -> per-column "I last saw this column at"
+//   - columnPrefs     -> per-column sort/min-score/max-age
+//   - readEntries     -> per-column "marked read" entry ids
+//   - columnSections  -> per-column Fresh/History collapse
+//   - hiddenEntries   -> per-user "hide this entry"
+//   - starredEntries  -> per-user "saved for later"
+//   - filterPresets   -> user-saved dashboard views
+//   - historyGroupBy  -> History tab group-by mode
+//
+// ``STORAGE_KEYS`` is kept as a frozen record so the namespacing
+// is still centralised. The two remaining entries are device-
+// only; new server-backed keys should NOT be added here.
 
 const SCHEMA = 'v1'
 const NAMESPACE = 'popping'
 
 export const STORAGE_KEYS = {
-  // Per-column "I last saw this column at" timestamps. JSON map
-  // ``{ [colName: string]: iso8601 }``. Used by App to compute the
-  // "new since last visit" chip on each column header.
-  lastViewed: `${NAMESPACE}.${SCHEMA}.col.lastViewed`,
-  // Per-column sort/filter prefs (sort, minScore, maxAgeHours).
-  // JSON map ``{ [colName: string]: ColumnPrefs }``.
-  columnPrefs: `${NAMESPACE}.${SCHEMA}.col.prefs`,
   // The last mobile-view column index (0..N-1). Tracked so swiping
   // between columns on phone doesn't reset position on refresh.
+  // Pure screen position; per-device is correct (the user looking
+  // at column 3 on their phone shouldn't shift their laptop to
+  // column 3 too).
   mobileColLast: `${NAMESPACE}.${SCHEMA}.mobileCol.last`,
-  // Per-column manual read entries. App keeps a set of "I marked
-  // this card read" ids per column so the dim state survives
-  // reloads without persisting across the source's natural refresh
-  // window. JSON map ``{ [colName: string]: number[] }``.
-  readEntries: `${NAMESPACE}.${SCHEMA}.col.readEntries`,
-  // Per-user "hide this entry" set. The user dismisses an entry
-  // via the card's context menu (right-click / long-press). The
-  // ids are flattened into a single number[] (rather than the
-  // per-column shape ``readEntries`` uses) because "hide" is
-  // entry-global: once an entry is hidden it shouldn't surface
-  // in any column or in the For You row, regardless of which
-  // column currently shows it. JSON array of numbers, trimmed
-  // to ``MAX_HIDDEN`` to prevent unbounded growth.
-  hiddenEntries: `${NAMESPACE}.${SCHEMA}.hidden.entries`,
-  // Per-user "starred" entries. Long-term save-for-later set,
-  // distinct from ``readEntries`` (which dims but doesn't save)
-  // and ``hiddenEntries`` (which dismisses). Starred items
-  // surface in a dedicated "Saved" column at the top of the
-  // dashboard, in the For You row, and in the Settings/Starr
-  // tab. Trimming is a soft cap (oldest stars are dropped at
-  // ``MAX_STARRED``) but in practice users keep 50-200 starred
-  // items long-term, so 1000 is plenty of headroom.
-  starredEntries: `${NAMESPACE}.${SCHEMA}.starred.entries`,
-  // User-saved filter presets. Each preset captures a complete
-  // "view" of the dashboard: which sources are filtered, what
-  // per-column sort/min-score/max-age the user prefers. The
-  // user can save a preset from the Drawer ("Save current as
-  // preset") and re-apply with a single click. Distinct from
-  // ``readEntries`` (per-card) and ``starredEntries`` (per-entry);
-  // presets are a dashboard-shape concern.
-  filterPresets: `${NAMESPACE}.${SCHEMA}.presets.list`,
   // BriefCard collapse preference. Boolean stored as '0' / '1' to
-  // match the rest of the codebase's storage convention.
+  // match the codebase's storage convention.
   briefCollapsed: `${NAMESPACE}.${SCHEMA}.brief.collapsed`,
-  // Per-column "New" / "History" section collapse state. JSON map
-  // ``{ [colName: string]: { newCollapsed: boolean; historyCollapsed: boolean } }``.
-  // Each section defaults to expanded; only the user's explicit
-  // collapses are recorded. Mirrors the BriefCard's collapse pattern
-  // but at the column level (two sections per column, not one).
-  columnSections: `${NAMESPACE}.${SCHEMA}.col.sections`,
-  // History tab's group-by toggle (``entry`` or ``none``).
-  // Persisted so the user's preferred grouping survives
-  // reloads. The History tab's default is ``entry`` (one
-  // row per article, most recent wins) but a power user
-  // who wants every individual event can opt in to
-  // ``none`` once and have it stick.
-  historyGroupBy: `${NAMESPACE}.${SCHEMA}.history.groupBy`,
 } as const
-
-// Same trim cap as ``readEntries``: keep the most-recent decisions
-// (the oldest hides are also the ones the user is least likely to
-// care about remembering). 1000 entries × ~6 bytes per id = ~6 KB,
-// comfortably under the 5 MB localStorage quota.
-export const MAX_HIDDEN = 1000
-
-// ``MAX_STARRED`` is intentionally equal to ``MAX_HIDDEN``: a power
-// user with 1000 starred items is using the feature as a personal
-// archive, not a quick-save list. We don't trim on read here (the
-// user's intentional saves are valuable) but we cap on write to
-// prevent abuse. The trim evicts the OLDEST stars on overflow
-// — which is the right semantics because the user's most
-// recent saves are the ones they care about most.
-export const MAX_STARRED = 1000
-
-// ``MAX_PRESETS`` is intentionally small: a power user with 50
-// named filter views is using presets as a content-curation
-// tool, not a quick-access list. We trim on write (oldest first)
-// to prevent abuse. The trim is rare in practice.
-export const MAX_PRESETS = 50
 
 export function safeGetItem(key: string): string | null {
   try {
@@ -125,6 +83,3 @@ export function safeRemoveItem(key: string): void {
     // See safeGetItem — best effort.
   }
 }
-
-
-
