@@ -34,6 +34,17 @@ export interface Entry {
   reddit_comment_count: number | null
 }
 
+// Full row with source name. Returned by the
+// per-entry endpoints (e.g. ``/api/entries/by-ids``)
+// that join the source for display. The dashboard's
+// ``Entry`` type is the slim list-row shape (no
+// source_name, no full meta) — see the list
+// endpoint's column projection for why. The Settings
+// overlay's list view uses this richer shape.
+export interface EntryOut extends Entry {
+  source_name: string
+}
+
 export interface Source {
   id: number
   name: string
