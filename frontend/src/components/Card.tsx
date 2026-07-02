@@ -330,11 +330,12 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
     showContextMenu(e.clientX, e.clientY, actions)
   }
 
-  // Visual state for unread vs selected. Read cards stay at 100%
-  // opacity but lose the ring — they're not "hidden", just clearly
-  // seen. Selected cards get a stronger accent ring regardless of
-  // read state so the keyboard focus is unambiguous.
-  const opacityClass = unread ? 'opacity-100' : 'opacity-60'
+  // Visual state for unread vs selected. The ring is the only signal:
+  // read = no ring (full-color card, no decorative chrome), unread =
+  // thin accent ring. Selected cards get a stronger accent ring
+  // regardless of read state so the keyboard focus is unambiguous.
+  // No opacity dim — dimming the text made read cards look "hidden"
+  // rather than "seen", and the ring absence is enough on its own.
   const ringClass = selected
     ? 'ring-2 ring-accent/70'
     : unread
@@ -358,7 +359,7 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
       className={`group relative rounded-ios-lg bg-bg-surface border border-hairline p-4 pl-5
                   hover:-translate-y-px hover:shadow-glow-md
                   transition-[transform,box-shadow,border-color] duration-200
-                  ${opacityClass} ${ringClass}`}
+                  ${ringClass}`}
     >
       {/* Category stripe. 2px wide, full height of the card. Lives
           outside the padding flow so it doesn't shift content when

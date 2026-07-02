@@ -133,6 +133,38 @@ function loadReadEntries(): Record<string, number[]> {
   }
 }
 
+// Per-column "New" / "History" section collapse state. Stored as
+// ``{ [colName: string]: { newCollapsed: boolean; historyCollapsed: boolean } }``.
+// The shape is forgiving on read: a missing column name, a
+// missing field, or a non-boolean value silently falls back to
+// "expanded" so a future shape change can't strand the user with
+// permanently-collapsed sections.
+type SectionCollapse = { newCollapsed: boolean; historyCollapsed: boolean }
+type ColumnSections = Record<string, SectionCollapse>
+function loadColumnSections(): ColumnSections {
+  if (typeof window === 'undefined') return {}
+  try {
+    const raw = safeGetItem(STORAGE_KEYS.columnSections)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return {}
+    const out: ColumnSections = {}
+    for (const [k, v] of Object.entries(parsed)) {
+      if (v && typeof v === 'object') {
+        const o = v as Partial<SectionCollapse>
+        out[k] = {
+          newCollapsed: typeof o.newCollapsed === 'boolean' ? o.newCollapsed : false,
+          historyCollapsed:
+            typeof o.historyCollapsed === 'boolean' ? o.historyCollapsed : false,
+        }
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
 function loadStarredEntries(): number[] {
   if (typeof window === 'undefined') return []
   try {
@@ -508,6 +540,13 @@ export function App() {
   const [filterPresets, setFilterPresets] = useState<FilterPreset[]>(loadFilterPresets)
   // Per-column sort/filter preferences.
   const [columnPrefs, setColumnPrefs] = useState<Record<string, ColumnPrefs>>(loadColumnPrefs)
+  // Per-column New/History section collapse state. The split is
+  // always on (every column has a New and a History section) but
+  // the user can collapse either section to keep the column
+  // scannable. Persisted per-column so the choice survives reloads
+  // and per-device settings sync (if the user signs in on another
+  // device, they get the same view).
+  const [columnSections, setColumnSections] = useState<ColumnSections>(loadColumnSections)
   // Search state. ``searchInput`` is the controlled input value;
   // ``searchQuery`` is the debounced value used for the fetch.
   const [searchInput, setSearchInput] = useState('')
@@ -770,6 +809,60 @@ export function App() {
     return out
   }, [columns, lastViewed, readEntries])
 
+  // New / History split per column. The split happens AFTER the
+  // per-column sort/filter (the previous useMemo), so the per-
+  // column ``sort: 'top' | 'newest' | 'oldest'`` preference still
+  // gates which entries appear — and within each section we always
+  // sort newest-first (the user's "newest in each section" choice
+  // supersedes the per-column ``sort`` for the visual order).
+  //
+  // Membership rule (matches ``unreadIdsByColumn``): an entry is
+  // "new" if it isn't in the manual ``readEntries`` set AND its
+  // ``fetched_at`` is after the column's ``lastViewed`` timestamp.
+  // Everything else is "history". The Card's ``unread`` prop is
+  // derived from section membership in Column, so we don't need
+  // to pass the Set down anymore.
+  const sectionsByColumn = useMemo(() => {
+    // Reused comparator. ``published_at`` is the user-facing
+    // "when was this posted" — what readers want. ``fetched_at``
+    // is the fallback for entries whose publisher didn't include
+    // a clean published timestamp (some RSS feeds). ``id`` is the
+    // final tiebreaker so equal-timestamp entries have a stable
+    // order across renders.
+    const byNewest = (a: Entry, b: Entry): number => {
+      const ta = a.published_at
+        ? new Date(a.published_at).getTime()
+        : a.fetched_at
+          ? new Date(a.fetched_at).getTime()
+          : 0
+      const tb = b.published_at
+        ? new Date(b.published_at).getTime()
+        : b.fetched_at
+          ? new Date(b.fetched_at).getTime()
+          : 0
+      if (tb !== ta) return tb - ta
+      return b.id - a.id
+    }
+    const out = new Map<string, { new: Entry[]; history: Entry[] }>()
+    for (const col of columns) {
+      const unread = unreadIdsByColumn.get(col.name) ?? new Set<number>()
+      const fresh: Entry[] = []
+      const past: Entry[] = []
+      for (const e of col.entries) {
+        if (unread.has(e.id)) fresh.push(e)
+        else past.push(e)
+      }
+      // Sort each slice. ``[...arr].sort`` so we don't mutate the
+      // upstream ``columns[].entries`` array (which would also
+      // affect ``unreadIdsByColumn``'s iteration order on the
+      // next render).
+      fresh.sort(byNewest)
+      past.sort(byNewest)
+      out.set(col.name, { new: fresh, history: past })
+    }
+    return out
+  }, [columns, unreadIdsByColumn])
+
   const refresh = useCallback(async () => {
     setRefreshing(true)
     try {
@@ -1027,6 +1120,10 @@ export function App() {
   useEffect(() => {
     safeSetItem(STORAGE_KEYS.lastViewed, JSON.stringify(lastViewed))
   }, [lastViewed])
+
+  useEffect(() => {
+    safeSetItem(STORAGE_KEYS.columnSections, JSON.stringify(columnSections))
+  }, [columnSections])
 
   // Cancel any in-flight brief-generation loop on unmount. Without
   // this, navigating away mid-generation leaves the polling loop
@@ -1463,6 +1560,40 @@ export function App() {
     setColumnPrefs((prev) => ({ ...prev, [columnName]: prefs }))
   }
 
+  // Toggle a single section's collapsed bit for a column. Lazily
+  // creates the column's entry on first toggle so the persisted
+  // record stays small (columns the user has never collapsed
+  // don't take up a key at all). The default is "expanded" — we
+  // only ever write when the user explicitly flips the bit, so
+  // the next mount picks up the right state.
+  const setColumnSection = (columnName: string, key: 'new' | 'history') => {
+    setColumnSections((prev) => {
+      const cur = prev[columnName] ?? { newCollapsed: false, historyCollapsed: false }
+      const flag = key === 'new' ? 'newCollapsed' : 'historyCollapsed'
+      const next: SectionCollapse = { ...cur, [flag]: !cur[flag] }
+      // If both bits are back to false, drop the column's entry
+      // entirely so the localStorage record stays compact. The
+      // loader treats a missing entry as "both expanded" so
+      // dropping is round-trip-safe.
+      if (!next.newCollapsed && !next.historyCollapsed) {
+        const { [columnName]: _drop, ...rest } = prev
+        return rest
+      }
+      return { ...prev, [columnName]: next }
+    })
+  }
+
+  // Defaulting lookup for the per-column collapse state. Missing
+  // column names (or missing fields) silently fall through to
+  // "both expanded" — matches the loader's contract.
+  const sectionsCollapsedFor = (columnName: string): { new: boolean; history: boolean } => {
+    const cur = columnSections[columnName]
+    return {
+      new: cur?.newCollapsed ?? false,
+      history: cur?.historyCollapsed ?? false,
+    }
+  }
+
   // The outer div lets us register a per-column ref on a wrapper
   // without breaking the grid layout — the wrapper uses
   // ``display: contents`` so its child (Column) participates in
@@ -1836,10 +1967,9 @@ export function App() {
                 <div key={col.name} ref={setColumnRef(col.name)} className="contents">
                   <Column
                     name={col.name}
-                    entries={col.entries}
+                    sections={sectionsByColumn.get(col.name) ?? { new: [], history: [] }}
                     sourcesById={sourcesById}
                     newCount={newCountByColumn.get(col.name)}
-                    unreadIds={unreadIdsByColumn.get(col.name)}
                     selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
                     cardRefs={cardRefs}
                     onMarkRead={() => markColumnRead(col.name)}
@@ -1865,6 +1995,8 @@ export function App() {
                     categoriesBySourceId={categoriesBySourceId}
                     expandedSummaries={expandedSummaries}
                     onToggleSummary={toggleSummary}
+                    sectionsCollapsed={sectionsCollapsedFor(col.name)}
+                    onToggleSection={(key) => setColumnSection(col.name, key)}
                   />
                 </div>
               ))}
@@ -1877,10 +2009,11 @@ export function App() {
           >
             <Column
               name={columns[mobileCol]?.name ?? ''}
-              entries={columns[mobileCol]?.entries ?? []}
+              sections={
+                sectionsByColumn.get(columns[mobileCol]?.name ?? '') ?? { new: [], history: [] }
+              }
               sourcesById={sourcesById}
               newCount={newCountByColumn.get(columns[mobileCol]?.name ?? '')}
-              unreadIds={unreadIdsByColumn.get(columns[mobileCol]?.name ?? '')}
               selectedId={
                 mobileCol === selectedColumnIndex ? selectedCardId ?? undefined : undefined
               }
@@ -1916,6 +2049,8 @@ export function App() {
               categoriesBySourceId={categoriesBySourceId}
               expandedSummaries={expandedSummaries}
               onToggleSummary={toggleSummary}
+              sectionsCollapsed={sectionsCollapsedFor(columns[mobileCol]?.name ?? '')}
+              onToggleSection={(key) => setColumnSection(columns[mobileCol]?.name ?? '', key)}
             />
             {columns.length > 1 && (
               <div className="flex justify-center gap-1 mt-2">

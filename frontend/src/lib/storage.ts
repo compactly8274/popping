@@ -61,6 +61,12 @@ export const STORAGE_KEYS = {
   // BriefCard collapse preference. Boolean stored as '0' / '1' to
   // match the rest of the codebase's storage convention.
   briefCollapsed: `${NAMESPACE}.${SCHEMA}.brief.collapsed`,
+  // Per-column "New" / "History" section collapse state. JSON map
+  // ``{ [colName: string]: { newCollapsed: boolean; historyCollapsed: boolean } }``.
+  // Each section defaults to expanded; only the user's explicit
+  // collapses are recorded. Mirrors the BriefCard's collapse pattern
+  // but at the column level (two sections per column, not one).
+  columnSections: `${NAMESPACE}.${SCHEMA}.col.sections`,
 } as const
 
 // Same trim cap as ``readEntries``: keep the most-recent decisions
