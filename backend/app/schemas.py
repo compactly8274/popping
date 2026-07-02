@@ -217,6 +217,16 @@ class EntryOut(BaseModel):
     image_url: Optional[str] = None
     # Local path under /assets, e.g. "thumbnails/1234.jpg".
     image_path: Optional[str] = None
+    # Joined source name. Populated by endpoints
+    # that JOIN sources for display (e.g. the
+    # by-ids endpoint used by the Settings
+    # overlay's Hidden and Starred tabs). The
+    # list endpoint deliberately omits it —
+    # the dashboard already has a source name
+    # map (sourcesById) so the JOIN would be
+    # redundant bytes on the wire for the
+    # common 200-row list poll.
+    source_name: Optional[str] = None
 
     class Config:
         from_attributes = True
