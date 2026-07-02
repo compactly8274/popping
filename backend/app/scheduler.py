@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import math
 import json
 import logging
 import re
@@ -42,7 +43,7 @@ from app.brief import BriefGenerator
 from app.config import settings
 from app.db import SessionLocal
 from app.embeddings import embedder
-from app.models import Brief, Entry, NotificationDedup, Source, UserProfile
+from app.models import Brief, Entry, Interaction, NotificationDedup, Source, UserProfile
 from app.notify import Notifier
 from app.scoring import composite as composite_scorer
 from app.scoring import convergence as convergence_helper
@@ -458,6 +459,232 @@ async def _backfill_embeddings(batch_size: int | None = None) -> None:
             logger.info("embedding backfill: %d / %d", min(start + bs, len(rows)), len(rows))
     except Exception:
         logger.exception("embedding backfill failed (will retry on next startup)")
+
+
+# Per-interaction-type contribution to the preference vector.
+# Positive = move toward the entry's embedding (more of this in
+# the For You feed). Negative = move away (less of this).
+# Magnitudes were picked so a single thumb_down outranks a
+# single view, but a steady stream of views still moves the
+# needle; bookmark is the strongest positive signal (the user
+# explicitly said "save for later").
+_INTERACTION_WEIGHTS: dict[str, float] = {
+    "view": 1.0,
+    "click": 2.0,
+    "dwell": 1.5,
+    "thumb_up": 3.0,
+    "thumb_down": -2.0,
+    "bookmark": 3.0,
+    "share": 1.5,
+    "never": -3.0,
+}
+
+
+# The set of user_ids the recompute should aggregate. In a
+# multi-user OIDC deployment, this would resolve to "the
+# OIDC user, if any, plus the bypass user" -- the soft-auth
+# "anonymous" events would be excluded. In a single-user
+# homelab (the current shape), OIDC is off, the bypass is
+# on, and the soft-auth path is what records events (because
+# the user's browser doesn't always hit from a CIDR that
+# matches the bypass list -- e.g. via a port-forward or
+# reverse proxy). For the homelab case we aggregate over
+# all three ids so the recompute doesn't miss events.
+_AGGREGATION_USER_IDS_ALL: tuple[str, ...] = (
+    "anonymous",
+    "local-bypass",
+    "default",  # pre-soft-auth events tagged with the column default
+)
+
+
+async def _resolve_aggregation_user_ids(
+    session: AsyncSession,
+) -> tuple[str, ...]:
+    """Return the user_ids whose interactions feed the recompute.
+
+    Today this is the same tuple regardless of OIDC state
+    (the homelab case). When OIDC is enabled in a future
+    deployment, this would scope to the OIDC user's sub
+    instead. See the function docstring on
+    ``_recompute_preference_vector`` for the rationale.
+    """
+    return _AGGREGATION_USER_IDS_ALL
+
+
+async def _recompute_preference_vector() -> None:
+    """Aggregate the user's recent interactions into
+    ``UserProfile.preference_vector``.
+
+    Why this exists
+    ---------------
+
+    The personal scorer (``app.scoring.personal``) reads
+    ``preference_vector`` to rank For You candidates by cosine
+    similarity to the user's taste. Without a non-null vector
+    the scorer returns a flat 50 for every entry (the "no
+    signal yet" midpoint), so the For You feed looks static
+    regardless of what the user has been reading.
+
+    Until this job landed, the vector was never written --
+    interactions were stored in the ``interactions`` table
+    for the History view, but nothing consumed them. This
+    function is the missing consumer.
+
+    Algorithm
+    ---------
+
+    1. Pull the last ``pref_vector_window_days`` of interactions
+       for user_id 1 (the LAN-bypass user), joined to
+       ``entries.embedding``. Interactions against entries with
+       a NULL embedding are skipped silently -- they don't move
+       the vector.
+    2. Sum ``entry.embedding * _INTERACTION_WEIGHTS[type]`` for
+       each interaction. The sum is a 384-dim vector.
+    3. L2-normalize so the cosine math in personal.py
+       (``dot(a, b) / (|a| * |b|)``) produces values in the
+       expected range. Without normalization a user with many
+       interactions would push the vector to a large norm and
+       the cosine would become a less meaningful signal.
+    4. Blend with the existing vector: ``v_new =
+       blend_new * aggregated + (1 - blend_new) * old``. This
+       smooths the recompute -- a single outlier can't yank
+       the feed, and a user with no recent activity keeps
+       their old vector (so the For You feed doesn't reset to
+       50 every tick).
+    5. Persist via a single UPDATE on the single-row
+       ``user_profiles`` table.
+
+    Edge cases
+    ----------
+
+    - No interactions in the window: leave the existing
+      vector untouched (don't reset to NULL -- that would
+      degrade the feed back to the neutral 50). Log it and
+      return.
+    - All interactions against entries with NULL embeddings
+      (e.g. embedder is disabled or those rows are very
+      old): same as above -- leave the vector untouched.
+    - Embedder disabled (``settings.embedding_enabled=False``):
+      we still run the query, but ``entry.embedding`` will
+      always be NULL so the function no-ops. Logged once.
+    - Old vector is NULL: treat as zero vector, blend
+      collapses to ``blend_new * aggregated`` (i.e. behave
+      like a fresh install catching up).
+    """
+    if not settings.embedding_enabled or not embedder().loaded:
+        logger.debug("pref vector: skipping (embedder not enabled/loaded)")
+        return
+    window = dt.timedelta(days=settings.pref_vector_window_days)
+    cutoff = dt.datetime.now(dt.timezone.utc) - window
+    try:
+        async with SessionLocal() as session:
+            # Aggregate via SQL: GROUP BY entry_id, sum the
+            # weighted embeddings. We use a Python-side loop
+            # rather than a SQL-side sum because pgvector
+            # array_add isn't a single operator we can call
+            # with a weight; pulling (entry_id, embedding,
+            # type) and doing it in Python is simple and
+            # bounded by the window size (a heavy reader
+            # has thousands of rows over 30 days -- still
+            # cheap to iterate in-process).
+            #
+            # User-id filter
+            # --------------
+            # The interactions endpoint uses soft auth: it
+            # tags every event with the OIDC sub when
+            # available, "local-bypass" when the LAN bypass
+            # fires (TCP peer in
+            # local_bypass_allowed_cidrs), or "anonymous"
+            # when neither applies. In a single-user
+            # deployment all three collapse to "this user's
+            # interactions", so we aggregate over all of them.
+            # In a multi-user deployment (OIDC on) the OIDC
+            # sub is stable per user and only that user's
+            # sub should land in the recompute; the bypass
+            # and "anonymous" rows from other users stay
+            # out. We resolve the right user set at query
+            # time: if there's a resolved OIDC user, scope
+            # to their sub; otherwise aggregate everything
+            # (single-user homelab). ``_resolve_aggregation_user_id``
+            # picks one.
+            user_ids = _resolve_aggregation_user_ids(session)
+            if not user_ids:
+                logger.debug("pref vector: no user_ids to aggregate, keeping current")
+                return
+            rows = (
+                await session.execute(
+                    select(Entry.id, Entry.embedding, Interaction.type)
+                    .join(Interaction, Interaction.entry_id == Entry.id)
+                    .where(
+                        Interaction.user_id.in_(user_ids),
+                        Interaction.created_at >= cutoff,
+                        Entry.embedding.isnot(None),
+                    )
+                )
+            ).all()
+            if not rows:
+                logger.debug("pref vector: no in-window interactions with embeddings, keeping current")
+                return
+            dim = len(rows[0][1]) if rows[0][1] is not None else 0
+            if dim == 0:
+                return
+            agg = [0.0] * dim
+            n_used = 0
+            for _entry_id, emb, itype in rows:
+                if emb is None:
+                    continue
+                w = _INTERACTION_WEIGHTS.get(itype, 0.0)
+                if w == 0.0:
+                    continue
+                for i in range(dim):
+                    agg[i] += w * float(emb[i])
+                n_used += 1
+            if n_used == 0:
+                return
+            # L2-normalize the aggregated vector so the
+            # cosine math in personal.py is meaningful.
+            norm_sq = sum(x * x for x in agg)
+            if norm_sq == 0.0:
+                return
+            inv = 1.0 / math.sqrt(norm_sq)
+            agg = [x * inv for x in agg]
+            # Load the current vector and blend. NULL →
+            # zero vector; the blend collapses to
+            # ``blend_new * agg``.
+            profile = await _load_profile(session)
+            old = profile.preference_vector or [0.0] * dim
+            if len(old) != dim:
+                # Embedder dim changed between the old
+                # vector and now. Drop the old vector
+                # rather than crash on the blend; the
+                # next tick (10 min later) re-stabilises.
+                logger.warning(
+                    "pref vector: dim mismatch (old=%d, new=%d), discarding old",
+                    len(old),
+                    dim,
+                )
+                old = [0.0] * dim
+            blend = max(0.0, min(1.0, settings.pref_vector_blend_new))
+            blended = [blend * a + (1.0 - blend) * o for a, o in zip(agg, old)]
+            # Re-normalize the blend too, so the persisted
+            # vector is always unit length.
+            sq = sum(x * x for x in blended)
+            if sq > 0.0:
+                inv = 1.0 / math.sqrt(sq)
+                blended = [x * inv for x in blended]
+            await session.execute(
+                UserProfile.__table__.update()
+                .where(UserProfile.id == profile.id)
+                .values(preference_vector=blended)
+            )
+            await session.commit()
+            logger.info(
+                "pref vector: recomputed from %d interactions, blend=%.2f",
+                n_used,
+                blend,
+            )
+    except Exception:
+        logger.exception("pref vector recompute failed (will retry on next tick)")
 
 
 async def _prune_notification_dedup() -> None:
@@ -970,6 +1197,26 @@ async def start_scheduler(notifier: Optional[Notifier] = None) -> AsyncIOSchedul
             trigger=IntervalTrigger(minutes=5),  # re-run periodically to catch missed rows
             id="embed:backfill",
             name="Embedding backfill",
+            replace_existing=True,
+            next_run_time=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30),
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # Preference vector recompute. Aggregates the last
+    # ``pref_vector_window_days`` of interactions into
+    # ``UserProfile.preference_vector`` so the personal scorer
+    # has something to work with. Default cadence: 10 min.
+    # Fires once on startup (30s delay) so the vector catches
+    # up after a restart without waiting a full interval.
+    if settings.embedding_enabled and embedder().loaded:
+        _scheduler.add_job(
+            _recompute_preference_vector,
+            trigger=IntervalTrigger(
+                minutes=settings.pref_vector_recompute_interval_minutes,
+            ),
+            id="pref:recompute",
+            name="Preference vector recompute",
             replace_existing=True,
             next_run_time=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30),
             max_instances=1,

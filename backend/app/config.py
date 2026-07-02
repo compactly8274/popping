@@ -224,6 +224,22 @@ class Settings(BaseSettings):
     scoring_weight_source: float = 0.15
     scoring_weight_engagement: float = 0.25
 
+    # --- Preference vector recompute -------------------------------------
+    # The personal scorer reads ``UserProfile.preference_vector``
+    # (a 384-dim embedding). It is recomputed from the last
+    # ``pref_vector_window_days`` of interactions, weighted by
+    # ``_INTERACTION_WEIGHTS`` (see scheduler._recompute_preference_vector).
+    # ``pref_vector_blend_new`` controls the new/old blend: 0.0 keeps the
+    # old vector forever, 1.0 replaces it with the freshly aggregated
+    # one each tick. 0.7 means the new vector contributes 70% per
+    # recompute -- enough to react within a few ticks (the default
+    # 10-min cadence → ~30% shift per 10 min when the user is
+    # actively engaging) without thrashing on a single
+    # outlier interaction.
+    pref_vector_window_days: int = 30
+    pref_vector_blend_new: float = 0.7
+    pref_vector_recompute_interval_minutes: int = 10
+
     # --- Phase 2: convergence boost ----------------------------------------
     # Cross-source story clusters (same normalized title in 24h) get a
     # multiplicative boost. Tweak to taste.
