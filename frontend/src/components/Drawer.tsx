@@ -110,6 +110,13 @@ export function Drawer({
   // function signature stays aligned with the Props type.
   onResetLocalState: _onResetLocalState,
   onOpenSettings,
+  // ``onSavePreset`` is a callback the parent (App)
+  // wires to its ``savePreset`` + a ``window.prompt``
+  // for the name. Used by the "Save current view"
+  // row in the Quick settings section. The
+  // callback returns nothing — the parent toasts
+  // the new preset's name.
+  onSavePreset,
 }: Props) {
   const [sources, setSources] = useState<Source[]>([])
   const [sourcesError, setSourcesError] = useState<string | null>(null)
