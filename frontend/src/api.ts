@@ -305,6 +305,20 @@ export const api = {
     const q = params.toString()
     return jsonFetch<Entry[]>(`/api/foryou${q ? `?${q}` : ''}`)
   },
+  // Fetch a list of entries by id. Used by the
+  // Settings overlay's Hidden and Starred tabs
+  // to render a list of the entries the user
+  // has hidden or starred (the ids are in
+  // localStorage; the dashboard's `entries`
+  // state doesn't include hidden entries).
+  //
+  // Returns the entries in the same order as
+  // the input ids. Ids that don't match a row
+  // are dropped silently.
+  entriesByIds: (ids: number[]) => {
+    if (ids.length === 0) return Promise.resolve([] as Entry[])
+    return jsonFetch<Entry[]>(`/api/entries/by-ids?ids=${ids.join(',')}`)
+  },
   ingest: (sourceName: string) =>
     jsonFetch<{ source: string; fetched: number; inserted: number; duplicates: number; error: string | null }>(
       `/api/ingest/${encodeURIComponent(sourceName)}`,
