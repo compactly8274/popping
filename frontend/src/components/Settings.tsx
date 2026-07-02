@@ -194,7 +194,7 @@ export function Settings({
             <span className="text-ios-body font-normal">Done</span>
           </button>
           <h2 className="text-2xl md:text-ios-large-title font-bold text-label-primary tracking-tight">
-            Settings
+            {tab === 'feeds' ? 'Settings' : `Settings → ${TAB_META[tab].label}`}
           </h2>
         </div>
         {/* Tab strip. iOS segmented control style — same 4-cell
@@ -797,37 +797,78 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
     source_id: number
     source_name: string
   }
+
+  // Group-by toggle. ``entry`` = one row per article (most
+  // recent interaction wins); ``none`` = one row per
+  // interaction. Backed by the backend's ``group_by`` query
+  // param. The total count follows the same dedup so the
+  // "Showing N of M" count is consistent.
+  const [groupBy, setGroupBy] = useState<'none' | 'entry'>('entry')
+
+  // The full list of items accumulated from paginated
+  // fetches. Appends in place when the user hits "Show
+  // more"; resets when ``groupBy`` changes.
   const [items, setItems] = useState<Item[] | null>(null)
   const [total, setTotal] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Refetch on mount and when the user changes tabs back to
-  // history. The ``useEffect`` deps are [] so this fires
-  // once per mount; App owns the mount/unmount via the
-  // conditional render in the parent.
-  useEffect(() => {
+  // Page size. Matches the backend default; the backend
+  // caps at 200. The frontend doesn't ask for more than
+  // 200 in a single fetch.
+  const PAGE_SIZE = 50
+
+  // Fetch a page of history. Resets the list when
+  // ``append`` is false (used on initial load + groupBy
+  // change); appends when ``append`` is true (used for
+  // "Show more"). The alive-ref guards against a slow
+  // fetch racing a tab change / unmount.
+  const fetchPage = (append: boolean) => {
+    if (append) {
+      setLoadingMore(true)
+    } else {
+      setLoading(true)
+    }
     let alive = true
-    setLoading(true)
     setError(null)
     api
-      .listRecentInteractions({ limit: 50 })
+      .listRecentInteractions({
+        limit: PAGE_SIZE,
+        offset: append ? (items?.length ?? 0) : 0,
+        groupBy,
+      })
       .then((res) => {
         if (!alive) return
-        setItems(res.items)
+        setItems((prev) =>
+          append ? [...(prev ?? []), ...res.items] : res.items,
+        )
         setTotal(res.total)
+        setHasMore(res.has_more)
         setLoading(false)
+        setLoadingMore(false)
       })
       .catch((err: Error) => {
         if (!alive) return
         setError(err.message)
         setLoading(false)
+        setLoadingMore(false)
         onError(err.message)
       })
     return () => {
       alive = false
     }
-  }, [onError])
+  }
+
+  // Refetch on mount + when ``groupBy`` changes. The
+  // dep array includes ``groupBy`` so the user sees
+  // the new grouping without a tab change.
+  useEffect(() => {
+    const cleanup = fetchPage(false)
+    return cleanup
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupBy, onError])
 
   if (loading) {
     return (
@@ -846,6 +887,7 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
   if (!items || items.length === 0) {
     return (
       <div className="pt-4 px-4 space-y-3">
+        <Controls groupBy={groupBy} onGroupByChange={setGroupBy} />
         <div className="rounded-ios bg-bg-surface border border-hairline p-3">
           <div className="text-ios-body text-label-primary">No history yet</div>
           <div className="text-ios-caption text-label-secondary mt-0.5">
@@ -860,12 +902,11 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
   }
 
   // Group items by type into Read / Hidden / Saved buckets.
-  // Order: most recent first, then group, then sort within
-  // group by recency. The "View" type fires on every card
-  // mark-read so the Read group is the dense one. The
-  // "never" type fires on eye-button hide so the Hidden
-  // group is smaller. The "bookmark" type fires on star
-  // so the Saved group is the small one.
+  // The "View" type fires on every card mark-read so the
+  // Read group is the dense one. The "never" type fires on
+  // eye-button hide so the Hidden group is smaller. The
+  // "bookmark" type fires on star so the Saved group is
+  // the small one.
   type Group = { label: string; color: string; items: Item[] }
   const read: Item[] = items.filter((i) => i.type === 'view')
   const hidden: Item[] = items.filter((i) => i.type === 'never')
@@ -878,47 +919,156 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
 
   return (
     <div className="pt-4 px-4 space-y-3">
+      <Controls groupBy={groupBy} onGroupByChange={setGroupBy} />
       <div className="text-ios-caption text-label-secondary">
         Showing {items.length} of {total}
       </div>
       {groups.map((g) => (
-        <div key={g.label} className="space-y-1">
+        <div key={g.label} className="space-y-2">
           <div
             className={`text-ios-caption uppercase tracking-wide ${g.color} font-semibold`}
           >
             {g.label} ({g.items.length})
           </div>
-          {g.items.map((i) => (
-            <a
-              key={i.id}
-              href={i.entry_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="block rounded-ios bg-bg-surface border border-hairline p-2.5
-                         hover:bg-bg-elevated active:opacity-60 transition-colors"
-            >
-              <div className="flex items-start gap-2">
-                <span className={`shrink-0 mt-0.5 text-ios-caption ${g.color}`} aria-hidden="true">
-                  {g.label === 'Read' ? '\u2713' : g.label === 'Hidden' ? '\u25ef with strike' : '\u2606'}
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div className="text-ios-body text-label-primary line-clamp-2">
-                    {i.entry_title}
-                  </div>
-                  <div className="text-ios-caption text-label-secondary mt-0.5 flex items-center gap-2">
-                    <span>{i.source_name}</span>
-                    <span aria-hidden="true">\u00b7</span>
-                    <span title={i.created_at}>{timeAgo(i.created_at)}</span>
-                  </div>
-                </div>
+          {groupByDate(g.items).map((bucket) => (
+            <div key={bucket.label} className="space-y-1">
+              <div className="text-ios-caption text-label-tertiary pl-1">
+                {bucket.label}
               </div>
-            </a>
+              {bucket.items.map((i) => (
+                <a
+                  key={i.id}
+                  href={i.entry_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block rounded-ios bg-bg-surface border border-hairline p-2.5
+                             hover:bg-bg-elevated active:opacity-60 transition-colors"
+                >
+                  <div className="flex items-start gap-2">
+                    <span className={`shrink-0 mt-0.5 text-ios-caption ${g.color}`} aria-hidden="true">
+                      {g.label === 'Read' ? '\u2713' : g.label === 'Hidden' ? '\u25ef with strike' : '\u2606'}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-ios-body text-label-primary line-clamp-2">
+                        {i.entry_title}
+                      </div>
+                      <div className="text-ios-caption text-label-secondary mt-0.5 flex items-center gap-2">
+                        <span>{i.source_name}</span>
+                        <span aria-hidden="true">\u00b7</span>
+                        <span title={i.created_at}>{timeAgo(i.created_at)}</span>
+                      </div>
+                    </div>
+                  </div>
+                </a>
+              ))}
+            </div>
           ))}
         </div>
       ))}
+      {hasMore && (
+        <button
+          onClick={() => fetchPage(true)}
+          disabled={loadingMore}
+          className="w-full rounded-ios bg-bg-surface border border-hairline p-2.5
+                     text-ios-body text-accent active:opacity-60
+                     disabled:opacity-40"
+        >
+          {loadingMore ? 'loading\u2026' : `Show more (${total - items.length} remaining)`}
+        </button>
+      )}
     </div>
   )
 }
+
+// Controls strip: a small two-pill toggle for the group-by
+// mode. iOS-style: pill-shaped, the active option is filled
+// with the accent color. ``min-h-[28px]`` keeps the touch
+// target large enough.
+function Controls({
+  groupBy,
+  onGroupByChange,
+}: {
+  groupBy: 'none' | 'entry'
+  onGroupByChange: (g: 'none' | 'entry') => void
+}) {
+  return (
+    <div className="flex gap-1" role="group" aria-label="group history by">
+      <button
+        onClick={() => onGroupByChange('entry')}
+        aria-pressed={groupBy === 'entry'}
+        className={`flex-1 rounded-full px-3 py-1.5 min-h-[28px] text-ios-caption
+                    ${groupBy === 'entry' ? 'bg-accent text-white' : 'bg-bg-surface text-label-primary border border-hairline'}`}
+      >
+        By entry
+      </button>
+      <button
+        onClick={() => onGroupByChange('none')}
+        aria-pressed={groupBy === 'none'}
+        className={`flex-1 rounded-full px-3 py-1.5 min-h-[28px] text-ios-caption
+                    ${groupBy === 'none' ? 'bg-accent text-white' : 'bg-bg-surface text-label-primary border border-hairline'}`}
+      >
+        All events
+      </button>
+    </div>
+  )
+}
+
+// Bucket items into Today / Yesterday / This week / Earlier
+// by their ``created_at``. Sorts each bucket by recency
+// (most recent first). The labels are short and human-
+// readable; the bucket boundaries are computed in the
+// user's local timezone (Date.now() and new Date() both
+// use the local TZ) so the labels match what the user
+// sees on the clock.
+type DateBucket = { label: string; items: HistoryItem[] }
+type HistoryItem = {
+  id: number
+  type: string
+  value: number
+  created_at: string
+  entry_id: number
+  entry_title: string
+  entry_url: string
+  entry_published_at: string | null
+  source_id: number
+  source_name: string
+}
+function groupByDate(items: HistoryItem[]): DateBucket[] {
+  const now = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000
+  // Start of the current week: treat Monday as the
+  // boundary. The user is reviewing "this week" so the
+  // standard Monday-boundary is fine; some users prefer
+  // Sunday \u2014 easy to swap here.
+  const startOfWeek = (() => {
+    const d = new Date(now)
+    const day = d.getDay() // 0 = Sunday, 1 = Monday
+    const diff = (day === 0 ? 6 : day - 1) // distance from Monday
+    d.setDate(d.getDate() - diff)
+    d.setHours(0, 0, 0, 0)
+    return d.getTime()
+  })()
+  const buckets: Record<string, HistoryItem[]> = {
+    Today: [],
+    Yesterday: [],
+    'This week': [],
+    Earlier: [],
+  }
+  for (const it of items) {
+    const ms = new Date(it.created_at).getTime()
+    if (ms >= startOfToday) buckets.Today.push(it)
+    else if (ms >= startOfYesterday) buckets.Yesterday.push(it)
+    else if (ms >= startOfWeek) buckets['This week'].push(it)
+    else buckets.Earlier.push(it)
+  }
+  return (
+    ['Today', 'Yesterday', 'This week', 'Earlier'] as const
+  )
+    .filter((label) => buckets[label].length > 0)
+    .map((label) => ({ label, items: buckets[label] }))
+}
+
 
 // ``timeAgo`` for the History rows. Duplicates the helper
 // already used by BriefCard and Card \u2014 not worth the
@@ -941,4 +1091,5 @@ function timeAgo(iso: string): string {
   const y = Math.floor(mo / 12)
   return `${y}y ago`
 }
+
 

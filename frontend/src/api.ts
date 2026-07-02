@@ -387,13 +387,19 @@ export const api = {
    * on ``(user_id, created_at DESC)`` plus a 3-way join)
    * and the result is small (50 rows); no caching needed
    * for the MVP. */
-  listRecentInteractions: (opts?: { types?: string[]; limit?: number; offset?: number }) => {
+  listRecentInteractions: (opts?: {
+    types?: string[]
+    limit?: number
+    offset?: number
+    groupBy?: 'none' | 'entry'
+  }) => {
     const params = new URLSearchParams()
     if (opts?.types && opts.types.length > 0) {
       params.set('types', opts.types.join(','))
     }
     if (opts?.limit != null) params.set('limit', String(opts.limit))
     if (opts?.offset != null) params.set('offset', String(opts.offset))
+    if (opts?.groupBy) params.set('group_by', opts.groupBy)
     const qs = params.toString()
     return jsonFetch<{
       items: Array<{
