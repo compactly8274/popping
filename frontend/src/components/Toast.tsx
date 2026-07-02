@@ -33,19 +33,37 @@ type Listener = (e: ToastEvent) => void
 const listeners = new Set<Listener>()
 
 /** Imperative API. Call from anywhere — no React
- *  tree needed. The optional `action` adds an
- *  Undo-style right-aligned button to the toast.
- *  When action is set, the auto-dismiss timer
- *  extends to 5 seconds. */
+ *  tree needed.
+ *
+ *  Two call signatures:
+ *    toast(message, kind)              — legacy
+ *    toast(message, { kind, action })  — with Undo
+ *
+ *  The legacy signature is preserved for callers
+ *  that don't pass an action. The new signature
+ *  adds an Undo-style right-aligned button to
+ *  the toast. When action is set, the
+ *  auto-dismiss timer extends to 5 seconds.
+ */
 export function toast(
   message: string,
-  options: { kind?: ToastEvent['kind']; action?: ToastAction } = {},
-) {
-  const event: ToastEvent = {
-    message,
-    kind: options.kind ?? 'info',
-    action: options.action,
+  options:
+    | ToastEvent['kind']
+    | { kind?: ToastEvent['kind']; action?: ToastAction } = 'info',
+): void {
+  // Normalize both signatures into a single
+  // ToastEvent shape. The old form passes a
+  // string 'kind' directly; the new form passes
+  // an options object.
+  let kind: ToastEvent['kind']
+  let action: ToastAction | undefined
+  if (typeof options === 'string') {
+    kind = options
+  } else {
+    kind = options.kind ?? 'info'
+    action = options.action
   }
+  const event: ToastEvent = { message, kind, action }
   for (const l of listeners) l(event)
 }
 
