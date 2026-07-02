@@ -724,12 +724,41 @@ export function App() {
 
   // Multi-sub column. One column, name reads "Filtering" so it stays
   // distinct from any category. The chip-bar header above the column
-  // carries the actual source list (see render). Entries come from
-  // ``entries`` directly — the backend already filtered by source when
-  // ``activeSources`` was non-empty at fetch time.
+  // carries the actual source list (see render).
+  //
+  // Client-side filter: the backend returns up to 200 entries
+  // (all sources) on every refresh, and we filter by
+  // ``activeSources`` here. The previous comment claimed the
+  // backend filtered at fetch time, but the only place that
+  // happens is the ``api.entries({ source: ... })`` call inside
+  // ``refresh()`` — and ``refresh()`` is NOT triggered by
+  // filter toggles (it's on a 60s auto-refresh + manual button).
+  // So if we relied on the backend filter, the multisub column
+  // would show stale data until the next refresh fired. The
+  // client-side filter is always up-to-date with the current
+  // ``activeSources`` state.
+  //
+  // The filter uses the entry's source_id mapped to its source
+  // name (via ``sourcesById``) because ``activeSources`` is a
+  // ``Set<string>`` of names, not ids. Entries whose source is
+  // not in the map (e.g. a source that was deleted) are
+  // excluded — safer than including them and showing the user
+  // "ghost" entries.
   const multisubColumn = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
-    return [{ name: 'Filtering', entries: visibleEntries }]
-  }, [entries])
+    if (activeSources.size === 0) {
+      // Defensive: this branch shouldn't be reached because
+      // ``viewKind`` switches to 'all' when ``activeSources``
+      // is empty, but we keep the empty case explicit so
+      // a stale memo doesn't accidentally render a
+      // unfiltered column.
+      return [{ name: 'Filtering', entries: [] }]
+    }
+    const filtered = visibleEntries.filter((e) => {
+      const name = sourcesById.get(e.source_id)
+      return name != null && activeSources.has(name)
+    })
+    return [{ name: 'Filtering', entries: filtered }]
+  }, [visibleEntries, activeSources, sourcesById])
 
   const baseColumns = viewKind === 'multisub' ? multisubColumn : allSubsColumns
 
@@ -784,31 +813,32 @@ export function App() {
     return out
   }, [columns, lastViewed])
 
-  // Unread entry ids per column — used to dim read cards.
+  // Fresh/History split per column. Fresh = the user has not
+  // manually marked this entry read. History = the user has.
+  // Independent of ``lastViewed`` so the column always has
+  // content — a first-time visit (no ``lastViewed`` set)
+  // still shows all entries as Fresh, and a "mark all read"
+  // move (which sets ``lastViewed``) doesn't make the column
+  // body empty. The ``lastViewed`` is still used for the
+  // "N new" chip on the column header, computed separately
+  // in ``newCountByColumn``.
   //
-  // Unread = entry's ``fetched_at`` is after the column's
-  // ``lastViewed`` timestamp AND the user has not manually marked
-  // this entry read via the per-card ✓ button. The manual set
-  // overrides the timestamp heuristic so a single tap dims one
-  // card without resetting the whole column.
+  // The multisub ("Filtering") column has no
+  // ``readEntries`` of its own (the user just toggled the
+  // filter), so all entries are Fresh on first view, which
+  // is the correct behavior.
   const unreadIdsByColumn = useMemo(() => {
     const out = new Map<string, Set<number>>()
     for (const col of columns) {
-      const last = lastViewed[col.name]
-      const lastMs = last ? new Date(last).getTime() : 0
       const manual = new Set(readEntries[col.name] ?? [])
       const ids = new Set<number>()
       for (const e of col.entries) {
-        // Skip entries the user explicitly marked read.
-        if (manual.has(e.id)) continue
-        if (lastMs > 0 && e.fetched_at && new Date(e.fetched_at).getTime() > lastMs) {
-          ids.add(e.id)
-        }
+        if (!manual.has(e.id)) ids.add(e.id)
       }
       if (ids.size > 0) out.set(col.name, ids)
     }
     return out
-  }, [columns, lastViewed, readEntries])
+  }, [columns, readEntries])
 
   // New / History split per column. The split happens AFTER the
   // per-column sort/filter (the previous useMemo), so the per-
@@ -2273,6 +2303,7 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
 
 
 

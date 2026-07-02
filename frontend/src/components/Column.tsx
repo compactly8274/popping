@@ -362,7 +362,7 @@ export function Column({
       </header>
       <div className="flex-1 overflow-y-auto space-y-2 pr-1">
         {entryCount === 0 ? (
-          <p className="text-ios-body text-label-secondary italic px-1">no fresh entries yet \u2014 the scheduler will fetch the first batch shortly</p>
+          <p className="text-ios-body text-label-secondary italic px-1">no entries in this column yet \u2014 the scheduler will fetch the first batch shortly</p>
         ) : (
           <>
             {/* Fresh section. Rendered first (the only section
@@ -397,6 +397,56 @@ export function Column({
                 // ``unread=true`` uniformly so every card gets
                 // the thin accent ring.
                 unreadForCard={() => true}
+                sourcesById={sourcesById}
+                selectedId={selectedId}
+                cardRefs={cardRefs}
+                categoriesBySourceId={categoriesBySourceId}
+                onMarkEntryRead={onMarkEntryRead}
+                expandedSummaries={expandedSummaries}
+                onToggleSummary={onToggleSummary}
+                onHideEntry={onHideEntry}
+                onHideToggle={onHideToggle}
+                hiddenSet={hiddenSet}
+                onStarEntry={onStarEntry}
+                starredSet={starredSet}
+              />
+            )}
+
+            {/* History sub-section. Shows entries the user
+                has marked read (per-column). Visually
+                dimmer than Fresh (Card's ``opacity-60``
+                when ``unread=false``). Acts as a quick
+                visual review for "what did I just read
+                in this column". The Drawer's History
+                tab is the full audit log with
+                timestamps + source metadata; this
+                section is the in-column glance.
+
+                The collapsed state is independent of
+                the Fresh section \u2014 the user can
+                collapse either or both. Default
+                expanded so the user always sees
+                something in the column after they've
+                read entries. The empty state
+                (``sections.history.length === 0``) is
+                handled by the parent \u2014 no
+                "HISTORY (0)" line. */}
+
+            {sections.history.length > 0 && (
+              <ColumnSection
+                label="History"
+                count={sections.history.length}
+                collapsed={sectionsCollapsed?.history ?? false}
+                onToggle={onToggleSection ? () => onToggleSection('history') : undefined}
+                entries={sections.history}
+                // All entries in the History section are
+                // read by construction \u2014 they were
+                // sorted OUT of the fresh set by the
+                // manual ``readEntries`` set. Pass
+                // ``unread=false`` uniformly so every
+                // card gets the dim opacity-60 + no
+                // accent ring.
+                unreadForCard={() => false}
                 sourcesById={sourcesById}
                 selectedId={selectedId}
                 cardRefs={cardRefs}
@@ -596,6 +646,7 @@ function ChevronIcon({ className, collapsed }: { className?: string; collapsed?:
     </svg>
   )
 }
+
 
 
 

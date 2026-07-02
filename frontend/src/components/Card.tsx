@@ -350,17 +350,30 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
     showContextMenu(e.clientX, e.clientY, actions)
   }
 
-  // Visual state for unread vs selected. The ring is the only signal:
-  // read = no ring (full-color card, no decorative chrome), unread =
-  // thin accent ring. Selected cards get a stronger accent ring
-  // regardless of read state so the keyboard focus is unambiguous.
-  // No opacity dim — dimming the text made read cards look "hidden"
-  // rather than "seen", and the ring absence is enough on its own.
+  // Visual state for unread vs selected vs read.
+  //
+  // The previous design (Claude code's refactor) used the ring
+  // as the only signal for read state. The user reported that
+  // the mark-read click had no visual effect — the ring
+  // absence is too subtle on its own. The original design
+  // had an opacity dim (opacity-60) for read cards. The
+  // dim is back: read cards are 60% opaque, so they're
+  // visibly "seen" without being "hidden".
+  //
+  // Ring is still used for selected (strong) and unread
+  // (thin). Read cards have no ring.
   const ringClass = selected
     ? 'ring-2 ring-accent/70'
     : unread
       ? 'ring-1 ring-accent/40'
       : ''
+  // The opacity dim is applied to the article container
+  // so the entire card (title, body, meta row, sources,
+  // summary) fades together. ``opacity-60`` is heavy
+  // enough to read as "seen at a glance" but light
+  // enough that the user can still read the card body
+  // if they expand it.
+  const dimClass = unread || selected ? '' : 'opacity-60'
 
   return (
     <article
@@ -378,8 +391,8 @@ export function _CardInner({ entry, sourceName, unread, selected, cardRef, onAct
       onContextMenu={onContextMenu}
       className={`group relative rounded-ios-lg bg-bg-surface border border-hairline p-4 pl-5
                   hover:-translate-y-px hover:shadow-glow-md
-                  transition-[transform,box-shadow,border-color] duration-200
-                  ${ringClass}`}
+                  transition-[transform,box-shadow,border-color,opacity] duration-200
+                  ${ringClass} ${dimClass}`}
     >
       {/* Category stripe. 2px wide, full height of the card. Lives
           outside the padding flow so it doesn't shift content when
