@@ -67,6 +67,13 @@ export const STORAGE_KEYS = {
   // collapses are recorded. Mirrors the BriefCard's collapse pattern
   // but at the column level (two sections per column, not one).
   columnSections: `${NAMESPACE}.${SCHEMA}.col.sections`,
+  // History tab's group-by toggle (``entry`` or ``none``).
+  // Persisted so the user's preferred grouping survives
+  // reloads. The History tab's default is ``entry`` (one
+  // row per article, most recent wins) but a power user
+  // who wants every individual event can opt in to
+  // ``none`` once and have it stick.
+  historyGroupBy: `${NAMESPACE}.${SCHEMA}.history.groupBy`,
 } as const
 
 // Same trim cap as ``readEntries``: keep the most-recent decisions
@@ -118,5 +125,6 @@ export function safeRemoveItem(key: string): void {
     // See safeGetItem — best effort.
   }
 }
+
 
 
