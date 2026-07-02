@@ -23,7 +23,7 @@
 // overlay" for free, and the overlay is dismissible by clearing the
 // param (Esc + tapping Done both do that).
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
   type LLMTagsResponse,
@@ -34,6 +34,7 @@ import {
 } from '../api'
 import { FeedManager } from './FeedManager'
 import { toast } from './Toast'
+import { safeGetItem, safeSetItem, STORAGE_KEYS } from '../lib/storage'
 
 export type SettingsTab =
   | 'feeds'
@@ -803,7 +804,29 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
   // interaction. Backed by the backend's ``group_by`` query
   // param. The total count follows the same dedup so the
   // "Showing N of M" count is consistent.
-  const [groupBy, setGroupBy] = useState<'none' | 'entry'>('entry')
+  //
+  // Persisted to localStorage so the user's preferred
+  // grouping survives reloads. The lazy initializer reads
+  // the stored value on first render; the useEffect below
+  // writes on change. Forgiving loader: any non-matching
+  // value (including a corrupted localStorage record or a
+  // future value we don't recognize) falls back to the
+  // default 'entry'. The default itself is the more useful
+  // one for a power user with many interactions (one row
+  // per article, not 200 individual read events).
+  const [groupBy, setGroupBy] = useState<'none' | 'entry'>(() => {
+    if (typeof window === 'undefined') return 'entry'
+    const stored = safeGetItem(STORAGE_KEYS.historyGroupBy)
+    return stored === 'none' ? 'none' : 'entry'
+  })
+
+  // Persist the toggle on change. The useState's lazy
+  // initializer reads on first render; this effect writes
+  // on every change. Same pattern as the other
+  // write-on-change hooks in the codebase.
+  useEffect(() => {
+    safeSetItem(STORAGE_KEYS.historyGroupBy, groupBy)
+  }, [groupBy])
 
   // The full list of items accumulated from paginated
   // fetches. Appends in place when the user hits "Show
@@ -869,6 +892,48 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
     return cleanup
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupBy, onError])
+
+  // Infinite scroll. An invisible sentinel div at the
+  // bottom of the list; when it scrolls into view
+  // (IntersectionObserver fires ``isIntersecting=true``)
+  // and there's more to load, we fetch the next page.
+  //
+  // Why IntersectionObserver over a scroll handler:
+  //  1. No throttle / debounce needed \u2014 the browser
+  //     calls us at the right time.
+  //  2. No layout reads on the main thread \u2014 IO is
+  //     off-thread.
+  //  3. The cleanup function disconnects cleanly.
+  //
+  // The ``sentinelRef`` is on a div at the bottom of
+  // the list. ``rootMargin: 200px`` means "fire when
+  // the sentinel is within 200px of the viewport" \u2014
+  // the next page starts loading before the user
+  // reaches the bottom, so the scroll feels instant.
+  const sentinelRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (typeof IntersectionObserver === 'undefined') return
+    const el = sentinelRef.current
+    if (!el) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting && hasMore && !loading && !loadingMore && !error) {
+            // Trigger the next page. ``fetchPage(true)``
+            // appends in place. We don't await \u2014 the
+            // observer can fire again while we're loading,
+            // the ``loadingMore`` guard prevents a double
+            // fetch.
+            void fetchPage(true)
+          }
+        }
+      },
+      { rootMargin: '200px' },
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasMore, loading, loadingMore, error, items?.length])
 
   if (loading) {
     return (
@@ -965,16 +1030,31 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
           ))}
         </div>
       ))}
+      {/* Infinite-scroll sentinel + manual fallback. The
+          sentinel is an invisible div that the
+          IntersectionObserver watches. When it scrolls
+          into view, the next page is fetched. The
+          loading hint is a small text element (not a
+          button) so the user can't accidentally tap
+          it \u2014 they get the next page by scrolling
+          alone. If IO is unsupported (very old
+          browsers), the loading hint is still visible
+          and the user can wait. We deliberately don't
+          include a clickable "Show more" button here
+          \u2014 the infinite-scroll observer is the
+          primary path. A small, visually subtle hint
+          ("loading\u2026" or "X more remaining") is
+          enough to communicate the state. */}
       {hasMore && (
-        <button
-          onClick={() => fetchPage(true)}
-          disabled={loadingMore}
-          className="w-full rounded-ios bg-bg-surface border border-hairline p-2.5
-                     text-ios-body text-accent active:opacity-60
-                     disabled:opacity-40"
+        <div
+          ref={sentinelRef}
+          className="text-ios-caption text-label-secondary text-center py-3"
+          aria-live="polite"
         >
-          {loadingMore ? 'loading\u2026' : `Show more (${total - items.length} remaining)`}
-        </button>
+          {loadingMore
+            ? 'loading more\u2026'
+            : `${total - items.length} more \u2014 scroll to load`}
+        </div>
       )}
     </div>
   )
@@ -1091,5 +1171,6 @@ function timeAgo(iso: string): string {
   const y = Math.floor(mo / 12)
   return `${y}y ago`
 }
+
 
 
