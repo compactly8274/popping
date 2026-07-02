@@ -1658,16 +1658,16 @@ function PresetChip({
   )
 }
 
-// Settings gear. Opens the Settings overlay (a
-                full-page sheet with tabs for feeds / LLM /
-                notifications / reset). Lives to the LEFT of the
-                hamburger so the hamburger keeps its right-edge
-                position; the two together read as "more menu
-                options → main menu." */}
-            <button
-              type="button"
-              onClick={() => openSettings('feeds')}
-              aria-label="open settings"
+{/* Settings gear. Opens the Settings overlay (a
+            full-page sheet with tabs for feeds / LLM /
+            notifications / reset). Lives to the LEFT of the
+            hamburger so the hamburger keeps its right-edge
+            position; the two together read as "more menu
+            options → main menu." */}
+          <button
+            type="button"
+            onClick={() => openSettings('feeds')}
+            aria-label="open settings"
               data-settings-gear
               className="w-11 h-11 flex items-center justify-center rounded-full text-label-primary active:bg-bg-elevated"
             >
