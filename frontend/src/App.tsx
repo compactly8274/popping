@@ -1337,6 +1337,71 @@ export function App() {
   //
   // ``useCallback`` so the keyboard-shortcut effect doesn't re-bind
   // on every render. ``setReadEntries`` is stable across renders.
+
+
+  // Reverse of ``markColumnRead``: remove a set
+  // of ids from ``readEntries[col]`` and clear
+  // ``lastViewed[col]``. Used by the column-mark-read
+  // Undo action. The cleared lastViewed means the
+  // "N new" chip will repopulate on the next
+  // refresh.
+  const unmarkColumnRead = useCallback(
+    (columnName: string, ids: number[]) => {
+      if (ids.length === 0) return
+      const idSet = new Set(ids)
+      setReadEntries((prev) => {
+        const cur = prev[columnName] ?? []
+        const next = cur.filter((id) => !idSet.has(id))
+        if (next.length === cur.length) return prev
+        return { ...prev, [columnName]: next }
+      })
+      setLastViewed((prev) => {
+        const next = { ...prev }
+        delete next[columnName]
+        return next
+      })
+      if (seenEntryIdsRef.current != null) {
+        const merged = new Set(seenEntryIdsRef.current)
+        for (const id of ids) merged.delete(id)
+        seenEntryIdsRef.current = merged
+      }
+    },
+    [],
+  )
+
+  // Reverse of ``markEntryRead``: remove the id
+  // from ``readEntries[col]`` so the entry moves
+  // back to the Fresh section. Used by the
+  // mark-read Undo action on the per-card check
+  // click.
+  const unmarkEntryRead = useCallback(
+    (columnName: string, entryId: number) => {
+      setReadEntries((prev) => {
+        const cur = prev[columnName] ?? []
+        const next = cur.filter((id) => id !== entryId)
+        if (next.length === cur.length) return prev
+        return { ...prev, [columnName]: next }
+      })
+    },
+    [],
+  )
+
+  // Reverse of ``hideEntry`` / ``toggleHideEntry``
+  // (hide branch): remove the id from
+  // ``hiddenEntries`` so the entry surfaces in
+  // the dashboard again. Used by the hide Undo
+  // action on both the per-card eye button and
+  // the context-menu "Hide this entry" item.
+  // Note: this does NOT reverse the
+  // ``markEntryRead`` that ``toggleHideEntry``
+  // also fires. The user has to tap check Undo
+  // separately to restore the Fresh/History
+  // split. This matches the prior
+  // one-step-at-a-time model.
+  const restoreHiddenEntry = useCallback((entryId: number) => {
+    setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
+  }, [])
+
   const markEntryRead = useCallback((columnName: string, entryId: number) => {
     setReadEntries((prev) => {
       const cur = prev[columnName] ?? []
@@ -1698,69 +1763,6 @@ export function App() {
       })
     }
   }
-
-  // Reverse of ``markColumnRead``: remove a set
-  // of ids from ``readEntries[col]`` and clear
-  // ``lastViewed[col]``. Used by the column-mark-read
-  // Undo action. The cleared lastViewed means the
-  // "N new" chip will repopulate on the next
-  // refresh.
-  const unmarkColumnRead = useCallback(
-    (columnName: string, ids: number[]) => {
-      if (ids.length === 0) return
-      const idSet = new Set(ids)
-      setReadEntries((prev) => {
-        const cur = prev[columnName] ?? []
-        const next = cur.filter((id) => !idSet.has(id))
-        if (next.length === cur.length) return prev
-        return { ...prev, [columnName]: next }
-      })
-      setLastViewed((prev) => {
-        const next = { ...prev }
-        delete next[columnName]
-        return next
-      })
-      if (seenEntryIdsRef.current != null) {
-        const merged = new Set(seenEntryIdsRef.current)
-        for (const id of ids) merged.delete(id)
-        seenEntryIdsRef.current = merged
-      }
-    },
-    [],
-  )
-
-  // Reverse of ``markEntryRead``: remove the id
-  // from ``readEntries[col]`` so the entry moves
-  // back to the Fresh section. Used by the
-  // mark-read Undo action on the per-card check
-  // click.
-  const unmarkEntryRead = useCallback(
-    (columnName: string, entryId: number) => {
-      setReadEntries((prev) => {
-        const cur = prev[columnName] ?? []
-        const next = cur.filter((id) => id !== entryId)
-        if (next.length === cur.length) return prev
-        return { ...prev, [columnName]: next }
-      })
-    },
-    [],
-  )
-
-  // Reverse of ``hideEntry`` / ``toggleHideEntry``
-  // (hide branch): remove the id from
-  // ``hiddenEntries`` so the entry surfaces in
-  // the dashboard again. Used by the hide Undo
-  // action on both the per-card eye button and
-  // the context-menu "Hide this entry" item.
-  // Note: this does NOT reverse the
-  // ``markEntryRead`` that ``toggleHideEntry``
-  // also fires. The user has to tap check Undo
-  // separately to restore the Fresh/History
-  // split. This matches the prior
-  // one-step-at-a-time model.
-  const restoreHiddenEntry = useCallback((entryId: number) => {
-    setHiddenEntries((prev) => prev.filter((id) => id !== entryId))
-  }, [])
 
   const toggleSource = (name: string) => {
     setActiveSources((prev) => {
@@ -2275,7 +2277,7 @@ export function App() {
                             kind: 'info',
                             action: {
                               label: 'Undo',
-                              onClick: () => toggleStarEntry(entryId),
+                              onClick: () => toggleStarEntry(e.id),
                             },
                           },
                         )

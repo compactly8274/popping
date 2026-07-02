@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 from typing import Optional
 
 from sqlalchemy import desc, select
@@ -39,14 +40,16 @@ logger = logging.getLogger("popping.brief")
 # How many top entries the digest covers. Large enough to give the LLM
 # real choice; small enough that the prompt stays under a few KB.
 _DIGEST_LIMIT = 25
-# Brief output budget. 400 tokens is enough for the headline sentence
+# Brief output budget. 600 tokens is enough for the headline sentence
 # (~40) + 5 highlights (~50 each = 250) + 3 watch items (~30 each = 90)
-# = ~380, with a small buffer. The previous 900-budget left room for
-# the model to leak chain-of-thought into the output before
-# hitting the limit; tightening the cap physically prevents that.
-# Pushover's body limit is ~4 KB (~1k tokens of English), so 400 is
-# comfortably within the notification budget too.
-_BRIEF_MAX_TOKENS = 400
+# = ~380, with a ~220-token buffer for verbose models or long
+# summaries. The previous 400-budget was tight enough that some
+# models (notably ``glm-5.2:cloud``) truncated mid-sentence after
+# 1-2 highlight bullets. 600 gives the model room to complete the
+# WATCH section without sacrificing the stop-sequence defense
+# against CoT leaks. Pushover's body limit is ~4 KB (~1k tokens of
+# English), so 600 is comfortably within the notification budget too.
+_BRIEF_MAX_TOKENS = 600
 
 # Stop sequences for the brief. Each entry is a string the model is
 # told to halt on — the moment any of these appears, generation stops
@@ -139,8 +142,59 @@ class BriefGenerator:
 
         content = (content or "").strip()
         if not content:
-            logger.warning("brief: LLM returned empty content — skipping persist")
+            logger.warning("brief: LLM returned empty content \u2014 skipping persist")
             return None
+
+        # Truncation retry. Some models (notably
+        # ``glm-5.2:cloud`` via Ollama Cloud) decide to
+        # stop generating after 1-2 highlight bullets,
+        # even with 600-token headroom. The prompt
+        # strengthening above addresses the common case;
+        # this retry catches the residual case where the
+        # model still truncates. We parse the response
+        # in the same shape the frontend uses (TODAY IN
+        # ONE SENTENCE / HIGHLIGHTS / WATCH sections)
+        # and retry if the WATCH section is missing. The
+        # retry uses a continuation prompt that asks
+        # the model to finish the brief from where it
+        # stopped, with a fresh max_tokens budget (300)
+        # that is enough to complete a 1-bullet WATCH
+        # section but not enough to leak CoT.
+        truncated_reason = self._is_truncated(content)
+        if truncated_reason and getattr(self, "_allow_retry", True):
+            logger.info(
+                "brief: response truncated (%s) \u2014 retrying with continuation prompt",
+                truncated_reason,
+            )
+            continuation = (
+                "Continue the brief below from where you stopped. Do "
+                "not restart, do not repeat, do not echo the existing "
+                "lines. Add only the missing section.\n\n"
+                f"{content}\n"
+            )
+            try:
+                retry = await provider.complete(
+                    continuation,
+                    max_tokens=300,
+                    stop=_BRIEF_STOP_SEQUENCES,
+                )
+            except ProviderError as exc:
+                logger.warning("brief: retry LLM call failed: %s", exc)
+            else:
+                retry = (retry or "").strip()
+                if retry:
+                    sep = "" if content.endswith("\n") else "\n"
+                    content = (content + sep + retry).strip()
+                    if self._is_truncated(content):
+                        logger.warning(
+                            "brief: retry still truncated \u2014 shipping partial brief (%d chars)",
+                            len(content),
+                        )
+                    else:
+                        logger.info(
+                            "brief: retry completed the brief (%d chars)",
+                            len(content),
+                        )
 
         # ``delivered_at`` is set when we successfully push the notification
         # in ``_dispatch``. Persist first, then notify — the row exists
@@ -470,12 +524,16 @@ class BriefGenerator:
             "on its own. Next, one sentence summarising the single most "
             "important development. Then a blank line. Then a line that "
             "is literally HIGHLIGHTS on its own. Then between three and "
-            "five bulleted lines, each starting with a hyphen. Then a "
-            "blank line. Then a line that is literally WATCH on its own. "
-            "Then between one and three bulleted lines, each starting "
-            "with a hyphen. Nothing else in the reply — no preamble, no "
+            "five bulleted lines, each starting with a hyphen, each "
+            "ending with a period. Then a blank line. Then a line that "
+            "is literally WATCH on its own. Then between one and three "
+            "bulleted lines, each starting with a hyphen, each ending "
+            "with a period. Nothing else in the reply \u2014 no preamble, no "
             "analysis, no reasoning, no explanations, no labels, no "
-            "headers, no bold, no italic, no markdown of any kind."
+            "headers, no bold, no italic, no markdown of any kind. "
+            "The brief is not complete until you have written the WATCH "
+            "section with at least one bullet. Do not stop after the "
+            "HIGHLIGHTS bullets \u2014 you must continue to the WATCH section."
         )
 
         # Anti-echo clause. Some models (notably the thinking-style
@@ -517,6 +575,38 @@ class BriefGenerator:
             f"Candidate entries:\n\n"
             f"{BriefGenerator._format_entries(entries)}\n"
         )
+
+    @staticmethod
+    def _is_truncated(content: str) -> Optional[str]:
+        """Return a short reason if the brief looks truncated,
+        ``None`` if it appears complete.
+
+        Heuristic: the brief is "complete" if it has all
+        three section headers (TODAY IN ONE SENTENCE,
+        HIGHLIGHTS, WATCH) and the WATCH section has at
+        least one bullet. We don't try to count highlights
+        here \u2014 the prompt asks for 3-5 and the parser
+        is robust to whatever count it gets. A brief
+        with HIGHLIGHTS but no WATCH is the most common
+        truncation pattern we see in practice.
+
+        Returns a human-readable reason string so the
+        caller can log it. ``None`` means the brief
+        looks complete.
+        """
+        if not content:
+            return "empty"
+        if "TODAY IN ONE SENTENCE" not in content:
+            return "missing headline header"
+        if "HIGHLIGHTS" not in content:
+            return "missing highlights header"
+        if "WATCH" not in content:
+            return "missing watch section"
+        watch_idx = content.upper().rfind("WATCH")
+        after_watch = content[watch_idx:]
+        if not re.search(r"^\s*-\s", after_watch, re.MULTILINE):
+            return "watch section has no bullets"
+        return None
 
     # ------------------------------------------------------------------
     # Notification dispatch
