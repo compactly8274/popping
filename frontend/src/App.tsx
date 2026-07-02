@@ -208,6 +208,94 @@ function loadHiddenEntries(): number[] {
 // long since aged out of the column's view.
 const MAX_PER_COLUMN = 200
 
+
+// Saved-preset chip strip. Renders the user’s saved filter
+// presets as horizontal chips above the column grid. Click a
+// chip to apply the preset; right-click to delete (with a
+// two-tap confirm). Hidden when the user has no presets —
+// a first-time user doesn’t see this affordance until
+// they save one.
+function PresetChips({
+  presets,
+  onApply,
+  onDelete,
+}: {
+  presets: FilterPreset[]
+  onApply: (preset: FilterPreset) => void
+  onDelete: (id: string) => void
+}) {
+  if (presets.length === 0) return null
+  return (
+    <div
+      className="flex gap-1.5 overflow-x-auto px-4 sm:px-6 py-2 border-b border-hairline bg-bg-app"
+      role="toolbar"
+      aria-label="saved filter presets"
+    >
+      <span
+        className="shrink-0 text-ios-caption uppercase tracking-wide text-label-tertiary self-center mr-1"
+        aria-hidden="true"
+      >
+        Saved
+      </span>
+      {presets.map((p) => (
+        <PresetChip
+          key={p.id}
+          preset={p}
+          onApply={() => onApply(p)}
+          onDelete={() => onDelete(p.id)}
+        />
+      ))}
+    </div>
+  )
+}
+
+function PresetChip({
+  preset,
+  onApply,
+  onDelete,
+}: {
+  preset: FilterPreset
+  onApply: () => void
+  onDelete: () => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  return (
+    <div className="shrink-0 flex items-center">
+      {confirming ? (
+        <div className="flex items-center gap-1.5 rounded-full bg-red-500/10 border border-red-500/30 pl-2.5 pr-1 py-0.5">
+          <span className="text-ios-caption text-red-400">Delete?</span>
+          <button
+            onClick={onDelete}
+            className="text-ios-caption text-red-400 active:opacity-60 font-semibold"
+            aria-label={`confirm delete preset ${preset.name}`}
+          >
+            Yes
+          </button>
+          <button
+            onClick={() => setConfirming(false)}
+            className="text-ios-caption text-label-secondary active:opacity-60"
+            aria-label={`cancel delete preset ${preset.name}`}
+          >
+            No
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={onApply}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            setConfirming(true)
+          }}
+          title={`Apply preset "${preset.name}". Right-click to delete.`}
+          className="shrink-0 rounded-full bg-accent-soft text-accent border border-accent-soft hover:bg-accent-soft/80 active:opacity-60 px-3 py-0.5 text-ios-caption font-medium"
+        >
+          {preset.name}
+        </button>
+      )}
+    </div>
+  )
+}
+
 export function App() {
   const [entries, setEntries] = useState<Entry[]>([])
   const [forYou, setForYou] = useState<Entry[]>([])
@@ -1571,92 +1659,6 @@ export function App() {
             >
               <RefreshIcon className={`w-5 h-5 ${refreshing ? 'animate-spin' : ''}`} />
             </button>
-// Saved-preset chip strip. Renders the user’s saved filter
-// presets as horizontal chips above the column grid. Click a
-// chip to apply the preset; right-click to delete (with a
-// two-tap confirm). Hidden when the user has no presets —
-// a first-time user doesn’t see this affordance until
-// they save one.
-function PresetChips({
-  presets,
-  onApply,
-  onDelete,
-}: {
-  presets: FilterPreset[]
-  onApply: (preset: FilterPreset) => void
-  onDelete: (id: string) => void
-}) {
-  if (presets.length === 0) return null
-  return (
-    <div
-      className="flex gap-1.5 overflow-x-auto px-4 sm:px-6 py-2 border-b border-hairline bg-bg-app"
-      role="toolbar"
-      aria-label="saved filter presets"
-    >
-      <span
-        className="shrink-0 text-ios-caption uppercase tracking-wide text-label-tertiary self-center mr-1"
-        aria-hidden="true"
-      >
-        Saved
-      </span>
-      {presets.map((p) => (
-        <PresetChip
-          key={p.id}
-          preset={p}
-          onApply={() => onApply(p)}
-          onDelete={() => onDelete(p.id)}
-        />
-      ))}
-    </div>
-  )
-}
-
-function PresetChip({
-  preset,
-  onApply,
-  onDelete,
-}: {
-  preset: FilterPreset
-  onApply: () => void
-  onDelete: () => void
-}) {
-  const [confirming, setConfirming] = useState(false)
-  return (
-    <div className="shrink-0 flex items-center">
-      {confirming ? (
-        <div className="flex items-center gap-1.5 rounded-full bg-red-500/10 border border-red-500/30 pl-2.5 pr-1 py-0.5">
-          <span className="text-ios-caption text-red-400">Delete?</span>
-          <button
-            onClick={onDelete}
-            className="text-ios-caption text-red-400 active:opacity-60 font-semibold"
-            aria-label={`confirm delete preset ${preset.name}`}
-          >
-            Yes
-          </button>
-          <button
-            onClick={() => setConfirming(false)}
-            className="text-ios-caption text-label-secondary active:opacity-60"
-            aria-label={`cancel delete preset ${preset.name}`}
-          >
-            No
-          </button>
-        </div>
-      ) : (
-        <button
-          onClick={onApply}
-          onContextMenu={(e) => {
-            e.preventDefault()
-            setConfirming(true)
-          }}
-          title={`Apply preset "${preset.name}". Right-click to delete.`}
-          className="shrink-0 rounded-full bg-accent-soft text-accent border border-accent-soft hover:bg-accent-soft/80 active:opacity-60 px-3 py-0.5 text-ios-caption font-medium"
-        >
-          {preset.name}
-        </button>
-      )}
-    </div>
-  )
-}
 
 {/* Settings gear. Opens the Settings overlay (a
             full-page sheet with tabs for feeds / LLM /
