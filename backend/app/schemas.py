@@ -388,6 +388,65 @@ class InteractionType(str, enum.Enum):
     never = "never"
 
 
+class InteractionOut(BaseModel):
+    """Single engagement event with joined entry + source metadata.
+
+    Returned by ``GET /api/interactions/recent`` for the Drawer's
+    History view. The History view needs the entry title + URL
+    + source name + the interaction's type (view / never /
+    bookmark) + value (signed: +1 for positive, -1 for negative)
+    + created_at (when the user did the thing).
+
+    The frontend renders a colored chip for the type:
+      view     = "Read"   (green / accent)
+      never    = "Hidden" (red)
+      bookmark = "Saved"  (yellow / star)
+      click    = "Opened" (gray)
+      dwell    = ""       (not surfaced in History)
+    plus the entry title (clickable, opens the URL) and a
+    source badge.
+
+    The value field is signed so the frontend can show the
+    polarity (e.g. "Read" entries with a positive value get
+    a green dot, "Hidden" entries with a negative value get
+    a red dot). We also accept a string type for the
+    interaction — a future model could record richer types
+    (e.g. "share", "dwell") without breaking the schema.
+    """
+
+    id: int
+    type: str
+    value: float
+    created_at: dt.datetime
+    entry_id: int
+    entry_title: str
+    entry_url: str
+    entry_published_at: Optional[dt.datetime] = None
+    source_id: int
+    source_name: str
+
+    class Config:
+        from_attributes = True
+
+
+class InteractionListOut(BaseModel):
+    """Response shape for ``GET /api/interactions/recent``.
+
+    Returns a list of ``InteractionOut`` plus the total count
+    of interactions matching the filter (so the frontend can
+    show "Showing 50 of 1,234" without an extra round-trip).
+
+    ``has_more`` is true when the returned page was the full
+    LIMIT, hinting to the UI that more exist. The frontend
+    ignores it for now (the History view fits 50 on screen)
+    but it's a free signal for the future.
+    """
+
+    items: list[InteractionOut]
+    total: int
+    has_more: bool
+
+
 class InteractionIn(BaseModel):
     """Body for ``POST /api/interactions``. Records one event.
 
@@ -414,3 +473,4 @@ class InteractionBatchIn(BaseModel):
     feedback.
     """
     events: list[InteractionIn]
+

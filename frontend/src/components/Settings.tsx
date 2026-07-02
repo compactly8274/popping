@@ -35,7 +35,14 @@ import {
 import { FeedManager } from './FeedManager'
 import { toast } from './Toast'
 
-export type SettingsTab = 'feeds' | 'llm' | 'notifications' | 'hidden' | 'starred' | 'reset'
+export type SettingsTab =
+  | 'feeds'
+  | 'llm'
+  | 'notifications'
+  | 'history'
+  | 'hidden'
+  | 'starred'
+  | 'reset'
 
 type Props = {
   open: boolean
@@ -85,6 +92,7 @@ const TAB_META: Record<SettingsTab, { label: string; icon: string }> = {
   feeds: { label: 'Feeds', icon: 'feeds' },
   llm: { label: 'LLM', icon: 'llm' },
   notifications: { label: 'Notifications', icon: 'bell' },
+  history: { label: 'History', icon: 'history' },
   hidden: { label: 'Hidden', icon: 'eye-off' },
   starred: { label: 'Saved', icon: 'star' },
   reset: { label: 'Reset', icon: 'reset' },
@@ -196,7 +204,7 @@ export function Settings({
             primary. ``role="tablist"`` so screen readers
             announce it as a tab group. */}
         <div className="flex gap-1 mx-4 mt-3 rounded-ios overflow-hidden border border-hairline" role="tablist">
-          {(['feeds', 'llm', 'notifications', 'hidden', 'starred', 'reset'] as SettingsTab[]).map((t) => {
+          {(['feeds', 'llm', 'notifications', 'history', 'hidden', 'starred', 'reset'] as SettingsTab[]).map((t) => {
             const active = t === tab
             return (
               <button
@@ -412,6 +420,8 @@ export function Settings({
             </div>
           )}
 
+          {tab === 'history' && <HistoryTabContent onError={onError} />}
+
           {tab === 'reset' && (
             <div className="pt-4 px-4 space-y-3">
               <div className="rounded-ios bg-bg-surface border border-hairline p-3">
@@ -473,6 +483,18 @@ function TabIcon({ name, active }: { name: string; active: boolean }) {
         <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="M3 10a7 7 0 1 1 2.05 4.95" />
           <polyline points="3 5 3 10 8 10" />
+        </svg>
+      )
+    case 'history':
+      // Lucide-style "history" tab icon. A clock face with
+      // a counter-clockwise arrow around it \u2014 the standard
+      // "what did I do" / "review" affordance. 1.5px
+      // stroke, 16x16, matches the rest of the tab strip.
+      return (
+        <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M3 10a7 7 0 1 0 2-4.7" />
+          <polyline points="3 3 3 6 6 6" />
+          <polyline points="10 5 10 10 13 12" />
         </svg>
       )
     case 'eye-off':
@@ -751,4 +773,172 @@ function LLMSection({
 
 
 
+
+
+// History tab content. Fetches the user's recent engagement
+// events and renders them as a chronological list grouped by
+// polarity. Each row is clickable and opens the entry URL in
+// a new tab.
+//
+// Fetches on mount; refreshes when the user navigates back to
+// the tab (the ``key`` prop on the parent could enforce a
+// remount, but for the MVP we just refetch when the user
+// navigates to the tab via the URL param change).
+function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
+  type Item = {
+    id: number
+    type: string
+    value: number
+    created_at: string
+    entry_id: number
+    entry_title: string
+    entry_url: string
+    entry_published_at: string | null
+    source_id: number
+    source_name: string
+  }
+  const [items, setItems] = useState<Item[] | null>(null)
+  const [total, setTotal] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  // Refetch on mount and when the user changes tabs back to
+  // history. The ``useEffect`` deps are [] so this fires
+  // once per mount; App owns the mount/unmount via the
+  // conditional render in the parent.
+  useEffect(() => {
+    let alive = true
+    setLoading(true)
+    setError(null)
+    api
+      .listRecentInteractions({ limit: 50 })
+      .then((res) => {
+        if (!alive) return
+        setItems(res.items)
+        setTotal(res.total)
+        setLoading(false)
+      })
+      .catch((err: Error) => {
+        if (!alive) return
+        setError(err.message)
+        setLoading(false)
+        onError(err.message)
+      })
+    return () => {
+      alive = false
+    }
+  }, [onError])
+
+  if (loading) {
+    return (
+      <div className="pt-4 px-4 text-ios-body text-label-secondary">
+        loading history\u2026
+      </div>
+    )
+  }
+  if (error) {
+    return (
+      <div className="pt-4 px-4 text-ios-body text-red-400">
+        failed to load history: {error}
+      </div>
+    )
+  }
+  if (!items || items.length === 0) {
+    return (
+      <div className="pt-4 px-4 space-y-3">
+        <div className="rounded-ios bg-bg-surface border border-hairline p-3">
+          <div className="text-ios-body text-label-primary">No history yet</div>
+          <div className="text-ios-caption text-label-secondary mt-0.5">
+            Mark a card as read (\u2713) or hide it (\u25ef with strike) and it will
+            show up here. The History view is grouped by polarity \u2014
+            reads are positive, hides are negative \u2014 so you can
+            review what you engaged with.
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // Group items by type into Read / Hidden / Saved buckets.
+  // Order: most recent first, then group, then sort within
+  // group by recency. The "View" type fires on every card
+  // mark-read so the Read group is the dense one. The
+  // "never" type fires on eye-button hide so the Hidden
+  // group is smaller. The "bookmark" type fires on star
+  // so the Saved group is the small one.
+  type Group = { label: string; color: string; items: Item[] }
+  const read: Item[] = items.filter((i) => i.type === 'view')
+  const hidden: Item[] = items.filter((i) => i.type === 'never')
+  const saved: Item[] = items.filter((i) => i.type === 'bookmark')
+  const groups: Group[] = [
+    { label: 'Read', color: 'text-green-500', items: read },
+    { label: 'Hidden', color: 'text-red-400', items: hidden },
+    { label: 'Saved', color: 'text-amber-400', items: saved },
+  ].filter((g) => g.items.length > 0)
+
+  return (
+    <div className="pt-4 px-4 space-y-3">
+      <div className="text-ios-caption text-label-secondary">
+        Showing {items.length} of {total}
+      </div>
+      {groups.map((g) => (
+        <div key={g.label} className="space-y-1">
+          <div
+            className={`text-ios-caption uppercase tracking-wide ${g.color} font-semibold`}
+          >
+            {g.label} ({g.items.length})
+          </div>
+          {g.items.map((i) => (
+            <a
+              key={i.id}
+              href={i.entry_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block rounded-ios bg-bg-surface border border-hairline p-2.5
+                         hover:bg-bg-elevated active:opacity-60 transition-colors"
+            >
+              <div className="flex items-start gap-2">
+                <span className={`shrink-0 mt-0.5 text-ios-caption ${g.color}`} aria-hidden="true">
+                  {g.label === 'Read' ? '\u2713' : g.label === 'Hidden' ? '\u25ef with strike' : '\u2606'}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-ios-body text-label-primary line-clamp-2">
+                    {i.entry_title}
+                  </div>
+                  <div className="text-ios-caption text-label-secondary mt-0.5 flex items-center gap-2">
+                    <span>{i.source_name}</span>
+                    <span aria-hidden="true">\u00b7</span>
+                    <span title={i.created_at}>{timeAgo(i.created_at)}</span>
+                  </div>
+                </div>
+              </div>
+            </a>
+          ))}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ``timeAgo`` for the History rows. Duplicates the helper
+// already used by BriefCard and Card \u2014 not worth the
+// module-level indirection for a 10-line function. Returns
+// a relative time string like "5m ago" or "2d ago".
+function timeAgo(iso: string): string {
+  if (!iso) return ''
+  const ms = Date.now() - new Date(iso).getTime()
+  if (ms < 0) return 'just now'
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  const d = Math.floor(h / 24)
+  if (d < 30) return `${d}d ago`
+  const mo = Math.floor(d / 30)
+  if (mo < 12) return `${mo}mo ago`
+  const y = Math.floor(mo / 12)
+  return `${y}y ago`
+}
 

@@ -46,7 +46,7 @@ from app.auth.deps import require_user
 from app.config import settings
 from app.db import get_session
 from app.models import Entry, Interaction
-from app.schemas import InteractionBatchIn, InteractionIn
+from app.schemas import InteractionBatchIn, InteractionIn, InteractionListOut, InteractionOut
 
 logger = logging.getLogger("popping.routes.interactions")
 
@@ -174,3 +174,122 @@ async def post_interactions_batch(
         user_id, len(body.events), inserted,
     )
     return {"inserted": inserted}
+
+
+@router.get("/interactions/recent", response_model=InteractionListOut)
+async def get_recent_interactions(
+    types: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(require_user),
+    session: AsyncSession = Depends(get_session),
+) -> InteractionListOut:
+    """Return the user's recent engagement events with entry
+    metadata joined in. Used by the frontend's History view
+    (in the Drawer) so the user can review what they've
+    marked read vs hidden vs starred.
+
+    Query parameters
+      - ``types``: comma-separated list of interaction types
+        to include. Empty = all types. Example:
+        ``?types=view,never&limit=20`` returns the user's
+        20 most recent reads + hides.
+      - ``limit``: page size (default 50, max 200).
+      - ``offset``: pagination offset (default 0).
+
+    Sort: ``created_at DESC`` so the most recent interactions
+    appear first. The user is reviewing their history in
+    reverse-chronological order — the "what did I just do"
+    pattern is more useful than the "first thing I ever
+    did" pattern.
+
+    Total count: a separate count query (so the frontend can
+    show "Showing 50 of 1,234" without paging the full
+    list). The count uses the same filters as the main
+    query so they can't disagree.
+
+    ``user_id`` is sourced from the session's ``sub`` so
+    multi-user deployments don't conflate their history.
+    Mirrors the write path's user_id handling.
+    """
+    user_id = user["sub"]
+    # Parse the types filter. Empty = all types (omit WHERE
+    # filter on type). The split is forgiving: an empty
+    # string, a string of commas, or whitespace is treated
+    # as "no filter".
+    type_list: list[str] = []
+    if types.strip():
+        type_list = [t.strip() for t in types.split(",") if t.strip()]
+
+    # The hidden dwell events: ``dwell`` fires per-card on
+    # mark-read as a "how long was this on screen" signal.
+    # The History view shouldn't show those — the user
+    # already sees the read event for the same entry. Filter
+    # dwell out by default. The frontend doesn't need to
+    # know about this; the types filter is optional.
+    if "dwell" not in type_list:
+        type_list.append("dwell")
+    # We use ``NOT IN (dwell)`` so the SQL still hits the
+    # (user_id, created_at) index; converting to a set
+    # membership check here keeps the query plan cheap.
+    exclude_types = {"dwell"}
+
+    # Build the query. Two separate queries (one for the
+    # page, one for the total) keep the main query simple
+    # and let the SQL planner use the index on
+    # (user_id, created_at).
+    from sqlalchemy import func, select
+    from app.models import Entry, Source
+
+    # Page query
+    page_q = (
+        select(Interaction, Entry, Source)
+        .join(Entry, Entry.id == Interaction.entry_id)
+        .join(Source, Source.id == Entry.source_id)
+        .where(Interaction.user_id == user_id)
+    )
+    if type_list:
+        page_q = page_q.where(Interaction.type.in_(type_list))
+    # Apply the dwell exclusion: NOT IN is cheaper than
+    # re-evaluating the type list.
+    if exclude_types:
+        page_q = page_q.where(Interaction.type.notin_(exclude_types))
+    page_q = (
+        page_q.order_by(Interaction.created_at.desc())
+        .offset(offset)
+        .limit(min(limit, 200))
+    )
+    rows = (await session.execute(page_q)).all()
+
+    # Total count query (same filters, no limit/offset)
+    count_q = (
+        select(func.count(Interaction.id))
+        .where(Interaction.user_id == user_id)
+    )
+    if type_list:
+        count_q = count_q.where(Interaction.type.in_(type_list))
+    if exclude_types:
+        count_q = count_q.where(Interaction.type.notin_(exclude_types))
+    total = (await session.execute(count_q)).scalar_one()
+
+    items = [
+        InteractionOut(
+            id=inter.id,
+            type=inter.type,
+            value=inter.value,
+            created_at=inter.created_at,
+            entry_id=entry.id,
+            entry_title=entry.title,
+            entry_url=entry.url,
+            entry_published_at=entry.published_at,
+            source_id=source.id,
+            source_name=source.name,
+        )
+        for (inter, entry, source) in rows
+    ]
+    return InteractionListOut(
+        items=items,
+        total=total,
+        has_more=(offset + len(items)) < total,
+    )
+

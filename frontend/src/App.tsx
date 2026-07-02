@@ -336,7 +336,7 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   // Settings overlay state. Driven by the URL so the back button
   // and refresh both behave correctly. ``?view=settings`` opens it;
-  // ``?view=settings&tab=feeds|llm|notifications|hidden|starred|reset``
+  // ``?view=settings&tab=feeds|llm|notifications|history|hidden|starred|reset``
   // picks the tab. ``null`` = closed.
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('feeds')
@@ -363,6 +363,7 @@ export function App() {
           t === 'feeds' ||
           t === 'llm' ||
           t === 'notifications' ||
+          t === 'history' ||
           t === 'hidden' ||
           t === 'starred' ||
           t === 'reset'
@@ -2161,7 +2162,7 @@ export function App() {
         onError={setError}
         onSourceRenamed={onSourceRenamed}
         onResetLocalState={resetLocalState}
-        onOpenSettings={() => openSettings('feeds')}
+        onOpenSettings={(tab) => openSettings(tab ?? 'feeds')}
       />
       <Settings
         open={settingsOpen}
@@ -2272,6 +2273,7 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
 
 
 
