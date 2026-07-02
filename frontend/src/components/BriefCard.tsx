@@ -336,9 +336,64 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGen
   // ``'0'`` or never set it now starts collapsed. The brief is
   // one tap away — the header is still rendered, just compact.
   const [collapsed, setCollapsed] = useState<boolean>(
-    () => typeof window === 'undefined' || safeGetItem(STORAGE_KEYS.briefCollapsed) !== '0',
+    // Default CLOSED. The brief is a low-frequency surface
+    // (the user usually wants to scan entries, not read a
+    // long-form brief) and shouldn't dominate the dashboard
+    // on first load. State persists per-browser via
+    // localStorage so the user's choice sticks across
+    // reloads. SSR-safe: the fallback covers the case where
+    // window/localStorage isn't available (e.g. an early
+    // mount in a future SSR build).
+    //
+    // The inversion of the default is a behaviour change for
+    // existing users: anyone who set the storage to ``'1'``
+    // (collapsed) keeps their preference; anyone who set it to
+    // ``'0'`` or never set it now starts collapsed. The brief is
+    // one tap away — the header is still rendered, just compact.
+    //
+    // One extra nudge: the brief starts collapsed regardless of
+    // the stored value on viewports below the sm breakpoint.
+    // On a phone, the PresetChips strip + the mobile column
+    // header are the most important things to see on first
+    // paint; a long expanded brief pushes them below the
+    // fold. The user's desktop preference is preserved (the
+    // effect re-syncs from localStorage on viewport change),
+    // but the initial render defaults to collapsed so a phone
+    // user who previously expanded the brief on desktop
+    // doesn't get a below-the-fold surprise.
+    () => {
+      if (typeof window === 'undefined') return true
+      if (window.matchMedia?.('(max-width: 639px)').matches) return true
+      return safeGetItem(STORAGE_KEYS.briefCollapsed) !== '0'
+    },
   )
   const bodyId = useId()
+
+  // Re-sync the collapsed state when the viewport crosses the
+  // sm breakpoint. If the user resizes their window or rotates
+  // their phone, the localStorage-driven default is correct for
+  // the new viewport. Without this, a desktop user who resizes
+  // to a phone window would keep the desktop preference until
+  // the next reload.
+  useEffect(() => {
+    const mql = window.matchMedia?.('(max-width: 639px)')
+    if (!mql) return
+    const sync = () => {
+      if (mql.matches) {
+        // Small viewport -- always collapsed regardless of
+        // stored preference. We don't write '1' here because
+        // the user might rotate back to landscape and want
+        // their original choice; the next load picks the
+        // right one.
+        setCollapsed(true)
+      } else {
+        // Wide viewport -- honour the stored preference.
+        setCollapsed(safeGetItem(STORAGE_KEYS.briefCollapsed) !== '0')
+      }
+    }
+    mql.addEventListener('change', sync)
+    return () => mql.removeEventListener('change', sync)
+  }, [])
 
   // Toggle the collapse. Functional setState avoids a stale-closure
   // hazard when two clicks land in the same React batch: each

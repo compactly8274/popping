@@ -159,10 +159,15 @@ function PresetChips({
       aria-label="saved filter presets"
     >
       <span
-        className="shrink-0 text-ios-caption uppercase tracking-wide text-label-tertiary self-center mr-1"
+        // Slightly bigger on mobile (the user's primary
+        // device) so the label is legible at arm's length.
+        // The desktop variant is the original terse caption
+        // style -- mobile users need to spot the strip on
+        // first paint, desktop users treat it as decoration.
+        className="shrink-0 self-center mr-1 text-ios-body sm:text-ios-caption uppercase tracking-wide text-label-secondary sm:text-label-tertiary font-medium"
         aria-hidden="true"
       >
-        Saved
+        Saved views
       </span>
       {presets.map((p) => (
         <PresetChip
