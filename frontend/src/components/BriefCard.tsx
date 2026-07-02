@@ -593,9 +593,9 @@ export function BriefCard({ brief, onBriefChange, tone, onToneChange, triggerGen
           </button>
         </div>
       ) : (
-      {/* Header row. The whole element is the toggle target — chevron,
-          title, tone badge, timestamp — but Regenerate is a child
-          marked ``data-brief-action`` so it bypasses the toggle. */}
+      // Header row. The whole element is the toggle target — chevron,
+      // title, tone badge, timestamp — but Regenerate is a child
+      // marked ``data-brief-action`` so it bypasses the toggle.
       <header
         role="button"
         tabIndex={0}
