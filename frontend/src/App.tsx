@@ -30,7 +30,7 @@ import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { Settings, type SettingsTab } from './components/Settings'
 import { recordImmediate } from './lib/interactions'
-import { MAX_HIDDEN, STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
+import { MAX_HIDDEN, MAX_STARRED, STORAGE_KEYS, safeGetItem, safeSetItem } from './lib/storage'
 
 const REFRESH_INTERVAL_MS = 60_000
 // Health pings don't need 60s cadence — DB / Redis status is slow-
@@ -133,6 +133,19 @@ function loadReadEntries(): Record<string, number[]> {
   }
 }
 
+function loadStarredEntries(): number[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = safeGetItem(STORAGE_KEYS.starredEntries)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((x): x is number => typeof x === 'number')
+  } catch {
+    return []
+  }
+}
+
 function loadHiddenEntries(): number[] {
   if (typeof window === 'undefined') return []
   try {
@@ -165,7 +178,7 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   // Settings overlay state. Driven by the URL so the back button
   // and refresh both behave correctly. ``?view=settings`` opens it;
-  // ``?view=settings&tab=feeds|llm|notifications|hidden|reset``
+  // ``?view=settings&tab=feeds|llm|notifications|hidden|starred|reset``
   // picks the tab. ``null`` = closed.
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('feeds')
@@ -193,6 +206,7 @@ export function App() {
           t === 'llm' ||
           t === 'notifications' ||
           t === 'hidden' ||
+          t === 'starred' ||
           t === 'reset'
         ) {
           setSettingsTab(t)
@@ -353,6 +367,13 @@ export function App() {
   // the user's "I never want to see this" intent applies across
   // every column view, not just the one where the card appeared.
   const [hiddenEntries, setHiddenEntries] = useState<number[]>(loadHiddenEntries)
+  // Per-user "starred" (saved) entry ids. Long-term save-for-later
+  // set, distinct from ``readEntries`` (dim) and ``hiddenEntries``
+  // (dismiss). Surfaced in a dedicated "Saved" column at the top
+  // of the dashboard, in the For You row, and in the Settings/Starred
+  // tab. The user can star / unstar from the card context menu
+  // ("Save for later") or via the keyboard ``s`` shortcut.
+  const [starredEntries, setStarredEntries] = useState<number[]>(loadStarredEntries)
   // Per-column sort/filter preferences.
   const [columnPrefs, setColumnPrefs] = useState<Record<string, ColumnPrefs>>(loadColumnPrefs)
   // Search state. ``searchInput`` is the controlled input value;
@@ -471,6 +492,29 @@ export function App() {
     () => forYou.filter((e) => !hiddenSet.has(e.id)),
     [forYou, hiddenSet],
   )
+  // Build a Set for O(1) starred-entry lookup. Mirrors the
+  // ``hiddenSet`` pattern: cheap to construct on every render,
+  // saves a linear pass on each downstream filter.
+  const starredSet = useMemo(() => new Set(starredEntries), [starredEntries])
+  // "Saved" column entries. The Saved column shows entries the
+  // user has starred, in chronological order (most recent first).
+  // Filter out hidden (a star + a hide is "I saved this but
+  // don't want to see it now" — hide wins). The order is
+  // chosen as published_at desc so the user sees their freshest
+  // saves at the top.
+  const visibleStarred = useMemo(
+    () =>
+      entries
+        .filter((e) => starredSet.has(e.id) && !hiddenSet.has(e.id))
+        .sort((a, b) => {
+          // published_at is a string (ISO 8601) so string
+          // comparison works for chronological order.
+          if (!a.published_at) return 1
+          if (!b.published_at) return -1
+          return b.published_at.localeCompare(a.published_at)
+        }),
+    [entries, starredSet, hiddenSet],
+  )
 
   // Apollo-style 3-surface model:
   //   1. For You     — top row on the dashboard, the personal front page.
@@ -491,12 +535,20 @@ export function App() {
   // row, in a single-column swipe.
   const allSubsColumns = useMemo<Array<{ name: string; entries: Entry[] }>>(() => {
     const out: Array<{ name: string; entries: Entry[] }> = []
+    // Saved column — the user's starred entries. Pinned at the
+    // top of the dashboard so intentional saves are the first
+    // thing they see on every load. Skipped when empty so a
+    // user who hasn't starred anything doesn't see an empty
+    // column wasting horizontal space.
+    if (visibleStarred.length > 0) {
+      out.push({ name: 'Saved', entries: visibleStarred })
+    }
     if (visibleForYou.length > 0) out.push({ name: 'For You', entries: visibleForYou })
     for (const cat of categories) {
       out.push({ name: cat, entries: byCategory.get(cat) ?? [] })
     }
     return out
-  }, [forYou, categories, byCategory])
+  }, [forYou, categories, byCategory, visibleStarred])
 
   // Multi-sub column. One column, name reads "Filtering" so it stays
   // distinct from any category. The chip-bar header above the column
@@ -900,6 +952,16 @@ export function App() {
     safeSetItem(STORAGE_KEYS.hiddenEntries, JSON.stringify(trimmed))
   }, [hiddenEntries])
 
+  // Persist starred entries. No trim on read (the user's
+  // intentional saves are valuable — we never silently evict
+  // a star) but cap on write at ``MAX_STARRED`` to prevent
+  // abuse. A failure here is non-fatal — same pattern as
+  // ``readEntries`` and ``hiddenEntries``.
+  useEffect(() => {
+    const trimmed = starredEntries.slice(-MAX_STARRED)
+    safeSetItem(STORAGE_KEYS.starredEntries, JSON.stringify(trimmed))
+  }, [starredEntries])
+
   // Debounced search. 300ms — standard "feels live but doesn't fire
   // on every keystroke". The mirror into ``searchQuery`` happens
   // inside the timeout so the actual fetch effect only re-runs on
@@ -990,6 +1052,24 @@ export function App() {
       if (prev.includes(entryId)) return prev
       const next = [...prev, entryId].slice(-MAX_HIDDEN)
       return next
+    })
+  }, [])
+
+  // Star / unstar an entry. Stars are a long-term save-for-later
+  // set: starred items surface in a dedicated "Saved" column at
+  // the top of the dashboard, in the For You row, and in the
+  // Settings/Starred tab. Records a ``bookmark`` engagement event
+  // so the ranker can use stars as a positive signal (the
+  // opposite of ``hide``'s ``never``).
+  const toggleStarEntry = useCallback((entryId: number) => {
+    setStarredEntries((prev) => {
+      if (prev.includes(entryId)) {
+        // Unstar. Filter out, don't trim — the user's removal
+        // is intentional and we don't want a subsequent star to
+        // bring it back.
+        return prev.filter((id) => id !== entryId)
+      }
+      return [...prev, entryId].slice(-MAX_STARRED)
     })
   }, [])
 
@@ -1090,6 +1170,24 @@ export function App() {
         if (e.metaKey || e.ctrlKey || e.altKey) return
         e.preventDefault()
         toggleSummary(selectedCardId)
+      } else if (e.key === 'b' && selectedCardId != null) {
+        // Toggle star (save-for-later) on the selected card.
+        // ``b`` for bookmark is the standard iOS / Gmail
+        // affordance; doesn't conflict with browser defaults
+        // (Cmd+B is bold-text in form fields but does nothing
+        // on the dashboard surface). Same modifier guards as
+        // ``s`` so Cmd+B still works when the dashboard has
+        // focus and a form field is active.
+        if (e.metaKey || e.ctrlKey || e.altKey) return
+        e.preventDefault()
+        const wasStarred = starredSet.has(selectedCardId)
+        toggleStarEntry(selectedCardId)
+        toast(
+          wasStarred
+            ? 'Removed from Saved.'
+            : 'Saved for later — see the Saved column.',
+          'info',
+        )
       } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey && !e.altKey) {
         // Refresh the dashboard. Bare ``r``; Cmd+R / Ctrl+R
         // already triggers the browser reload so we don't fight
@@ -1572,6 +1670,17 @@ export function App() {
                       hideEntry(entryId)
                       toast('Entry hidden. Restore from Settings.', 'info')
                     }}
+                    onStarEntry={(entryId) => {
+                      const wasStarred = starredSet.has(entryId)
+                      toggleStarEntry(entryId)
+                      toast(
+                        wasStarred
+                          ? 'Removed from Saved.'
+                          : 'Saved for later — see the Saved column.',
+                        'info',
+                      )
+                    }}
+                    starredSet={starredSet}
                     prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
                     onPrefsChange={(next) => setPrefsFor(col.name, next)}
                     totalCount={col.totalCount}
@@ -1606,6 +1715,17 @@ export function App() {
                 hideEntry(entryId)
                 toast('Entry hidden. Restore from Settings.', 'info')
               }}
+              onStarEntry={(entryId) => {
+                const wasStarred = starredSet.has(entryId)
+                toggleStarEntry(entryId)
+                toast(
+                  wasStarred
+                    ? 'Removed from Saved.'
+                    : 'Saved for later — see the Saved column.',
+                  'info',
+                )
+              }}
+              starredSet={starredSet}
               prefs={
                 columns[mobileCol]
                   ? columnPrefs[columns[mobileCol].name] ?? DEFAULT_PREFS
@@ -1680,6 +1800,12 @@ export function App() {
           if (hiddenEntries.length === 0) return
           setHiddenEntries([])
           toast('All hidden entries restored.', 'info')
+        }}
+        starredEntries={starredEntries}
+        onUnstarAll={() => {
+          if (starredEntries.length === 0) return
+          setStarredEntries([])
+          toast('All saved entries cleared.', 'info')
         }}
       />
 
@@ -1762,6 +1888,11 @@ function RefreshIcon({ className }: { className?: string }) {
     </svg>
   )
 }
+
+
+
+
+
 
 
 

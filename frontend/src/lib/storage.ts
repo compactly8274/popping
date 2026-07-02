@@ -41,6 +41,15 @@ export const STORAGE_KEYS = {
   // column currently shows it. JSON array of numbers, trimmed
   // to ``MAX_HIDDEN`` to prevent unbounded growth.
   hiddenEntries: `${NAMESPACE}.${SCHEMA}.hidden.entries`,
+  // Per-user "starred" entries. Long-term save-for-later set,
+  // distinct from ``readEntries`` (which dims but doesn't save)
+  // and ``hiddenEntries`` (which dismisses). Starred items
+  // surface in a dedicated "Saved" column at the top of the
+  // dashboard, in the For You row, and in the Settings/Starr
+  // tab. Trimming is a soft cap (oldest stars are dropped at
+  // ``MAX_STARRED``) but in practice users keep 50-200 starred
+  // items long-term, so 1000 is plenty of headroom.
+  starredEntries: `${NAMESPACE}.${SCHEMA}.starred.entries`,
   // BriefCard collapse preference. Boolean stored as '0' / '1' to
   // match the rest of the codebase's storage convention.
   briefCollapsed: `${NAMESPACE}.${SCHEMA}.brief.collapsed`,
@@ -51,6 +60,15 @@ export const STORAGE_KEYS = {
 // care about remembering). 1000 entries × ~6 bytes per id = ~6 KB,
 // comfortably under the 5 MB localStorage quota.
 export const MAX_HIDDEN = 1000
+
+// ``MAX_STARRED`` is intentionally equal to ``MAX_HIDDEN``: a power
+// user with 1000 starred items is using the feature as a personal
+// archive, not a quick-save list. We don't trim on read here (the
+// user's intentional saves are valuable) but we cap on write to
+// prevent abuse. The trim evicts the OLDEST stars on overflow
+// — which is the right semantics because the user's most
+// recent saves are the ones they care about most.
+export const MAX_STARRED = 1000
 
 export function safeGetItem(key: string): string | null {
   try {
@@ -80,3 +98,4 @@ export function safeRemoveItem(key: string): void {
     // See safeGetItem — best effort.
   }
 }
+

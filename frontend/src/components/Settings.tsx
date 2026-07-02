@@ -35,7 +35,7 @@ import {
 import { FeedManager } from './FeedManager'
 import { toast } from './Toast'
 
-export type SettingsTab = 'feeds' | 'llm' | 'notifications' | 'hidden' | 'reset'
+export type SettingsTab = 'feeds' | 'llm' | 'notifications' | 'hidden' | 'starred' | 'reset'
 
 type Props = {
   open: boolean
@@ -75,6 +75,10 @@ type Props = {
   // ``onRestoreAllHidden``).
   onRestoreHidden: (entryId: number) => void
   onRestoreAllHidden: () => void
+  // List of currently-starred (saved) entry ids. Shown on the
+  // Saved tab so the user can review and bulk-unsave.
+  starredEntries: number[]
+  onUnstarAll: () => void
 }
 
 const TAB_META: Record<SettingsTab, { label: string; icon: string }> = {
@@ -82,6 +86,7 @@ const TAB_META: Record<SettingsTab, { label: string; icon: string }> = {
   llm: { label: 'LLM', icon: 'llm' },
   notifications: { label: 'Notifications', icon: 'bell' },
   hidden: { label: 'Hidden', icon: 'eye-off' },
+  starred: { label: 'Saved', icon: 'star' },
   reset: { label: 'Reset', icon: 'reset' },
 }
 
@@ -101,6 +106,8 @@ export function Settings({
   hiddenEntries,
   onRestoreHidden,
   onRestoreAllHidden,
+  starredEntries,
+  onUnstarAll,
 }: Props) {
   // Live data fetched when the overlay opens. The Feeds tab reuses
   // the ``sources`` prop (App owns it), but the LLM and
@@ -189,7 +196,7 @@ export function Settings({
             primary. ``role="tablist"`` so screen readers
             announce it as a tab group. */}
         <div className="flex gap-1 mx-4 mt-3 rounded-ios overflow-hidden border border-hairline" role="tablist">
-          {(['feeds', 'llm', 'notifications', 'hidden', 'reset'] as SettingsTab[]).map((t) => {
+          {(['feeds', 'llm', 'notifications', 'hidden', 'starred', 'reset'] as SettingsTab[]).map((t) => {
             const active = t === tab
             return (
               <button
@@ -370,6 +377,41 @@ export function Settings({
             </div>
           )}
 
+          {tab === 'starred' && (
+            // No GroupedSection/GroupedRow in this file — same
+            // inlined-markup pattern as the hidden tab. Future
+            // improvement: per-entry title display so the user
+            // can see what they saved (would need an entries
+            // fetch keyed by id).
+            <div className="pt-4 px-4 space-y-3">
+              <div className="rounded-ios bg-bg-surface border border-hairline p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-ios-body text-label-primary">
+                      {starredEntries.length === 0
+                        ? 'No saved entries'
+                        : `${starredEntries.length} saved ${starredEntries.length === 1 ? 'entry' : 'entries'}`}
+                    </div>
+                    <div className="text-ios-caption text-label-secondary mt-0.5">
+                      {starredEntries.length === 0
+                        ? 'Right-click a card → Save for later (or press s) to bookmark an entry. Saved items surface in the Saved column at the top of the dashboard.'
+                        : 'The Saved column at the top of the dashboard shows your bookmarks, most recent first. Clear all removes every star.'}
+                    </div>
+                  </div>
+                  {starredEntries.length > 0 && (
+                    <button
+                      onClick={onUnstarAll}
+                      className="text-ios-body text-red-400 active:opacity-60 shrink-0"
+                      aria-label="clear all saved entries"
+                    >
+                      Clear all
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {tab === 'reset' && (
             <div className="pt-4 px-4 space-y-3">
               <div className="rounded-ios bg-bg-surface border border-hairline p-3">
@@ -435,15 +477,24 @@ function TabIcon({ name, active }: { name: string; active: boolean }) {
       )
     case 'eye-off':
       // Lucide-style "eye-off" tab icon. Open eye shape with a
-      // diagonal strike through it â the standard "hidden" affordance.
+      // diagonal strike through it — the standard "hidden" affordance.
       return (
         <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="M2 10s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z" />
           <line x1="3" y1="3" x2="17" y2="17" />
         </svg>
       )
+    case 'star':
+      // Lucide-style star tab icon. Same outline pattern as the
+      // rest of the tab strip (1.5px stroke). 5-pointed, the
+      // standard "saved" affordance.
+      return (
+        <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <polygon points="10 2 12.5 7.5 18 8 14 12 15 18 10 15 5 18 6 12 2 8 7.5 7.5" />
+        </svg>
+      )
     default:
-      return null
+
   }
 }
 
@@ -697,6 +748,7 @@ function LLMSection({
     </div>
   )
 }
+
 
 
 
