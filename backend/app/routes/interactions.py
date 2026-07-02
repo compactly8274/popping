@@ -181,6 +181,7 @@ async def get_recent_interactions(
     types: str = "",
     limit: int = 50,
     offset: int = 0,
+    group_by: str = "none",
     user: dict = Depends(require_user),
     session: AsyncSession = Depends(get_session),
 ) -> InteractionListOut:
@@ -196,6 +197,14 @@ async def get_recent_interactions(
         20 most recent reads + hides.
       - ``limit``: page size (default 50, max 200).
       - ``offset``: pagination offset (default 0).
+      - ``group_by``: ``none`` (default, one row per
+        interaction) or ``entry`` (one row per entry,
+        most recent wins). When ``entry``, the same
+        article can only appear once in the page even
+        if the user has read it on multiple days.
+
+    Sort: ``created_at DESC`` so the most recent interactions
+    appear first.
 
     Sort: ``created_at DESC`` so the most recent interactions
     appear first. The user is reviewing their history in
@@ -234,6 +243,13 @@ async def get_recent_interactions(
     # membership check here keeps the query plan cheap.
     exclude_types = {"dwell"}
 
+    # Validate group_by. Whitelist: any other value falls
+    # back to ``none``. We don't 400 on bad input — the
+    # frontend is the only caller and the param is a
+    # simple toggle.
+    if group_by not in ("none", "entry"):
+        group_by = "none"
+
     # Build the query. Two separate queries (one for the
     # page, one for the total) keep the main query simple
     # and let the SQL planner use the index on
@@ -241,7 +257,9 @@ async def get_recent_interactions(
     from sqlalchemy import func, select
     from app.models import Entry, Source
 
-    # Page query
+    # Page query. The base is identical for both
+    # grouping modes; we swap the ORDER BY + add a
+    # DISTINCT ON for the entry-dedup path.
     page_q = (
         select(Interaction, Entry, Source)
         .join(Entry, Entry.id == Interaction.entry_id)
@@ -254,22 +272,50 @@ async def get_recent_interactions(
     # re-evaluating the type list.
     if exclude_types:
         page_q = page_q.where(Interaction.type.notin_(exclude_types))
-    page_q = (
-        page_q.order_by(Interaction.created_at.desc())
-        .offset(offset)
-        .limit(min(limit, 200))
-    )
+
+    if group_by == "entry":
+        # Postgres-specific: DISTINCT ON (entry_id) returns
+        # one row per entry_id. The ORDER BY must start
+        # with the DISTINCT ON column, then the
+        # ``created_at DESC`` picks the most recent row
+        # per group. ``offset`` and ``limit`` apply after
+        # the dedup.
+        page_q = (
+            page_q.distinct(Interaction.entry_id)
+            .order_by(Interaction.entry_id, Interaction.created_at.desc())
+            .offset(offset)
+            .limit(min(limit, 200))
+        )
+    else:
+        page_q = (
+            page_q.order_by(Interaction.created_at.desc())
+            .offset(offset)
+            .limit(min(limit, 200))
+        )
     rows = (await session.execute(page_q)).all()
 
-    # Total count query (same filters, no limit/offset)
-    count_q = (
-        select(func.count(Interaction.id))
-        .where(Interaction.user_id == user_id)
-    )
-    if type_list:
-        count_q = count_q.where(Interaction.type.in_(type_list))
-    if exclude_types:
-        count_q = count_q.where(Interaction.type.notin_(exclude_types))
+    # Total count query. For ``group_by=entry`` we count
+    # the distinct entry_ids (so the total matches the
+    # visible deduped page); for ``group_by=none`` it's
+    # the raw row count.
+    if group_by == "entry":
+        count_q = (
+            select(func.count(func.distinct(Interaction.entry_id)))
+            .where(Interaction.user_id == user_id)
+        )
+        if type_list:
+            count_q = count_q.where(Interaction.type.in_(type_list))
+        if exclude_types:
+            count_q = count_q.where(Interaction.type.notin_(exclude_types))
+    else:
+        count_q = (
+            select(func.count(Interaction.id))
+            .where(Interaction.user_id == user_id)
+        )
+        if type_list:
+            count_q = count_q.where(Interaction.type.in_(type_list))
+        if exclude_types:
+            count_q = count_q.where(Interaction.type.notin_(exclude_types))
     total = (await session.execute(count_q)).scalar_one()
 
     items = [
@@ -292,4 +338,5 @@ async def get_recent_interactions(
         total=total,
         has_more=(offset + len(items)) < total,
     )
+
 
