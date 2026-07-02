@@ -327,8 +327,8 @@ export const api = {
   // the input ids. Ids that don't match a row
   // are dropped silently.
   entriesByIds: (ids: number[]) => {
-    if (ids.length === 0) return Promise.resolve([] as Entry[])
-    return jsonFetch<Entry[]>(`/api/entries/by-ids?ids=${ids.join(',')}`)
+    if (ids.length === 0) return Promise.resolve([] as EntryOut[])
+    return jsonFetch<EntryOut[]>(`/api/entries/by-ids?ids=${ids.join(',')}`)
   },
   ingest: (sourceName: string) =>
     jsonFetch<{ source: string; fetched: number; inserted: number; duplicates: number; error: string | null }>(
