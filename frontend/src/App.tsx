@@ -138,18 +138,22 @@ export type FilterPreset = {
 
 // Saved-preset chip strip. Renders the user’s saved filter
 // presets as horizontal chips above the column grid. Click a
-// chip to apply the preset; right-click to delete (with a
-// two-tap confirm). Hidden when the user has no presets —
-// a first-time user doesn’t see this affordance until
+// chip to apply the preset; tap the "⋯" on a chip (or right-click
+// it) for rename / update / delete. Hidden when the user has no
+// presets — a first-time user doesn’t see this affordance until
 // they save one.
 function PresetChips({
   presets,
   onApply,
   onDelete,
+  onRename,
+  onUpdate,
 }: {
   presets: FilterPreset[]
   onApply: (preset: FilterPreset) => void
   onDelete: (id: string) => void
+  onRename: (id: string, name: string) => void
+  onUpdate: (id: string) => void
 }) {
   if (presets.length === 0) return null
   return (
@@ -175,6 +179,8 @@ function PresetChips({
           preset={p}
           onApply={() => onApply(p)}
           onDelete={() => onDelete(p.id)}
+          onRename={(name) => onRename(p.id, name)}
+          onUpdate={() => onUpdate(p.id)}
         />
       ))}
     </div>
@@ -185,45 +191,117 @@ function PresetChip({
   preset,
   onApply,
   onDelete,
+  onRename,
+  onUpdate,
 }: {
   preset: FilterPreset
   onApply: () => void
   onDelete: () => void
+  onRename: (name: string) => void
+  onUpdate: () => void
 }) {
-  const [confirming, setConfirming] = useState(false)
-  return (
-    <div className="shrink-0 flex items-center">
-      {confirming ? (
-        <div className="flex items-center gap-1.5 rounded-full bg-red-500/10 border border-red-500/30 pl-2.5 pr-1 py-0.5">
-          <span className="text-ios-caption text-red-400">Delete?</span>
-          <button
-            onClick={onDelete}
-            className="text-ios-caption text-red-400 active:opacity-60 font-semibold"
-            aria-label={`confirm delete preset ${preset.name}`}
-          >
-            Yes
-          </button>
-          <button
-            onClick={() => setConfirming(false)}
-            className="text-ios-caption text-label-secondary active:opacity-60"
-            aria-label={`cancel delete preset ${preset.name}`}
-          >
-            No
-          </button>
-        </div>
-      ) : (
+  // Three states: the normal chip, the "⋯" action row (rename /
+  // update / delete), and delete's own confirm step. Right-click is
+  // still a shortcut straight into the action row (desktop muscle
+  // memory from the old delete-only version), but the explicit "⋯"
+  // button is the one guaranteed to work everywhere — long-press
+  // isn't wired up here, so right-click alone would leave touch
+  // users with no way to rename or delete a chip at all.
+  const [mode, setMode] = useState<'idle' | 'actions' | 'confirmDelete'>('idle')
+
+  if (mode === 'confirmDelete') {
+    return (
+      <div className="shrink-0 flex items-center gap-1.5 rounded-full bg-red-500/10 border border-red-500/30 pl-2.5 pr-1 py-0.5">
+        <span className="text-ios-caption text-red-400">Delete?</span>
         <button
-          onClick={onApply}
-          onContextMenu={(e) => {
-            e.preventDefault()
-            setConfirming(true)
-          }}
-          title={`Apply preset "${preset.name}". Right-click to delete.`}
-          className="shrink-0 rounded-full bg-accent-soft text-accent border border-accent-soft hover:bg-accent-soft/80 active:opacity-60 px-3 py-0.5 text-ios-caption font-medium"
+          onClick={onDelete}
+          className="text-ios-caption text-red-400 active:opacity-60 font-semibold"
+          aria-label={`confirm delete preset ${preset.name}`}
         >
-          {preset.name}
+          Yes
         </button>
-      )}
+        <button
+          onClick={() => setMode('idle')}
+          className="text-ios-caption text-label-secondary active:opacity-60"
+          aria-label={`cancel delete preset ${preset.name}`}
+        >
+          No
+        </button>
+      </div>
+    )
+  }
+
+  if (mode === 'actions') {
+    return (
+      <div className="shrink-0 flex items-center gap-2 rounded-full bg-bg-elevated border border-hairline pl-2.5 pr-1.5 py-0.5">
+        <button
+          onClick={() => {
+            // Native prompt, pre-filled with the current name —
+            // same low-ceremony pattern "Save current view" uses.
+            const name = window.prompt('Rename this view', preset.name)
+            setMode('idle')
+            if (name === null) return
+            const trimmed = name.trim()
+            if (!trimmed || trimmed === preset.name) return
+            onRename(trimmed)
+            toast(`Renamed to “${trimmed}”.`, 'info')
+          }}
+          className="text-ios-caption text-label-primary active:opacity-60"
+          aria-label={`rename preset ${preset.name}`}
+        >
+          Rename
+        </button>
+        <button
+          onClick={() => {
+            onUpdate()
+            setMode('idle')
+            toast(`“${preset.name}” updated to the current view.`, 'info')
+          }}
+          className="text-ios-caption text-label-primary active:opacity-60"
+          aria-label={`update preset ${preset.name} to the current filter and column settings`}
+          title="Overwrite this view with the current filter + per-column settings"
+        >
+          Update
+        </button>
+        <button
+          onClick={() => setMode('confirmDelete')}
+          className="text-ios-caption text-red-400 active:opacity-60"
+          aria-label={`delete preset ${preset.name}`}
+        >
+          Delete
+        </button>
+        <button
+          onClick={() => setMode('idle')}
+          className="text-label-tertiary active:opacity-60 px-0.5"
+          aria-label="cancel"
+        >
+          ✕
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="shrink-0 flex items-center rounded-full bg-accent-soft border border-accent-soft overflow-hidden">
+      <button
+        onClick={onApply}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          setMode('actions')
+        }}
+        title={`Apply preset "${preset.name}". Tap ⋯ to rename, update, or delete.`}
+        className="text-accent hover:bg-accent-soft/80 active:opacity-60 pl-3 pr-1.5 py-0.5 text-ios-caption font-medium"
+      >
+        {preset.name}
+      </button>
+      <button
+        onClick={() => setMode('actions')}
+        aria-label={`options for preset ${preset.name}`}
+        title="Rename, update, or delete this view"
+        className="text-accent/70 hover:bg-accent-soft/80 active:opacity-60 pl-1 pr-2.5 py-0.5 text-ios-caption"
+      >
+        ⋯
+      </button>
     </div>
   )
 }
@@ -1451,12 +1529,43 @@ export function App() {
   )
 
   // Delete a preset by id. The chip strip handles its own
-  // long-press -> delete flow.
+  // options-menu -> confirm flow.
   const deletePreset = useCallback((id: string) => {
     setFilterPresets(
       filterPresetsRef.current.filter((p) => p.id !== id),
     )
   }, [setFilterPresets])
+
+  // Rename a preset in place. Only the label changes -- the
+  // captured filter + column prefs are untouched. The chip's
+  // "Rename" action collects the new name via a prompt and calls
+  // this with the already-trimmed, already-changed value.
+  const renamePreset = useCallback(
+    (id: string, name: string) => {
+      setFilterPresets(
+        filterPresetsRef.current.map((p) => (p.id === id ? { ...p, name } : p)),
+      )
+    },
+    [setFilterPresets],
+  )
+
+  // Overwrite a preset's captured filter + column prefs with
+  // whatever the dashboard is showing right now, keeping its id
+  // and name. Without this the only way to adjust a saved view
+  // was delete-and-recreate, which loses the id (and any other
+  // metadata a future feature might hang off it).
+  const updatePreset = useCallback(
+    (id: string) => {
+      setFilterPresets(
+        filterPresetsRef.current.map((p) =>
+          p.id === id
+            ? { ...p, activeSources: Array.from(activeSources), columnPrefs }
+            : p,
+        ),
+      )
+    },
+    [activeSources, columnPrefs, setFilterPresets],
+  )
 
   // Toggle the inline-summary panel for an entry. Independent of
   // mark-read — expanding a card doesn't mark it, and marking a
@@ -2102,6 +2211,8 @@ export function App() {
         presets={filterPresets}
         onApply={applyPreset}
         onDelete={deletePreset}
+        onRename={renamePreset}
+        onUpdate={updatePreset}
       />
 
       {showSearchView ? (

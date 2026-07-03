@@ -399,11 +399,12 @@ export function Drawer({
                 per-column prefs as a named preset. The
                 chip strip above the dashboard shows the
                 saved presets; tapping a chip applies
-                the saved view. Long-press a chip to
-                delete. Without this row the user has no
-                way to create a preset \u2014 the
-                ``savePreset`` callback in App was dead
-                code before this row was added.
+                the saved view, and tapping its "\u22ef"
+                opens rename / update-to-current / delete.
+                Without this row the user has no way to
+                create a preset \u2014 the ``savePreset``
+                callback in App was dead code before this
+                row was added.
                 The Drawer closes after the prompt so
                 the user sees the new chip on the
                 strip immediately. */}
