@@ -174,3 +174,34 @@ async def require_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+
+# ---------------------------------------------------------------------------
+# Soft-auth user_id resolution
+# ---------------------------------------------------------------------------
+
+# Synthetic user_id for a soft-authed request with no resolved session or
+# bypass identity. In the default deployment shape (OIDC off, local bypass
+# off — the README's own quickstart) this is the ONLY user_id that will
+# ever be used, since there's no way for ``current_user`` to return a real
+# one. Shared by every route that wants to work without a login (see
+# ``app.routes.interactions`` and ``app.routes.preferences``).
+ANONYMOUS_USER_ID = "anonymous"
+
+
+def resolve_user_id(user: dict | None) -> str:
+    """Return a stable user_id for a soft-authed request.
+
+    Routes that use ``current_user`` (not ``require_user``) so a
+    cookie-less visitor can still use the app need a stable id to key
+    their data by. Falling through to a hard 401 in that case would
+    silently drop every write from the default, no-auth-configured
+    deployment — a fresh ``docker compose up -d`` would never be able
+    to persist read state, hidden entries, or anything else, because
+    there's no session cookie and the local bypass defaults to off.
+    This is the shared fallback: soft-auth routes resolve the user_id
+    through this function instead of gating on login.
+    """
+    if user is not None and "sub" in user:
+        return user["sub"]
+    return ANONYMOUS_USER_ID

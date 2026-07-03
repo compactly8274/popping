@@ -380,14 +380,14 @@ _LOOKBACK = timedelta(days=30)
 _TANH_DIVISOR = 5.0
 
 
-# Sentinel user_ids the interactions endpoint falls back to when a
-# request isn't attributable to a stable OIDC identity: "anonymous"
-# (no session, bypass off or out of range), "local-bypass" (LAN
+# Sentinel user_ids soft-auth routes fall back to when a request
+# isn't attributable to a stable OIDC identity: "anonymous" (no
+# session, bypass off or out of range), "local-bypass" (LAN
 # bypass), and "default" (legacy rows predating soft auth). One
 # physical user's browser can land under any of the three depending
 # on which auth path a given request happened to take (see
-# ``app.routes.interactions._resolve_user_id``), so scoring has to
-# aggregate over all three rather than picking just one — mirrors
+# ``app.auth.deps.resolve_user_id``), so scoring has to aggregate
+# over all three rather than picking just one — mirrors
 # ``app.scheduler._AGGREGATION_USER_IDS_ALL``, which the preference-
 # vector recompute already gets right.
 _SOFT_AUTH_USER_IDS: tuple[str, ...] = ("anonymous", "local-bypass", "default")

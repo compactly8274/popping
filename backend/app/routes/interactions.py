@@ -42,7 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.deps import current_user
+from app.auth.deps import current_user, resolve_user_id
 from app.config import settings
 from app.db import get_session
 from app.models import Entry, Interaction
@@ -63,49 +63,19 @@ logger = logging.getLogger("popping.routes.interactions")
 # real user_id so per-user data is preserved.
 router = APIRouter(tags=["interactions"])
 
-
-# Synthetic user_id for engagement events when
-# there's no resolved user. Used by the
-# /api/interactions endpoints as a fallback so
-# events from cookie-less / non-bypassed
-# requests still land in the DB. In a multi-user
-# deployment, every cookie-less event would land
-# under this single id — the History view would
-# show "anonymous" clicks. In a single-user
-# deployment, this is the only user_id anyway.
-_ANONYMOUS_USER_ID = "anonymous"
-
-
-def _resolve_user_id(user: dict | None) -> str:
-    """Return a stable user_id for the engagement
-    event.
-
-    The interactions endpoints are soft-auth (use
-    ``current_user`` not ``require_user``) so a
-    user with no cookie can still browse the
-    dashboard. Engagement events need a stable
-    user_id to attribute the event to. When
-    there's no user (no cookie + no bypass), we
-    fall back to a synthetic "anonymous" id
-    rather than 401. The events still land in the
-    DB; in a multi-user deployment the
-    unattributed events are visible only to
-    developers reading the raw rows (the History
-    view filters by the current user's sub, so
-    "anonymous" events don't pollute the user's
-    review feed).
-
-    The previous behavior was 401 in this case,
-    which silently dropped every engagement event
-    fired by a cookie-less dashboard (the
-    frontend's ``recordImmediate`` only
-    console.warns in dev). Result: empty History
-    tab + no ranking signal. The fallback
-    restores the engagement pipeline.
-    """
-    if user is not None and "sub" in user:
-        return user["sub"]
-    return _ANONYMOUS_USER_ID
+# ``resolve_user_id`` (app.auth.deps) is the shared fallback: when
+# there's no cookie and the bypass doesn't apply, engagement events
+# land under the synthetic "anonymous" id rather than 401ing. The
+# events still land in the DB; in a multi-user deployment the
+# unattributed events are visible only to developers reading the raw
+# rows (the History view filters by the current user's sub, so
+# "anonymous" events don't pollute the user's review feed).
+#
+# The previous behavior was 401 in this case, which silently dropped
+# every engagement event fired by a cookie-less dashboard (the
+# frontend's ``recordImmediate`` only console.warns in dev). Result:
+# empty History tab + no ranking signal. The fallback restores the
+# engagement pipeline.
 
 
 async def _commit_unique(session: AsyncSession, event: Interaction) -> int | None:
@@ -135,7 +105,7 @@ async def post_interaction(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Record one engagement event. Returns the inserted row id."""
-    user_id = _resolve_user_id(user)
+    user_id = resolve_user_id(user)
     row = Interaction(
         entry_id=body.entry_id,
         user_id=user_id,
@@ -204,7 +174,7 @@ async def post_interactions_batch(
         )
     entry_ids = list({e.entry_id for e in body.events})
     valid_ids = await _existing_entry_ids(session, entry_ids)
-    user_id = _resolve_user_id(user)
+    user_id = resolve_user_id(user)
     inserted = 0
     for evt in body.events:
         if evt.entry_id not in valid_ids:
@@ -274,7 +244,7 @@ async def get_recent_interactions(
     multi-user deployments don't conflate their history.
     Mirrors the write path's user_id handling.
     """
-    user_id = _resolve_user_id(user)
+    user_id = resolve_user_id(user)
     # Parse the types filter. Empty = all types (omit WHERE
     # filter on type). The split is forgiving: an empty
     # string, a string of commas, or whitespace is treated
