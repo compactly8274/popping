@@ -281,8 +281,12 @@ function PresetChip({
     )
   }
 
+  // Two independent pills (not one fused pill via a nested flex +
+  // overflow-hidden wrapper) — that construction collapsed to a
+  // sliver in practice, so this sticks to the same single-``<button>``-
+  // per-pill shape the original (working) chip used, just twice.
   return (
-    <div className="shrink-0 flex items-center rounded-full bg-accent-soft border border-accent-soft overflow-hidden">
+    <div className="shrink-0 flex items-center gap-0.5">
       <button
         onClick={onApply}
         onContextMenu={(e) => {
@@ -290,7 +294,7 @@ function PresetChip({
           setMode('actions')
         }}
         title={`Apply preset "${preset.name}". Tap ⋯ to rename, update, or delete.`}
-        className="text-accent hover:bg-accent-soft/80 active:opacity-60 pl-3 pr-1.5 py-0.5 text-ios-caption font-medium"
+        className="shrink-0 rounded-full bg-accent-soft text-accent border border-accent-soft hover:bg-accent-soft/80 active:opacity-60 pl-3 pr-2 py-0.5 text-ios-caption font-medium"
       >
         {preset.name}
       </button>
@@ -298,7 +302,7 @@ function PresetChip({
         onClick={() => setMode('actions')}
         aria-label={`options for preset ${preset.name}`}
         title="Rename, update, or delete this view"
-        className="text-accent/70 hover:bg-accent-soft/80 active:opacity-60 pl-1 pr-2.5 py-0.5 text-ios-caption"
+        className="shrink-0 rounded-full bg-accent-soft text-accent/70 border border-accent-soft hover:bg-accent-soft/80 active:opacity-60 px-2 py-0.5 text-ios-caption"
       >
         ⋯
       </button>
