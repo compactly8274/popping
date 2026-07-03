@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.deps import current_user, require_user
 from app.config import settings
 from app.db import get_session
-from app.feed_recommendations import recommendations_for, recommendations_for_user
+from app.feed_recommendations import aggregation_user_ids, recommendations_for_user
 from app.models import Source
 from app.schemas import (
     FeedRecommendation,
@@ -561,16 +561,15 @@ async def _test_source_impl(
         url = body.url
 
     # URL safety check — SSRF guard runs here too. ``check_url_safe``
-    # raises on private/loopback addresses. We catch and report as
-    # invalid_url so the user understands the URL was rejected, not
-    # the network.
-    try:
-        check_url_safe(url)
-    except ValueError as exc:
+    # returns (bool, reason) rather than raising, so the result has
+    # to be checked explicitly — report a rejection as invalid_url
+    # so the user understands the URL was rejected, not the network.
+    safe, reason = check_url_safe(url)
+    if not safe:
         return SourceTestResult(
             ok=False,
             error_kind="invalid_url",
-            error=str(exc),
+            error=reason,
         )
 
     # Validate custom_headers the same way Add does, but only if
@@ -684,18 +683,16 @@ async def feed_recommendations_endpoint(
     user: dict | None = Depends(current_user),
 ) -> list[FeedRecommendation]:
     """Curated list of feeds the user might want to add, re-ranked by
-    the user's last-30-days interaction co-occurrence. Without a
-    logged-in user the list is returned in the editorial order.
-    See ``backend/app/feed_recommendations.py`` for the ranking math
-    and how to update the curated list.
+    the user's last-30-days interaction co-occurrence. Falls back to
+    the static editorial order when there's no engagement history yet
+    (including for a fully anonymous caller). See
+    ``backend/app/feed_recommendations.py`` for the ranking math,
+    ``aggregation_user_ids`` for how a request maps to the interaction
+    rows that count as "this user's", and how to update the curated
+    list.
     """
     rows = (await session.scalars(select(Source.name))).all()
     active = list(rows)
-    if user is None:
-        # Anonymous: no engagement rows to score, so serve the static
-        # list. We still strip already-added sources so a freshly
-        # deleted session doesn't leak "Add BBC News" duplicates.
-        return [FeedRecommendation(**r) for r in recommendations_for(active)]
-    recs = await recommendations_for_user(session, active, user["sub"])
+    recs = await recommendations_for_user(session, active, aggregation_user_ids(user))
     return [FeedRecommendation(**r) for r in recs]
 

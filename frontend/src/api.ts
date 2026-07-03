@@ -164,10 +164,32 @@ export interface LLMTagsResponse {
   stale?: boolean
 }
 
+// Thrown by ``jsonFetch`` on a non-2xx response. ``detail`` carries
+// FastAPI's parsed error body (a string, or the list-of-field-errors
+// shape from a 422) when the response had one, so callers like
+// ``parseApiError`` can surface the actual reason instead of just the
+// HTTP status line.
+export class ApiError extends Error {
+  detail?: unknown
+  constructor(message: string, detail?: unknown) {
+    super(message)
+    this.name = 'ApiError'
+    this.detail = detail
+  }
+}
+
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, { credentials: 'include', ...init })
   if (!resp.ok) {
-    throw new Error(`${resp.status} ${resp.statusText} for ${url}`)
+    let detail: unknown
+    try {
+      const body = await resp.json()
+      detail = (body as { detail?: unknown } | null)?.detail
+    } catch {
+      // Response body wasn't JSON (or was empty) — no field-level
+      // detail available; the status-line message is all we have.
+    }
+    throw new ApiError(`${resp.status} ${resp.statusText} for ${url}`, detail)
   }
   return resp.json() as Promise<T>
 }

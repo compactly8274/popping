@@ -353,12 +353,14 @@ def recommendations_for(active_source_names: list[str]) -> list[dict]:
     on the server side prevents a stale client from showing
     "Add BBC News" duplicates.
 
-    Returns a fresh list (caller may mutate) in the curated order.
-    Names are compared verbatim — the API endpoints also enforce
-    lowercase so a case-mismatch can't slip through.
+    Returns a fresh list of fresh dict copies (caller may mutate,
+    including per-item keys, without touching the module-level
+    ``RECOMMENDATIONS`` list shared by every other caller) in the
+    curated order. Names are compared verbatim — the API endpoints
+    also enforce lowercase so a case-mismatch can't slip through.
     """
     active = set(active_source_names or [])
-    return [r for r in RECOMMENDATIONS if r["name"] not in active]
+    return [dict(r) for r in RECOMMENDATIONS if r["name"] not in active]
 
 
 # Event types that subtract from a category's net score. Listed here
@@ -378,13 +380,47 @@ _LOOKBACK = timedelta(days=30)
 _TANH_DIVISOR = 5.0
 
 
+# Sentinel user_ids the interactions endpoint falls back to when a
+# request isn't attributable to a stable OIDC identity: "anonymous"
+# (no session, bypass off or out of range), "local-bypass" (LAN
+# bypass), and "default" (legacy rows predating soft auth). One
+# physical user's browser can land under any of the three depending
+# on which auth path a given request happened to take (see
+# ``app.routes.interactions._resolve_user_id``), so scoring has to
+# aggregate over all three rather than picking just one — mirrors
+# ``app.scheduler._AGGREGATION_USER_IDS_ALL``, which the preference-
+# vector recompute already gets right.
+_SOFT_AUTH_USER_IDS: tuple[str, ...] = ("anonymous", "local-bypass", "default")
+
+
+def aggregation_user_ids(user: dict | None) -> tuple[str, ...]:
+    """User ids whose interactions should feed this caller's recommendation
+    scoring.
+
+    A genuine OIDC identity is scoped to just its own ``sub`` — in a
+    multi-user deployment, one user's interaction history shouldn't
+    bleed into another's recommendations. Anonymous / local-bypass /
+    pre-soft-auth traffic all collapse onto the shared sentinel
+    family instead, since in the single-user deployment this app is
+    designed for, they're all the same person arriving via different
+    auth paths.
+    """
+    if user is not None and user.get("auth_method") == "oidc":
+        return (user["sub"],)
+    return _SOFT_AUTH_USER_IDS
+
+
 async def _category_scores(
-    session: AsyncSession, user_id: str
+    session: AsyncSession, user_ids: tuple[str, ...]
 ) -> dict[str, float]:
-    """Return ``{category: net_score}`` for the user, rolled up across
+    """Return ``{category: net_score}`` for the user(s), rolled up across
     the last ``_LOOKBACK`` window. ``net_score`` is the sum of
     ``+1`` per positive interaction and ``-1`` per ``thumb_down`` /
     ``never``. Categories with no engagement don't appear.
+
+    ``user_ids`` is plural — see ``aggregation_user_ids`` — so a
+    single person's interactions recorded under different sentinel
+    ids (or a real OIDC sub) all count toward the same score.
 
     Negative types live as constants so the SQL reads cleanly. We do
     the negation in SQL rather than fetching rows and folding in
@@ -404,7 +440,7 @@ async def _category_scores(
         select(Source.category.label("category"), net_expr.label("net_score"))
         .join(Entry, Entry.source_id == Source.id)
         .join(Interaction, Interaction.entry_id == Entry.id)
-        .where(Interaction.user_id == user_id)
+        .where(Interaction.user_id.in_(user_ids))
         .where(Interaction.created_at >= cutoff)
         .group_by(Source.category)
     )
@@ -425,17 +461,17 @@ def _squeeze(raw: float) -> float:
 async def recommendations_for_user(
     session: AsyncSession,
     active_source_names: list[str],
-    user_id: str,
+    user_ids: tuple[str, ...],
 ) -> list[dict]:
-    """Re-ranked recommendation list for a logged-in user.
+    """Re-ranked recommendation list for a user.
 
     Filtering matches ``recommendations_for`` (skip already-added
-    sources). Ranking uses the user's last-30-days interaction
-    co-occurrence: candidates in a category the user engages with
-    float up; candidates in a category the user has thumbed-down
-    sink (or stay neutral if no signal). Ties fall back to the
-    curated ``RECOMMENDATIONS`` order so the list is stable when
-    the user has no data.
+    sources). Ranking uses the last-30-days interaction co-occurrence
+    across ``user_ids`` (see ``aggregation_user_ids``): candidates in
+    a category the user engages with float up; candidates in a
+    category the user has thumbed-down sink (or stay neutral if no
+    signal). Ties fall back to the curated ``RECOMMENDATIONS`` order
+    so the list is stable when there's no data.
 
     Returns a fresh list — the caller may serialize it directly.
     """
@@ -443,7 +479,7 @@ async def recommendations_for_user(
     if not candidates:
         return candidates
 
-    raw_scores = await _category_scores(session, user_id)
+    raw_scores = await _category_scores(session, user_ids)
     if not raw_scores:
         # No engagement yet — fall through to curated order, which is
         # already what ``recommendations_for`` returned.

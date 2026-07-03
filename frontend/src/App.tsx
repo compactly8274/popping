@@ -572,21 +572,6 @@ export function App() {
     [sources],
   )
 
-  const byCategory = useMemo(() => {
-    const grouped = new Map<string, Entry[]>()
-    for (const e of entries) {
-      const sourceName = sourcesById.get(e.source_id)
-      const src = sourceName != null ? sourcesByName.get(sourceName) : undefined
-      const cat = src?.category ?? 'other'
-      const arr = grouped.get(cat) ?? []
-      arr.push(e)
-      grouped.set(cat, arr)
-    }
-    return grouped
-  }, [entries, sourcesByName, sourcesById])
-
-  const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
-
   // Build a Set for O(1) hidden-entry lookup. We recompute on
   // every render where ``hiddenEntries`` changes (the underlying
   // Set is cheap to construct; the entries render path is the
@@ -601,6 +586,21 @@ export function App() {
     () => entries.filter((e) => !hiddenSet.has(e.id)),
     [entries, hiddenSet],
   )
+
+  const byCategory = useMemo(() => {
+    const grouped = new Map<string, Entry[]>()
+    for (const e of visibleEntries) {
+      const sourceName = sourcesById.get(e.source_id)
+      const src = sourceName != null ? sourcesByName.get(sourceName) : undefined
+      const cat = src?.category ?? 'other'
+      const arr = grouped.get(cat) ?? []
+      arr.push(e)
+      grouped.set(cat, arr)
+    }
+    return grouped
+  }, [visibleEntries, sourcesByName, sourcesById])
+
+  const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
   const visibleForYou = useMemo(
     () => forYou.filter((e) => !hiddenSet.has(e.id)),
     [forYou, hiddenSet],
@@ -661,7 +661,7 @@ export function App() {
       out.push({ name: cat, entries: byCategory.get(cat) ?? [] })
     }
     return out
-  }, [forYou, categories, byCategory, visibleStarred])
+  }, [visibleForYou, categories, byCategory, visibleStarred])
 
   // Multi-sub column. One column, name reads "Filtering" so it stays
   // distinct from any category. The chip-bar header above the column
@@ -776,22 +776,34 @@ export function App() {
   // "N new" chip on the column header, computed separately
   // in ``newCountByColumn``.
   //
-  // The multisub ("Filtering") column has no
-  // ``readEntries`` of its own (the user just toggled the
-  // filter), so all entries are Fresh on first view, which
-  // is the correct behavior.
+  // Read state is stored per-column (``readEntries[columnName]``)
+  // because "mark all read" and its Undo are column-scoped
+  // actions, but the same entry can appear in several columns at
+  // once (For You, its category column, a multi-source filter).
+  // "Read" is a property of the entry, not of any one column it
+  // happens to appear in — so membership here is the UNION of
+  // every column's manual read-set, not just this column's own.
+  // Without this, marking (or hiding, which also marks read) an
+  // entry from For You left it looking unread in its category
+  // column, and vice versa.
+  const globalReadIds = useMemo(() => {
+    const out = new Set<number>()
+    for (const ids of Object.values(readEntries)) {
+      for (const id of ids) out.add(id)
+    }
+    return out
+  }, [readEntries])
   const unreadIdsByColumn = useMemo(() => {
     const out = new Map<string, Set<number>>()
     for (const col of columns) {
-      const manual = new Set(readEntries[col.name] ?? [])
       const ids = new Set<number>()
       for (const e of col.entries) {
-        if (!manual.has(e.id)) ids.add(e.id)
+        if (!globalReadIds.has(e.id)) ids.add(e.id)
       }
       if (ids.size > 0) out.set(col.name, ids)
     }
     return out
-  }, [columns, readEntries])
+  }, [columns, globalReadIds])
 
   // New / History split per column. The split happens AFTER the
   // per-column sort/filter (the previous useMemo), so the per-
@@ -2096,7 +2108,7 @@ export function App() {
         <main className="flex-1 overflow-y-auto p-3 sm:p-4">
           <SearchResults
             query={searchQuery}
-            entries={searchResults}
+            entries={searchResults.filter((e) => !hiddenSet.has(e.id))}
             sourcesById={sourcesById}
             error={searchError}
             searching={searching}
@@ -2115,18 +2127,18 @@ export function App() {
               2. By-category grid — the All Subs columns. Skipped in
                  'multisub' view because the multi-sub column is the
                  whole dashboard there. */}
-          {viewKind === 'all' && forYou.length > 0 && (
+          {viewKind === 'all' && visibleForYou.length > 0 && (
             <section className="hidden md:block px-4 pt-4 pb-3 border-b border-hairline">
               <header className="flex items-center justify-between mb-2">
                 <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
                   For You
                 </h2>
                 <span className="text-ios-caption text-label-tertiary">
-                  {forYou.length} {forYou.length === 1 ? 'entry' : 'entries'}
+                  {visibleForYou.length} {visibleForYou.length === 1 ? 'entry' : 'entries'}
                 </span>
               </header>
               <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                {forYou.map((e) => {
+                {visibleForYou.map((e) => {
                   // Per-card engagement props. The For You
                   // row was previously read-only — no
                   // mark-read, no hide, no star. The user
@@ -2138,15 +2150,13 @@ export function App() {
                   // star a For You card the same way
                   // they would in a category column.
                   //
-                  // ``unread`` is ``true`` for every For
-                  // You card on first render — the
-                  // ``readEntries['For You']`` set is the
-                  // user's read state in this row, and
-                  // the dim kicks in when they tap ✓.
-                  // The per-column lastViewed isn't
-                  // used here (the For You has no column
-                  // header with a "mark all read"
-                  // button).
+                  // ``unread`` reflects ``globalReadIds``, the
+                  // union of every column's manual read-set —
+                  // so marking this card read here also dims
+                  // it in its category column, and marking it
+                  // read there dims it here too. The per-column
+                  // lastViewed isn't used here (the For You row
+                  // has no "mark all read" button).
                   //
                   // ``selected`` / ``onActivate`` /
                   // ``cardRef`` are not passed because
@@ -2154,7 +2164,7 @@ export function App() {
                   // per-row, and the For You row is
                   // not a "column" the user can scroll
                   // into.
-                  const isRead = (readEntries['For You'] ?? []).includes(e.id)
+                  const isRead = globalReadIds.has(e.id)
                   return (
                     <Card
                       key={e.id}
