@@ -111,8 +111,8 @@ class BriefGenerator:
     async def generate(self, *, session: AsyncSession, tone: str = "terse") -> Optional[Brief]:
         """Build a new Brief for the requested tone. Returns the row, or
         None if generation was skipped (no provider, empty digest, etc.)."""
-        provider = router.provider_for("brief")
-        if provider is None:
+        providers = router.providers_for("brief")
+        if not providers:
             logger.info("brief: no LLM provider configured — skipping generation")
             return None
         if tone not in ("terse", "narrative", "alert"):
@@ -130,14 +130,34 @@ class BriefGenerator:
         # a cache hit (5s TTL) so it's a no-op cost.
         window_hours = await self._resolve_window_hours()
         prompt = self._build_prompt(entries, tone, window_hours)
-        try:
-            content = await provider.complete(
-                prompt,
-                max_tokens=_BRIEF_MAX_TOKENS,
-                stop=_BRIEF_STOP_SEQUENCES,
-            )
-        except ProviderError as exc:
-            logger.warning("brief: LLM call failed: %s", exc)
+
+        # Try each configured provider in order (a user-pinned provider
+        # yields a single-element list here — see ``Router.providers_for``
+        # — so this is a no-op in that case). Without this, a single
+        # transient failure (timeout, 5xx, rate limit) from whichever
+        # provider happened to be first silently dropped the scheduled
+        # daily Brief, a manual "Generate" click, or a convergence alert.
+        content: str | None = None
+        provider = None
+        for candidate in providers:
+            try:
+                content = await candidate.complete(
+                    prompt,
+                    max_tokens=_BRIEF_MAX_TOKENS,
+                    stop=_BRIEF_STOP_SEQUENCES,
+                )
+            except ProviderError as exc:
+                logger.warning(
+                    "brief: LLM call failed on %s: %s — trying next provider",
+                    candidate.name,
+                    exc,
+                )
+                continue
+            provider = candidate
+            break
+
+        if provider is None:
+            logger.warning("brief: all configured LLM providers failed — skipping generation")
             return None
 
         content = (content or "").strip()
@@ -229,8 +249,8 @@ class BriefGenerator:
         one-sentence ``alert`` tone summary of the cluster and persist
         that as its own Brief row so the dashboard surfaces it.
         """
-        provider = router.provider_for("brief")
-        if provider is None:
+        providers = router.providers_for("brief")
+        if not providers:
             return None
 
         entries = await self._select_entries_by_slug(session, slug, limit=6)
@@ -246,19 +266,30 @@ class BriefGenerator:
             "Lead with the fact, not 'this story'. No bullet points, no preamble, "
             "no markdown, no bold, no headers, no analysis. Output only the sentence."
         )
-        try:
-            # Same stop sequences as the digest. The alert prompt is
-            # already tight ("write ONE sentence… output only the
-            # sentence"), but the same model tendencies apply — the
-            # model might still leak if asked to analyze a cluster.
-            content = await provider.complete(
-                prompt,
-                max_tokens=120,
-                stop=_BRIEF_STOP_SEQUENCES,
-            )
-        except ProviderError as exc:
-            logger.warning("brief: alert LLM call failed: %s", exc)
-            return None
+        # Same fallback-on-failure as ``generate`` — see the comment
+        # there. A convergence alert is time-sensitive; it shouldn't
+        # go missing because the first configured provider hiccuped.
+        content: str | None = None
+        for candidate in providers:
+            try:
+                # Same stop sequences as the digest. The alert prompt is
+                # already tight ("write ONE sentence… output only the
+                # sentence"), but the same model tendencies apply — the
+                # model might still leak if asked to analyze a cluster.
+                content = await candidate.complete(
+                    prompt,
+                    max_tokens=120,
+                    stop=_BRIEF_STOP_SEQUENCES,
+                )
+            except ProviderError as exc:
+                logger.warning(
+                    "brief: alert LLM call failed on %s: %s — trying next provider",
+                    candidate.name,
+                    exc,
+                )
+                content = None
+                continue
+            break
         content = (content or "").strip()
         if not content:
             return None

@@ -148,7 +148,7 @@ class Router:
         return None
 
     def provider_for(self, task: str) -> Provider | None:
-        """Pick the provider AND its model name together.
+        """Pick the first usable provider AND its model name together.
 
         Earlier versions picked the model from a single chain regardless
         of which provider actually won — so when no API keys were set
@@ -156,40 +156,62 @@ class Router:
         "claude-sonnet-4-6" (or similar), which doesn't exist locally
         and returned 404 from /api/generate.
 
-        Now: first try the user-pinned provider (runtime_settings),
-        then fall through to the env chain. Model name is resolved for
-        the chosen backend only.
+        This is just the head of ``providers_for`` — see that method for
+        the full selection order. Most callers only need the first
+        pick; a caller that wants resilience against a single
+        provider's transient failure (timeout, 5xx, rate limit) should
+        use ``providers_for`` and retry down the list instead.
+        """
+        providers = self.providers_for(task)
+        return providers[0] if providers else None
+
+    def providers_for(self, task: str) -> list[Provider]:
+        """Every usable provider for ``task``, in fallback order.
+
+        Selection order:
+            1. If ``llm.provider`` is pinned in runtime_settings (via the
+               UI picker), that pin is the ONLY candidate — pinning is
+               an explicit choice (e.g. "stay on local Ollama, don't
+               spend the cloud key") and silently trying a different
+               provider after it would violate that choice. Empty list
+               if the pinned backend has no usable auth.
+            2. Otherwise, the env chain in order: Anthropic → OpenAI →
+               Groq → Ollama Cloud → local Ollama (unconditional — no
+               API key needed). Every backend with a configured model
+               AND usable auth is included, not just the first, so a
+               caller can retry the next one if an earlier one fails.
         """
         snap = runtime_settings.snapshot_sync()
 
         # ---- Path 1: user-pinned provider (UI override) ----------------
-        # The UI picker lets the user pin a specific provider regardless
-        # of which env keys are set. _construct returns None if the
-        # chosen backend has no usable auth — we surface that as "not
-        # configured" rather than 500-ing.
+        # _construct returns None if the chosen backend has no usable
+        # auth — we surface that as "not configured" (empty list)
+        # rather than 500-ing.
         pinned = snap.get("llm.provider")
         if pinned:
             model = self._model_for(task, pinned)
             if not model:
-                return None
-            return self._construct(pinned, model)
+                return []
+            provider = self._construct(pinned, model)
+            return [provider] if provider is not None else []
 
         # ---- Path 2: env-driven chain -----------------------------------
-        # First API key set wins. ``_construct`` short-circuits to None
-        # when the chosen backend has no auth, so the chain naturally
-        # falls through to the next candidate.
+        # ``_construct`` short-circuits to None when a backend has no
+        # auth, so those backends are simply skipped rather than
+        # appended as a broken entry.
+        out: list[Provider] = []
         for backend in ("anthropic", "openai", "groq", "ollama_cloud"):
             model = self._model_for(task, backend)
             if not model:
                 continue
             provider = self._construct(backend, model)
             if provider is not None:
-                return provider
+                out.append(provider)
         # Local Ollama is the unconditional fallback — no API key needed.
         model = self._model_for(task, "ollama")
-        if not model:
-            return None
-        return OllamaProvider(model)
+        if model:
+            out.append(OllamaProvider(model))
+        return out
 
 
 router = Router()

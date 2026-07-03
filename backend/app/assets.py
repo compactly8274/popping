@@ -239,6 +239,20 @@ async def _pick_favicon_url(page_url: str) -> Optional[str]:
             if resp.status_code >= 400:
                 logger.debug("assets: %s → HTTP %s (icon probe)", page_url, resp.status_code)
                 return None
+            # Re-check the FINAL URL after the redirect chain — same
+            # per-hop guard as ``_download``. The entry-time check
+            # above only covers ``page_url`` itself; the shared
+            # client follows redirects, so a chain like
+            # ``public.example.com → 169.254.169.254/`` clears entry
+            # (public host) but must be caught here (private hop).
+            final_url = str(resp.url)
+            if final_url != page_url:
+                final_safe, _reason = check_url_safe(final_url)
+                if not final_safe:
+                    logger.debug(
+                        "assets: %s redirected to denied host %s", page_url, final_url,
+                    )
+                    return None
             ct = resp.headers.get("content-type") or ""
             if "html" not in ct.lower() and "xml" not in ct.lower():
                 # RSS / JSON / etc — no <link> tags. Don't waste

@@ -170,16 +170,20 @@ function friendlyTestError(
 }
 
 function parseApiError(err: unknown, fallback: string): string {
-  // FastAPI returns 422 with `{detail: [{loc: [...], msg: "..."}, ...]}`.
-  // The message field is the most useful bit; flatten to a single string.
+  // FastAPI returns 422 with `{detail: [{loc: [...], msg: "..."}, ...]}`
+  // (validation errors) or `{detail: "..."}` (a plain HTTPException).
+  // ``jsonFetch`` (api.ts) attaches that parsed `detail` to the thrown
+  // ``ApiError``, so check it before falling back to the generic
+  // "<status> <statusText>" message — otherwise the specific,
+  // useful reason never gets a chance to show.
   const e = err as { message?: string; detail?: unknown }
-  if (typeof e.message === 'string') return e.message
   if (Array.isArray(e.detail)) {
     return e.detail
       .map((d: any) => (d && typeof d.msg === 'string' ? d.msg : JSON.stringify(d)))
       .join('; ')
   }
   if (typeof e.detail === 'string') return e.detail
+  if (typeof e.message === 'string') return e.message
   return fallback
 }
 
