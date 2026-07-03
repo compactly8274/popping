@@ -32,17 +32,21 @@ Endpoints
     the "reset all preferences" button (not implemented today;
     included for completeness).
 
-All four endpoints require a logged-in user (``require_user``).
-The user_id is sourced from the session's ``sub`` (real OIDC) or
-the synthetic ``"local-bypass"`` sub (LAN bypass) -- both are
-opaque strings here, so the migration to "real" OIDC later
-(where multiple users share a deployment) works without changes
-to this route.
-
-Auth: requires ``require_user``. The OIDC case is the long-term
-shape; the bypass case is the current "I just want this on my
-LAN" shape. Both produce a stable ``sub`` string the
-``user_preferences`` row is keyed by.
+Auth: soft (``current_user``, not ``require_user``), resolved to a
+stable id via ``resolve_user_id``: the session's ``sub`` for real
+OIDC, the synthetic ``"local-bypass"`` sub for the LAN bypass, or
+the synthetic ``"anonymous"`` id when neither applies. That last
+case is the DEFAULT deployment shape — ``OIDC_ENABLED=false`` and
+``LOCAL_AUTH_BYPASS=false`` are both off out of the box, so a
+fresh ``docker compose up -d`` has no way to ever produce a
+session cookie or a bypass grant. Gating these routes on
+``require_user`` (the previous behavior) meant every GET/PUT/DELETE
+401'd for that default install: read state, hidden entries, saved
+entries, and column sort/filter prefs would silently never persist
+past the current page load (the frontend only console.warns on a
+failed preference write in dev). The soft-auth + anonymous-fallback
+pattern mirrors ``app.routes.interactions``, which had the same bug
+and was already fixed this way.
 """
 
 from __future__ import annotations
@@ -55,26 +59,19 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.deps import require_user
-from app.config import settings
+from app.auth.deps import current_user, resolve_user_id
 from app.db import get_session
 from app.models import UserPreference
 from app.schemas import UserPreferenceIn, UserPreferenceListOut, UserPreferenceOut
 
 logger = logging.getLogger("popping.routes.preferences")
 
-# Match the pattern in routes/interactions.py: when OIDC is on, the
-# router-level dep list is non-empty and every endpoint requires a
-# logged-in user. When OIDC is off, the dep is applied per-handler so
-# the route still works in single-user / bypass deployments.
-_route_deps = [Depends(require_user)] if settings.oidc_enabled else []
-
-router = APIRouter(tags=["preferences"], dependencies=_route_deps)
+router = APIRouter(tags=["preferences"])
 
 
 @router.get("/preferences", response_model=UserPreferenceListOut)
 async def list_preferences(
-    user: dict = Depends(require_user),
+    user: dict | None = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> UserPreferenceListOut:
     """Return every (key, value) row for the caller.
@@ -88,7 +85,7 @@ async def list_preferences(
     back to the localStorage seed in that case -- see the
     one-way migration doc in the frontend's lib/preferences.ts.
     """
-    user_id = user["sub"]
+    user_id = resolve_user_id(user)
     rows = await session.scalars(
         select(UserPreference).where(UserPreference.user_id == user_id)
     )
@@ -106,7 +103,7 @@ async def list_preferences(
 @router.get("/preferences/{key}", response_model=UserPreferenceOut)
 async def get_preference(
     key: str,
-    user: dict = Depends(require_user),
+    user: dict | None = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> UserPreferenceOut:
     """Return one (key, value) row for the caller. 404 if absent.
@@ -116,7 +113,7 @@ async def get_preference(
     (e.g. a future "did the user dismiss this onboarding hint?"
     check that loads one specific preference on demand).
     """
-    user_id = user["sub"]
+    user_id = resolve_user_id(user)
     row = await session.scalar(
         select(UserPreference).where(
             UserPreference.user_id == user_id,
@@ -139,7 +136,7 @@ async def get_preference(
 async def put_preference(
     key: str,
     body: UserPreferenceIn,
-    user: dict = Depends(require_user),
+    user: dict | None = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> UserPreferenceOut:
     """Upsert one (key, value) row for the caller. Idempotent.
@@ -160,7 +157,7 @@ async def put_preference(
     one card read on every visible-card-scroll would otherwise
     burn 2x the round-trips.
     """
-    user_id = user["sub"]
+    user_id = resolve_user_id(user)
     stmt = (
         pg_insert(UserPreference)
         .values(user_id=user_id, key=key, value=body.value)
@@ -188,7 +185,7 @@ async def put_preference(
 @router.delete("/preferences/{key}", status_code=204)
 async def delete_preference(
     key: str,
-    user: dict = Depends(require_user),
+    user: dict | None = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> None:
     """Remove a single (key) row. Idempotent: returns 204 whether or
@@ -198,7 +195,7 @@ async def delete_preference(
     so a future "reset all preferences" button or per-key clear
     action has a server-side target.
     """
-    user_id = user["sub"]
+    user_id = resolve_user_id(user)
     await session.execute(
         delete(UserPreference).where(
             UserPreference.user_id == user_id,
