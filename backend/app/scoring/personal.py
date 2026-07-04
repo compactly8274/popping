@@ -57,11 +57,16 @@ def _cosine(a, b) -> Optional[float]:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
-def _vector_score(entry_emb, pref_vec) -> float:
+def vector_score(entry_emb, pref_vec) -> float:
     """Map cosine similarity → 0..100. None inputs return the neutral 50.
 
     Both arguments can be a list, a numpy.ndarray (pgvector read-back),
     or None — ``_cosine`` normalises either.
+
+    Public (not just this module's ``score()``): ``app.feed_recommendations``
+    reuses this to rank the curated feed list by similarity to the same
+    ``preference_vector`` that drives For You, rather than duplicating
+    the cosine + rescale + neutral-fallback logic.
     """
     c = _cosine(entry_emb, pref_vec)
     if c is None:
@@ -98,7 +103,7 @@ def score(entry: Entry, source: Source | None, profile: UserProfile | None) -> f
     documented "NULL embedding → neutral 50" behaviour instead of
     an ``AttributeError`` that 500s the whole endpoint."""
     embedding = getattr(entry, "embedding", None)
-    vec = _vector_score(embedding, profile.preference_vector if profile else None)
+    vec = vector_score(embedding, profile.preference_vector if profile else None)
     cat_mult = _category_multiplier(
         source.category if source else None,
         profile.followed_categories if profile else None,
