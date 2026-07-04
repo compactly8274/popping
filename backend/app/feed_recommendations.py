@@ -37,14 +37,30 @@ Conventions:
       because the user can see the empty column; they can then
       either configure Hydra or delete the row.
 
-Ranking (``recommendations_for``):
-    When the user has zero interaction rows we serve the list in its
-    curated order. Once ``Interaction`` rows land, we aggregate per
-    source-category scores from the last 30 days, negate
-    ``thumb_down`` / ``never`` events, and squeeze through ``tanh``
-    so a single hot category doesn't dominate the ordering. We then
-    sort the candidates by ``score desc, curated_index asc`` so ties
-    fall back to the editorial order and the list feels stable.
+Ranking (``recommendations_for_user``):
+    Blends two independent signals, each rescaled to ``[0, 1]``:
+
+    1. Category co-occurrence — aggregate per-source-category scores
+       from the last 30 days of ``Interaction`` rows, negate
+       ``thumb_down`` / ``never`` events, and squeeze through
+       ``tanh`` so a single hot category doesn't dominate.
+    2. Vector similarity — cosine similarity between the user's
+       ``UserProfile.preference_vector`` (the same one that ranks
+       For You) and a one-time sentence embedding of each
+       candidate's name + blurb. This is what makes the ranking
+       track "your algorithm" rather than just a coarse category
+       tally: two feeds in the same curated category can still
+       come out in a different order if one's editorial blurb
+       reads closer to what you actually engage with.
+
+    ``_CATEGORY_WEIGHT`` / ``_VECTOR_WEIGHT`` control the blend.
+    Either signal defaults to neutral (0 co-occurrence, 0.5
+    similarity) when it isn't available yet (no interactions, no
+    preference vector, or embeddings disabled) — so a fresh install
+    with neither serves the curated (editorial) order untouched,
+    and a user with only one signal still gets ranked by it alone.
+    Ties fall back to ``curated_index asc`` so the list stays
+    stable when both signals agree.
 """
 
 from __future__ import annotations
@@ -55,7 +71,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Entry, Interaction, Source
+from app.embeddings import embedder
+from app.models import Entry, Interaction, Source, UserProfile
+from app.scoring.personal import vector_score
 
 
 # A tuple of (name, category, url, blurb). Storing as a list of dicts
@@ -458,6 +476,45 @@ def _squeeze(raw: float) -> float:
     return math.tanh(raw / _TANH_DIVISOR)
 
 
+# Blend weights for the two ranking signals — see the module
+# docstring's "Ranking" section. Slightly favors the vector signal:
+# it's continuous and per-candidate (distinguishes two feeds in the
+# same curated category), where category co-occurrence is coarser
+# and only as fine-grained as the curated list's category labels.
+_CATEGORY_WEIGHT = 0.4
+_VECTOR_WEIGHT = 0.6
+
+# Candidate name -> embedding. The curated ``RECOMMENDATIONS`` list
+# only changes via a code edit + restart (see the module docstring),
+# so embedding each candidate's blurb once per process and reusing it
+# forever is correct, not just an optimization — there's nothing to
+# invalidate the cache on.
+_CANDIDATE_EMBEDDINGS: dict[str, list[float]] = {}
+
+
+async def _ensure_candidate_embeddings(candidates: list[dict]) -> None:
+    """Embed any candidate not already in ``_CANDIDATE_EMBEDDINGS``.
+
+    Text is ``"<name> <category>: <blurb>"`` — the same shape of
+    signal (short description, no boilerplate) the entry embedding
+    pipeline feeds the model elsewhere. A no-op batch (nothing
+    missing, or embeddings disabled — ``embed_many`` then returns
+    all-``None`` and every candidate is silently skipped) costs
+    nothing.
+    """
+    missing = [c for c in candidates if c["name"] not in _CANDIDATE_EMBEDDINGS]
+    if not missing:
+        return
+    texts = [
+        f"{c['name'].replace('_', ' ')} {c['category']}: {c['blurb']}"
+        for c in missing
+    ]
+    vectors = await embedder().embed_many(texts)
+    for candidate, vec in zip(missing, vectors):
+        if vec is not None:
+            _CANDIDATE_EMBEDDINGS[candidate["name"]] = vec
+
+
 async def recommendations_for_user(
     session: AsyncSession,
     active_source_names: list[str],
@@ -466,11 +523,12 @@ async def recommendations_for_user(
     """Re-ranked recommendation list for a user.
 
     Filtering matches ``recommendations_for`` (skip already-added
-    sources). Ranking uses the last-30-days interaction co-occurrence
-    across ``user_ids`` (see ``aggregation_user_ids``): candidates in
-    a category the user engages with float up; candidates in a
-    category the user has thumbed-down sink (or stay neutral if no
-    signal). Ties fall back to the curated ``RECOMMENDATIONS`` order
+    sources). Ranking blends the last-30-days interaction
+    co-occurrence across ``user_ids`` (see ``aggregation_user_ids``)
+    with cosine similarity between each candidate's embedding and the
+    user's ``preference_vector`` — see the module docstring's
+    "Ranking" section for the full algorithm and why both signals
+    matter. Ties fall back to the curated ``RECOMMENDATIONS`` order
     so the list is stable when there's no data.
 
     Returns a fresh list — the caller may serialize it directly.
@@ -480,19 +538,38 @@ async def recommendations_for_user(
         return candidates
 
     raw_scores = await _category_scores(session, user_ids)
-    if not raw_scores:
-        # No engagement yet — fall through to curated order, which is
-        # already what ``recommendations_for`` returned.
+    squeezed = {cat: _squeeze(score) for cat, score in raw_scores.items()}
+
+    profile = await session.scalar(select(UserProfile).where(UserProfile.id == 1))
+    pref_vec = profile.preference_vector if profile else None
+    vec_scores: dict[str, float] = {}
+    if pref_vec is not None:
+        await _ensure_candidate_embeddings(candidates)
+        vec_scores = {
+            c["name"]: vector_score(_CANDIDATE_EMBEDDINGS.get(c["name"]), pref_vec)
+            for c in candidates
+        }
+
+    if not squeezed and not vec_scores:
+        # Neither signal available yet (no interactions, no
+        # preference vector) — fall through to curated order, which
+        # is already what ``recommendations_for`` returned.
         return candidates
 
-    squeezed = {cat: _squeeze(score) for cat, score in raw_scores.items()}
     # Pre-compute the curated index so ties are deterministic.
     for idx, item in enumerate(candidates):
         item.setdefault("_curated_index", idx)
-    # Sort by descending category score, then by curated index ascending.
-    candidates.sort(
-        key=lambda item: (-squeezed.get(item["category"], 0.0), item["_curated_index"])
-    )
+
+    def _combined_score(item: dict) -> float:
+        cat_component = squeezed.get(item["category"], 0.0)  # 0..1, 0 = no signal
+        # vector_score is 0..100 with 50 as its own "no signal"
+        # neutral; rescale to 0..1 so the two components are
+        # comparable and neither dominates just from its native range.
+        vec_component = vec_scores.get(item["name"], 50.0) / 100.0
+        return _CATEGORY_WEIGHT * cat_component + _VECTOR_WEIGHT * vec_component
+
+    # Sort by descending combined score, then by curated index ascending.
+    candidates.sort(key=lambda item: (-_combined_score(item), item["_curated_index"]))
     # Strip the helper key before returning — the API serializer
     # doesn't know about it.
     for item in candidates:
