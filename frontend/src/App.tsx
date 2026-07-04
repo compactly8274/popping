@@ -958,11 +958,24 @@ export function App() {
     setRefreshing(true)
     try {
       const sourceArg = activeSources.size > 0 ? Array.from(activeSources) : undefined
+      // A flat global `limit` on the unfiltered "give me everything"
+      // fetch lets one high-volume or high-scoring category (Hacker
+      // News' 5-minute refresh, say) crowd a slower/lower-scoring one
+      // out of the response entirely once the table has enough rows
+      // — the category still shows the "+N new" chip (it's fed by
+      // whatever landed) but the column itself renders almost
+      // nothing, because its actual rows never made the cut. The
+      // multi-source filter view doesn't have this problem (it's
+      // already scoped to a handful of sources), so only the
+      // unfiltered path uses ``perCategoryLimit`` instead of ``limit``.
+      const entriesReq = sourceArg
+        ? api.entries({ limit: 200, source: sourceArg })
+        : api.entries({ perCategoryLimit: 100 })
       // Hot path: entries + sources + for-you. These change with
       // every ingest and the user expects them to be near-real-time
       // when the dashboard is open.
       const [e, s, fy] = await Promise.all([
-        api.entries({ limit: 200, source: sourceArg }),
+        entriesReq,
         api.sources(),
         api.forYou({ limit: 25 }).catch(() => [] as Entry[]),
       ])

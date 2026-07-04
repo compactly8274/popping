@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
@@ -92,6 +92,22 @@ async def list_entries(
         description="Substring search across title and meta.summary (case-insensitive)",
     ),
     limit: int = Query(default=50, ge=1, le=500),
+    per_category_limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=200,
+        description=(
+            "When set (and category/source/q are all unset), return up to this "
+            "many entries PER SOURCE CATEGORY instead of one global top-`limit`. "
+            "A flat global limit lets a single high-volume or high-scoring "
+            "category (e.g. Hacker News' 5-minute refresh) crowd slower or "
+            "lower-scoring categories out of the response entirely once the "
+            "table has enough rows — this guarantees every category gets a "
+            "fair slice regardless of how the others score. Ignored (falls "
+            "back to the flat `limit`) once any of category/source/q narrows "
+            "the query to something other than 'the whole dashboard'."
+        ),
+    ),
 ) -> list[EntryListOut]:
     # Slim column projection — the list endpoint returns EntryListOut
     # (no meta JSONB blob). The dashboard only ever reads meta.summary
@@ -166,7 +182,35 @@ async def list_entries(
         # but ignore larger values — a search for a common substring
         # could otherwise try to return tens of thousands of rows.
         limit = min(limit, _SEARCH_LIMIT_CAP)
-    stmt = stmt.limit(limit)
+
+    if per_category_limit is not None and not category and not source and not q:
+        # Per-category windowed query instead of one global top-`limit`.
+        # ``ROW_NUMBER() OVER (PARTITION BY category ORDER BY ...)``
+        # ranks each category's own rows independently, so a slow or
+        # low-scoring category still gets its top
+        # ``per_category_limit`` rows even if every one of them would
+        # rank below `limit` in a single cross-category ordering.
+        rn = (
+            func.row_number()
+            .over(
+                partition_by=Source.category,
+                order_by=(Entry.composite_score.desc(), Entry.published_at.desc().nullslast()),
+            )
+            .label("rn")
+        )
+        ranked = (
+            select(*columns, rn)
+            .join(Source, Entry.source_id == Source.id)
+            .subquery()
+        )
+        column_names = [c.name for c in columns]
+        stmt = (
+            select(*[ranked.c[name] for name in column_names])
+            .where(ranked.c.rn <= per_category_limit)
+            .order_by(ranked.c.composite_score.desc(), ranked.c.published_at.desc().nullslast())
+        )
+    else:
+        stmt = stmt.limit(limit)
     rows = (await session.execute(stmt)).mappings().all()
     # ``reddit_comment_count`` projects as text (JSONB ``->>`` always
     # returns text). The schema expects Optional[int]; coerce here so
