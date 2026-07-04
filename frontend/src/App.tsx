@@ -826,38 +826,6 @@ export function App() {
     })
   }, [baseColumns, columnPrefs])
 
-  // New-entry per column. An entry is "new" when its id isn't in the
-  // seen-set from the previous refresh AND/OR it's newer than the
-  // user's last visit to this column. Union of both — anything
-  // unacknowledged surfaces.
-  const newCountByColumn = useMemo(() => {
-    const out = new Map<string, number>()
-    const seen = seenEntryIdsRef.current
-    for (const col of columns) {
-      const last = lastViewed[col.name]
-      const lastMs = last ? new Date(last).getTime() : 0
-      let n = 0
-      for (const e of col.entries) {
-        const isNewSinceRefresh = seen != null && !seen.has(e.id)
-        const isNewSinceVisit =
-          lastMs > 0 && e.fetched_at != null && new Date(e.fetched_at).getTime() > lastMs
-        if (isNewSinceRefresh || isNewSinceVisit) n++
-      }
-      if (n > 0) out.set(col.name, n)
-    }
-    return out
-  }, [columns, lastViewed])
-
-  // Fresh/History split per column. Fresh = the user has not
-  // manually marked this entry read. History = the user has.
-  // Independent of ``lastViewed`` so the column always has
-  // content — a first-time visit (no ``lastViewed`` set)
-  // still shows all entries as Fresh, and a "mark all read"
-  // move (which sets ``lastViewed``) doesn't make the column
-  // body empty. The ``lastViewed`` is still used for the
-  // "N new" chip on the column header, computed separately
-  // in ``newCountByColumn``.
-  //
   // Read state is stored per-column (``readEntries[columnName]``)
   // because "mark all read" and its Undo are column-scoped
   // actions, but the same entry can appear in several columns at
@@ -875,6 +843,51 @@ export function App() {
     }
     return out
   }, [readEntries])
+
+  // New-entry per column. An entry is "new" when it hasn't already
+  // been marked read (from ANY view — see ``globalReadIds`` above)
+  // AND either its id isn't in the seen-set from the previous
+  // refresh, or it's newer than the user's last visit to this
+  // column.
+  //
+  // The read-state exclusion matters because an entry frequently
+  // shows up in more than one place (its category column AND the
+  // For You row, say). Without it, reading something from For You
+  // didn't stop its category column's "+N new" chip from counting
+  // it — the chip would claim N new items, but expanding the
+  // column showed mostly already-read (History) entries, because
+  // the chip and the Fresh/History split were reading two
+  // completely different signals (fetch/visit timing vs. manual
+  // read state).
+  const newCountByColumn = useMemo(() => {
+    const out = new Map<string, number>()
+    const seen = seenEntryIdsRef.current
+    for (const col of columns) {
+      const last = lastViewed[col.name]
+      const lastMs = last ? new Date(last).getTime() : 0
+      let n = 0
+      for (const e of col.entries) {
+        if (globalReadIds.has(e.id)) continue
+        const isNewSinceRefresh = seen != null && !seen.has(e.id)
+        const isNewSinceVisit =
+          lastMs > 0 && e.fetched_at != null && new Date(e.fetched_at).getTime() > lastMs
+        if (isNewSinceRefresh || isNewSinceVisit) n++
+      }
+      if (n > 0) out.set(col.name, n)
+    }
+    return out
+  }, [columns, lastViewed, globalReadIds])
+
+  // Fresh/History split per column. Fresh = the user has not
+  // manually marked this entry read. History = the user has.
+  // Independent of ``lastViewed`` so the column always has
+  // content — a first-time visit (no ``lastViewed`` set)
+  // still shows all entries as Fresh, and a "mark all read"
+  // move (which sets ``lastViewed``) doesn't make the column
+  // body empty. The ``lastViewed`` is still used for the
+  // "N new" chip on the column header, computed separately
+  // in ``newCountByColumn``. ``globalReadIds`` is defined above,
+  // next to ``newCountByColumn``, since both now depend on it.
   const unreadIdsByColumn = useMemo(() => {
     const out = new Map<string, Set<number>>()
     for (const col of columns) {
