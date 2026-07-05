@@ -10,6 +10,9 @@ The scheduler owns:
     - Upsert into the entries table (by url — natural primary key for feeds)
     - Embedding the entry text at ingest (phase 2)
     - Composite scoring at ingest (phase 2)
+    - Periodic rescore of recently-fetched entries so recency decay and
+      preference-vector updates actually reach rows already in the table
+      instead of only ever applying at the moment of ingest
     - One-shot embedding backfill for entries with NULL embedding (phase 2)
     - Source-row bookkeeping (last_fetch_at, last_error, error_count)
     - Auto-disabling sources after ``_AUTO_DISABLE_THRESHOLD``
@@ -33,10 +36,11 @@ from typing import Any, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import delete, select, text
+from sqlalchemy import bindparam, delete, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app import assets
 from app.brief import BriefGenerator
@@ -47,6 +51,7 @@ from app.models import Brief, Entry, Interaction, NotificationDedup, Source, Use
 from app.notify import Notifier
 from app.scoring import composite as composite_scorer
 from app.scoring import convergence as convergence_helper
+from app.scoring import personal as personal_scorer
 from app.scoring import recency
 from app.sources import list_sources
 from app.sources.base import SourcePlugin
@@ -719,6 +724,108 @@ async def _recompute_preference_vector() -> None:
         logger.exception("pref vector recompute failed (will retry on next tick)")
 
 
+# How far back to rescore. Long enough to outlast the slowest
+# category half-life with room to spare (deals: 48h) so nothing
+# still-relevant is skipped; short enough that the batch stays a
+# few thousand rows, not the whole table.
+_RESCORE_WINDOW_DAYS = 7
+_RESCORE_INTERVAL_MINUTES = 15
+
+
+async def _rescore_recent_entries() -> None:
+    """Recompute ``composite_score`` (and ``personal_score``) for
+    everything fetched in the last ``_RESCORE_WINDOW_DAYS``.
+
+    Why this exists
+    ----------------
+
+    ``_ingest`` sets ``composite_score`` / ``personal_score`` exactly
+    once, at insert time, and nothing ever touches them again.
+    ``composite_score``'s recency component is ``recency.score()`` —
+    an exponential decay meant to fall from 100 toward 0 as an entry
+    ages — but since the stored value is never recomputed, it stays
+    frozen at whatever it was the moment the row landed. In practice
+    every entry looks "fresh" (recency ≈ 100) at its own ingest, so
+    the decay this column was designed to express never actually
+    happens in the data — an entry ingested a week ago competes in
+    ``ORDER BY composite_score DESC`` on equal footing with one
+    ingested a minute ago, as long as their INITIAL scores were
+    similar.
+
+    The same staleness hits ``personal_score``: it's computed once
+    against whatever ``preference_vector`` existed at that moment.
+    ``_recompute_preference_vector`` updates the vector itself every
+    ``pref_vector_recompute_interval_minutes``, but an entry inserted
+    before the user's taste became clear (or before they started
+    ignoring a source like Wikipedia On This Day) keeps its
+    original, likely-neutral personal_score forever — the profile
+    gets smarter, already-scored entries don't.
+
+    Net effect on For You / the dashboard: sources that always look
+    "fresh" at ingest (Wikipedia On This Day sets ``published_at`` to
+    the fetch time, not the historical event's date — see
+    ``app.sources.wikipedia_on_this_day``) keep a permanently
+    high-looking composite_score, and never get corrected downward
+    even once the user's preference vector clearly disfavors them.
+    This job is the periodic correction: recompute both columns
+    against the CURRENT profile and the CURRENT wall clock for
+    everything young enough to still matter, using the exact same
+    scoring functions ingest uses (no duplicated logic to drift).
+
+    ``raw_score`` is deliberately left untouched — see its comment
+    at the ``_ingest`` call site: it's a permanent "how fresh was
+    this when it arrived" quality marker, not a decaying signal.
+    """
+    try:
+        async with SessionLocal() as session:
+            profile = await _load_profile(session)
+            cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=_RESCORE_WINDOW_DAYS)
+            rows = (
+                await session.execute(
+                    select(Entry)
+                    .options(selectinload(Entry.source))
+                    .where(Entry.fetched_at >= cutoff)
+                )
+            ).scalars().all()
+            if not rows:
+                return
+            updates: list[dict] = []
+            for entry in rows:
+                new_composite = composite_scorer.score(entry, entry.source, profile)
+                new_personal = personal_scorer.score(entry, entry.source, profile)
+                if new_composite != entry.composite_score or new_personal != entry.personal_score:
+                    updates.append(
+                        {"_id": entry.id, "composite_score": new_composite, "personal_score": new_personal}
+                    )
+            if updates:
+                # Bulk UPDATE-by-primary-key: one round-trip for the
+                # whole batch via executemany-style bound params,
+                # rather than one UPDATE per row. ``Entry.__table__.update()``
+                # (Core, not the ORM-mapped ``update(Entry)``) so this
+                # doesn't trip SQLAlchemy's "ORM Bulk UPDATE by Primary
+                # Key" special-casing, which expects a different calling
+                # convention — same pattern the thumbnail-path and
+                # preference-vector bulk updates elsewhere in this file
+                # already use.
+                stmt = (
+                    Entry.__table__.update()
+                    .where(Entry.id == bindparam("_id"))
+                    .values(
+                        composite_score=bindparam("composite_score"),
+                        personal_score=bindparam("personal_score"),
+                    )
+                )
+                await session.execute(stmt, updates)
+                await session.commit()
+                logger.info(
+                    "rescore: updated %d/%d recent entries",
+                    len(updates),
+                    len(rows),
+                )
+    except Exception:
+        logger.exception("rescore: failed (will retry next tick)")
+
+
 async def _prune_notification_dedup() -> None:
     """Prune ``notification_dedup`` rows older than the retention window.
 
@@ -1254,6 +1361,25 @@ async def start_scheduler(notifier: Optional[Notifier] = None) -> AsyncIOSchedul
             max_instances=1,
             coalesce=True,
         )
+
+    # Rescore recent entries. composite_score / personal_score are
+    # otherwise write-once at ingest — see _rescore_recent_entries's
+    # docstring for why that means recency decay and preference-vector
+    # updates never reach already-ingested rows without this. Runs
+    # 15s after the preference-vector recompute above (best-effort
+    # ordering, not a hard dependency) so the first pass after a
+    # restart scores against the freshly-recomputed vector rather
+    # than whatever was persisted before the restart.
+    _scheduler.add_job(
+        _rescore_recent_entries,
+        trigger=IntervalTrigger(minutes=_RESCORE_INTERVAL_MINUTES),
+        id="score:rescore_recent",
+        name="Rescore recent entries",
+        replace_existing=True,
+        next_run_time=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=45),
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Phase 4: scheduled daily Brief at BRIEF_SCHEDULE_HOUR UTC. Set
     # to -1 to disable (manual only). Fires once on startup too if the
