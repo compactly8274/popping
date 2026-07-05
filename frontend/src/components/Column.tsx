@@ -148,6 +148,7 @@ export function Column({
 }: Props) {
   const [popoverOpen, setPopoverOpen] = useState(false)
   const popoverRef = useRef<HTMLDivElement | null>(null)
+  const prefsButtonRef = useRef<HTMLButtonElement | null>(null)
 
   // Keep the latest ``cardRefs`` value in a ref so we can ship a
   // stable ref callback to each ``Card``. Without this, the inline
@@ -208,13 +209,40 @@ export function Column({
   // element exists (the column header is visible on touch layouts
   // too — the swipe changes the visible column but the header is
   // always rendered). The handler stays the same on both.
-  const onHeaderClick = () => {
+  //
+  // The sort/filter popover and its trigger button are DOM children
+  // of this header (they need to be, for the ``absolute`` positioning
+  // below), so they rely on ``stopPropagation`` to keep their clicks
+  // from also firing "mark read". That's fragile — a native
+  // ``<select>``'s change event doesn't reliably respect
+  // ``stopPropagation`` on every browser/mobile webview, and any
+  // future control added to the popover has to remember to opt out
+  // too. Guard here as well: if the click actually landed inside the
+  // popover or its button, bail out regardless of whether it was
+  // supposed to have been stopped upstream. This is what was behind
+  // "changing the sort marked the column read" — interacting with
+  // the popover's controls could still reach this handler.
+  const onHeaderClick = (e: React.MouseEvent) => {
+    const target = e.target as Node
+    if (popoverRef.current?.contains(target)) return
+    if (prefsButtonRef.current?.contains(target)) return
     onMarkRead?.()
   }
   // Keyboard support — the header is interactive (it triggers an
   // action), so it should be a button. role="button" + tabIndex={0}
   // matches the pattern BriefCard uses for its collapse header.
+  //
+  // Same guard as onHeaderClick: Space on a focused <select> (the
+  // sort / max-age dropdowns) or arrow-key interaction with the
+  // min-score range slider is exactly "Enter or Space" from the
+  // header's point of view once it bubbles, so without this check
+  // adjusting the sort from the keyboard would ALSO mark the column
+  // read (and Space would fight the select for its default
+  // open-the-dropdown behavior).
   const onHeaderKey = (e: React.KeyboardEvent) => {
+    const target = e.target as Node
+    if (popoverRef.current?.contains(target)) return
+    if (prefsButtonRef.current?.contains(target)) return
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault()
       onMarkRead?.()
@@ -302,6 +330,7 @@ export function Column({
             ceremony for a single special case. */}
         {onPrefsChange && name !== 'For You' && (
           <button
+            ref={prefsButtonRef}
             data-column-action="prefs"
             onClick={(e) => {
               // Don't let the click bubble up to the header — it
