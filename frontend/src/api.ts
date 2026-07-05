@@ -214,6 +214,13 @@ export const api = {
       // Backend caps results at 50 regardless of `limit`.
       q?: string
       limit?: number
+      // Per-category cap instead of one global top-`limit`. Only
+      // takes effect when category/source/q are all unset (the
+      // backend ignores it otherwise) — see the route docstring.
+      // Use this for "give me the whole dashboard" fetches so a
+      // high-volume category can't crowd a slower one out of the
+      // response entirely.
+      perCategoryLimit?: number
     },
   ) => {
     const params = new URLSearchParams()
@@ -228,6 +235,9 @@ export const api = {
     }
     if (opts?.q) params.set('q', opts.q)
     if (opts?.limit) params.set('limit', String(opts.limit))
+    if (opts?.perCategoryLimit) {
+      params.set('per_category_limit', String(opts.perCategoryLimit))
+    }
     const q = params.toString()
     return jsonFetch<Entry[]>(`/api/entries${q ? `?${q}` : ''}`)
   },
