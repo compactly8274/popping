@@ -24,6 +24,7 @@ import time — hence this file does it at the very top, ahead of the
 from __future__ import annotations
 
 import os
+import tempfile
 
 os.environ.setdefault("POSTGRES_HOST", "localhost")
 os.environ.setdefault("POSTGRES_PORT", "5432")
@@ -39,6 +40,15 @@ os.environ.setdefault("POSTGRES_DB", "popping_test")
 # (No ``POPPING_`` prefix — ``Settings`` doesn't declare one, so
 # pydantic-settings matches the bare, case-insensitive field name.)
 os.environ.setdefault("EMBEDDING_ENABLED", "false")
+# ``app.main`` mounts StaticFiles(directory=settings.assets_dir) at
+# import time (not inside the lifespan), and that constructor raises
+# immediately if the directory doesn't exist. The default
+# ("/app/assets") only exists inside the production container/volume —
+# point it at a throwaway temp dir so importing the app doesn't depend
+# on incidental host filesystem state (a bare CI runner doesn't have
+# "/app"; some dev machines do, which is why this can pass locally and
+# fail in CI without this).
+os.environ.setdefault("ASSETS_DIR", tempfile.mkdtemp(prefix="popping-test-assets-"))
 
 import pytest
 import pytest_asyncio
