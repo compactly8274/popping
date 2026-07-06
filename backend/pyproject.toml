@@ -29,9 +29,27 @@ dependencies = [
     "apprise>=1.8",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# The app's SQLAlchemy engine (``app.db.engine``) is a module-level
+# singleton, same as it is in the running app under uvicorn — exactly
+# one event loop for its whole lifetime. Pytest-asyncio's default is a
+# fresh loop per test function, which orphans the engine's pooled
+# asyncpg connections (opened under a previous test's loop) and raises
+# "Future attached to a different loop". Session-scoped loops for both
+# fixtures and tests keep the engine and every test on the same loop.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"

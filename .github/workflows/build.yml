@@ -26,6 +26,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  backend-tests:
+    name: backend tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: popping_test
+          POSTGRES_PASSWORD: popping_test
+          POSTGRES_DB: popping_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U popping_test -d popping_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend + test deps
+        working-directory: backend
+        run: pip install -e ".[test]"
+
+      - name: Create pgvector extension
+        run: |
+          PGPASSWORD=popping_test psql -h localhost -U popping_test -d popping_test \
+            -c 'CREATE EXTENSION IF NOT EXISTS vector'
+
+      - name: Run pytest
+        working-directory: backend
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: popping_test
+          POSTGRES_PASSWORD: popping_test
+          POSTGRES_DB: popping_test
+        run: pytest -q
+
   build-backend:
     name: backend image
     runs-on: ubuntu-latest
