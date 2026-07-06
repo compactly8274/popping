@@ -132,7 +132,7 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
-export function _CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred, onHideToggle, hidden }: Props) {
+export function CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred, onHideToggle, hidden }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   // Touch tracking for long-press → copy URL.
@@ -746,7 +746,7 @@ function _cardPropsEqual(prev: Props, next: Props): boolean {
   )
 }
 
-export const Card = memo(_CardInner, _cardPropsEqual) as typeof _CardInner
+export const Card = memo(CardInner, _cardPropsEqual) as typeof CardInner
 
 // iOS-style checkmark. Used for the per-card mark-read ✓. 2px stroke
 // is heavier than the 1.75 the header icons use — the ✓ is the

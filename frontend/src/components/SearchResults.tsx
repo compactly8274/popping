@@ -18,9 +18,41 @@ type Props = {
   // being no rows for their query.
   error?: string | null
   searching?: boolean
+  // Per-card engagement, wired the same way as the "For You" row
+  // in App — search results are cross-column, so there's no single
+  // owning column to mark read against. Callers should scope reads
+  // under a shared pseudo-column key (App uses ``'Search'``).
+  categoriesBySourceId?: Map<number, string>
+  // Entries the user has already read anywhere on the dashboard
+  // (App's ``globalReadIds``). Drives the dimmed/unread ring.
+  readIds?: Set<number>
+  onMarkRead?: (entryId: number) => void
+  onHide?: (entryId: number) => void
+  onHideToggle?: (entryId: number) => void
+  hiddenSet?: Set<number>
+  onStar?: (entryId: number) => void
+  starredSet?: Set<number>
+  expandedSummaries?: Set<number>
+  onToggleSummary?: (entryId: number) => void
 }
 
-export function SearchResults({ query, entries, sourcesById, error, searching }: Props) {
+export function SearchResults({
+  query,
+  entries,
+  sourcesById,
+  error,
+  searching,
+  categoriesBySourceId,
+  readIds,
+  onMarkRead,
+  onHide,
+  onHideToggle,
+  hiddenSet,
+  onStar,
+  starredSet,
+  expandedSummaries,
+  onToggleSummary,
+}: Props) {
   return (
     <section className="flex flex-col h-full overflow-hidden">
       <header className="flex items-center justify-between px-1 pb-2 border-b border-hairline">
@@ -46,7 +78,21 @@ export function SearchResults({ query, entries, sourcesById, error, searching }:
           </p>
         ) : (
           entries.map((e) => (
-            <Card key={e.id} entry={e} sourceName={sourcesById.get(e.source_id)} />
+            <Card
+              key={e.id}
+              entry={e}
+              sourceName={sourcesById.get(e.source_id)}
+              category={categoriesBySourceId?.get(e.source_id)}
+              unread={readIds ? !readIds.has(e.id) : undefined}
+              expanded={expandedSummaries?.has(e.id) ?? false}
+              onToggleSummary={onToggleSummary ? () => onToggleSummary(e.id) : undefined}
+              onMarkRead={onMarkRead ? () => onMarkRead(e.id) : undefined}
+              onHide={onHide ? () => onHide(e.id) : undefined}
+              onHideToggle={onHideToggle ? () => onHideToggle(e.id) : undefined}
+              hidden={hiddenSet?.has(e.id) ?? false}
+              onStar={onStar ? () => onStar(e.id) : undefined}
+              starred={starredSet?.has(e.id) ?? false}
+            />
           ))
         )}
       </div>

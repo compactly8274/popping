@@ -24,6 +24,13 @@ class SourcePlugin(ABC):
     category: str = ""                   # "news" | "deals" | "vulns" | ...
     url: str = ""                        # canonical feed/API/page URL
     refresh_interval_seconds: int = 3600  # default 1h
+    # Set by row-driven (dynamic) plugins (DynamicRssPlugin,
+    # DynamicRedditPlugin) to the backing Source row's id, so the
+    # scheduler can compute the job id (``ingest:dynamic:<id>``) for
+    # backoff rescheduling without a class-vs-instance branch at
+    # every call site. None for class-driven built-ins, which use
+    # ``ingest:<name>`` instead.
+    source_id: int | None = None
 
     @abstractmethod
     async def fetch(self) -> list[dict]:

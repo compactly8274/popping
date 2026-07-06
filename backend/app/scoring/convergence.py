@@ -86,8 +86,6 @@ async def counts(
         # so there are at most ``1 + a tiny jitter`` keys live at any
         # moment, but pruning is cheap insurance.
         for old in list(_cache.keys()):
-            if old != key and _cache[old] is result:
-                pass
             if old[1] < key[1] - 2:  # older than ~60s — drop
                 _cache.pop(old, None)
     return result

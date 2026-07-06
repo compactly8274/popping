@@ -469,6 +469,7 @@ export function Column({
                 sourcesById={sourcesById}
                 selectedId={selectedId}
                 cardRefs={cardRefs}
+                setCardRef={setCardRef}
                 categoriesBySourceId={categoriesBySourceId}
                 onMarkEntryRead={onMarkEntryRead}
                 expandedSummaries={expandedSummaries}
@@ -519,6 +520,7 @@ export function Column({
                 sourcesById={sourcesById}
                 selectedId={selectedId}
                 cardRefs={cardRefs}
+                setCardRef={setCardRef}
                 categoriesBySourceId={categoriesBySourceId}
                 onMarkEntryRead={onMarkEntryRead}
                 expandedSummaries={expandedSummaries}
@@ -557,6 +559,7 @@ type SectionProps = {
     | Map<number, HTMLElement | null>
     | React.MutableRefObject<Map<number, HTMLElement | null>>
     | undefined
+  setCardRef: (entryId: number) => (el: HTMLElement | null) => void
   categoriesBySourceId: Map<number, string> | undefined
   onMarkEntryRead: ((entryId: number) => void) | undefined
   expandedSummaries: Set<number> | undefined
@@ -578,6 +581,7 @@ function ColumnSection({
   sourcesById,
   selectedId,
   cardRefs,
+  setCardRef,
   categoriesBySourceId,
   onMarkEntryRead,
   expandedSummaries,
@@ -638,25 +642,7 @@ function ColumnSection({
                 sourceName={sourcesById.get(e.source_id)}
                 unread={unreadForCard(e)}
                 selected={selectedId === e.id}
-                cardRef={
-                  cardRefs
-                    ? (el: HTMLElement | null) => {
-                        // cardRefs can be either a Map or a
-                        // ref-of-Map. The ref-of-Map shape is what
-                        // App uses (a single mutable Map that all
-                        // columns write into) so keyboard nav can
-                        // find any card by id regardless of which
-                        // column is currently mounted.
-                        if ('current' in cardRefs) {
-                          if (el) cardRefs.current.set(e.id, el)
-                          else cardRefs.current.delete(e.id)
-                        } else {
-                          if (el) cardRefs.set(e.id, el)
-                          else cardRefs.delete(e.id)
-                        }
-                      }
-                    : undefined
-                }
+                cardRef={cardRefs ? setCardRef(e.id) : undefined}
                 category={categoriesBySourceId?.get(e.source_id)}
                 onMarkRead={onMarkEntryRead ? () => onMarkEntryRead(e.id) : undefined}
                 expanded={expandedSummaries?.has(e.id) ?? false}

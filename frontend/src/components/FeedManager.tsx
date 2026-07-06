@@ -179,7 +179,11 @@ function parseApiError(err: unknown, fallback: string): string {
   const e = err as { message?: string; detail?: unknown }
   if (Array.isArray(e.detail)) {
     return e.detail
-      .map((d: any) => (d && typeof d.msg === 'string' ? d.msg : JSON.stringify(d)))
+      .map((d: unknown) =>
+        d && typeof d === 'object' && typeof (d as { msg?: unknown }).msg === 'string'
+          ? (d as { msg: string }).msg
+          : JSON.stringify(d),
+      )
       .join('; ')
   }
   if (typeof e.detail === 'string') return e.detail
@@ -467,7 +471,7 @@ function SourceRow({
         return { ok: false as const, error: 'must be a flat {"Header": "value"} map' }
       }
       return { ok: true as const, value: parsed as Record<string, string> }
-    } catch (e) {
+    } catch {
       return { ok: false as const, error: 'invalid JSON' }
     }
   })()

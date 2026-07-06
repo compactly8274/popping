@@ -47,7 +47,6 @@ import {
   type ColumnPrefsValue,
   type ColumnSectionsValue,
   type FilterPresetValue,
-  type HistoryGroupByValue,
   type ReadEntriesValue,
   MAX_HIDDEN,
   MAX_STARRED,
@@ -533,8 +532,9 @@ export function App() {
   const setStarredEntries: (ids: number[]) => void = prefs.setStarredEntries
   const setFilterPresets: (presets: FilterPresetValue[]) => void =
     prefs.setFilterPresets
-  const setHistoryGroupBy: (mode: HistoryGroupByValue) => void =
-    prefs.setHistoryGroupBy
+  // Note: no local ``setHistoryGroupBy`` alias — Settings.tsx's
+  // History tab calls ``usePreferences()`` directly for that setter
+  // rather than receiving it as a prop from here.
   // Mirror the 8 preference values into refs so handlers can
   // read the latest value without stale-closure bugs. Without
   // this, a handler that did
@@ -1752,6 +1752,8 @@ export function App() {
     toggleSummary,
     refresh,
     toggleHideEntry,
+    starredSet,
+    toggleStarEntry,
   ])
 
   // Scroll the keyboard-selected card into view.
@@ -2217,7 +2219,11 @@ export function App() {
       )}
 
       {error && (
-        <div className="sticky top-0 z-15 px-4 py-2 bg-red-500/15 border-b border-red-500/40 text-ios-caption text-red-200 flex items-center justify-between gap-2">
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="sticky top-0 z-15 px-4 py-2 bg-red-500/15 border-b border-red-500/40 text-ios-caption text-red-200 flex items-center justify-between gap-2"
+        >
           <span className="break-words">{error}</span>
           <button
             onClick={() => setError(null)}
@@ -2253,6 +2259,49 @@ export function App() {
             sourcesById={sourcesById}
             error={searchError}
             searching={searching}
+            categoriesBySourceId={categoriesBySourceId}
+            readIds={globalReadIds}
+            expandedSummaries={expandedSummaries}
+            onToggleSummary={toggleSummary}
+            onMarkRead={(entryId) => {
+              markEntryRead('Search', entryId)
+              toast('Marked as read', {
+                kind: 'info',
+                action: {
+                  label: 'Undo',
+                  onClick: () => unmarkEntryRead('Search', entryId),
+                },
+              })
+            }}
+            onHide={(entryId) => {
+              hideEntry(entryId)
+              toast('Entry hidden.', {
+                kind: 'info',
+                action: {
+                  label: 'Undo',
+                  onClick: () => restoreHiddenEntry(entryId),
+                },
+              })
+            }}
+            onHideToggle={(entryId) => toggleHideEntry('Search', entryId)}
+            hiddenSet={hiddenSet}
+            onStar={(entryId) => {
+              const wasStarred = starredSet.has(entryId)
+              toggleStarEntry(entryId)
+              toast(
+                wasStarred
+                  ? 'Removed from Saved.'
+                  : 'Saved for later — see the Saved column.',
+                {
+                  kind: 'info',
+                  action: {
+                    label: 'Undo',
+                    onClick: () => toggleStarEntry(entryId),
+                  },
+                },
+              )
+            }}
+            starredSet={starredSet}
           />
         </main>
       ) : columns.length === 0 ? (
@@ -2530,12 +2579,6 @@ export function App() {
         onSourceToggle={toggleSourceAndMaybeClose}
         onClearAllFilters={clearSourceFilters}
         onCategoryJump={jumpToCategory}
-        briefTone={briefTone}
-        onBriefToneChange={setBriefTone}
-        triggerGenerate={triggerBriefGenerate}
-        generating={generatingBrief}
-        onError={setError}
-        onSourceRenamed={onSourceRenamed}
         onResetLocalState={resetLocalState}
         onOpenSettings={(tab) => openSettings(tab ?? 'feeds')}
         onSavePreset={() => {
