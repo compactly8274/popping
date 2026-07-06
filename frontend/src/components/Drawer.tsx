@@ -47,33 +47,6 @@ type Props = {
   // back with the category name; App owns the column refs and
   // scrolls the right one into view.
   onCategoryJump?: (category: string) => void
-  // Active brief tone, lifted from App so the Drawer's "Generate
-  // brief now" stays in sync with the BriefCard pills.
-  briefTone: 'terse' | 'narrative' | 'alert'
-  onBriefToneChange: (next: 'terse' | 'narrative' | 'alert') => void
-  // Lifted brief-generation trigger from App. The Drawer's
-  // "Generate brief now" button used to fire the POST inline and
-  // close, leaving the user with no visible feedback while the
-  // LLM roundtrip ran (3-10s on Ollama) and no surfaced error if
-  // it failed. Now Drawer delegates to the same trigger App's
-  // header uses, so both surfaces share the poll-until-done loop
-  // and the same error path. ``generating`` is exposed so the
-  // button label can show "Generating brief…" mid-flight without
-  // each surface spinning up its own loading state.
-  triggerGenerate: (
-    tone: 'terse' | 'narrative' | 'alert',
-    onError?: (msg: string) => void,
-  ) => Promise<void>
-  generating: boolean
-  // Phase 5: FeedManager errors flow up to App's red banner for
-  // a single, consistent error surface.
-  onError: (msg: string) => void
-  // Phase 5+: when the user renames a source via FeedManager's
-  // inline edit, the Drawer bubbles the old→new mapping up so App
-  // can remap ``activeSources`` in the same render cycle. Without
-  // this, the chip bar briefly loses the renamed source during the
-  // gap between PATCH and the next ``refresh()`` resolving.
-  onSourceRenamed?: (oldName: string, newName: string) => void
   // Wipe namespaced localStorage keys + reload. App owns the
   // actual reset so the source of truth (App's ``useState``
   // mirrors) resets in lockstep. No longer used by the Drawer
@@ -100,11 +73,6 @@ export function Drawer({
   onSourceToggle,
   onClearAllFilters,
   onCategoryJump,
-  briefTone,
-  onBriefToneChange,
-  triggerGenerate,
-  onError,
-  onSourceRenamed,
   // Reset hook. No longer used inside the Drawer (the action
   // moved to Settings) but kept in the destructuring so the
   // function signature stays aligned with the Props type.
@@ -160,7 +128,7 @@ export function Drawer({
   useEffect(() => {
     if (!open) return
     refetchSources()
-  }, [open]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open])
 
   // Esc dismisses the drawer. Mirrors the iOS sheet pattern where
   // the swipe-down and back-tap gestural dismiss are also Esc on a

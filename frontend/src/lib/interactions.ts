@@ -55,7 +55,7 @@ const queue: InteractionEvent[] = []
 const seen = new Set<number>()
 
 let flushScheduled = false
-let uninstalled = false
+const uninstalled = false
 
 // Cap matches the backend's _BATCH_MAX so a queued flush never 422s.
 const MAX_QUEUE = 50

@@ -96,6 +96,9 @@ class DynamicRedditPlugin(SourcePlugin):
         self.category = source_row.category
         self.url = source_row.url
         self.refresh_interval_seconds = source_row.refresh_interval_seconds
+        # Lets the scheduler compute this job's id (``ingest:dynamic:<id>``)
+        # for backoff rescheduling without reaching into ``_source_row``.
+        self.source_id = source_row.id
 
     async def fetch(self) -> list[dict]:
         # Parse the user-entered subreddit reference. Malformed inputs

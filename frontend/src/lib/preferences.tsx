@@ -66,7 +66,7 @@ import {
   type ReactNode,
 } from 'react'
 import { api } from '../api'
-import { STORAGE_KEYS, safeGetItem, safeRemoveItem } from './storage'
+import { safeGetItem, safeRemoveItem } from './storage'
 
 // ---------------------------------------------------------------------------
 // Key registry. Single source of truth for which preference keys exist
@@ -174,10 +174,6 @@ interface PreferenceRow {
   key: string
   value: unknown
   updated_at: string
-}
-
-interface PreferencesListResponse {
-  items: PreferenceRow[]
 }
 
 // ---------------------------------------------------------------------------
@@ -370,14 +366,10 @@ export interface PreferencesContextValue {
   // (useCallback with empty dep) so consumers can put them in
   // their useEffect dep arrays without thrash.
 
-  /** Mark one entry as read. Convenience for the high-frequency
-   *  "I clicked ✓ on a card" path. The full ``readEntries`` map
-   *  is also exposed via ``state`` for the consumer that needs
-   *  the union (e.g. the "is this card read?" check in Card.tsx). */
-  markRead: (columnId: string, entryId: number) => void
-
-  /** Update the read-set for one column. Used by markRead's
-   *  trimming logic and by any "unread" action. */
+  /** Update the read-set for one column. Used for both marking an
+   *  entry read and any "unread" action; the full ``readEntries``
+   *  map is exposed via ``state`` for the consumer that needs the
+   *  union (e.g. the "is this card read?" check in Card.tsx). */
   setReadEntries: (
     columnId: string,
     ids: ReadEntriesValue,
@@ -560,40 +552,9 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // ---- per-key setters ----
-
-  const markRead = useCallback(
-    (columnId: string, entryId: number) => {
-      setState((prev) => {
-        const cur = prev.readEntries[columnId] ?? []
-        if (cur.includes(entryId)) return prev
-        // Same trim cap the old code used: 200 per column.
-        const next = [...cur, entryId].slice(-MAX_PER_COLUMN)
-        return {
-          ...prev,
-          readEntries: { ...prev.readEntries, [columnId]: next },
-        }
-      })
-      const key = `${PREFERENCE_KEYS.readEntries}:${columnId}`
-      // We re-read state from the latest setState via a ref trick
-      // -- simpler is to compute the new list here. But the
-      // setState updater is the source of truth for the in-memory
-      // shape; for the server write we approximate with the
-      // "append" -- the server is the latest-value-wins, so a
-      // stale read here just means one extra row we don't care
-      // about. We use a callback ref pattern below for the
-      // correct read.
-      pendingRef.current.set(key, 'PENDING_RECOMPUTE')
-      scheduleSync()
-    },
-    [scheduleSync],
-  )
-
-  // ... (the rest of the setters follow the same pattern: setState
-  // for the optimistic update, then enqueue the server write.)
-  // [Implementation note: see the consolidated setter block below
-  // for the full set. The per-key setters share the debounce
-  // machinery; the only difference is which field of state they
-  // touch.]
+  //
+  // All setters follow the same pattern: setState for the optimistic
+  // update, then enqueue the server write via pendingRef + scheduleSync.
 
   const setReadEntries = useCallback(
     (columnId: string, ids: ReadEntriesValue) => {
@@ -710,33 +671,11 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
     [scheduleSync],
   )
 
-  // markRead needs the latest state at the time the server PUT
-  // fires, not the time the user clicked. The naive closure above
-  // uses a placeholder; the real write happens in a ``useEffect``
-  // that reads state after the optimistic update has landed.
-  // [See "markRead real write" effect below.]
-  useEffect(() => {
-    for (const [key, value] of pendingRef.current.entries()) {
-      if (value !== 'PENDING_RECOMPUTE') continue
-      pendingRef.current.delete(key)
-      // Compute the real value from current state.
-      if (key.startsWith(`${PREFERENCE_KEYS.readEntries}:`)) {
-        const columnId = key.slice(`${PREFERENCE_KEYS.readEntries}:`.length)
-        const list = state.readEntries[columnId] ?? []
-        pendingRef.current.set(key, list.slice(-MAX_PER_COLUMN))
-      }
-    }
-    // Don't reschedule here -- the timer is already armed by
-    // markRead's call to scheduleSync above. The setTimeout
-    // callback will pick up the updated values when it fires.
-  }, [state])
-
   const value = useMemo<PreferencesContextValue>(
     () => ({
       state,
       loading,
       seeded,
-      markRead,
       setReadEntries,
       setLastViewed,
       clearLastViewed,
@@ -751,7 +690,6 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
       state,
       loading,
       seeded,
-      markRead,
       setReadEntries,
       setLastViewed,
       clearLastViewed,

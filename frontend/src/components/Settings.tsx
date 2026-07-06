@@ -383,7 +383,11 @@ export function Settings({
                   briefs) is untouched — a refresh re-fetches everything.
                 </p>
                 <button
-                  onClick={() => onResetLocalState()}
+                  onClick={() => {
+                    if (window.confirm('Clear local state? This wipes read marks, column preferences, and last-viewed timestamps on this device. This can\'t be undone.')) {
+                      onResetLocalState()
+                    }
+                  }}
                   className="mt-3 w-full min-h-[44px] rounded-ios bg-red-500/15 border border-red-500/40 text-red-300 active:opacity-60"
                 >
                   Clear local state
@@ -678,6 +682,11 @@ function LLMSection({
                 {useFreeText ? 'pick from list' : 'type a name instead'}
               </button>
             )}
+            {hasRecommendations && (
+              <div className="mt-1 text-ios-caption text-label-tertiary">
+                ★ marks models recommended for this task
+              </div>
+            )}
           </div>
           <div>
             <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
@@ -697,6 +706,11 @@ function LLMSection({
                 </option>
               ))}
             </select>
+            {hasScoringRecommendations && (
+              <div className="mt-1 text-ios-caption text-label-tertiary">
+                ★ marks models recommended for this task
+              </div>
+            )}
           </div>
           {tagsLoading && (
             <div className="text-ios-caption text-label-secondary">loading models…</div>
@@ -1257,6 +1271,12 @@ function HiddenTabContent({
   const [loaded, setLoaded] = useState<EntryIdListContentProps['loaded']>([])
   const [loading, setLoading] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+  // Depend on content, not array identity — ``ids`` is a fresh array
+  // reference from the parent on every render even when its contents
+  // haven't changed, which would otherwise re-fetch on every render.
+  // Memoized (not inlined in the deps array below) so
+  // react-hooks/exhaustive-deps can statically verify it.
+  const idsKey = useMemo(() => ids.join(','), [ids])
   useEffect(() => {
     if (ids.length === 0) {
       setLoaded([])
@@ -1292,7 +1312,10 @@ function HiddenTabContent({
     return () => {
       alive = false
     }
-  }, [ids.join(',')])
+    // Keyed on idsKey (content) deliberately instead of ids (reference);
+    // see the comment above idsKey.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idsKey])
   return (
     <EntryIdListContent
       actionLabel="Restore"
@@ -1324,6 +1347,9 @@ function StarredTabContent({
   const [loaded, setLoaded] = useState<EntryIdListContentProps['loaded']>([])
   const [loading, setLoading] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+  // Depend on content, not array identity — see the identical comment
+  // in HiddenTabContent above.
+  const idsKey = useMemo(() => ids.join(','), [ids])
   useEffect(() => {
     if (ids.length === 0) {
       setLoaded([])
@@ -1359,7 +1385,9 @@ function StarredTabContent({
     return () => {
       alive = false
     }
-  }, [ids.join(',')])
+    // Keyed on idsKey (content) deliberately instead of ids (reference).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idsKey])
   return (
     <EntryIdListContent
       actionLabel="Remove"

@@ -15,6 +15,11 @@ The scheduler owns:
       instead of only ever applying at the moment of ingest
     - One-shot embedding backfill for entries with NULL embedding (phase 2)
     - Source-row bookkeeping (last_fetch_at, last_error, error_count)
+    - Exponential backoff on consecutive failures (widens the job's own
+      interval instead of retrying at full cadence) and a short error
+      category (blocked / not found / upstream error / network) prefixed
+      onto ``last_error`` so the FeedManager tooltip is diagnosable
+      without reading backend logs
     - Auto-disabling sources after ``_AUTO_DISABLE_THRESHOLD``
       consecutive failures (see comment on the constant)
     - Periodic purge of expired sessions (DB-backed auth)
@@ -33,6 +38,7 @@ import logging
 import re
 from typing import Any, Optional
 
+import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -142,6 +148,77 @@ _FAVICON_RETRY_INTERVAL = dt.timedelta(hours=1)
 # so the user gets a clean retry slate rather than an immediate
 # re-disable on the first hiccup.
 _AUTO_DISABLE_THRESHOLD = 6
+
+# Backoff on consecutive failures. Without this, a source on a fast
+# cadence (Hacker News: 5 min) that starts failing retries at full
+# speed right up until auto-disable — 6 failures land inside 30
+# minutes, hammering an already-struggling or paywalled endpoint the
+# whole time. Doubling the interval per consecutive failure spreads
+# those same 6 attempts out (5 → 10 → 20 → 40 → 80 → 160 min for a
+# 5-min base), capped so a slow source (CISA KEV: 6h) doesn't back
+# off into "once a week" territory before auto-disable even kicks in.
+_BACKOFF_MULTIPLIER = 2
+_BACKOFF_MAX_SECONDS = 6 * 3600  # 6h cap regardless of base interval
+
+
+def _classify_error(exc: Exception) -> str:
+    """Short human category prefixed onto ``last_error``.
+
+    Doesn't change retry/backoff behavior (that's keyed on the raw
+    consecutive-failure count, not the error kind) — this only makes
+    the FeedManager tooltip say something more useful than a bare
+    exception repr. "blocked" specifically flags the 401/402/403
+    family so a paywall/auth-gate (see rfd.py's Tollbit note) reads
+    as "this endpoint is refusing us" rather than an unexplained
+    error the user has to go dig through logs to understand.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code in (401, 402, 403):
+            return "blocked"
+        if code == 404:
+            return "not found"
+        if 500 <= code < 600:
+            return "upstream error"
+        return "http error"
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TooManyRedirects)):
+        return "network"
+    return "error"
+
+
+def _ingest_job_id(plugin_cls: Any) -> str | None:
+    """The scheduler job id for a class-driven or row-driven plugin.
+
+    Mirrors the id each is registered under in ``start_scheduler`` /
+    ``_add_or_replace_dynamic_job``. Returns None for a dynamic
+    instance that somehow has no ``source_id`` (shouldn't happen —
+    defensive so a reschedule attempt no-ops instead of raising).
+    """
+    if isinstance(plugin_cls, SourcePlugin):
+        if plugin_cls.source_id is None:
+            return None
+        return _dynamic_job_id(plugin_cls.source_id)
+    return f"ingest:{plugin_cls.name}"
+
+
+def _reschedule_ingest_job(plugin_cls: Any, interval_seconds: float) -> None:
+    """Change an ingest job's interval without waiting for a restart.
+
+    Used both to back a job off after a failure and to restore its
+    normal cadence once it starts succeeding again. Best-effort: a
+    rescheduling hiccup is logged and swallowed rather than allowed
+    to turn into (or mask) an ingest failure of its own — the job
+    keeps running at whatever interval it already had.
+    """
+    if _scheduler is None:
+        return
+    job_id = _ingest_job_id(plugin_cls)
+    if job_id is None:
+        return
+    try:
+        _scheduler.reschedule_job(job_id, trigger=IntervalTrigger(seconds=interval_seconds))
+    except Exception:
+        logger.debug("scheduler: could not reschedule %s", job_id, exc_info=True)
 
 
 def _should_retry_favicon(last_fetch_at: dt.datetime | None) -> bool:
@@ -292,10 +369,17 @@ async def _ingest(plugin_cls: Any) -> dict:
                         thumbnail_jobs.append((inserted_id, remote_image_url))
                 else:
                     summary["duplicates"] += 1
+            was_backed_off = (source.error_count or 0) > 0
             source.last_fetch_at = dt.datetime.now(dt.timezone.utc)
             source.last_error = None
             source.error_count = 0
             await session.commit()
+            if was_backed_off:
+                # Recovering from a failure streak — restore the
+                # normal cadence (see the failure branch below for
+                # where it got widened). A healthy source that's
+                # never failed skips this; nothing to restore.
+                _reschedule_ingest_job(plugin_cls, plugin_cls.refresh_interval_seconds)
             # Re-fetch inserted rows for the post-hook (notification
             # path) after the commit so they have stable ids.
             if thumbnail_jobs:
@@ -317,7 +401,9 @@ async def _ingest(plugin_cls: Any) -> dict:
         exc_type = type(exc).__name__
         msg = str(exc).strip()
         msg = msg.splitlines()[0][:200] if msg else ""
-        summary["error"] = f"{exc_type}: {msg}" if msg else exc_type
+        category = _classify_error(exc)
+        detail = f"{exc_type}: {msg}" if msg else exc_type
+        summary["error"] = f"[{category}] {detail}"
         try:
             async with SessionLocal() as session:
                 source = await session.scalar(
@@ -349,6 +435,17 @@ async def _ingest(plugin_cls: Any) -> dict:
                             source.error_count,
                             source.last_error,
                         )
+                    elif source.active:
+                        # Back off instead of retrying at full cadence —
+                        # see _BACKOFF_MULTIPLIER's comment. Skipped once
+                        # auto-disabled above (a disabled source doesn't
+                        # tick at all, so there's nothing to reschedule).
+                        backoff_seconds = min(
+                            plugin_cls.refresh_interval_seconds
+                            * (_BACKOFF_MULTIPLIER ** source.error_count),
+                            _BACKOFF_MAX_SECONDS,
+                        )
+                        _reschedule_ingest_job(plugin_cls, backoff_seconds)
                     await session.commit()
         except Exception:
             logger.exception("could not record error for %s", plugin_cls.name)
@@ -1816,6 +1913,11 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
     row = await session.get(Source, source_id)
     if row is None:
         return False
+    # Captured before the delete/commit below — ``row`` is expired
+    # (SQLAlchemy's default expire_on_commit) once the transaction
+    # commits, and it's been deleted besides, so touching row.name
+    # afterward would try to re-SELECT a row that's no longer there.
+    source_name = row.name
     # Built-in sources (BBC, HN, etc.) ARE deletable now. The
     # row goes away, the scheduler job is removed, the
     # dashboard stops showing the source. The plugin class
@@ -1836,7 +1938,7 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
     if _scheduler is not None:
         try:
             _scheduler.remove_job(_dynamic_job_id(source_id))
-            logger.info("scheduler: removed dynamic job for %s (id=%d)", name, source_id)
+            logger.info("scheduler: removed dynamic job for %s (id=%d)", source_name, source_id)
         except Exception:
             pass
     return True
