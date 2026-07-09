@@ -1489,12 +1489,21 @@ export function App() {
           kind: 'info',
           action: {
             label: 'Undo',
-            onClick: () => restoreHiddenEntry(entryId),
+            // Undo the WHOLE action, not just the hidden-set half —
+            // this used to only call restoreHiddenEntry, which
+            // unhid the entry but left it marked read, so it stayed
+            // sitting in History instead of returning to Fresh. A
+            // user hitting Undo on "Entry moved to history" expects
+            // the entry back where it was, not half-moved.
+            onClick: () => {
+              restoreHiddenEntry(entryId)
+              unmarkEntryRead(columnName, entryId)
+            },
           },
         })
       }
     },
-    [hiddenSet, markEntryRead, restoreHiddenEntry, setHiddenEntries],
+    [hiddenSet, markEntryRead, restoreHiddenEntry, unmarkEntryRead, setHiddenEntries],
   )
 
   // Star / unstar an entry. Stars are a long-term save-for-later
@@ -1705,6 +1714,10 @@ export function App() {
         if (e.metaKey || e.ctrlKey || e.altKey) return
         e.preventDefault()
         const wasStarred = starredSet.has(selectedCardId)
+        // Mirrors the star button's onClick (Card.tsx) — the ranker
+        // needs this event regardless of input path, or the
+        // preference vector never learns from keyboard-driven saves.
+        recordImmediate({ entry_id: selectedCardId, type: 'bookmark' })
         toggleStarEntry(selectedCardId)
         toast(
                           wasStarred
@@ -1732,6 +1745,15 @@ export function App() {
         e.preventDefault()
         const col = columns[selectedColumnIndex]
         if (!col) return
+        // Mirrors the eye button's onClick (Card.tsx): record the
+        // 'never' signal only on the hide direction (not unhide),
+        // same guard the button uses. Without this the preference
+        // vector never sees keyboard-driven hides — a card hidden
+        // with 'h' looked identical to one never touched, so the
+        // ranker kept recommending the same kind of thing.
+        if (!hiddenSet.has(selectedCardId)) {
+          recordImmediate({ entry_id: selectedCardId, type: 'never' })
+        }
         toggleHideEntry(col.name, selectedCardId)
       } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey && !e.altKey) {
         // Refresh the dashboard. Bare ``r``; Cmd+R / Ctrl+R
@@ -1752,6 +1774,7 @@ export function App() {
     toggleSummary,
     refresh,
     toggleHideEntry,
+    hiddenSet,
     starredSet,
     toggleStarEntry,
   ])
