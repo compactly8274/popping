@@ -12,6 +12,13 @@
 //     can scan for what they haven't read yet. Defaults to "read"
 //     so cards that haven't been computed (e.g. before F2 lands on
 //     a given column) don't all flash unread.
+//   - Swipe right = mark read, swipe left = hide (Apollo/iOS Mail
+//     style). See the SWIPE_* constants below for the tuning —
+//     there's a dead zone + a direction lock so an intentional
+//     vertical scroll never gets mistaken for a swipe, and a firm
+//     commit threshold so a short/accidental drag always snaps back
+//     with no action taken. The buttons below stay as an explicit
+//     backup for anyone who doesn't want to use the gesture.
 
 import { memo, useEffect, useRef, useState, type MouseEvent, type TouchEvent } from 'react'
 import { api, type Entry } from '../api'
@@ -132,6 +139,28 @@ function scoreBand(score: number): { color: string; label: string } {
 const LONG_PRESS_MS = 500
 const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
+// Swipe-to-act tuning. The previous mobile gesture (swipe to change
+// column, in App.tsx) had none of this — any 60px horizontal delta
+// fired regardless of direction, which is what made it feel like a
+// hair trigger. This one is deliberately firmer:
+//   - DEAD_ZONE: below this, nothing happens yet (absorbs finger
+//     jitter and the first few px of every scroll attempt).
+//   - DIRECTION_RATIO: once past the dead zone, the gesture only
+//     locks into a horizontal swipe if the horizontal delta clearly
+//     dominates the vertical one. Otherwise it's treated as a
+//     vertical scroll and the card ignores the rest of the touch —
+//     an intentional scroll never gets hijacked into a swipe.
+//   - MAX_REVEAL: the card can't be dragged past this; further
+//     finger movement just holds it there (no rubber-band physics,
+//     keeps the interaction predictable).
+//   - COMMIT: how far (out of MAX_REVEAL) the drag has to go before
+//     release fires the action. ~66% of the max reveal — anything
+//     short of that snaps back with no action taken.
+const SWIPE_DEAD_ZONE_PX = 12
+const SWIPE_DIRECTION_RATIO = 1.3
+const SWIPE_MAX_REVEAL_PX = 88
+const SWIPE_COMMIT_PX = 58
+
 export function CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred, onHideToggle, hidden }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
@@ -139,6 +168,18 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
   // Kept in refs so the values don't trigger re-renders mid-press.
   const touchStart = useRef<{ x: number; y: number; t: number; id: number; onInteractiveChild: boolean } | null>(null)
   const longPressTimer = useRef<number | null>(null)
+
+  // Swipe-to-act state. Refs, not useState — a touchmove-driven
+  // re-render for every pixel of drag would be needlessly expensive
+  // across a list of 20-50 cards. Visuals are applied imperatively
+  // (see applySwipeVisual) and only the final commit/cancel touches
+  // React state, via the same onMarkRead / onHideToggle callbacks
+  // the buttons already use.
+  const articleRef = useRef<HTMLElement | null>(null)
+  const readRevealRef = useRef<HTMLDivElement | null>(null)
+  const hideRevealRef = useRef<HTMLDivElement | null>(null)
+  const swipeDx = useRef(0)
+  const swipeLock = useRef<'none' | 'horizontal' | 'vertical'>('none')
 
   // Stable DOM-ref callback. The Column passes a fresh lambda per
   // card per render; we stash the latest in a ref and forward
@@ -150,6 +191,7 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
   const cardRefLatest = useRef<typeof cardRef>(cardRef)
   cardRefLatest.current = cardRef
   const stableCardRef = useRef((el: HTMLElement | null) => {
+    articleRef.current = el
     cardRefLatest.current?.(el)
   }).current
 
@@ -214,19 +256,68 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
     }
   }
 
+  // Push the current drag offset onto the DOM directly (no React
+  // state) so a fast finger doesn't queue a render per pixel.
+  // ``animate`` adds a short transition for the release snap;
+  // during an active drag we want 1:1 finger tracking, so it's
+  // omitted on every touchmove call.
+  const applySwipeVisual = (dx: number, animate: boolean) => {
+    const el = articleRef.current
+    if (el) {
+      el.style.transition = animate ? 'transform 180ms ease-out' : ''
+      el.style.transform = dx === 0 ? '' : `translateX(${dx}px)`
+    }
+    const progress = Math.min(1, Math.abs(dx) / SWIPE_MAX_REVEAL_PX)
+    if (readRevealRef.current) {
+      readRevealRef.current.style.opacity = dx > 0 ? String(progress) : '0'
+    }
+    if (hideRevealRef.current) {
+      hideRevealRef.current.style.opacity = dx < 0 ? String(progress) : '0'
+    }
+  }
+
+  const resetSwipe = (animate: boolean) => {
+    swipeDx.current = 0
+    swipeLock.current = 'none'
+    applySwipeVisual(0, animate)
+  }
+
+  // Mirrors the checkmark button's onClick (below) exactly — same
+  // event, same callback — so a swipe-right and a tap produce an
+  // identical outcome.
+  const commitMarkRead = () => {
+    if (!onMarkRead) return
+    const dwellMs = Math.min(Date.now() - mountTime.current, 5 * 60 * 1000)
+    recordImmediate({ entry_id: entry.id, type: 'view' })
+    recordBatched({ entry_id: entry.id, type: 'dwell', value: dwellMs })
+    onMarkRead()
+  }
+
+  // Mirrors the eye button's onClick (below) exactly.
+  const commitHideToggle = () => {
+    if (!onHideToggle) return
+    if (!hidden) {
+      recordImmediate({ entry_id: entry.id, type: 'never' })
+    }
+    onHideToggle()
+  }
+
   const onTouchStart = (e: TouchEvent<HTMLElement>) => {
     // Single finger only. Two-finger gestures (pinch, etc.) skip the
-    // long-press path entirely — we don't want to fire copy on pinch.
+    // long-press AND swipe paths entirely — we don't want to fire
+    // copy or a swipe action on pinch.
     if (e.touches.length !== 1) {
       clearLongPress()
+      resetSwipe(false)
       touchStart.current = null
       return
     }
     const t = e.touches[0]
     // Mark whether the touch originated on the thumbnail (or any
-    // other interactive child like the future score chip). The
-    // long-press path skips when this is set so we don't fire
-    // copy-URL on top of the thumbnail's own click handler.
+    // other interactive child like the mark-read / star / eye
+    // buttons). Both the long-press-copy path and the swipe path
+    // skip when this is set, so dragging a button doesn't also
+    // drag the card underneath it.
     const target = e.target as HTMLElement
     const onInteractiveChild = !!target.closest('[data-card-interactive]')
     touchStart.current = {
@@ -236,6 +327,7 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
       id: t.identifier,
       onInteractiveChild,
     }
+    resetSwipe(false)
     if (onInteractiveChild) {
       // Don't arm the timer at all — saves the cleanup path too.
       return
@@ -243,28 +335,92 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
     clearLongPress()
     longPressTimer.current = window.setTimeout(() => {
       // Re-check the touch is still the same finger and roughly in
-      // place. If the user has already started swiping the column we
-      // bail so we don't fire copy mid-swipe.
+      // place. If the user has already started swiping we bail so
+      // we don't fire copy mid-swipe.
       const start = touchStart.current
-      if (!start || start.onInteractiveChild) return
+      if (!start || start.onInteractiveChild || swipeLock.current === 'horizontal') return
       longPressTimer.current = null
       void copyUrl(entry.url)
     }, LONG_PRESS_MS)
   }
 
-  const onTouchMove = (e: TouchEvent<HTMLElement>) => {
-    const start = touchStart.current
-    if (!start) return
-    const t = e.touches[0]
-    if (Math.abs(t.clientX - start.x) > LONG_PRESS_MOVE_TOLERANCE_PX ||
-        Math.abs(t.clientY - start.y) > LONG_PRESS_MOVE_TOLERANCE_PX) {
-      clearLongPress()
+  // Native (non-passive) touchmove listener. JSX's onTouchMove is
+  // registered passive by React for scroll performance, which means
+  // preventDefault() inside it is silently ignored — the page would
+  // keep scrolling underneath an in-progress card swipe. Drawer.tsx
+  // hit the same issue for its swipe-to-dismiss and solved it the
+  // same way: a manual, non-passive listener via addEventListener.
+  useEffect(() => {
+    const el = articleRef.current
+    if (!el) return
+    const onMove = (e: globalThis.TouchEvent) => {
+      const start = touchStart.current
+      if (!start || start.onInteractiveChild || e.touches.length !== 1) return
+      const t = e.touches[0]
+      const dx = t.clientX - start.x
+      const dy = t.clientY - start.y
+
+      if (swipeLock.current === 'none') {
+        if (Math.abs(dx) < SWIPE_DEAD_ZONE_PX && Math.abs(dy) < SWIPE_DEAD_ZONE_PX) {
+          // Still inside the dead zone — could be a tap, could be
+          // the start of a scroll or a swipe. Wait for more signal.
+          if (Math.abs(dx) > LONG_PRESS_MOVE_TOLERANCE_PX || Math.abs(dy) > LONG_PRESS_MOVE_TOLERANCE_PX) {
+            clearLongPress()
+          }
+          return
+        }
+        clearLongPress()
+        if (Math.abs(dx) > Math.abs(dy) * SWIPE_DIRECTION_RATIO) {
+          swipeLock.current = 'horizontal'
+        } else {
+          // Vertical intent — this is a scroll, not a swipe. Don't
+          // touch it again for the rest of this touch sequence.
+          swipeLock.current = 'vertical'
+          return
+        }
+      }
+      if (swipeLock.current !== 'horizontal') return
+
+      // A right-swipe with no onMarkRead wired (or a left-swipe with
+      // no onHideToggle) has nothing to commit to — clamp to 0 so
+      // the card doesn't visually drag in a direction that does
+      // nothing on release.
+      let clamped = dx
+      if (dx > 0 && !onMarkRead) clamped = 0
+      if (dx < 0 && !onHideToggle) clamped = 0
+      clamped = Math.max(-SWIPE_MAX_REVEAL_PX, Math.min(SWIPE_MAX_REVEAL_PX, clamped))
+      if (clamped !== 0) {
+        // Only now, once we're actually dragging the card, block the
+        // page from also scrolling underneath the gesture.
+        e.preventDefault()
+      }
+      swipeDx.current = clamped
+      applySwipeVisual(clamped, false)
     }
-  }
+    el.addEventListener('touchmove', onMove, { passive: false })
+    return () => el.removeEventListener('touchmove', onMove)
+    // onMarkRead / onHideToggle are read fresh from the closure each
+    // effect run (the deps array below re-attaches the listener
+    // whenever either identity changes, which — per Card.memo's
+    // custom comparator — is only when the Column re-derives its
+    // per-card callbacks, not on every poll).
+  }, [onMarkRead, onHideToggle])
 
   const onTouchEnd = (e: TouchEvent<HTMLElement>) => {
     const start = touchStart.current
     clearLongPress()
+    const wasSwiping = swipeLock.current === 'horizontal'
+    const finalDx = swipeDx.current
+    if (wasSwiping) {
+      resetSwipe(true)
+      if (Math.abs(finalDx) >= SWIPE_COMMIT_PX) {
+        e.preventDefault()
+        e.stopPropagation()
+        if (finalDx > 0) commitMarkRead()
+        else commitHideToggle()
+      }
+    }
+    swipeLock.current = 'none'
     if (!start) return
     touchStart.current = null
     // If the press held LONG_PRESS_MS the timer already fired (and we
@@ -279,7 +435,7 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
     // thumbnail opens the article as the user expects.
     const timerFired = longPressTimer.current === null
     const dur = Date.now() - start.t
-    if (timerFired && dur >= LONG_PRESS_MS) {
+    if (!wasSwiping && timerFired && dur >= LONG_PRESS_MS) {
       e.preventDefault()
       e.stopPropagation()
     }
@@ -287,6 +443,7 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
 
   const onTouchCancel = () => {
     clearLongPress()
+    resetSwipe(true)
     touchStart.current = null
   }
 
@@ -400,24 +557,51 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
   const dimClass = unread || selected ? '' : 'opacity-60'
 
   return (
-    <article
-      ref={stableCardRef}
-      data-card-id={entry.id}
-      // ``tabIndex`` only on the selected card so the rest of the
-      // grid isn't a giant tab-stop forest. Arrow keys set
-      // tabIndex={0} and call focus() when the user moves with the
-      // keyboard.
-      tabIndex={selected ? 0 : -1}
-      onTouchStart={onTouchStart}
-      onTouchMove={onTouchMove}
-      onTouchEnd={onTouchEnd}
-      onTouchCancel={onTouchCancel}
-      onContextMenu={onContextMenu}
-      className={`group relative rounded-ios-lg bg-bg-surface border border-hairline p-4 pl-5
-                  hover:-translate-y-px hover:shadow-glow-md
-                  transition-[transform,box-shadow,border-color,opacity] duration-200
-                  ${ringClass} ${dimClass}`}
-    >
+    <div className="relative">
+      {/* Swipe-reveal backgrounds. Sit behind the card (z-order is
+          implicit — the article below has its own opaque
+          background), full-bleed so the color reads as "the card is
+          sliding off this surface" rather than a separate strip.
+          Opacity is driven imperatively by applySwipeVisual as the
+          user drags; at rest both sit fully transparent and
+          pointer-events-none so they never intercept a tap. */}
+      {onMarkRead && (
+        <div
+          ref={readRevealRef}
+          aria-hidden="true"
+          className="absolute inset-0 rounded-ios-lg bg-emerald-600 flex items-center pl-5 pointer-events-none opacity-0"
+        >
+          <CheckIcon className="w-5 h-5 text-white" filled />
+          <span className="ml-2 text-ios-body font-medium text-white">Read</span>
+        </div>
+      )}
+      {onHideToggle && (
+        <div
+          ref={hideRevealRef}
+          aria-hidden="true"
+          className="absolute inset-0 rounded-ios-lg bg-red-600 flex items-center justify-end pr-5 pointer-events-none opacity-0"
+        >
+          <span className="mr-2 text-ios-body font-medium text-white">Hide</span>
+          <EyeIcon className="w-5 h-5 text-white" closed />
+        </div>
+      )}
+      <article
+        ref={stableCardRef}
+        data-card-id={entry.id}
+        // ``tabIndex`` only on the selected card so the rest of the
+        // grid isn't a giant tab-stop forest. Arrow keys set
+        // tabIndex={0} and call focus() when the user moves with the
+        // keyboard.
+        tabIndex={selected ? 0 : -1}
+        onTouchStart={onTouchStart}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchCancel}
+        onContextMenu={onContextMenu}
+        className={`group relative rounded-ios-lg bg-bg-surface border border-hairline p-4 pl-5
+                    hover:-translate-y-px hover:shadow-glow-md
+                    transition-[box-shadow,border-color,opacity] duration-200
+                    ${ringClass} ${dimClass}`}
+      >
       {/* Category stripe. 2px wide, full height of the card. Lives
           outside the padding flow so it doesn't shift content when
           a category is/isn't known. ``aria-hidden`` because the
@@ -713,7 +897,8 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
                 : summary}
         </div>
       )}
-    </article>
+      </article>
+    </div>
   )
 }
 
