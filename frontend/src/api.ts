@@ -38,6 +38,10 @@ export interface Entry {
   // when audio_url is non-null.
   audio_url: string | null
   duration_seconds: number | null
+  // Podcasting 2.0 transcript URL, when the feed publishes one.
+  // Non-null gates the card's "Summarize episode" affordance (see
+  // api.podcastSummary).
+  transcript_url: string | null
 }
 
 // Full row with source name. Returned by the
@@ -383,6 +387,22 @@ export const api = {
   entrySummary: (entryId: number) =>
     jsonFetch<{ summary: string | null; cached: boolean }>(
       `/api/entries/${entryId}/summary`,
+      { method: 'POST' },
+    ),
+  /** LLM-written summary of a podcast episode's transcript. Only
+   * applicable to entries whose feed publishes a Podcasting 2.0
+   * transcript (``entry.transcript_url`` non-null) — reuses that
+   * transcript rather than transcribing the audio itself, so it's
+   * cheap (no speech-to-text) but only works for feeds that opt in.
+   * ``available`` is false when there's no transcript at all (the
+   * card should hide/disable the affordance in that case, though in
+   * practice the UI only ever calls this when ``transcript_url`` is
+   * already known to be set). ``summary`` can still be null/empty
+   * with ``available: true`` when the transcript fetch or the LLM
+   * call failed — the UI shows a "couldn't summarize" message. */
+  podcastSummary: (entryId: number) =>
+    jsonFetch<{ summary: string | null; cached: boolean; available: boolean }>(
+      `/api/entries/${entryId}/podcast_summary`,
       { method: 'POST' },
     ),
 

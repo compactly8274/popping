@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import re
+import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import urljoin
 
@@ -221,7 +222,63 @@ def _parse_itunes_duration(entry: Any) -> int | None:
     else:
         return None
     return h * 3600 + m * 60 + s
-    return None
+
+
+# Podcasting 2.0 namespace — https://podcastindex.org/namespace/1.0.
+# feedparser doesn't recognize this namespace (it's newer than
+# feedparser's built-in itunes/media/dc/content handling), so
+# <podcast:transcript> tags are silently dropped by the feedparser
+# pass. We separately walk the raw XML with ElementTree to pick them
+# up. Content-type preference: JSON (Podcast Index's own schema —
+# structured, cheapest to turn into clean text), then plain text,
+# then HTML, then the caption formats (VTT/SRT — need timing-cue
+# stripping before they're useful as summarization input).
+_PODCAST_NS = "https://podcastindex.org/namespace/1.0"
+_TRANSCRIPT_TYPE_PRIORITY = {
+    "application/json": 0,
+    "text/plain": 1,
+    "text/html": 2,
+    "text/vtt": 3,
+    "application/srt": 4,
+    "text/srt": 4,
+}
+
+
+def _extract_podcast_transcripts(xml_text: str) -> dict[str, tuple[str, str]]:
+    """Map each ``<item>``'s link/guid to its best ``<podcast:transcript>``
+    (url, content_type), for feeds that ship one. Returns {} for feeds
+    that don't use the podcast namespace or fail to parse as strict
+    XML — feedparser's lenient parse already succeeded by this point
+    (this function only runs after that), so a strict-parse failure
+    here just means "no transcripts", not "the feed is broken".
+
+    Keyed by both the item's <link> text and <guid> text (whichever
+    the caller's feedparser entry exposes) since either can be the
+    identifier ``fetch_rss`` looks the result up by.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return {}
+    ns = {"podcast": _PODCAST_NS}
+    result: dict[str, tuple[str, str]] = {}
+    for item in root.iter("item"):
+        candidates: list[tuple[str, str]] = []
+        for t in item.findall("podcast:transcript", ns):
+            url = t.get("url")
+            ctype = (t.get("type") or "").lower().strip()
+            if url:
+                candidates.append((url, ctype))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda c: _TRANSCRIPT_TYPE_PRIORITY.get(c[1], 99))
+        best = candidates[0]
+        link_el = item.find("link")
+        guid_el = item.find("guid")
+        for el in (link_el, guid_el):
+            if el is not None and el.text:
+                result[el.text.strip()] = best
+    return result
 
 
 # Per-stage timeouts for the RSS fetch. ``connect`` is the TCP /
@@ -311,12 +368,14 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
                             f"rss: {url} redirected to a denied host"
                         )
             feed = feedparser.parse(resp.text)
+            transcripts_by_key = _extract_podcast_transcripts(resp.text)
             items: list[dict] = []
             for entry in feed.entries:
                 image_url = _pick_image_url(entry)
+                entry_url = _entry_url(entry)
                 item: dict[str, Any] = {
                     "title": entry.get("title", ""),
-                    "url": _entry_url(entry),
+                    "url": entry_url,
                     "published_at": _parse_published(entry),
                     "summary": entry.get("summary", ""),
                     # Top-level so the ingest pipeline can pop it out of
@@ -335,6 +394,16 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
                 duration_seconds = _parse_itunes_duration(entry)
                 if duration_seconds is not None:
                     item["duration_seconds"] = duration_seconds
+                # Transcript, if the feed publishes one via the
+                # Podcasting 2.0 <podcast:transcript> tag. Looked up
+                # by link first (matches entry_url, the common case),
+                # falling back to the guid (feedparser's ``id``) for
+                # feeds whose <link> and <guid> differ.
+                transcript = transcripts_by_key.get(entry_url) or transcripts_by_key.get(
+                    entry.get("id") or ""
+                )
+                if transcript:
+                    item["transcript_url"], item["transcript_type"] = transcript
                 items.append(item)
             # HTTP 200 but the body doesn't look like an RSS/Atom
             # feed: Cloudflare challenges, paywall interstitials,
