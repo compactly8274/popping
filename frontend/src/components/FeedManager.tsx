@@ -60,6 +60,12 @@ const REFRESH_PRESETS: Array<{ value: number; label: string }> = [
   { value: 86400, label: '24 hours' },
 ]
 
+// Mirrors the backend's _PODCAST_DEFAULT_REFRESH (routes/sources.py)
+// — episodes publish far less often than news, so the "Podcast"
+// radio bumps the refresh dropdown to this instead of the 1h
+// plain-RSS default.
+const PODCAST_DEFAULT_REFRESH = 21600
+
 // Categories the user can pick from when adding a custom source.
 // Existing source categories + a couple of common extras the
 // recommendations list uses. Free-form text is also accepted in the
@@ -75,6 +81,7 @@ const CATEGORY_OPTIONS = [
   'policy',
   'longform',
   'deals',
+  'podcast',
   'other',
 ]
 
@@ -1022,10 +1029,13 @@ function AddCustomTab({
   // Subtype selector — drives both the URL placeholder/label and the
   // client-side validation. ``"rss"`` (default) takes a feed URL;
   // ``"reddit"`` takes a subreddit reference (``r/python`` or full
-  // ``https://www.reddit.com/r/python``). The backend applies the
-  // same dispatch in ``routes/sources.create_source_endpoint`` so
-  // the field reaches ``POST /api/sources`` as ``type``.
-  const [sourceType, setSourceType] = useState<'rss' | 'reddit'>('rss')
+  // ``https://www.reddit.com/r/python``); ``"podcast"`` also takes a
+  // feed URL (podcast feeds are RSS-shaped — the backend extracts
+  // the episode audio + duration from the same fetch). The backend
+  // applies the same dispatch in
+  // ``routes/sources.create_source_endpoint`` so the field reaches
+  // ``POST /api/sources`` as ``type``.
+  const [sourceType, setSourceType] = useState<'rss' | 'reddit' | 'podcast'>('rss')
   const [submitting, setSubmitting] = useState(false)
   // Test step. ``testing`` is true while the request is in flight;
   // ``testResult`` holds the last result so the user can see
@@ -1057,7 +1067,7 @@ function AddCustomTab({
       return 'name must be lowercase letters, digits, or underscore (1-120 chars)'
     }
     if (!trimmedUrl) return 'url is required'
-    if (sourceType === 'rss') {
+    if (sourceType === 'rss' || sourceType === 'podcast') {
       try {
         new URL(trimmedUrl)
       } catch {
@@ -1080,7 +1090,7 @@ function AddCustomTab({
     const trimmedUrl = url.trim()
     if (!trimmedUrl) {
       setUrlError('url is required')
-    } else if (sourceType === 'rss') {
+    } else if (sourceType === 'rss' || sourceType === 'podcast') {
       try {
         new URL(trimmedUrl)
         setUrlError(null)
@@ -1192,13 +1202,15 @@ function AddCustomTab({
         </p>
       </div>
       {/* Subtype selector. Drives the URL label + placeholder + the
-          validator branch in ``submit``. Two radios sit next to the
-          URL field so the user sees the choice immediately — a
-          dropdown would work but adds a click and hides the most
-          common choice (RSS). ``ml-auto`` on the radios block pushes
-          the group to the right edge so the label + radios share a
-          single visual row on mobile. */}
-      <fieldset className="flex items-center gap-3">
+          validator branch in ``submit``. Radios sit next to the URL
+          field so the user sees the choice immediately — a dropdown
+          would work but adds a click and hides the most common
+          choice (RSS). Picking "Podcast" also bumps the refresh
+          default to 6h (episodes are infrequent; polling hourly
+          just wastes requests — see _PODCAST_DEFAULT_REFRESH on the
+          backend) unless the user has already customized it away
+          from the plain-RSS default. */}
+      <fieldset className="flex items-center gap-3 flex-wrap">
         <legend className="sr-only">Source type</legend>
         <span className="text-ios-caption uppercase tracking-wide text-label-tertiary">Type</span>
         <label className="flex items-center gap-1 text-ios-caption text-label-primary">
@@ -1207,7 +1219,10 @@ function AddCustomTab({
             name="fm-type"
             value="rss"
             checked={sourceType === 'rss'}
-            onChange={() => setSourceType('rss')}
+            onChange={() => {
+              setSourceType('rss')
+              if (refresh === PODCAST_DEFAULT_REFRESH) setRefresh(3600)
+            }}
             className="accent-accent"
           />
           RSS / Atom
@@ -1218,10 +1233,28 @@ function AddCustomTab({
             name="fm-type"
             value="reddit"
             checked={sourceType === 'reddit'}
-            onChange={() => setSourceType('reddit')}
+            onChange={() => {
+              setSourceType('reddit')
+              if (refresh === PODCAST_DEFAULT_REFRESH) setRefresh(900)
+            }}
             className="accent-accent"
           />
           Subreddit
+        </label>
+        <label className="flex items-center gap-1 text-ios-caption text-label-primary">
+          <input
+            type="radio"
+            name="fm-type"
+            value="podcast"
+            checked={sourceType === 'podcast'}
+            onChange={() => {
+              setSourceType('podcast')
+              if (refresh === 3600) setRefresh(PODCAST_DEFAULT_REFRESH)
+              if (category === 'news') setCategory('podcast')
+            }}
+            className="accent-accent"
+          />
+          Podcast
         </label>
       </fieldset>
       <div>
@@ -1229,17 +1262,19 @@ function AddCustomTab({
           className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1"
           htmlFor="fm-url"
         >
-          {sourceType === 'rss' ? 'RSS / Atom URL' : 'Subreddit'}
+          {sourceType === 'reddit' ? 'Subreddit' : sourceType === 'podcast' ? 'Podcast RSS URL' : 'RSS / Atom URL'}
         </label>
         <input
           id="fm-url"
-          type={sourceType === 'rss' ? 'url' : 'text'}
+          type={sourceType === 'reddit' ? 'text' : 'url'}
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder={
-            sourceType === 'rss'
-              ? 'https://example.com/feed.xml'
-              : 'r/python or https://www.reddit.com/r/python'
+            sourceType === 'reddit'
+              ? 'r/python or https://www.reddit.com/r/python'
+              : sourceType === 'podcast'
+                ? 'https://example.com/podcast/feed.xml'
+                : 'https://example.com/feed.xml'
           }
           className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
         />

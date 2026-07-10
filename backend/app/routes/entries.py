@@ -137,6 +137,11 @@ async def list_entries(
         # cheap on large entry tables.
         Entry.meta.op("->>")("reddit_thread_url").label("reddit_thread_url"),
         Entry.meta.op("->>")("reddit_comment_count").label("reddit_comment_count_text"),
+        # Podcast episode audio, same pull-out-of-meta pattern. NULL
+        # for every non-podcast entry — the card only renders the
+        # "Listen" affordance when audio_url is non-null.
+        Entry.meta.op("->>")("audio_url").label("audio_url"),
+        Entry.meta.op("->>")("duration_seconds").label("duration_seconds_text"),
     )
     stmt = select(*columns).join(Source, Entry.source_id == Source.id)
     if q:
@@ -234,6 +239,12 @@ async def list_entries(
                 # write or a bad migration left a non-int string,
                 # null it out rather than 422 the whole list.
                 data["reddit_comment_count"] = None
+        raw_duration = data.pop("duration_seconds_text", None)
+        if raw_duration is not None:
+            try:
+                data["duration_seconds"] = int(raw_duration)
+            except (TypeError, ValueError):
+                data["duration_seconds"] = None
         out.append(EntryListOut.model_validate(data))
     return out
 

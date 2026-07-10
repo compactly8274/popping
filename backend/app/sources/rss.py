@@ -181,6 +181,49 @@ def _pick_image_url(entry: Any) -> str | None:
     return None
 
 
+def _pick_audio_enclosure(entry: Any) -> str | None:
+    """The episode's audio file URL from the RSS <enclosure> tag, or
+    None. Podcast feeds ship exactly one audio enclosure per item —
+    a plain article feed has none, which is the common case and
+    correctly returns None rather than a guess (same "no signal
+    beats a guessed one" rule ``_pick_image_url`` and the RFD
+    engagement extractor already follow).
+    """
+    for enc in entry.get("enclosures") or []:
+        ct = (enc.get("type") or "").lower()
+        if ct.startswith("audio/") and enc.get("href"):
+            return enc["href"]
+    return None
+
+
+def _parse_itunes_duration(entry: Any) -> int | None:
+    """Episode duration in seconds from <itunes:duration>, or None.
+
+    The tag isn't consistently formatted across podcast hosts — some
+    ship plain seconds ("3723"), others "H:MM:SS" or "MM:SS". Handles
+    all three; returns None (not 0) when the field is absent or
+    unparseable so a missing duration doesn't render as "0:00".
+    """
+    raw = entry.get("itunes_duration")
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if raw.isdigit():
+        return int(raw)
+    parts = raw.split(":")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    nums = [int(p) for p in parts]
+    if len(nums) == 3:
+        h, m, s = nums
+    elif len(nums) == 2:
+        h, m, s = 0, nums[0], nums[1]
+    else:
+        return None
+    return h * 3600 + m * 60 + s
+    return None
+
+
 # Per-stage timeouts for the RSS fetch. ``connect`` is the TCP /
 # TLS handshake budget — failing fast here is correct, because a
 # host that can't accept the connection in 10s isn't coming back.
@@ -271,17 +314,28 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
             items: list[dict] = []
             for entry in feed.entries:
                 image_url = _pick_image_url(entry)
-                items.append(
-                    {
-                        "title": entry.get("title", ""),
-                        "url": _entry_url(entry),
-                        "published_at": _parse_published(entry),
-                        "summary": entry.get("summary", ""),
-                        # Top-level so the ingest pipeline can pop it out of
-                        # meta cleanly. NULL when the feed ships no image.
-                        "image_url": image_url,
-                    }
-                )
+                item: dict[str, Any] = {
+                    "title": entry.get("title", ""),
+                    "url": _entry_url(entry),
+                    "published_at": _parse_published(entry),
+                    "summary": entry.get("summary", ""),
+                    # Top-level so the ingest pipeline can pop it out of
+                    # meta cleanly. NULL when the feed ships no image.
+                    "image_url": image_url,
+                }
+                # Podcast fields. Only added when present — unlike
+                # image_url (which the ingest pipeline always pops,
+                # so it needs a stable key) these have no dedicated
+                # Entry column and just flow into meta, so an absent
+                # key is cheaper than an always-present null (matches
+                # the RFD engagement extractor's convention).
+                audio_url = _pick_audio_enclosure(entry)
+                if audio_url:
+                    item["audio_url"] = audio_url
+                duration_seconds = _parse_itunes_duration(entry)
+                if duration_seconds is not None:
+                    item["duration_seconds"] = duration_seconds
+                items.append(item)
             # HTTP 200 but the body doesn't look like an RSS/Atom
             # feed: Cloudflare challenges, paywall interstitials,
             # JavaScript-rendered shells, etc. all return HTML that
