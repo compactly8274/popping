@@ -279,6 +279,12 @@ class EntryListOut(BaseModel):
     # optional-chaining on every render.
     reddit_thread_url: Optional[str] = None
     reddit_comment_count: Optional[int] = None
+    # Podcast episode audio, same pull-out-of-meta pattern as the
+    # reddit fields above. Both null for every non-podcast entry;
+    # the card only renders the "Listen" affordance when audio_url
+    # is non-null.
+    audio_url: Optional[str] = None
+    duration_seconds: Optional[int] = None
 
     class Config:
         from_attributes = True

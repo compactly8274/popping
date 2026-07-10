@@ -63,6 +63,7 @@ from app.sources import list_sources
 from app.sources.base import SourcePlugin
 from app.sources.dynamic_reddit import DynamicRedditPlugin
 from app.sources.dynamic_rss import DynamicRssPlugin
+from app.sources.podcast import DynamicPodcastPlugin
 
 logger = logging.getLogger("popping.scheduler")
 
@@ -1576,10 +1577,12 @@ async def backfill_now() -> dict:
 #
 # ``Source`` rows whose ``name`` is not in the registered plugin
 # registry are "dynamic" — they have no class backing them and need a
-# runtime-constructed plugin to be fetched. Today this only covers
-# ``type="rss"`` (served by ``DynamicRssPlugin``); Phase 6 will add
-# ``type="podcast"``, Phase 7 ``type="youtube_channel"``. Both will
-# land as their own ``_plugin_for(row)`` branch below.
+# runtime-constructed plugin to be fetched. Covers ``type="rss"``
+# (``DynamicRssPlugin``), ``type="reddit"`` (``DynamicRedditPlugin``),
+# and ``type="podcast"`` (``DynamicPodcastPlugin`` — podcast feeds are
+# RSS-shaped, so this is a thin wrapper around the same fetch path).
+# Phase 7 will add ``type="youtube_channel"`` as its own
+# ``_plugin_for(row)`` branch below.
 #
 # Each dynamic row gets its own scheduler job keyed by
 # ``ingest:dynamic:{row.id}``. This id is what the routes use to
@@ -1609,7 +1612,9 @@ def _plugin_for(row: Source) -> SourcePlugin | None:
         return DynamicRssPlugin(row)
     if row.type == "reddit":
         return DynamicRedditPlugin(row)
-    # Phase 6/7 will add ``podcast`` and ``youtube_channel`` here.
+    if row.type == "podcast":
+        return DynamicPodcastPlugin(row)
+    # Phase 7 will add ``youtube_channel`` here.
     logger.debug(
         "scheduler: no plugin for source %s (id=%d, type=%s) — skipping",
         row.name, row.id, row.type,

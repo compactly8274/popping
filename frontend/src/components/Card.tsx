@@ -106,6 +106,7 @@ function categoryStripeClass(category: string | undefined): string {
     case 'policy':   return 'bg-cyan-500/70'
     case 'longform': return 'bg-rose-500/70'
     case 'deals':    return 'bg-lime-500/70'
+    case 'podcast':  return 'bg-orange-500/70'
     default:         return 'bg-neutral-600/70'
   }
 }
@@ -120,6 +121,17 @@ function timeAgo(iso: string | null): string {
   if (hours < 24) return `${hours}h ago`
   const days = Math.floor(hours / 24)
   return `${days}d ago`
+}
+
+// Podcast episode duration, MM:SS under an hour and H:MM:SS past it
+// — matches how every podcast app formats episode length.
+function formatDuration(totalSeconds: number): string {
+  const h = Math.floor(totalSeconds / 3600)
+  const m = Math.floor((totalSeconds % 3600) / 60)
+  const s = Math.floor(totalSeconds % 60)
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m)
+  const ss = String(s).padStart(2, '0')
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
 }
 
 // Score bands. Each tier is a gradient now — the flat bg-score-*
@@ -871,6 +883,36 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
           <span>Discussed on Reddit</span>
           {typeof entry.reddit_comment_count === 'number' && entry.reddit_comment_count > 0 && (
             <span className="text-label-secondary">· {entry.reddit_comment_count} comments</span>
+          )}
+        </a>
+      )}
+      {/* Podcast episode audio. Same footer treatment as the Reddit
+          cross-reference above — only appears when the entry came
+          from a podcast feed (``audio_url`` non-null, populated by
+          app.sources.rss's enclosure extraction). Opens the raw
+          audio file directly rather than embedding a player: an
+          inline <audio> element would need per-card playback state
+          and competing-playback handling across a list of 20-50
+          cards, which is a lot of surface area for what the browser
+          already does for free on an audio-file link. */}
+      {entry.audio_url && (
+        <a
+          href={entry.audio_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-card-interactive
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            recordImmediate({ entry_id: entry.id, type: 'click' })
+            window.open(entry.audio_url!, '_blank', 'noopener,noreferrer')
+          }}
+          className="mt-1.5 inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+        >
+          <span aria-hidden="true">🎧</span>
+          <span>Listen</span>
+          {typeof entry.duration_seconds === 'number' && entry.duration_seconds > 0 && (
+            <span className="text-label-secondary">· {formatDuration(entry.duration_seconds)}</span>
           )}
         </a>
       )}

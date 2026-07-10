@@ -543,6 +543,13 @@ just without the vector signal.
 - **Phase 4**: The Brief generator (daily + manual + convergence
   triggers), notifications via Apprise (preferred) / Pushover (fallback),
   alert paths for high-CVSS CVEs and convergence clusters. ✅
+- **Phase 5**: user-managed feeds — add/edit/delete dynamic RSS and
+  Reddit sources from the UI, per-source custom headers, a Test-before-Add
+  fetch check, and a preference-vector-ranked Recommended tab. ✅
+- **Phase 6**: podcast sources (`type="podcast"`) — reuses the RSS fetch
+  path since podcast feeds are RSS-shaped; extracts the episode audio
+  file and duration from the `<enclosure>` / `<itunes:duration>` tags.
+  The card renders a "🎧 Listen" link when an entry has one. ✅
 
 ## Environment variables
 

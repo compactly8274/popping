@@ -70,6 +70,13 @@ _REFRESH_MAX = 86_400
 # point. The inline editor can override per-row.
 _REDDIT_DEFAULT_REFRESH = 900
 
+# Default refresh for ``type="podcast"`` rows. Episodes publish
+# weekly/daily at most — polling every hour (the plain-RSS default)
+# just wastes a scheduler tick and a request to the host for months
+# at a time between episodes. 6h is generous headroom for same-day
+# discovery without hammering the feed.
+_PODCAST_DEFAULT_REFRESH = 21_600
+
 # Mirrors ``Source.category``'s ``String(40)``. A PATCH / POST with a
 # longer string would crash on the DB layer with a Postgres
 # ``value too long for type character varying(40)`` — surfaced as a
@@ -300,30 +307,40 @@ async def create_source_endpoint(
 ) -> SourceOut:
     """Add a new dynamic source.
 
-    v1 accepts ``type="rss"`` and ``type="reddit"`` (``"podcast"`` /
-    ``"youtube_channel"`` land in later phases and route to their
-    own plugin dispatchers via ``scheduler._plugin_for``).
+    v1 accepts ``type="rss"``, ``type="reddit"``, and
+    ``type="podcast"`` (podcast feeds are RSS-shaped — see
+    ``app.sources.podcast``). ``"youtube_channel"`` lands in a later
+    phase and routes to its own plugin dispatcher via
+    ``scheduler._plugin_for``.
     """
     _validate_name(body.name)
     # Type-aware URL validation. Reddit rows accept a subreddit
     # reference (``r/python``) and get rewritten to the canonical
-    # Reddit thread URL; RSS rows take a plain http(s) feed URL.
+    # Reddit thread URL; RSS and podcast rows take a plain http(s)
+    # feed URL (a podcast feed IS an RSS feed).
     if body.type == "reddit":
         url = _validate_reddit_url(body.url)
     else:
         _validate_url(body.url)
         url = body.url
-    if body.type not in ("rss", "reddit"):
+    if body.type not in ("rss", "reddit", "podcast"):
         raise HTTPException(
             status_code=400,
-            detail=f"unsupported type {body.type!r} (only 'rss' and 'reddit' are accepted in this build)",
+            detail=f"unsupported type {body.type!r} (only 'rss', 'reddit', and 'podcast' are accepted in this build)",
         )
     _validate_category(body.category)
     # ``refresh_interval_seconds`` is optional in the schema; default
     # to a per-type sensible value when absent. Reddit moves faster
-    # than news RSS so 15 min vs 1h is the right baseline.
+    # than news RSS so 15 min vs 1h is the right baseline; podcasts
+    # are the opposite — episodes are infrequent, so 6h avoids
+    # polling a feed that won't change for days.
     if body.refresh_interval_seconds is None:
-        refresh = _REDDIT_DEFAULT_REFRESH if body.type == "reddit" else _REFRESH_MIN * 60
+        if body.type == "reddit":
+            refresh = _REDDIT_DEFAULT_REFRESH
+        elif body.type == "podcast":
+            refresh = _PODCAST_DEFAULT_REFRESH
+        else:
+            refresh = _REFRESH_MIN * 60
     else:
         refresh = _validate_refresh(body.refresh_interval_seconds)
     headers = _validate_custom_headers(body.custom_headers)
@@ -499,11 +516,11 @@ async def _test_source_impl(
     # validation here is intentionally a subset of the create flow's
     # (no DB write, no scheduler registration) so a Test never has
     # side effects beyond the upstream fetch.
-    if body.type not in ("rss", "reddit"):
+    if body.type not in ("rss", "reddit", "podcast"):
         return SourceTestResult(
             ok=False,
             error_kind="unsupported_type",
-            error=f"unsupported type {body.type!r} (only 'rss' and 'reddit' are accepted)",
+            error=f"unsupported type {body.type!r} (only 'rss', 'reddit', and 'podcast' are accepted)",
         )
 
     # Name is optional on Test, but if provided it must be valid AND
@@ -593,7 +610,10 @@ async def _test_source_impl(
     # same parse + normalize logic the live ingest uses — a
     # "works on test" result is a true "Add will work" signal.
     try:
-        if body.type == "rss":
+        if body.type in ("rss", "podcast"):
+            # Podcast feeds are RSS-shaped — same fetcher, which
+            # already extracts audio_url / duration_seconds when
+            # present (see app.sources.podcast).
             from app.sources.rss import fetch_rss
             items = await fetch_rss(url, headers=headers)
         else:  # "reddit"

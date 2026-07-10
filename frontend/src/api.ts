@@ -32,6 +32,12 @@ export interface Entry {
   // thread when `reddit_thread_url` is non-null.
   reddit_thread_url: string | null
   reddit_comment_count: number | null
+  // Podcast episode audio (populated from the RSS <enclosure> +
+  // <itunes:duration> tags — see app.sources.rss). Both null for
+  // every non-podcast entry; the card renders a "Listen" affordance
+  // when audio_url is non-null.
+  audio_url: string | null
+  duration_seconds: number | null
 }
 
 // Full row with source name. Returned by the
@@ -269,7 +275,7 @@ export const api = {
    * re-running with curl. */
   testSource: (body: {
     name?: string
-    type?: 'rss' | 'reddit'
+    type?: 'rss' | 'reddit' | 'podcast'
     category?: string
     url: string
     custom_headers?: Record<string, string> | null
