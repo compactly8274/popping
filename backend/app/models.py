@@ -138,6 +138,17 @@ class Entry(Base):
     # so a future LLM-summary path can populate the same column
     # under a different source without another migration.
     cached_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # LLM-generated summary of a podcast episode's transcript.
+    # Populated by POST /api/entries/{id}/podcast_summary the first
+    # time it's requested — same NULL-vs-empty-string cache contract
+    # as cached_summary (NULL = not asked yet, "" = asked but no
+    # transcript / LLM available, non-empty = the summary). Kept as
+    # its own column rather than reusing cached_summary: they cache
+    # different things (the feed's own blurb vs. an AI-generated
+    # summary of the audio content) for entries that could plausibly
+    # want both, and conflating them would make the UI unable to
+    # tell which kind of text it's showing.
+    podcast_transcript_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     fetched_at: Mapped[dt.datetime] = mapped_column(

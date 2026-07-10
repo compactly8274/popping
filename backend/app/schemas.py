@@ -196,6 +196,25 @@ class EntrySummaryOut(BaseModel):
     cached: bool = False
 
 
+class EntryPodcastSummaryOut(BaseModel):
+    """Body of ``POST /api/entries/{id}/podcast_summary``.
+
+    ``available`` is False when the entry has no
+    ``meta.transcript_url`` at all — the podcast doesn't publish a
+    Podcasting-2.0 transcript, so there's nothing to summarize. This
+    is distinct from ``summary=""``, which means a transcript existed
+    but the fetch or the LLM call failed (or no LLM provider is
+    configured); that failure is still cached (see
+    ``Entry.podcast_transcript_summary``) so a retry isn't
+    attempted on every tap, but ``available`` staying True tells the
+    frontend the feature is applicable here, just unsuccessful this
+    time.
+    """
+    summary: Optional[str] = None
+    cached: bool = False
+    available: bool = True
+
+
 class EntryOut(BaseModel):
     id: int
     source_id: int
@@ -285,6 +304,10 @@ class EntryListOut(BaseModel):
     # is non-null.
     audio_url: Optional[str] = None
     duration_seconds: Optional[int] = None
+    # Podcasting 2.0 transcript URL, when the feed publishes one.
+    # Drives the "Summarize episode" affordance — see
+    # POST /entries/{id}/podcast_summary.
+    transcript_url: Optional[str] = None
 
     class Config:
         from_attributes = True

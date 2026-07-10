@@ -216,6 +216,17 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
   const [summary, setSummary] = useState<string | null>(null)
   const [summaryError, setSummaryError] = useState(false)
 
+  // Podcast transcript summary. Separate local toggle (not lifted to
+  // App like ``expanded``/``onToggleSummary`` — there's no keyboard
+  // shortcut for it, so plain component state is simpler) and
+  // separate cache state, since a podcast entry can have both a
+  // regular feed summary (meta.summary) and a transcript summary,
+  // and they're different content the user might want independently.
+  const [podcastSummaryExpanded, setPodcastSummaryExpanded] = useState(false)
+  const [podcastSummary, setPodcastSummary] = useState<string | null>(null)
+  const [podcastSummaryError, setPodcastSummaryError] = useState(false)
+  const [podcastSummaryUnavailable, setPodcastSummaryUnavailable] = useState(false)
+
   // Mount timestamp. Reset on every mount via useEffect so the
   // dwell counter starts at 0 for each card instance (not for
   // each unique entry id \u2014 a re-mount on the same entry after a
@@ -251,6 +262,31 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
       cancelled = true
     }
   }, [expanded, entry.id, summary, summaryError])
+
+  useEffect(() => {
+    if (!podcastSummaryExpanded) return
+    if (podcastSummary !== null) return
+    if (podcastSummaryError) return
+    if (podcastSummaryUnavailable) return
+    let cancelled = false
+    api
+      .podcastSummary(entry.id)
+      .then((r) => {
+        if (cancelled) return
+        if (!r.available) {
+          setPodcastSummaryUnavailable(true)
+          return
+        }
+        setPodcastSummary(r.summary ?? '')
+      })
+      .catch(() => {
+        if (cancelled) return
+        setPodcastSummaryError(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [podcastSummaryExpanded, entry.id, podcastSummary, podcastSummaryError, podcastSummaryUnavailable])
 
   // Record one ``view`` event per (entry, session). ``recordBatched``
   // dedups internally so even if React strict-mode mounts the card
@@ -896,25 +932,65 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
           cards, which is a lot of surface area for what the browser
           already does for free on an audio-file link. */}
       {entry.audio_url && (
-        <a
-          href={entry.audio_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          data-card-interactive
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            recordImmediate({ entry_id: entry.id, type: 'click' })
-            window.open(entry.audio_url!, '_blank', 'noopener,noreferrer')
-          }}
-          className="mt-1.5 inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
-        >
-          <span aria-hidden="true">🎧</span>
-          <span>Listen</span>
-          {typeof entry.duration_seconds === 'number' && entry.duration_seconds > 0 && (
-            <span className="text-label-secondary">· {formatDuration(entry.duration_seconds)}</span>
+        <div className="mt-1.5 flex items-center gap-3">
+          <a
+            href={entry.audio_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-card-interactive
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              recordImmediate({ entry_id: entry.id, type: 'click' })
+              window.open(entry.audio_url!, '_blank', 'noopener,noreferrer')
+            }}
+            className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+          >
+            <span aria-hidden="true">🎧</span>
+            <span>Listen</span>
+            {typeof entry.duration_seconds === 'number' && entry.duration_seconds > 0 && (
+              <span className="text-label-secondary">· {formatDuration(entry.duration_seconds)}</span>
+            )}
+          </a>
+          {/* Only shown when the feed publishes a Podcasting 2.0
+              transcript (entry.transcript_url) — reuses that
+              transcript for an LLM summary rather than transcribing
+              the audio ourselves, so the affordance only makes
+              sense (and only appears) when one exists. */}
+          {entry.transcript_url && (
+            <button
+              type="button"
+              data-card-interactive
+              onClick={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                setPodcastSummaryExpanded((v) => !v)
+              }}
+              className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+            >
+              <span aria-hidden="true">📝</span>
+              <span>{podcastSummaryExpanded ? 'Hide summary' : 'Summarize episode'}</span>
+            </button>
           )}
-        </a>
+        </div>
+      )}
+      {podcastSummaryExpanded && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap"
+        >
+          {podcastSummaryError ? (
+            <span className="italic">couldn't generate a summary — try again later</span>
+          ) : podcastSummaryUnavailable ? (
+            <span className="italic text-label-tertiary">this episode has no transcript to summarize</span>
+          ) : podcastSummary === null ? (
+            <span className="italic text-label-tertiary">summarizing episode…</span>
+          ) : podcastSummary === '' ? (
+            <span className="italic text-label-tertiary">couldn't generate a summary (no transcript text or no LLM configured)</span>
+          ) : (
+            podcastSummary
+          )}
+        </div>
       )}
       {/* Inline summary. Sits between the meta row and the bottom
           edge of the card so it reads as "extra content below the

@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import Entry, Source
-from app.schemas import EntryListOut, EntryOut, EntrySummaryOut
+from app.podcast_transcript import fetch_transcript_text, summarize_transcript
+from app.schemas import EntryListOut, EntryOut, EntryPodcastSummaryOut, EntrySummaryOut
 
 router = APIRouter(tags=["entries"])
 
@@ -142,6 +143,11 @@ async def list_entries(
         # "Listen" affordance when audio_url is non-null.
         Entry.meta.op("->>")("audio_url").label("audio_url"),
         Entry.meta.op("->>")("duration_seconds").label("duration_seconds_text"),
+        # Podcasting 2.0 transcript URL, when the feed publishes one.
+        # NULL for everything else — the card only shows "Summarize
+        # episode" when this is non-null (see
+        # POST /entries/{id}/podcast_summary).
+        Entry.meta.op("->>")("transcript_url").label("transcript_url"),
     )
     stmt = select(*columns).join(Source, Entry.source_id == Source.id)
     if q:
@@ -415,4 +421,65 @@ async def entry_summary_endpoint(
     await session.commit()
 
     return EntrySummaryOut(summary=cleaned, cached=False)
+
+
+@router.post(
+    "/entries/{entry_id}/podcast_summary",
+    response_model=EntryPodcastSummaryOut,
+)
+async def entry_podcast_summary_endpoint(
+    entry_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> EntryPodcastSummaryOut:
+    """Return (or fetch the transcript + generate + cache) an
+    LLM-written summary of a podcast episode.
+
+    Only applicable to entries whose feed published a Podcasting 2.0
+    ``<podcast:transcript>`` tag (extracted at ingest time into
+    ``meta.transcript_url`` / ``meta.transcript_type`` — see
+    ``app.sources.rss``). Deliberately not real speech-to-text: this
+    reuses a transcript the podcast host already produced rather
+    than transcribing the audio ourselves, so it only works for feeds
+    that opt into the tag.
+
+    Cache semantics mirror ``/summary`` above:
+      - ``podcast_transcript_summary is None``  → never attempted →
+        fetch transcript + summarize + persist.
+      - ``podcast_transcript_summary == ""``    → attempted, no
+        usable result (fetch failed / no LLM configured / LLM
+        returned nothing) → return empty without re-attempting.
+      - populated                                → return cached.
+    """
+    row = await session.get(Entry, entry_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="entry not found")
+
+    if row.podcast_transcript_summary is not None:
+        return EntryPodcastSummaryOut(
+            summary=row.podcast_transcript_summary, cached=True, available=True,
+        )
+
+    meta = row.meta or {}
+    transcript_url = meta.get("transcript_url")
+    transcript_type = meta.get("transcript_type") or ""
+    if not isinstance(transcript_url, str) or not transcript_url:
+        # No transcript published for this episode — nothing to
+        # cache (a future re-ingest of the feed could pick one up if
+        # the host adds one later, so we don't want to permanently
+        # record "unavailable" on the row).
+        return EntryPodcastSummaryOut(summary=None, cached=False, available=False)
+
+    transcript_text = await fetch_transcript_text(transcript_url, transcript_type)
+    summary = None
+    if transcript_text:
+        summary = await summarize_transcript(row.title, transcript_text)
+
+    # Persist even on failure (empty string) — same rationale as
+    # cached_summary: without this, a broken transcript URL or an
+    # unconfigured LLM provider would re-attempt the fetch + (would-be)
+    # LLM call on every single tap.
+    row.podcast_transcript_summary = summary or ""
+    await session.commit()
+
+    return EntryPodcastSummaryOut(summary=summary, cached=False, available=True)
 
