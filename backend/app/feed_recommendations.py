@@ -1,41 +1,29 @@
-"""Curated feed recommendations.
+"""Feed recommendations.
 
-A hand-picked list of feeds the user might want to add. The
-FeedManager Drawer surface ("Recommended" tab) shows this list, minus
-anything the user has already added. Adding fires ``POST /api/sources``
-which uses the dynamic-source path — RSS rows go through
+Feeds the user might want to add, served from the
+``feed_recommendation_candidates`` table and shown minus anything the
+user has already added. Adding fires ``POST /api/sources`` which uses
+the dynamic-source path — RSS rows go through
 ``backend/app/sources/dynamic_rss.py``; ``type="reddit"`` rows go
 through ``backend/app/sources/dynamic_reddit.py``.
 
-Updating the static list is a code change + backend restart. That's
-deliberate: the curated list is the editorial seed; ``recommendations_for``
-re-ranks it dynamically by interaction co-occurrence once the user
-has accumulated engagement signals.
+The pool has two sources (the row's ``source`` column):
+    - ``"editorial"`` — the original 28 hand-picked feeds, seeded by
+      ``alembic/versions/0017_feed_recommendation_candidates.py``.
+      Was a hardcoded ``RECOMMENDATIONS`` list prior to that
+      migration; see the migration's docstring for the full seed and
+      the conventions each row follows (naming, category, blurb).
+    - ``"llm"`` — rows added by ``app.feed_discovery``, either
+      triggered automatically when the user adds a custom source
+      (nearest-neighbor expansion) or on demand via
+      ``POST /api/feed-recommendations/discover``.
 
-Conventions:
-    - All URLs are RSS / Atom feeds, or canonical
-      ``https://www.reddit.com/r/<sub>`` for ``type="reddit"`` rows.
-    - Names are unique, lowercase, [a-z0-9_]+ — matches the regex
-      ``POST /api/sources`` validates against. Reddit entries use
-      the ``reddit_<sub>`` prefix so they're visually distinct
-      from RSS rows in the source list.
-    - Categories are loose; the backend stores them verbatim. The
-      dashboard groups by category so an unexpected value just
-      becomes its own column.
-    - ``blurb`` is one line; the Drawer shows it under the name as
-      the editorial "why this feed" rationale.
-    - Built-in sources (``bbc_news``, ``hn_top``, etc.) are NOT in
-      this list — the backend filter strips them anyway because the
-      frontend tells us the active source names, but keeping them
-      out of the source list avoids confusion if a future change
-      drops the server-side filter.
-    - Reddit entries are only useful when the user has wired up
-      Hydra (``REDDIT_HYDRA_URL``). Without it, the per-subreddit
-      plugin's ``fetch`` short-circuits to ``[]`` and the row
-      appears in the Source list but produces no entries. The
-      curator-shipped Reddit rows surface that gap visually
-      because the user can see the empty column; they can then
-      either configure Hydra or delete the row.
+Because the pool is DB-backed, updating or adding to it is a row
+insert/update, not a code change + restart. ``recommendations_for_user``
+re-ranks whatever's currently ``active`` by interaction co-occurrence
+and embedding similarity once the user has accumulated engagement
+signals — see the "Ranking" section below, unchanged by the storage
+migration.
 
 Ranking (``recommendations_for_user``):
     Blends two independent signals, each rescaled to ``[0, 1]``:
@@ -72,313 +60,52 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.embeddings import embedder
-from app.models import Entry, Interaction, Source, UserProfile
+from app.models import Entry, FeedRecommendationCandidate, Interaction, Source, UserProfile
 from app.scoring.personal import vector_score
 
 
-# A tuple of (name, category, url, blurb). Storing as a list of dicts
-# keeps the JSON serialization for the API endpoint trivial (each row
-# becomes one response item) and lets us swap the implementation for
-# a DB-backed one in Phase 8 without changing the route.
-RECOMMENDATIONS: list[dict] = [
-    # --- tech --------------------------------------------------------------
-    {
-        "name": "the_verge",
-        "category": "tech",
-        "url": "https://www.theverge.com/rss/index.xml",
-        "blurb": "consumer-tech launches, reviews, policy",
-    },
-    {
-        "name": "arstechnica",
-        "category": "tech",
-        "url": "https://feeds.arstechnica.com/arstechnica/index",
-        "blurb": "deeper tech reporting; Ars' long-form is worth the read",
-    },
-    {
-        "name": "techcrunch",
-        "category": "tech",
-        "url": "https://techcrunch.com/feed/",
-        "blurb": "startups, funding rounds, founder interviews",
-    },
-    {
-        # NOTE: ``hackernews_best`` (hnrss.org/best) was previously
-        # here but the upstream serves a Ubiquiti self-signed cert
-        # on its public endpoint, so TLS verification fails for
-        # any client without that private CA in its trust store.
-        # Not something we can work around from this side. The
-        # built-in ``hn_top`` plugin (Hacker News via the official
-        # firebaseio.com API) is already registered and works;
-        # users who specifically want the "best" filtered subset
-        # can add a custom source pointing at the endpoint once
-        # hnrss.org sorts their cert. The entry is intentionally
-        # removed from the curated list rather than shipped with a
-        # broken URL — surfacing a feed we know fails costs more
-        # user trust than not recommending it at all.
-        "name": "lobsters",
-        "category": "tech",
-        "url": "https://lobste.rs/rss",
-        "blurb": "curated tech discussion, fewer memes than HN",
-    },
-    {
-        "name": "github_blog",
-        "category": "tech",
-        "url": "https://github.blog/feed/",
-        "blurb": "GitHub product changes; Copilot / Actions news",
-    },
-    # --- news --------------------------------------------------------------
-    {
-        "name": "reuters_top",
-        "category": "news",
-        "url": "https://feeds.reuters.com/Reuters/worldNews",
-        "blurb": "Reuters world wire — wire-service neutrality",
-    },
-    {
-        # NOTE: AP News has been the search for an alternate URL
-        # since AP shut down their official RSS feeds in late 2017.
-        # The legacy ``feeds.feedburner.com/ap-topnews`` (which used
-        # to work via Feedburner's redirector) now resolves to a
-        # 200-OK body that is just the move-to-new-host notice —
-        # no actual feed. The community AWS mirror at
-        # ``associated-press.s3-website-us-east-1.amazonaws.com``
-        # is also dead (all files are 55-byte stubs). AP's own
-        # ``apnews.com/hub/apf-topnews?format=xml`` is just the
-        # HTML hub page (not a feed). No working public RSS exists
-        # for AP today. Reuters World is the substitute; if AP
-        # ships a real feed later, drop it back in here.
-        "name": "the_guardian_world",
-        "category": "news",
-        "url": "https://www.theguardian.com/world/rss",
-        "blurb": "Guardian world — long-running international coverage",
-    },
-    {
-        # CBC's CDN hangs the connection when our default
-        # ``Popping/0.2`` User-Agent identifies the request as a
-        # scraper. The recommendation ships ``default_headers``
-        # with a browser-shaped UA so the Add button is one-tap —
-        # the frontend passes it through as ``custom_headers`` at
-        # POST time. The cmlink URL is the canonical short link;
-        # the 301 resolves to ``/webfeed/rss/rss-topstories``.
-        "name": "cbc_top",
-        "category": "news",
-        "url": "https://www.cbc.ca/cmlink/rss-topstories",
-        "blurb": "CBC Top Stories — browser UA pre-applied",
-        # Mirror the UA used by ``app.assets._BROWSER_UA``. Kept in
-        # sync by code review; the cost of drifting is just CBC
-        # coming back blocked, but it's worth surfacing the
-        # dependency in this comment. ``default_headers`` is read
-        # only by the recommended-add path in FeedManager.
-        "default_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            )
-        },
-    },
-    {
-        "name": "nyt_world",
-        "category": "news",
-        "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-        "blurb": "NYT world (metered; RSS bypasses the wall)",
-    },
-    {
-        "name": "al_jazeera",
-        "category": "news",
-        "url": "https://www.aljazeera.com/xml/rss/all.xml",
-        "blurb": "Al Jazeera English — distinct framing from US/UK wires",
-    },
-    {
-        "name": "economist",
-        "category": "news",
-        "url": "https://www.economist.com/finance-and-economics/rss.xml",
-        "blurb": "Economist finance + economics feed",
-    },
-    # --- science / space ---------------------------------------------------
-    {
-        "name": "nasa_breakthrough",
-        "category": "science",
-        "url": "https://www.nasa.gov/news-release/feed/",
-        "blurb": "NASA news releases — mission updates, discoveries",
-    },
-    {
-        "name": "nature",
-        "category": "science",
-        "url": "https://www.nature.com/nature.rss",
-        "blurb": "Nature — primary research highlights",
-    },
-    {
-        "name": "arxiv_cs",
-        "category": "science",
-        "url": "https://export.arxiv.org/rss/cs",
-        "blurb": "arXiv cs — daily CS preprints",
-    },
-    # --- finance / markets -------------------------------------------------
-    {
-        "name": "marketwatch_top",
-        "category": "finance",
-        "url": "https://feeds.marketwatch.com/marketwatch/topstories/",
-        "blurb": "MarketWatch top stories",
-    },
-    {
-        "name": "ft_home",
-        "category": "finance",
-        "url": "https://www.ft.com/rss/home",
-        "blurb": "Financial Times home (metered but useful headlines)",
-    },
-    {
-        "name": "seekingalpha_headlines",
-        "category": "finance",
-        "url": "https://seekingalpha.com/feed.xml",
-        "blurb": "Seeking Alpha headlines",
-    },
-    # --- security / vulns (in addition to built-in NVD + CISA) -----------
-    {
-        "name": "krebs_on_security",
-        "category": "vulns",
-        "url": "https://krebsonsecurity.com/feed/",
-        "blurb": "Krebs — investigations, breach writeups",
-    },
-    {
-        "name": "schneier",
-        "category": "vulns",
-        "url": "https://www.schneier.com/feed/atom/",
-        "blurb": "Schneier on Security — crypto + policy analysis",
-    },
-    {
-        "name": "the_hacker_news",
-        "category": "vulns",
-        "url": "https://feeds.feedburner.com/TheHackersNews",
-        "blurb": "The Hacker News — daily vulnerability roundups",
-    },
-    {
-        "name": "sans_isc",
-        "category": "vulns",
-        "url": "https://isc.sans.edu/rssfeed_full.xml",
-        "blurb": "SANS Internet Storm Center — handler diaries",
-    },
-    # --- policy / gov ------------------------------------------------------
-    {
-        "name": "eff",
-        "category": "policy",
-        "url": "https://www.eff.org/rss/updates.xml",
-        "blurb": "EFF — digital-rights news and analysis",
-    },
-    {
-        "name": "fcc_daily_digest",
-        "category": "policy",
-        "url": "https://www.fcc.gov/feeds/daily-digest",
-        "blurb": "FCC Daily Digest — official telecom actions",
-    },
-    # --- longform / interesting -------------------------------------------
-    {
-        "name": "longreads",
-        "category": "longform",
-        "url": "https://longreads.com/feed/",
-        "blurb": "LongReads — picks of the week's best longform",
-    },
-    {
-        "name": "stratechery",
-        "category": "longform",
-        "url": "https://stratechery.com/feed/",
-        "blurb": "Stratechery — Ben Thompson on tech strategy",
-    },
-    # --- deals (light) -----------------------------------------------------
-    {
-        "name": "slickdeals_frontpage",
-        "category": "deals",
-        "url": "https://slickdeals.net/newsearch.php?mode=frontpage&rss=1",
-        "blurb": "Slickdeals front page (rate-limited; refresh conservatively)",
-    },
-    # --- open source / dev ecosystem ---------------------------------------
-    {
-        "name": "lwn_net",
-        "category": "tech",
-        "url": "https://lwn.net/headlines/rss",
-        "blurb": "LWN.net — Linux / kernel / free-software deep coverage",
-    },
-    {
-        "name": "rust_blog",
-        "category": "tech",
-        "url": "https://blog.rust-lang.org/feed.xml",
-        "blurb": "Rust language blog — release notes, RFCs",
-    },
-    # --- Reddit (per-subreddit; requires REDDIT_HYDRA_URL) ---------------
-    # The ``type: "reddit"`` discriminator is passed through to
-    # ``POST /api/sources`` by the Recommended tab, which routes the
-    # row to ``DynamicRedditPlugin`` instead of ``DynamicRssPlugin``.
-    # ``url`` is the canonical Reddit thread URL — the route layer
-    # also accepts ``r/python`` shorthand but we ship the full URL
-    # here so the source list renders a uniform shape. Subreddits
-    # are chosen for the same editorial reasons as the RSS rows:
-    # general-purpose + a few focused ones that overlap with the
-    # existing category structure (tech, news, science).
-    {
-        "name": "reddit_python",
-        "type": "reddit",
-        "category": "tech",
-        "url": "https://www.reddit.com/r/python",
-        "blurb": "r/python — news, discussion, project showcases",
-    },
-    {
-        "name": "reddit_programming",
-        "type": "reddit",
-        "category": "tech",
-        "url": "https://www.reddit.com/r/programming",
-        "blurb": "r/programming — language-agnostic dev discussion",
-    },
-    {
-        "name": "reddit_machinelearning",
-        "type": "reddit",
-        "category": "tech",
-        "url": "https://www.reddit.com/r/MachineLearning",
-        "blurb": "r/MachineLearning — papers, course announcements, industry",
-    },
-    {
-        "name": "reddit_technology",
-        "type": "reddit",
-        "category": "tech",
-        "url": "https://www.reddit.com/r/technology",
-        "blurb": "r/technology — broad tech news + discussion",
-    },
-    {
-        "name": "reddit_news",
-        "type": "reddit",
-        "category": "news",
-        "url": "https://www.reddit.com/r/news",
-        "blurb": "r/news — top stories, mainstream aggregation",
-    },
-    {
-        "name": "reddit_worldnews",
-        "type": "reddit",
-        "category": "news",
-        "url": "https://www.reddit.com/r/worldnews",
-        "blurb": "r/worldnews — international stories, heavy commentary",
-    },
-    {
-        "name": "reddit_science",
-        "type": "reddit",
-        "category": "science",
-        "url": "https://www.reddit.com/r/science",
-        "blurb": "r/science — peer-reviewed discussion + new papers",
-    },
-]
-
-
-def recommendations_for(active_source_names: list[str]) -> list[dict]:
-    """Strip recommendations the user has already added.
+async def recommendations_for(
+    session: AsyncSession, active_source_names: list[str]
+) -> list[dict]:
+    """Active candidates, minus anything the user has already added.
 
     ``active_source_names`` is the list of source ``name`` strings
     the user currently has rows for (built-in + dynamic). Filtering
     on the server side prevents a stale client from showing
     "Add BBC News" duplicates.
 
-    Returns a fresh list of fresh dict copies (caller may mutate,
-    including per-item keys, without touching the module-level
-    ``RECOMMENDATIONS`` list shared by every other caller) in the
-    curated order. Names are compared verbatim — the API endpoints
-    also enforce lowercase so a case-mismatch can't slip through.
+    Returns a fresh list of dicts (one per row, shaped for
+    ``FeedRecommendation``) ordered by ``id`` ascending — editorial
+    rows were seeded in curated order and keep low ids, so this
+    preserves the original curated ordering as the tie-break while
+    letting newly discovered (``source="llm"``) rows sort after them
+    absent a ranking signal.
     """
     active = set(active_source_names or [])
-    return [dict(r) for r in RECOMMENDATIONS if r["name"] not in active]
+    stmt = (
+        select(FeedRecommendationCandidate)
+        .where(FeedRecommendationCandidate.active.is_(True))
+        .order_by(FeedRecommendationCandidate.id.asc())
+    )
+    rows = (await session.scalars(stmt)).all()
+    return [_candidate_to_dict(row) for row in rows if row.name not in active]
+
+
+def _candidate_to_dict(row: FeedRecommendationCandidate) -> dict:
+    """``FeedRecommendationCandidate`` row -> plain dict shaped for
+    ``FeedRecommendation``. ``type`` defaults to "rss" when NULL to
+    match the schema's default (the column is nullable so editorial
+    RSS rows don't carry a redundant "rss" string)."""
+    return {
+        "_id": row.id,
+        "name": row.name,
+        "category": row.category,
+        "url": row.url,
+        "blurb": row.blurb,
+        "type": row.type or "rss",
+        "default_headers": row.default_headers,
+        "source": row.source,
+    }
 
 
 # Event types that subtract from a category's net score. Listed here
@@ -466,6 +193,19 @@ async def _category_scores(
     return {row.category: float(row.net_score or 0.0) for row in rows}
 
 
+async def top_category_for_user(session: AsyncSession, user_ids: tuple[str, ...]) -> str | None:
+    """The category with the highest net interaction score for
+    ``user_ids`` over the last ``_LOOKBACK`` window, or None if there's
+    no engagement signal yet. Used by ``POST /api/feed-recommendations/
+    discover`` to infer a category when the caller doesn't name one —
+    "find more feeds like the ones I already engage with."
+    """
+    raw_scores = await _category_scores(session, user_ids)
+    if not raw_scores:
+        return None
+    return max(raw_scores.items(), key=lambda kv: kv[1])[0]
+
+
 def _squeeze(raw: float) -> float:
     """Map raw net-score to ``[0, 1]`` via ``tanh`` so a single hot
     category can't pull every recommendation toward it. Output is
@@ -484,35 +224,54 @@ def _squeeze(raw: float) -> float:
 _CATEGORY_WEIGHT = 0.4
 _VECTOR_WEIGHT = 0.6
 
-# Candidate name -> embedding. The curated ``RECOMMENDATIONS`` list
-# only changes via a code edit + restart (see the module docstring),
-# so embedding each candidate's blurb once per process and reusing it
-# forever is correct, not just an optimization — there's nothing to
-# invalidate the cache on.
-_CANDIDATE_EMBEDDINGS: dict[str, list[float]] = {}
 
-
-async def _ensure_candidate_embeddings(candidates: list[dict]) -> None:
-    """Embed any candidate not already in ``_CANDIDATE_EMBEDDINGS``.
+async def _ensure_candidate_embeddings(
+    session: AsyncSession, candidates: list[dict]
+) -> dict[str, list[float]]:
+    """Embed any candidate whose DB row has a NULL ``embedding``,
+    persist the result, and return ``{name: embedding}`` for every
+    candidate passed in (including ones that already had one).
 
     Text is ``"<name> <category>: <blurb>"`` — the same shape of
     signal (short description, no boilerplate) the entry embedding
-    pipeline feeds the model elsewhere. A no-op batch (nothing
-    missing, or embeddings disabled — ``embed_many`` then returns
-    all-``None`` and every candidate is silently skipped) costs
-    nothing.
+    pipeline feeds the model elsewhere. Persisting to the row (rather
+    than the old in-memory ``_CANDIDATE_EMBEDDINGS`` process cache)
+    means a freshly restarted backend doesn't re-embed the whole pool
+    on its first request, and a newly discovered LLM row only gets
+    embedded once, ever. A no-op batch (nothing missing, or
+    embeddings disabled — ``embed_many`` then returns all-``None``
+    and every candidate is silently skipped) costs nothing.
     """
-    missing = [c for c in candidates if c["name"] not in _CANDIDATE_EMBEDDINGS]
-    if not missing:
-        return
+    by_name = {c["name"]: c for c in candidates}
+    existing = (
+        await session.execute(
+            select(FeedRecommendationCandidate.name, FeedRecommendationCandidate.embedding)
+            .where(FeedRecommendationCandidate.name.in_(by_name.keys()))
+        )
+    ).all()
+    result: dict[str, list[float]] = {
+        row.name: row.embedding for row in existing if row.embedding is not None
+    }
+    missing_names = [name for name in by_name if name not in result]
+    if not missing_names:
+        return result
     texts = [
-        f"{c['name'].replace('_', ' ')} {c['category']}: {c['blurb']}"
-        for c in missing
+        f"{by_name[name]['name'].replace('_', ' ')} {by_name[name]['category']}: {by_name[name]['blurb']}"
+        for name in missing_names
     ]
     vectors = await embedder().embed_many(texts)
-    for candidate, vec in zip(missing, vectors):
-        if vec is not None:
-            _CANDIDATE_EMBEDDINGS[candidate["name"]] = vec
+    for name, vec in zip(missing_names, vectors):
+        if vec is None:
+            continue
+        result[name] = vec
+        await session.execute(
+            FeedRecommendationCandidate.__table__.update()
+            .where(FeedRecommendationCandidate.name == name)
+            .values(embedding=vec)
+        )
+    if any(v is not None for v in vectors):
+        await session.commit()
+    return result
 
 
 async def recommendations_for_user(
@@ -528,12 +287,12 @@ async def recommendations_for_user(
     with cosine similarity between each candidate's embedding and the
     user's ``preference_vector`` — see the module docstring's
     "Ranking" section for the full algorithm and why both signals
-    matter. Ties fall back to the curated ``RECOMMENDATIONS`` order
-    so the list is stable when there's no data.
+    matter. Ties fall back to the pool's insertion order (id asc) so
+    the list is stable when there's no data.
 
     Returns a fresh list — the caller may serialize it directly.
     """
-    candidates = recommendations_for(active_source_names)
+    candidates = await recommendations_for(session, active_source_names)
     if not candidates:
         return candidates
 
@@ -544,34 +303,35 @@ async def recommendations_for_user(
     pref_vec = profile.preference_vector if profile else None
     vec_scores: dict[str, float] = {}
     if pref_vec is not None:
-        await _ensure_candidate_embeddings(candidates)
+        embeddings = await _ensure_candidate_embeddings(session, candidates)
         vec_scores = {
-            c["name"]: vector_score(_CANDIDATE_EMBEDDINGS.get(c["name"]), pref_vec)
+            c["name"]: vector_score(embeddings.get(c["name"]), pref_vec)
             for c in candidates
         }
 
-    if not squeezed and not vec_scores:
-        # Neither signal available yet (no interactions, no
-        # preference vector) — fall through to curated order, which
-        # is already what ``recommendations_for`` returned.
-        return candidates
+    if squeezed or vec_scores:
+        # Pre-compute the pool order so ties are deterministic.
+        for idx, item in enumerate(candidates):
+            item.setdefault("_pool_index", idx)
 
-    # Pre-compute the curated index so ties are deterministic.
-    for idx, item in enumerate(candidates):
-        item.setdefault("_curated_index", idx)
+        def _combined_score(item: dict) -> float:
+            cat_component = squeezed.get(item["category"], 0.0)  # 0..1, 0 = no signal
+            # vector_score is 0..100 with 50 as its own "no signal"
+            # neutral; rescale to 0..1 so the two components are
+            # comparable and neither dominates just from its native range.
+            vec_component = vec_scores.get(item["name"], 50.0) / 100.0
+            return _CATEGORY_WEIGHT * cat_component + _VECTOR_WEIGHT * vec_component
 
-    def _combined_score(item: dict) -> float:
-        cat_component = squeezed.get(item["category"], 0.0)  # 0..1, 0 = no signal
-        # vector_score is 0..100 with 50 as its own "no signal"
-        # neutral; rescale to 0..1 so the two components are
-        # comparable and neither dominates just from its native range.
-        vec_component = vec_scores.get(item["name"], 50.0) / 100.0
-        return _CATEGORY_WEIGHT * cat_component + _VECTOR_WEIGHT * vec_component
+        # Sort by descending combined score, then by pool index ascending.
+        candidates.sort(key=lambda item: (-_combined_score(item), item["_pool_index"]))
+        for item in candidates:
+            item.pop("_pool_index", None)
+    # else: neither signal available yet (no interactions, no
+    # preference vector) — fall through to pool order, which is
+    # already what ``recommendations_for`` returned.
 
-    # Sort by descending combined score, then by curated index ascending.
-    candidates.sort(key=lambda item: (-_combined_score(item), item["_curated_index"]))
-    # Strip the helper key before returning — the API serializer
-    # doesn't know about it.
+    # Strip the internal row-id key before returning — the API
+    # serializer (``FeedRecommendation``) doesn't know about it.
     for item in candidates:
-        item.pop("_curated_index", None)
+        item.pop("_id", None)
     return candidates

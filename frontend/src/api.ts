@@ -347,7 +347,24 @@ export const api = {
     // for the curated list and ``schemas.FeedRecommendation`` for
     // the wire shape.
     default_headers?: Record<string, string> | null
+    // "editorial" (hand-picked) or "llm" (found by
+    // POST /feed-recommendations/discover). The Recommended tab
+    // labels "llm" rows distinctly.
+    source?: string
   }>>('/api/feed-recommendations'),
+
+  /** "Find more feeds" — asks the backend to LLM-suggest and
+   * fetch-validate a few more feeds for a category (the named one,
+   * or the user's top-engagement category if omitted), then persist
+   * any that check out into the recommendation pool. ``added`` may
+   * legitimately be 0 (no provider configured, or nothing new
+   * validated) — not an error. */
+  discoverFeeds: (category?: string) =>
+    jsonFetch<{ category: string; added: number }>('/api/feed-recommendations/discover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category: category ?? null }),
+    }),
 
   /** Personal top-N feed. Requires auth when OIDC is enabled; local
    * bypass users always pass through. */
