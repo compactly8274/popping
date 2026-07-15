@@ -7,10 +7,21 @@ to the article, thumbs something up or down, etc. The events feed:
      (``app.feed_recommendations``) — counts interactions per
      source category over a 30-day window, with thumb_down / never
      counted as -1, to re-rank the Recommended tab.
-  2. (Future) The For You personalization model — interaction
-     sequences could replace or augment the static preference vector
-     in ``UserProfile``. Not wired today; the table is the raw
-     substrate for that work.
+  2. The For You personalization model — ``app.scheduler.
+     _recompute_preference_vector`` (runs on a
+     ``pref_vector_recompute_interval_minutes``-minute tick, default
+     10) aggregates each interaction's entry embedding, weighted by
+     type (``_INTERACTION_WEIGHTS`` — thumb_up/bookmark/thumb_down/
+     never are the heaviest), into ``UserProfile.preference_vector``.
+     This is content-level, not just category-level: hiding a card
+     (``never``) pushes the vector away from THAT entry's embedding,
+     not just its source or category, and vice versa for a
+     positive interaction. ``app.scheduler._rescore_recent_entries``
+     (a separate, more frequent tick) then re-applies the updated
+     vector to already-ingested entries' scores. Both are batch, not
+     real-time — an interaction typically takes one tick (up to
+     ``pref_vector_recompute_interval_minutes``) to visibly move the
+     feed.
 
 Auth: when OIDC is enabled, requires a logged-in user. The
 ``user_id`` column is sourced from the session's ``sub`` — not a
