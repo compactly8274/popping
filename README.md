@@ -432,6 +432,17 @@ personal = vector_score * category_multiplier(followed, muted)
 similarity to the user's `preference_vector`, rescaled from `[-1, 1]` to
 `[0, 100]`. NULL vectors return a neutral 50 (cold-start midpoint).
 
+`preference_vector` itself is populated from interactions, not just
+category follows — `app.scheduler._recompute_preference_vector` (a
+`pref_vector_recompute_interval_minutes`-minute tick, default 10)
+aggregates each interaction's *entry embedding*, weighted by type
+(thumb_up/bookmark pull toward, thumb_down/never push away), into the
+vector. So a hide or a read acts on that specific card's content, not
+just its source or category — `_rescore_recent_entries` (a separate,
+more frequent tick) then re-applies the updated vector to already-
+ingested entries. Both are batch, not real-time: an interaction takes
+up to one tick to visibly move the feed.
+
 ### Convergence boost
 
 Computed at query time, not at ingest, so clusters pick up the boost
