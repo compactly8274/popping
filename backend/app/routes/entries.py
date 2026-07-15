@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -56,16 +57,22 @@ def _escape_like(term: str) -> str:
 
 
 def _clean_summary(raw: str | None) -> str:
-    """Strip HTML tags, collapse whitespace, trim.
+    """Strip HTML tags, unescape entities, collapse whitespace, trim.
 
     Returns "" when ``raw`` is empty / None — the caller
     distinguishes "" (asked, none) from "cache hit" via the
     ``cached_summary`` column directly. The length cap is applied
     by the caller (so the same function can be reused for non-card
-    contexts later without surprising truncation)."""
+    contexts later without surprising truncation).
+
+    The unescape pass matters for the same reason it's applied to
+    titles in ``app.sources.base.validate_required`` — some feeds
+    double-encode, so a literal ``&#8217;`` (etc.) survives the XML
+    parse and needs a second html-unescape to read as ``'``."""
     if not raw:
         return ""
     text = _HTML_TAG_RE.sub(" ", raw)
+    text = html.unescape(text)
     text = _WHITESPACE_RE.sub(" ", text).strip()
     return text
 
