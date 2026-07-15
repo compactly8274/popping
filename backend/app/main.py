@@ -30,6 +30,7 @@ from app import runtime_settings
 from app.routes import brief as brief_routes
 from app.routes import entries as entries_routes
 from app.routes import foryou as foryou_routes
+from app.routes import framing as framing_routes
 from app.routes import health as health_routes
 from app.routes import ingest as ingest_routes
 from app.routes import interactions as interactions_routes
@@ -162,6 +163,7 @@ app.include_router(health_routes.router, prefix="/api")
 app.include_router(sources_routes.router, prefix="/api")
 app.include_router(entries_routes.router, prefix="/api")
 app.include_router(foryou_routes.router, prefix="/api")
+app.include_router(framing_routes.router, prefix="/api")
 app.include_router(ingest_routes.router, prefix="/api")
 app.include_router(interactions_routes.router, prefix="/api")
 app.include_router(preferences_routes.router, prefix="/api")
