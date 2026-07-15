@@ -182,6 +182,33 @@ class FeedRecommendation(BaseModel):
     blurb: str
     type: str = "rss"
     default_headers: Optional[dict] = None
+    # "editorial" (hand-picked) or "llm" (found by app.feed_discovery).
+    # Lets the Recommended tab label discovered rows distinctly.
+    source: str = "editorial"
+
+
+class FeedDiscoverRequest(BaseModel):
+    """Body for ``POST /api/feed-recommendations/discover``.
+
+    ``category`` is optional — omit it to let the backend infer one
+    from the user's top-scoring category (``app.feed_recommendations.
+    top_category_for_user``), falling back to a fixed default when
+    there's no engagement history yet (cold start).
+    """
+    category: Optional[str] = None
+
+
+class FeedDiscoverResult(BaseModel):
+    """Body of ``POST /api/feed-recommendations/discover``.
+
+    ``category`` is the category actually searched (echoes the
+    request's ``category``, or reports the inferred one). ``added``
+    is how many new candidates were validated and persisted —
+    frequently 0 (the LLM had nothing new / nothing validated), which
+    is a normal outcome, not an error.
+    """
+    category: str
+    added: int
 
 
 class EntrySummaryOut(BaseModel):

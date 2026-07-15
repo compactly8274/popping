@@ -10,6 +10,7 @@ it's on.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from urllib.parse import urlparse
 
@@ -22,10 +23,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import current_user, require_user
 from app.config import settings
-from app.db import get_session
-from app.feed_recommendations import aggregation_user_ids, recommendations_for_user
+from app.db import SessionLocal, get_session
+from app.feed_discovery import discover_candidates, recent_llm_candidate_count
+from app.feed_recommendations import (
+    aggregation_user_ids,
+    recommendations_for_user,
+    top_category_for_user,
+)
 from app.models import Source
 from app.schemas import (
+    FeedDiscoverRequest,
+    FeedDiscoverResult,
     FeedRecommendation,
     SourceCreate,
     SourceOut,
@@ -40,11 +48,52 @@ from app import scheduler
 
 router = APIRouter(tags=["sources"])
 
+logger = logging.getLogger("popping.routes.sources")
+
 # Auth: matches the pattern in ``routes/ingest.py``. When OIDC is on,
 # POST/PATCH/DELETE require a logged-in user; GETs stay open. When
 # OIDC is off (single-user LAN), the bypass grants the same identity
 # the manual ingest endpoint already accepts.
 _write_deps = [Depends(require_user)] if settings.oidc_enabled else []
+
+# Strong references to in-flight auto-discovery tasks — same reason
+# ``routes/brief.py``'s ``_RUNNING_TASKS`` exists: ``asyncio.create_task``
+# returns a weakly-held Task, so a fire-and-forget discovery call could
+# be garbage-collected mid-flight. Each task removes itself on completion.
+_DISCOVERY_TASKS: set[asyncio.Task] = set()
+
+# Skip scheduling the auto-discovery background call once this many
+# LLM-sourced candidates already landed in the category recently (see
+# ``app.feed_discovery.recent_llm_candidate_count`` for the window).
+# Bounds LLM spend if the user adds several feeds in the same
+# category in quick succession — each add would otherwise fire its
+# own discovery call.
+_AUTO_DISCOVERY_COOLDOWN_CAP = 3
+
+
+async def _run_auto_discovery(category: str, context: str, discovered_from_source_id: int) -> None:
+    """Background: ask the LLM for a few more feeds like the one the
+    user just added. Uses its own session (the request-scoped one is
+    closed by the time this runs). Errors are logged and swallowed —
+    this is best-effort enrichment of the Recommended pool, never
+    something the Add-source call should fail on.
+    """
+    try:
+        async with SessionLocal() as session:
+            if await recent_llm_candidate_count(session, category) >= _AUTO_DISCOVERY_COOLDOWN_CAP:
+                return
+            await discover_candidates(
+                session,
+                category=category,
+                context=context,
+                discovered_from_source_id=discovered_from_source_id,
+            )
+    except Exception:
+        logger.exception("auto feed discovery failed for category=%s", category)
+    finally:
+        task = asyncio.current_task()
+        if task is not None:
+            _DISCOVERY_TASKS.discard(task)
 
 
 # --- Validation helpers --------------------------------------------------
@@ -353,6 +402,19 @@ async def create_source_endpoint(
         refresh=refresh,
         custom_headers=headers,
     )
+    # Auto-expand the Recommended pool from what the user just added.
+    # Reddit isn't in scope for LLM feed discovery (it only suggests
+    # RSS/Atom URLs), so this only fires for rss/podcast rows.
+    # Fire-and-forget: the Add call shouldn't wait on an LLM roundtrip.
+    if body.type in ("rss", "podcast"):
+        task = asyncio.create_task(
+            _run_auto_discovery(
+                category=row.category,
+                context=f"For context, the user just added a feed named {row.name!r} ({row.url}).",
+                discovered_from_source_id=row.id,
+            )
+        )
+        _DISCOVERY_TASKS.add(task)
     return SourceOut.model_validate(row)
 
 
@@ -715,4 +777,48 @@ async def feed_recommendations_endpoint(
     active = list(rows)
     recs = await recommendations_for_user(session, active, aggregation_user_ids(user))
     return [FeedRecommendation(**r) for r in recs]
+
+
+# Cold-start fallback when POST /discover is called with no category
+# and the user has no engagement history yet to infer one from.
+_DISCOVER_DEFAULT_CATEGORY = "tech"
+
+
+@router.post(
+    "/feed-recommendations/discover",
+    response_model=FeedDiscoverResult,
+    dependencies=_write_deps,
+)
+async def feed_recommendations_discover_endpoint(
+    body: FeedDiscoverRequest,
+    session: AsyncSession = Depends(get_session),
+    user: dict | None = Depends(current_user),
+) -> FeedDiscoverResult:
+    """"Find more feeds" — the Recommended tab's on-demand LLM
+    discovery button. Synchronous (unlike the auto-trigger on Add):
+    a single LLM call + a handful of validation fetches is a few
+    seconds, well within a normal request budget, and the user is
+    actively waiting on this one rather than it happening as a side
+    effect of something else.
+
+    Runs for one category per call, either the one the caller names
+    or (when omitted) the user's top-scoring category by interaction
+    history — falling back to ``_DISCOVER_DEFAULT_CATEGORY`` cold
+    start. See ``app.feed_discovery.discover_candidates`` for the
+    validation pipeline; ``added`` can legitimately be 0.
+    """
+    if body.category is not None:
+        _validate_category(body.category)
+        category = body.category.strip()
+    else:
+        category = await top_category_for_user(
+            session, aggregation_user_ids(user)
+        ) or _DISCOVER_DEFAULT_CATEGORY
+
+    created = await discover_candidates(
+        session,
+        category=category,
+        context="The user tapped \"find more feeds\" for this category in their dashboard.",
+    )
+    return FeedDiscoverResult(category=category, added=len(created))
 

@@ -31,7 +31,7 @@
 // up at Add time). The Test step is non-destructive and
 // reversible — tapping it doesn't change the form state.
 
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, type Source } from '../api'
 import { SourceIcon } from './SourceIcon'
 import { toast } from './Toast'
@@ -901,6 +901,11 @@ type Recommendation = {
   // (CBC). The frontend passes them through to ``POST /api/sources``
   // as ``custom_headers`` — no extra click needed.
   default_headers?: Record<string, string> | null
+  // "editorial" (hand-picked) or "llm" (found via the "Find more
+  // feeds" button / auto-discovery). Drives the small badge next to
+  // the name so a freshly-discovered row reads differently from the
+  // curated set.
+  source?: string
 }
 
 function RecommendedTab({
@@ -915,30 +920,55 @@ function RecommendedTab({
   const [recs, setRecs] = useState<Recommendation[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [adding, setAdding] = useState<string | null>(null)
+  // "Find more feeds" button state. ``discovering`` disables the
+  // button while the LLM call + validation fetches are in flight
+  // (a few seconds); ``discoverMsg`` is a one-line status the user
+  // sees after it resolves ("found 2 new feeds" / "nothing new
+  // found this time" — added=0 is a normal outcome, not an error).
+  const [discovering, setDiscovering] = useState(false)
+  const [discoverMsg, setDiscoverMsg] = useState<string | null>(null)
 
-  // Fetch on mount. We don't poll — the user can navigate away and
-  // back if they want a fresh list, and the backend is a static
-  // module so the response is cheap.
-  useEffect(() => {
-    let cancelled = false
+  // Shared loader — used for the mount fetch and for refetching after
+  // "Find more feeds" adds new rows to the pool.
+  const fetchRecs = useCallback(async () => {
     setLoading(true)
-    api
-      .feedRecommendations()
-      .then((rows) => {
-        if (cancelled) return
-        // Backend already strips names that exist; the frontend
-        // filter is a defensive belt-and-suspenders for a stale
-        // cache that doesn't yet know about a freshly-added row.
-        setRecs(rows.filter((r) => !existingNames.has(r.name)))
-      })
-      .catch((err) => onError(parseApiError(err, 'failed to load recommendations')))
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
-    return () => {
-      cancelled = true
+    try {
+      const rows = await api.feedRecommendations()
+      // Backend already strips names that exist; the frontend filter
+      // is a defensive belt-and-suspenders for a stale cache that
+      // doesn't yet know about a freshly-added row.
+      setRecs(rows.filter((r) => !existingNames.has(r.name)))
+    } catch (err) {
+      onError(parseApiError(err, 'failed to load recommendations'))
+    } finally {
+      setLoading(false)
     }
   }, [existingNames, onError])
+
+  // Fetch on mount. We don't otherwise poll — the user can navigate
+  // away and back for a fresh list, and "Find more feeds" (below)
+  // covers the case where the pool itself changes.
+  useEffect(() => {
+    fetchRecs()
+  }, [fetchRecs])
+
+  const findMore = async () => {
+    setDiscovering(true)
+    setDiscoverMsg(null)
+    try {
+      const result = await api.discoverFeeds()
+      setDiscoverMsg(
+        result.added > 0
+          ? `found ${result.added} new feed${result.added === 1 ? '' : 's'} in ${result.category}`
+          : `nothing new found for ${result.category} this time`,
+      )
+      if (result.added > 0) await fetchRecs()
+    } catch (err) {
+      onError(parseApiError(err, 'failed to find more feeds'))
+    } finally {
+      setDiscovering(false)
+    }
+  }
 
   const add = async (rec: Recommendation) => {
     setAdding(rec.name)
@@ -975,39 +1005,77 @@ function RecommendedTab({
     }
   }
 
+  // "Find more feeds" header — shown above the list regardless of
+  // loading/empty state so the user can trigger discovery even when
+  // the curated pool is fully added (the most likely time they'd
+  // actually want it).
+  const findMoreHeader = (
+    <div className="px-3 pt-1 pb-2 flex items-center gap-2 border-b border-hairline">
+      <button
+        onClick={findMore}
+        disabled={discovering}
+        className="shrink-0 min-h-[28px] rounded-ios border border-accent text-accent active:opacity-60 disabled:opacity-40 px-2 py-0.5 text-ios-caption"
+      >
+        {discovering ? 'looking…' : '🔎 find more feeds'}
+      </button>
+      {discoverMsg && (
+        <span className="text-ios-caption text-label-tertiary truncate">{discoverMsg}</span>
+      )}
+    </div>
+  )
+
   if (loading) {
-    return <p className="text-ios-body text-label-secondary italic px-1">loading…</p>
+    return (
+      <>
+        {findMoreHeader}
+        <p className="text-ios-body text-label-secondary italic px-3 py-2">loading…</p>
+      </>
+    )
   }
   if (!recs || recs.length === 0) {
     return (
-      <p className="text-ios-body text-label-secondary italic px-1">
-        you've added all the recommended feeds — try the Add custom tab
-      </p>
+      <>
+        {findMoreHeader}
+        <p className="text-ios-body text-label-secondary italic px-3 py-2">
+          you've added all the recommended feeds — try Find more feeds or the Add custom tab
+        </p>
+      </>
     )
   }
   return (
-    <ul>
-      {recs.map((r) => (
-        <li
-          key={r.name}
-          className="px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0"
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <span className="truncate font-medium text-label-primary">{r.name}</span>
-            <span className="text-label-tertiary shrink-0 text-[11px]">{r.category}</span>
-            <button
-              onClick={() => add(r)}
-              disabled={adding === r.name}
-              className="ml-auto shrink-0 min-h-[28px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white px-2 py-0.5 text-ios-caption"
-              aria-label={`add ${r.name}`}
-            >
-              {adding === r.name ? 'adding…' : 'Add'}
-            </button>
-          </div>
-          <p className="text-ios-caption text-label-secondary mt-0.5">{r.blurb}</p>
-        </li>
-      ))}
-    </ul>
+    <>
+      {findMoreHeader}
+      <ul>
+        {recs.map((r) => (
+          <li
+            key={r.name}
+            className="px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0"
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="truncate font-medium text-label-primary">{r.name}</span>
+              <span className="text-label-tertiary shrink-0 text-[11px]">{r.category}</span>
+              {r.source === 'llm' && (
+                <span
+                  className="shrink-0 inline-flex items-center rounded-full bg-accent-soft px-1.5 text-[10px] uppercase tracking-wide text-accent"
+                  title="found via AI feed discovery"
+                >
+                  found for you
+                </span>
+              )}
+              <button
+                onClick={() => add(r)}
+                disabled={adding === r.name}
+                className="ml-auto shrink-0 min-h-[28px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white px-2 py-0.5 text-ios-caption"
+                aria-label={`add ${r.name}`}
+              >
+                {adding === r.name ? 'adding…' : 'Add'}
+              </button>
+            </div>
+            <p className="text-ios-caption text-label-secondary mt-0.5">{r.blurb}</p>
+          </li>
+        ))}
+      </ul>
+    </>
   )
 }
 

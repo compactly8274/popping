@@ -355,3 +355,50 @@ class UserPreference(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# FeedRecommendationCandidate: the pool ``GET /api/feed-recommendations``
+# ranks and serves from. Replaces the old in-code ``RECOMMENDATIONS``
+# list (see alembic/versions/0017_feed_recommendation_candidates.py for
+# the migration that seeds this table with the original 28 editorial
+# rows) so the pool can grow via LLM discovery without a deploy.
+# ---------------------------------------------------------------------------
+
+
+class FeedRecommendationCandidate(Base):
+    __tablename__ = "feed_recommendation_candidates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    blurb: Mapped[str] = mapped_column(Text, nullable=False)
+    # "rss" (default), "reddit", or "podcast" — passed straight through
+    # to POST /api/sources the same way the old dict's "type" key was.
+    type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    default_headers: Mapped[Optional[dict]] = mapped_column(postgresql.JSONB, nullable=True)
+    # "editorial" (hand-picked, seeded by the migration) or "llm"
+    # (added by app.feed_discovery). Surfaced to the frontend so the
+    # Recommended tab can label discovered rows distinctly.
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="editorial")
+    # Soft-disable without losing the row (dead feed, bad LLM
+    # suggestion the user dismissed) — mirrors Source.active.
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Sentence embedding of "<name> <category>: <blurb>", persisted so
+    # ranking doesn't need to re-embed the pool on every request (the
+    # old in-memory ``_CANDIDATE_EMBEDDINGS`` cache died with the
+    # process; this survives restarts and lets a fresh backend serve
+    # a fully-ranked list without a warm-up request).
+    embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(384), nullable=True)
+    # Which user-added Source (if any) triggered this row via
+    # embedding-nearest-neighbor discovery. NULL for editorial rows
+    # and for LLM rows discovered from a category rather than a
+    # specific source. ondelete SET NULL: deleting the source that
+    # inspired a suggestion shouldn't cascade-delete the suggestion.
+    discovered_from_source_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("sources.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
