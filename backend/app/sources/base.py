@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from abc import ABC, abstractmethod
 
 
@@ -62,6 +63,13 @@ def validate_required(name: str, raw: dict) -> dict:
     raises ``TypeError`` because ``fetch`` is unimplemented). Keeping
     the same body as ``SourcePlugin.normalize`` means any change to
     the contract flows through both call sites.
+
+    ``title`` is HTML-unescaped. Some feeds (WordPress-generated ones
+    in particular — The Verge is one) double-encode their titles, so
+    the XML parse only resolves the outer layer and leaves a literal
+    ``&#8217;`` etc. sitting in the text (e.g. ``"Nomad&#8217;s
+    accessories"`` instead of ``"Nomad's accessories"``). A no-op on
+    a title that was already clean.
     """
     title = raw.get("title")
     url = raw.get("url")
@@ -69,7 +77,7 @@ def validate_required(name: str, raw: dict) -> dict:
         raise ValueError(f"{name}: item missing title or url: {raw!r}")
     published_at = raw.get("published_at")
     return {
-        "title": str(title).strip(),
+        "title": html.unescape(str(title).strip()),
         "url": str(url).strip(),
         "published_at": published_at,
         "meta": {k: v for k, v in raw.items() if k not in ("title", "url", "published_at")},
