@@ -48,7 +48,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app import assets
+from app import assets, framing
 from app.brief import BriefGenerator
 from app.config import settings
 from app.db import SessionLocal
@@ -1096,6 +1096,23 @@ async def _check_convergence() -> None:
         logger.exception("convergence check failed")
 
 
+async def _cluster_framing() -> None:
+    """Framing Watch: recompute same-story/different-headline clusters
+    over the trailing ``framing_window_hours``. See ``app.framing`` for
+    the full algorithm — this is just the scheduler wrapper (own
+    session, log-and-swallow on failure, matching every other job in
+    this module)."""
+    try:
+        async with SessionLocal() as session:
+            result = await framing.cluster_recent_entries(session)
+            logger.info(
+                "framing: considered=%d clusters=%d tone_calls=%d",
+                result["entries_considered"], result["clusters"], result["tone_calls"],
+            )
+    except Exception:
+        logger.exception("framing cluster job failed")
+
+
 async def _daily_brief() -> None:
     """Daily scheduled Brief at ``BRIEF_SCHEDULE_HOUR`` UTC."""
     if not _brief_generator:
@@ -1506,6 +1523,25 @@ async def start_scheduler(notifier: Optional[Notifier] = None) -> AsyncIOSchedul
         max_instances=1,
         coalesce=True,
     )
+
+    # Framing Watch: same-story/different-headline clustering (see
+    # app.framing). Needs entry embeddings the same way the
+    # preference-vector job does, so it's gated the same way. Default
+    # cadence: 60 min — full rescan of the trailing
+    # ``framing_window_hours`` each tick, cheap at personal-dashboard
+    # entry volume. Fires once on startup (20s delay) so Framing Watch
+    # isn't empty for a full hour after a restart.
+    if settings.embedding_enabled and embedder().loaded:
+        _scheduler.add_job(
+            _cluster_framing,
+            trigger=IntervalTrigger(minutes=settings.framing_cluster_interval_minutes),
+            id="framing:cluster",
+            name="Framing Watch clustering",
+            replace_existing=True,
+            next_run_time=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=20),
+            max_instances=1,
+            coalesce=True,
+        )
 
     # Reddit cross-reference sweep. Walks entries that don't already
     # have ``meta.reddit_thread_url`` and asks Hydra whether the URL

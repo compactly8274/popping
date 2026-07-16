@@ -597,3 +597,31 @@ class UserPreferenceIn(BaseModel):
     """
 
     value: Optional[object] = None
+
+
+class FramingArticleOut(BaseModel):
+    """One outlet's version of a Framing Watch story. ``framing_tone``
+    is null until ``app.framing``'s batched classifier tags it (which
+    only happens for clustered entries, and only once per entry)."""
+
+    entry_id: int
+    title: str
+    url: str
+    source_name: str
+    favicon_path: Optional[str] = None
+    published_at: Optional[dt.datetime] = None
+    framing_tone: Optional[str] = None
+
+
+class FramingClusterOut(BaseModel):
+    """Body of one row of ``GET /api/framing-clusters``. ``wire_source``
+    is a best-effort AP/Reuters/AFP label (null when nothing matched —
+    the cluster still stands on embedding similarity alone).
+    ``articles`` has 2+ entries by construction (see
+    ``app.framing.cluster_recent_entries`` — clusters below 2 members
+    get deleted), ordered oldest-published first."""
+
+    cluster_id: int
+    wire_source: Optional[str] = None
+    first_seen_at: Optional[dt.datetime] = None
+    articles: list[FramingArticleOut]

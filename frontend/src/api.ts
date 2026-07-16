@@ -211,6 +211,26 @@ export interface CurrentUser {
   auth_method?: 'oidc' | 'local' | 'bypass'
 }
 
+// Framing Watch — one outlet's version of a same-underlying-story
+// cluster (see backend/app/framing.py). ``framing_tone`` is null
+// until the backend's batched classifier tags it.
+export interface FramingArticle {
+  entry_id: number
+  title: string
+  url: string
+  source_name: string
+  favicon_path: string | null
+  published_at: string | null
+  framing_tone: 'neutral' | 'urgent' | 'alarmist' | null
+}
+
+export interface FramingCluster {
+  cluster_id: number
+  wire_source: string | null
+  first_seen_at: string | null
+  articles: FramingArticle[]
+}
+
 export const api = {
   health: () => jsonFetch<Health>('/api/health'),
   entries: (
@@ -375,6 +395,10 @@ export const api = {
     const q = params.toString()
     return jsonFetch<Entry[]>(`/api/foryou${q ? `?${q}` : ''}`)
   },
+  /** Framing Watch clusters — same underlying story, different
+   * outlet/headline. Read-only; clustering itself runs on the
+   * backend's hourly scheduler job (app.framing). */
+  framingClusters: () => jsonFetch<FramingCluster[]>('/api/framing-clusters'),
   // Fetch a list of entries by id. Used by the
   // Settings overlay's Hidden and Starred tabs
   // to render a list of the entries the user

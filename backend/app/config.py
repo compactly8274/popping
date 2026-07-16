@@ -247,6 +247,26 @@ class Settings(BaseSettings):
     convergence_boost_2: float = 1.10
     convergence_boost_3plus: float = 1.20
 
+    # --- Framing Watch: same-story / different-headline clustering --------
+    # Distinct from convergence above: convergence matches on normalized
+    # TITLE (same headline, multiple sources); framing clustering matches
+    # on EMBEDDING similarity (same underlying story, different headlines
+    # — the media-framing-bias case). See app.framing.
+    #
+    # Cosine similarity floor for two entries to count as the same
+    # underlying story. Entry.embedding is built from title + the feed's
+    # own short summary blurb (no full article body is stored), so this
+    # threshold is tuned for a fairly short text signal — start around
+    # 0.92-0.95 and adjust based on false-positive/negative rate in your
+    # own feed mix.
+    framing_similarity_threshold: float = 0.93
+    # Entries must be published within this many hours of each other to
+    # cluster, even if their embeddings are similar enough — keeps an
+    # evergreen "explainer" story from clustering with an unrelated
+    # breaking-news piece that happens to read similarly.
+    framing_window_hours: int = 48
+    framing_cluster_interval_minutes: int = 60
+
     # --- Phase 4: The Brief + notifications -------------------------------
     # UTC hour at which the scheduler generates the daily brief. Brief is
     # idempotent — generating it twice on the same day just overwrites the

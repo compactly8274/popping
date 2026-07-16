@@ -22,6 +22,7 @@ import { BriefCard } from './components/BriefCard'
 import { Card } from './components/Card'
 import { Column, DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
 import { Drawer } from './components/Drawer'
+import { FramingWatch } from './components/FramingWatch'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
 import { SearchResults } from './components/SearchResults'
@@ -2427,6 +2428,7 @@ export function App() {
               </div>
             </section>
           )}
+          {viewKind === 'all' && <FramingWatch />}
           <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
             {columns
               .filter((col) => viewKind === 'multisub' || col.name !== 'For You')

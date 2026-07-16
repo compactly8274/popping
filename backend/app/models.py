@@ -150,6 +150,23 @@ class Entry(Base):
     # tell which kind of text it's showing.
     podcast_transcript_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Framing Watch (app.framing): which same-story cluster this entry
+    # belongs to, if any. NULL = not part of a detected cluster (the
+    # overwhelming majority of entries). An entry belongs to at most one
+    # cluster — clusters are recomputed wholesale each run (see
+    # app.framing.cluster_recent_entries), so this is derived state, not
+    # something a user edits. ondelete SET NULL: deleting a cluster row
+    # (e.g. it dropped below 2 members) shouldn't cascade-delete entries.
+    story_cluster_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("story_clusters.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # This entry's headline tone, one of "neutral" / "urgent" / "alarmist"
+    # — set once, in a single batched LLM call covering every
+    # not-yet-classified headline in the entry's cluster at the time it
+    # joined (see app.framing._classify_tones). NULL until classified
+    # (only happens for clustered entries); never recomputed afterward.
+    framing_tone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
     expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     fetched_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -402,3 +419,43 @@ class FeedRecommendationCandidate(Base):
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# StoryCluster: "Framing Watch" — the same underlying story republished
+# under different headlines by different outlets (see app.framing).
+# Membership lives on Entry.story_cluster_id rather than an array/join
+# table here, since an entry belongs to at most one cluster — a plain FK
+# is the normalized shape for an exclusive membership, and matches every
+# other one-to-many relationship in this schema (Entry.source_id, etc.).
+# ---------------------------------------------------------------------------
+
+
+class StoryCluster(Base):
+    __tablename__ = "story_clusters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # "AP" / "Reuters" / "AFP" / etc., detected via a byline/dateline
+    # regex over each member's title + summary blurb (app.framing.
+    # detect_wire_source). NULL when no member's text matched a known
+    # wire-service pattern — the cluster still stands on embedding
+    # similarity alone; wire attribution is a nice-to-have label, not
+    # a requirement for clustering.
+    wire_source: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    # Earliest published_at among current members — "when did this
+    # story first break," independent of which outlet's copy an entry
+    # currently is. Recomputed (can move earlier) each time a new,
+    # earlier-published member joins.
+    first_seen_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # No ORM relationship to Entry here (deliberately) — members are
+    # queried explicitly (``select(Entry).where(Entry.story_cluster_id
+    # == cluster.id)``) everywhere they're needed, same as
+    # FeedRecommendationCandidate.discovered_from_source_id doesn't
+    # carry a relationship back to Source. Avoids async lazy-load
+    # foot-guns for what's a simple, always-explicit query.
