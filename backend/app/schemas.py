@@ -147,6 +147,14 @@ class SourceTestResult(BaseModel):
       - ``unsupported_type`` ``type`` is not in the accepted set
       - ``network_error``    connection refused, DNS, TLS, etc.
       - ``unknown``          catch-all
+
+    ``resolved_url`` is set when the submitted URL was an Apple
+    Podcasts show page (``podcasts.apple.com/.../id<N>``) that got
+    resolved to its actual RSS feed via ``app.apple_podcasts`` —
+    null for every other URL, including one that was already a
+    direct feed URL. The frontend shows this so the user sees what
+    actually got fetched/would be added, rather than the resolution
+    happening invisibly.
     """
     ok: bool
     status_code: Optional[int] = None
@@ -154,6 +162,7 @@ class SourceTestResult(BaseModel):
     sample_titles: list[str] = []
     error_kind: Optional[str] = None
     error: Optional[str] = None
+    resolved_url: Optional[str] = None
 
 
 class FeedRecommendation(BaseModel):
