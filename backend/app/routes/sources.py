@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.apple_podcasts import PodcastResolutionError, resolve_feed_url
 from app.auth.deps import current_user, require_user
 from app.config import settings
 from app.db import SessionLocal, get_session
@@ -363,6 +364,13 @@ async def create_source_endpoint(
     ``scheduler._plugin_for``.
     """
     _validate_name(body.name)
+    # Apple Podcasts catalog links (podcasts.apple.com/.../id<N>)
+    # aren't a feed — resolve to the real RSS URL before validating.
+    # No-op for anything that doesn't match the pattern.
+    try:
+        body.url = await resolve_feed_url(body.url)
+    except PodcastResolutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     # Type-aware URL validation. Reddit rows accept a subreddit
     # reference (``r/python``) and get rewritten to the canonical
     # Reddit thread URL; RSS and podcast rows take a plain http(s)
@@ -458,6 +466,13 @@ async def update_source_endpoint(
                 detail=f"name {body.name!r} is reserved for a built-in source",
             )
     if body.url is not None:
+        # Apple Podcasts catalog links aren't a feed — resolve to the
+        # real RSS URL before validating. No-op for anything that
+        # doesn't match the pattern.
+        try:
+            body.url = await resolve_feed_url(body.url)
+        except PodcastResolutionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         # PATCH URL is also type-aware: re-validate as a subreddit
         # reference when the row is a Reddit row (so a typo'd edit
         # doesn't store a malformed URL the plugin can't fetch).
@@ -585,6 +600,22 @@ async def _test_source_impl(
             error=f"unsupported type {body.type!r} (only 'rss', 'reddit', and 'podcast' are accepted)",
         )
 
+    # Apple Podcasts catalog links (podcasts.apple.com/.../id<N>)
+    # aren't a feed — resolve to the real RSS URL before anything
+    # below touches ``body.url``. A no-op for any URL that doesn't
+    # match the pattern (``resolved_url`` stays None). Every
+    # SourceTestResult returned past this point carries
+    # ``resolved_url`` so the frontend can show / adopt the real URL
+    # regardless of whether the rest of the test succeeds.
+    resolved_url: str | None = None
+    try:
+        new_url = await resolve_feed_url(body.url)
+    except PodcastResolutionError as exc:
+        return SourceTestResult(ok=False, error_kind="invalid_url", error=str(exc))
+    if new_url != body.url:
+        resolved_url = new_url
+        body.url = new_url
+
     # Name is optional on Test, but if provided it must be valid AND
     # not collide with an existing source or built-in. We deliberately
     # do this BEFORE the URL fetch so a name conflict doesn't waste
@@ -594,6 +625,7 @@ async def _test_source_impl(
             _validate_name(body.name)
         except HTTPException as exc:
             return SourceTestResult(
+                resolved_url=resolved_url,
                 ok=False,
                 error_kind="invalid_url",  # closest match; user sees the message
                 error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
@@ -601,6 +633,7 @@ async def _test_source_impl(
         # Reserved-name guard — same set ``create_source_endpoint`` enforces.
         if body.name in registered_plugin_names():
             return SourceTestResult(
+                resolved_url=resolved_url,
                 ok=False,
                 error_kind="name_conflict",
                 error=f"name {body.name!r} is reserved for a built-in source",
@@ -611,6 +644,7 @@ async def _test_source_impl(
         )
         if existing.scalar_one_or_none() is not None:
             return SourceTestResult(
+                resolved_url=resolved_url,
                 ok=False,
                 error_kind="name_conflict",
                 error=f"a source named {body.name!r} already exists",
@@ -624,6 +658,7 @@ async def _test_source_impl(
             url = _validate_reddit_url(body.url)
         except HTTPException as exc:
             return SourceTestResult(
+                resolved_url=resolved_url,
                 ok=False,
                 error_kind="invalid_url",
                 error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
@@ -633,6 +668,7 @@ async def _test_source_impl(
             _validate_url(body.url)
         except HTTPException as exc:
             return SourceTestResult(
+                resolved_url=resolved_url,
                 ok=False,
                 error_kind="invalid_url",
                 error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
@@ -646,6 +682,7 @@ async def _test_source_impl(
     safe, reason = check_url_safe(url)
     if not safe:
         return SourceTestResult(
+            resolved_url=resolved_url,
             ok=False,
             error_kind="invalid_url",
             error=reason,
@@ -661,6 +698,7 @@ async def _test_source_impl(
         )
     except HTTPException as exc:
         return SourceTestResult(
+            resolved_url=resolved_url,
             ok=False,
             error_kind="unknown",
             error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
@@ -683,6 +721,7 @@ async def _test_source_impl(
             items = await fetch_subreddit(url, headers=headers)
     except httpx.TimeoutException as exc:
         return SourceTestResult(
+            resolved_url=resolved_url,
             ok=False,
             error_kind="timeout",
             error=f"feed took too long to respond ({exc})",
@@ -695,6 +734,7 @@ async def _test_source_impl(
             else "unknown"
         )
         return SourceTestResult(
+            resolved_url=resolved_url,
             ok=False,
             status_code=code,
             error_kind=kind,
@@ -703,12 +743,14 @@ async def _test_source_impl(
     except httpx.HTTPError as exc:
         # Connection refused, DNS failure, TLS, etc.
         return SourceTestResult(
+            resolved_url=resolved_url,
             ok=False,
             error_kind="network_error",
             error=str(exc),
         )
     except asyncio.TimeoutError:
         return SourceTestResult(
+            resolved_url=resolved_url,
             ok=False,
             error_kind="timeout",
             error="feed took too long to respond",
@@ -720,6 +762,7 @@ async def _test_source_impl(
         msg = str(exc)
         kind = "parse_error" if "parse" in msg.lower() or "missing" in msg.lower() else "unknown"
         return SourceTestResult(
+            resolved_url=resolved_url,
             ok=False,
             error_kind=kind,
             error=msg or exc.__class__.__name__,
@@ -730,6 +773,7 @@ async def _test_source_impl(
     # do that on the way into the DB). We just want a count and a
     # few titles for the UI.
     return SourceTestResult(
+        resolved_url=resolved_url,
         ok=True,
         item_count=len(items),
         sample_titles=[str(it.get("title", ""))[:120] for it in items[:3]],

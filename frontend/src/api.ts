@@ -103,6 +103,11 @@ export interface SourceTestResult {
     | 'unknown'
     | null
   error: string | null
+  // Set when the submitted URL was an Apple Podcasts show page
+  // (podcasts.apple.com/.../id<N>) resolved server-side to its
+  // actual RSS feed URL. Null for every other URL, including one
+  // that was already a direct feed URL.
+  resolved_url: string | null
 }
 
 export interface Health {

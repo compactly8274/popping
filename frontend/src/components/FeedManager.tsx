@@ -1116,6 +1116,15 @@ function AddCustomTab({
     message: string
     itemCount?: number
     sampleTitles?: string[]
+    // Set when the tested URL was an Apple Podcasts show page the
+    // backend resolved to its real feed URL. We don't rewrite the
+    // ``url`` field's own state to match — doing so would trip the
+    // "clear stale test result on any form change" effect below and
+    // wipe this very result out from under itself. Add already
+    // resolves the same way server-side, so the row that gets
+    // created uses the real feed URL regardless of what's still
+    // showing in the input.
+    resolvedUrl?: string
   } | null>(null)
   // Inline validation state mirrors the submit validator. ``urlError``
   // and ``nameError`` show why Test / Add are disabled; they clear
@@ -1233,11 +1242,13 @@ function AddCustomTab({
           message: `Looks good — ${result.item_count ?? 0} items found`,
           itemCount: result.item_count ?? 0,
           sampleTitles: result.sample_titles,
+          resolvedUrl: result.resolved_url ?? undefined,
         })
       } else {
         setTestResult({
           kind: 'err',
           message: friendlyTestError(result.error_kind, result.error),
+          resolvedUrl: result.resolved_url ?? undefined,
         })
       }
     } catch (err) {
@@ -1395,6 +1406,12 @@ function AddCustomTab({
             {testResult.kind === 'ok' ? '✓ ' : '✗ '}
             {testResult.message}
           </div>
+          {testResult.resolvedUrl && (
+            <div className="mt-1 text-ios-caption opacity-80 break-all">
+              Resolved Apple Podcasts link to the real feed: {testResult.resolvedUrl}
+              {testResult.kind === 'ok' && ' — Add will use this URL.'}
+            </div>
+          )}
           {testResult.kind === 'ok' && testResult.sampleTitles && testResult.sampleTitles.length > 0 && (
             <ul className="mt-2 space-y-0.5 text-ios-caption text-emerald-200/80">
               {testResult.sampleTitles.map((t, i) => (
