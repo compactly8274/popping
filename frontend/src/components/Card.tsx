@@ -569,6 +569,20 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
         },
       })
     }
+    actions.push({
+      label: '👍 Thumbs up',
+      onClick: () => {
+        recordImmediate({ entry_id: entry.id, type: 'thumb_up' })
+        toast('👍 Thanks — tuning toward more like this.', 'info')
+      },
+    })
+    actions.push({
+      label: '👎 Thumbs down',
+      onClick: () => {
+        recordImmediate({ entry_id: entry.id, type: 'thumb_down' })
+        toast('👎 Got it — tuning down similar stories.', 'info')
+      },
+    })
     actions.push({ label: 'Copy link', onClick: () => copyUrl(entry.url) })
     actions.push({
       label: 'Open in new tab',
@@ -889,6 +903,55 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             <EyeIcon className="w-4 h-4" closed={!!hidden} />
           </button>
         )}
+        {/* Thumbs up/down. Pure taste signal — unlike star (which
+            also organizes the entry into Saved) and hide (which
+            also removes it from view), a thumb click has no
+            side effect beyond the interaction event itself. The
+            backend already weights ``thumb_up``/``thumb_down`` in
+            the preference-vector recompute (same magnitude as
+            bookmark/never) — this is just the missing UI to fire
+            them; nothing backend-side needed. Deliberately
+            stateless (no persisted "you already rated this"
+            highlight, unlike star/hidden) to avoid a new synced-
+            preference-set subsystem for what's meant to be a
+            lightweight, low-friction signal — a toast is
+            confirmation enough. Always rendered (no callback prop
+            gate) since firing the interaction doesn't depend on
+            any parent-owned state. */}
+        <button
+          type="button"
+          data-card-interactive
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            recordImmediate({ entry_id: entry.id, type: 'thumb_up' })
+            toast('👍 Thanks — tuning toward more like this.', 'info')
+          }}
+          aria-label="thumbs up"
+          title="thumbs up"
+          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated active:text-accent"
+        >
+          <span aria-hidden="true" className="text-sm leading-none">👍</span>
+        </button>
+        <button
+          type="button"
+          data-card-interactive
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            recordImmediate({ entry_id: entry.id, type: 'thumb_down' })
+            toast('👎 Got it — tuning down similar stories.', 'info')
+          }}
+          aria-label="thumbs down"
+          title="thumbs down"
+          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated active:text-accent"
+        >
+          <span aria-hidden="true" className="text-sm leading-none">👎</span>
+        </button>
       {/* Reddit cross-reference footer. Rendered between the meta row
           and the summary block so it reads as "extra metadata about
           the article", not "extra metadata about the source". Only
