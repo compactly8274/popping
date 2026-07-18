@@ -106,6 +106,10 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model_scoring: str = "llama-3.1-8b-instant"
     groq_model_brief: str = "llama-3.1-70b-versatile"
+    # Also gates app.podcast_asr — real speech-to-text (Groq's hosted
+    # Whisper) for podcast episodes whose feed doesn't publish a
+    # Podcasting 2.0 transcript tag. Reuses this same key; no
+    # separate ASR credential.
 
     # --- Source API keys (phase 2+) ----------------------------------------
     keepa_api_key: str = ""

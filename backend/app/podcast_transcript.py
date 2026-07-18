@@ -5,14 +5,10 @@ Feeds that publish a Podcasting 2.0 ``<podcast:transcript>`` tag
 speech-to-text entirely: fetch the transcript the podcast host
 already produced, and summarize it with the same LLM provider the
 Brief generator uses. No audio processing, no per-minute transcription
-cost — this only works for feeds that opt into the tag, which is why
-it's presented in the UI as "Summarize episode" rather than always
-available (see ``routes/entries.py``'s handling of a missing
-transcript).
-
-Deliberately NOT doing real speech-to-text (Whisper / AssemblyAI /
-Deepgram) here — that's a separate, paid-per-minute feature with its
-own cost model, held off pending user testing of this cheaper path.
+cost — this is always the first path tried (see ``routes/entries.py``'s
+``entry_podcast_summary_endpoint``), falling back to real speech-to-text
+via ``app.podcast_asr`` (Groq's hosted Whisper) only for feeds that
+don't publish a transcript tag.
 """
 
 from __future__ import annotations
