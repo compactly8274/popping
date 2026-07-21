@@ -106,6 +106,16 @@ export type ColumnSectionsValue = {
 export type HistoryGroupByValue = 'entry' | 'none'
 
 /**
+ * Per-entry vote direction. Keyed by entry id (as a string — JSON
+ * object keys are always strings; consumers convert with
+ * ``String(entryId)`` / ``Number(key)``). Absence of a key means "no
+ * vote" — there's no explicit ``null`` entry, matching how
+ * hiddenEntries/starredEntries represent "not a member" as "not in
+ * the array" rather than storing an explicit false.
+ */
+export type VotedEntriesValue = Record<string, 'up' | 'down'>
+
+/**
  * One filter preset. Captures a complete dashboard view:
  * which sources are filtered, and the per-column prefs.
  */
@@ -134,6 +144,10 @@ export type PreferencesState = {
   // Per-user lists. The dashboard treats these as flat arrays.
   hiddenEntries: number[]
   starredEntries: number[]
+  // Per-user map: entry id -> vote direction. A map (not a list, like
+  // hidden/starred) because a vote is three-state (up/down/none), not
+  // a boolean membership test.
+  votedEntries: VotedEntriesValue
   // Per-user singletons (one value, not a map).
   filterPresets: FilterPresetValue[]
   historyGroupBy: HistoryGroupByValue
@@ -147,6 +161,7 @@ export const PREFERENCE_KEYS = {
   columnSections: 'column_sections',
   hiddenEntries: 'hidden_entries',
   starredEntries: 'starred_entries',
+  votedEntries: 'voted_entries',
   filterPresets: 'filter_presets',
   historyGroupBy: 'history_group_by',
 } as const
@@ -162,6 +177,7 @@ const DEFAULT_STATE: PreferencesState = {
   columnSections: {},
   hiddenEntries: [],
   starredEntries: [],
+  votedEntries: {},
   filterPresets: [],
   historyGroupBy: 'entry',
 }
@@ -403,6 +419,9 @@ export interface PreferencesContextValue {
 
   /** Add or remove an entry from the "starred" set. */
   setStarredEntries: (ids: number[]) => void
+
+  /** Set (or clear, via ``null``) one entry's vote direction. */
+  setEntryVote: (entryId: number, direction: 'up' | 'down' | null) => void
 
   /** Replace the saved-presets list. */
   setFilterPresets: (presets: FilterPresetValue[]) => void
@@ -653,6 +672,29 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
     [scheduleSync],
   )
 
+  // Sets (or clears, via ``direction: null``) a single entry's vote.
+  // Unlike setHiddenEntries/setStarredEntries (which take the full
+  // replacement array — the caller already computed it), this takes
+  // just the one entry that changed because Card.tsx's vote buttons
+  // only know "toggle this entry's direction," not the whole map.
+  const setEntryVote = useCallback(
+    (entryId: number, direction: 'up' | 'down' | null) => {
+      setState((prev) => {
+        const nextVotes = { ...prev.votedEntries }
+        if (direction === null) {
+          delete nextVotes[String(entryId)]
+        } else {
+          nextVotes[String(entryId)] = direction
+        }
+        const trimmed = trimVotedEntries(nextVotes)
+        pendingRef.current.set(PREFERENCE_KEYS.votedEntries, trimmed)
+        return { ...prev, votedEntries: trimmed }
+      })
+      scheduleSync()
+    },
+    [scheduleSync],
+  )
+
   const setFilterPresets = useCallback(
     (presets: FilterPresetValue[]) => {
       setState((prev) => ({ ...prev, filterPresets: presets }))
@@ -683,6 +725,7 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
       setColumnSections,
       setHiddenEntries,
       setStarredEntries,
+      setEntryVote,
       setFilterPresets,
       setHistoryGroupBy,
     }),
@@ -697,6 +740,7 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
       setColumnSections,
       setHiddenEntries,
       setStarredEntries,
+      setEntryVote,
       setFilterPresets,
       setHistoryGroupBy,
     ],
@@ -732,10 +776,34 @@ export function usePreferences(): PreferencesContextValue {
 export const MAX_PER_COLUMN = 200
 export const MAX_HIDDEN = 1000
 export const MAX_STARRED = 1000
+// Votes accumulate one entry at a time as the user scrolls, so the
+// cap needs more headroom than hidden/starred (deliberate actions).
+export const MAX_VOTED = 2000
 // ``MAX_PRESETS`` is the cap on saved filter presets. Lives
 // here rather than in storage.ts because presets moved
 // server-side with the rest of the preferences.
 export const MAX_PRESETS = 50
+
+/**
+ * Trim ``votes`` down to ``MAX_VOTED`` entries when over cap,
+ * dropping the numerically-smallest entry ids first. Entry ids are
+ * an auto-increment PK, so the smallest ids are the oldest entries —
+ * a reasonable "drop the stuff that's aged out of view anyway"
+ * heuristic without needing to track vote timestamps separately
+ * (unlike hiddenEntries/starredEntries, a plain JS object has no
+ * reliable insertion-order enumeration once its keys look numeric —
+ * they get reordered ascending — so "oldest entry id" is the only
+ * cheap ordering available here).
+ */
+function trimVotedEntries(votes: VotedEntriesValue): VotedEntriesValue {
+  const ids = Object.keys(votes)
+  if (ids.length <= MAX_VOTED) return votes
+  const sorted = ids.map(Number).sort((a, b) => a - b)
+  const toDrop = sorted.slice(0, ids.length - MAX_VOTED)
+  const out = { ...votes }
+  for (const id of toDrop) delete out[String(id)]
+  return out
+}
 
 /**
  * Decode one server row into the right field of a PreferencesState.
@@ -778,6 +846,14 @@ function applyRowToState(out: PreferencesState, row: PreferenceRow) {
         (x): x is number => typeof x === 'number',
       )
     }
+  } else if (key === PREFERENCE_KEYS.votedEntries) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const filtered: VotedEntriesValue = {}
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        if (v === 'up' || v === 'down') filtered[k] = v
+      }
+      out.votedEntries = filtered
+    }
   } else if (key === PREFERENCE_KEYS.filterPresets) {
     if (Array.isArray(value)) {
       out.filterPresets = value as FilterPresetValue[]
@@ -812,6 +888,13 @@ function mergeStateFromServer(
       server.starredEntries.length > 0
         ? server.starredEntries
         : seed.starredEntries,
+    // Object spread (not "either seed or server") — there's no
+    // localStorage seed for votes (a new preference key, never
+    // stored client-side before this), so this always reduces to
+    // ``server.votedEntries`` in practice; spread keeps the shape
+    // consistent with the other maps above rather than introducing
+    // a third merge idiom.
+    votedEntries: { ...seed.votedEntries, ...server.votedEntries },
     filterPresets:
       server.filterPresets.length > 0
         ? server.filterPresets

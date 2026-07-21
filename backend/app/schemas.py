@@ -39,6 +39,16 @@ class SourceOut(BaseModel):
     # ``app.scheduler`` into ``app.schemas``).
     auto_disabled: bool = False
 
+    # Net thumbs score across every entry from this source:
+    # sum(thumb_up) - sum(thumb_down). NOT an ORM attribute — there's
+    # no column or relationship on ``Source`` for this, it's a SQL
+    # aggregate the route computes separately (see
+    # ``routes.sources._net_vote_scores``) and assigns onto this
+    # field after ``model_validate`` runs. Defaults to 0 (never
+    # voted on) rather than None so the frontend can render it
+    # directly without a null check.
+    net_vote_score: int = 0
+
     class Config:
         from_attributes = True
 

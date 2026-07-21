@@ -80,6 +80,11 @@ export interface Source {
   // re-enabling) from a manually-paused one (routine user choice).
   // See ``app.models.Source.auto_disabled``.
   auto_disabled: boolean
+  // Net thumbs score across every entry from this source:
+  // sum(thumb_up) - sum(thumb_down). 0 = never voted on (or an even
+  // split). Powers the FeedManager row badge so a net-negative
+  // source (one the user keeps downvoting) stands out.
+  net_vote_score: number
 }
 
 /** Result of ``POST /api/sources/test``. ``ok`` is the only field the
@@ -318,7 +323,7 @@ export const api = {
    * re-running with curl. */
   testSource: (body: {
     name?: string
-    type?: 'rss' | 'reddit' | 'podcast'
+    type?: 'rss' | 'reddit' | 'podcast' | 'youtube_channel'
     category?: string
     url: string
     custom_headers?: Record<string, string> | null

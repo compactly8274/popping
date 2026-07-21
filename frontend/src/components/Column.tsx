@@ -112,6 +112,11 @@ type Props = {
   // passes the same Set the eye button uses for its
   // open/closed state.
   hiddenSet?: Set<number>
+  // Per-card vote action + lookup — same shape as star/hide but a
+  // three-state Map (no entry / 'up' / 'down') instead of a Set,
+  // since a vote isn't a boolean membership test.
+  onVoteEntry?: (entryId: number, direction: 'up' | 'down' | null) => void
+  votedMap?: Map<number, 'up' | 'down'>
   // Per-section collapse state (Miniflux-style). When a section
   // is collapsed, only its header renders — the cards are
   // unmounted. Persisted in localStorage by App, keyed by column
@@ -143,6 +148,8 @@ export function Column({
   starredSet,
   onHideToggle,
   hiddenSet,
+  onVoteEntry,
+  votedMap,
   sectionsCollapsed,
   onToggleSection,
 }: Props) {
@@ -479,6 +486,8 @@ export function Column({
                 hiddenSet={hiddenSet}
                 onStarEntry={onStarEntry}
                 starredSet={starredSet}
+                onVoteEntry={onVoteEntry}
+                votedMap={votedMap}
               />
             )}
 
@@ -530,6 +539,8 @@ export function Column({
                 hiddenSet={hiddenSet}
                 onStarEntry={onStarEntry}
                 starredSet={starredSet}
+                onVoteEntry={onVoteEntry}
+                votedMap={votedMap}
               />
             )}
           </>
@@ -569,6 +580,8 @@ type SectionProps = {
   hiddenSet: Set<number> | undefined
   onStarEntry: ((entryId: number) => void) | undefined
   starredSet: Set<number> | undefined
+  onVoteEntry: ((entryId: number, direction: 'up' | 'down' | null) => void) | undefined
+  votedMap: Map<number, 'up' | 'down'> | undefined
 }
 
 function ColumnSection({
@@ -591,6 +604,8 @@ function ColumnSection({
   hiddenSet,
   onStarEntry,
   starredSet,
+  onVoteEntry,
+  votedMap,
 }: SectionProps) {
   return (
     <div>
@@ -652,6 +667,8 @@ function ColumnSection({
                 hidden={hiddenSet?.has(e.id) ?? false}
                 onStar={onStarEntry ? () => onStarEntry(e.id) : undefined}
                 starred={starredSet?.has(e.id) ?? false}
+                onVote={onVoteEntry ? (dir) => onVoteEntry(e.id, dir) : undefined}
+                vote={votedMap?.get(e.id) ?? null}
               />
             )
           })}

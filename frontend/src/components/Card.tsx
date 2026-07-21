@@ -89,6 +89,16 @@ type Props = {
   // of mark-read — expanding a card doesn't mark it.
   expanded?: boolean
   onToggleSummary?: () => void
+  // Per-card vote. ``vote`` is the entry's current persisted
+  // direction (null = no vote) — drives the filled/unfilled arrow
+  // icon and the button's tinted background so the user can see at
+  // a glance which way (if any) they've already voted. ``onVote``
+  // receives the FINAL desired direction, already toggled — Card
+  // computes "clicking the same direction again clears it" itself
+  // (it has the current ``vote`` value in scope) so the caller
+  // (App.tsx) doesn't need matching toggle logic.
+  vote?: 'up' | 'down' | null
+  onVote?: (direction: 'up' | 'down' | null) => void
 }
 
 // Map a category name to a Tailwind background class for the left
@@ -96,18 +106,50 @@ type Props = {
 // only consumer and we want it obvious from Card.tsx which colors
 // map to which categories. ``other`` falls through to a neutral
 // slate so unrecognized categories don't render without a stripe.
+// Full opacity (not the old /70) — paired with the wider 3px stripe
+// below, this reads as a deliberate accent rather than a faint tick
+// mark, closer to how Apollo's per-community color bar pops against
+// a dark background.
 function categoryStripeClass(category: string | undefined): string {
   switch (category) {
-    case 'news':     return 'bg-blue-500/70'
-    case 'tech':     return 'bg-violet-500/70'
-    case 'vulns':    return 'bg-red-500/70'
-    case 'science':  return 'bg-emerald-500/70'
-    case 'finance':  return 'bg-amber-500/70'
-    case 'policy':   return 'bg-cyan-500/70'
-    case 'longform': return 'bg-rose-500/70'
-    case 'deals':    return 'bg-lime-500/70'
-    case 'podcast':  return 'bg-orange-500/70'
-    default:         return 'bg-neutral-600/70'
+    case 'news':     return 'bg-blue-500'
+    case 'tech':     return 'bg-violet-500'
+    case 'vulns':    return 'bg-red-500'
+    case 'science':  return 'bg-emerald-500'
+    case 'finance':  return 'bg-amber-500'
+    case 'policy':   return 'bg-cyan-500'
+    case 'longform': return 'bg-rose-500'
+    case 'deals':    return 'bg-lime-500'
+    case 'podcast':  return 'bg-orange-500'
+    case 'video':    return 'bg-pink-500'
+    default:         return 'bg-neutral-600'
+  }
+}
+
+// Same category -> hue mapping as the stripe, but as a text color
+// for the source name in the meta row. Previously the source name
+// used ``text-label-primary`` — visually identical to the title
+// right above it, so the two blurred into one gray mass ("looks
+// like a spreadsheet"). Tinting the source name gives every card an
+// immediate, scannable category identity without adding a second
+// element, and echoes the stripe color so the two reinforce each
+// other rather than introducing a third, unrelated color. The 400
+// shade (one step lighter than the stripe's 500) reads better as
+// body text against the dark background than the more saturated 500
+// would at this size.
+function categorySourceTextClass(category: string | undefined): string {
+  switch (category) {
+    case 'news':     return 'text-blue-400'
+    case 'tech':     return 'text-violet-400'
+    case 'vulns':    return 'text-red-400'
+    case 'science':  return 'text-emerald-400'
+    case 'finance':  return 'text-amber-400'
+    case 'policy':   return 'text-cyan-400'
+    case 'longform': return 'text-rose-400'
+    case 'deals':    return 'text-lime-400'
+    case 'podcast':  return 'text-orange-400'
+    case 'video':    return 'text-pink-400'
+    default:         return 'text-label-primary'
   }
 }
 
@@ -145,6 +187,34 @@ function scoreBand(score: number): { color: string; label: string } {
   return               { color: 'bg-gradient-to-br from-neutral-500 to-neutral-700',   label: 'cold' }
 }
 
+// There's no dedicated "un-vote" interaction type on the backend —
+// the interactions table is an append-only log, and thumb_up/
+// thumb_down are the only vote-shaped types it knows. So clearing or
+// switching a vote is expressed as a CANCEL event (the inverse of
+// whatever was previously recorded) followed by an APPLY event (the
+// new direction, if any) — both land in the same log the backend
+// already aggregates for the source net-score and the preference-
+// vector recompute, and a cancel-then-apply pair nets to exactly the
+// right delta without any backend changes:
+//   up -> null (toggle off):   [thumb_down]                 net -1
+//   down -> null (toggle off): [thumb_up]                   net +1
+//   null -> up:                [thumb_up]                   net +1
+//   null -> down:               [thumb_down]                net -1
+//   up -> down (switch):       [thumb_down, thumb_down]      net -2
+//   down -> up (switch):       [thumb_up, thumb_up]          net +2
+function voteInteractionEvents(
+  prev: 'up' | 'down' | null,
+  next: 'up' | 'down' | null,
+): Array<'thumb_up' | 'thumb_down'> {
+  if (prev === next) return []
+  const events: Array<'thumb_up' | 'thumb_down'> = []
+  if (prev === 'up') events.push('thumb_down')
+  if (prev === 'down') events.push('thumb_up')
+  if (next === 'up') events.push('thumb_up')
+  if (next === 'down') events.push('thumb_down')
+  return events
+}
+
 // Long-press threshold. ~500ms is the conventional "long enough to
 // mean something, short enough not to feel laggy". The 10px move
 // tolerance lets a finger jitter slightly without cancelling.
@@ -173,9 +243,10 @@ const SWIPE_DIRECTION_RATIO = 1.3
 const SWIPE_MAX_REVEAL_PX = 88
 const SWIPE_COMMIT_PX = 58
 
-export function CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred, onHideToggle, hidden }: Props) {
+export function CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred, onHideToggle, hidden, vote, onVote }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
+  const sourceTextClass = categorySourceTextClass(category)
   // Touch tracking for long-press → copy URL.
   // Kept in refs so the values don't trigger re-renders mid-press.
   const touchStart = useRef<{ x: number; y: number; t: number; id: number; onInteractiveChild: boolean } | null>(null)
@@ -569,20 +640,30 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
         },
       })
     }
-    actions.push({
-      label: '👍 Thumbs up',
-      onClick: () => {
-        recordImmediate({ entry_id: entry.id, type: 'thumb_up' })
-        toast('👍 Thanks — tuning toward more like this.', 'info')
-      },
-    })
-    actions.push({
-      label: '👎 Thumbs down',
-      onClick: () => {
-        recordImmediate({ entry_id: entry.id, type: 'thumb_down' })
-        toast('👎 Got it — tuning down similar stories.', 'info')
-      },
-    })
+    if (onVote) {
+      actions.push({
+        label: vote === 'up' ? '▲ Remove upvote' : '▲ Upvote',
+        onClick: () => {
+          const next = vote === 'up' ? null : 'up'
+          for (const type of voteInteractionEvents(vote ?? null, next)) {
+            recordImmediate({ entry_id: entry.id, type })
+          }
+          if (next === 'up') toast('▲ Thanks — tuning toward more like this.', 'info')
+          onVote(next)
+        },
+      })
+      actions.push({
+        label: vote === 'down' ? '▼ Remove downvote' : '▼ Downvote',
+        onClick: () => {
+          const next = vote === 'down' ? null : 'down'
+          for (const type of voteInteractionEvents(vote ?? null, next)) {
+            recordImmediate({ entry_id: entry.id, type })
+          }
+          if (next === 'down') toast('▼ Got it — tuning down similar stories.', 'info')
+          onVote(next)
+        },
+      })
+    }
     actions.push({ label: 'Copy link', onClick: () => copyUrl(entry.url) })
     actions.push({
       label: 'Open in new tab',
@@ -664,14 +745,14 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
                     transition-[box-shadow,border-color,opacity] duration-200
                     ${ringClass} ${dimClass}`}
       >
-      {/* Category stripe. 2px wide, full height of the card. Lives
+      {/* Category stripe. 3px wide, full height of the card. Lives
           outside the padding flow so it doesn't shift content when
           a category is/isn't known. ``aria-hidden`` because the
           color is decorative — the category name (if shown) carries
           the semantic. */}
       <div
         aria-hidden="true"
-        className={`absolute left-0 top-0 bottom-0 w-0.5 rounded-l-ios-lg ${stripeClass}`}
+        className={`absolute left-0 top-0 bottom-0 w-[3px] rounded-l-ios-lg ${stripeClass}`}
       />
       <div className="flex items-start justify-between gap-3 mb-2">
         <a
@@ -722,9 +803,23 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
         </span>
       </div>
       <div className="flex items-center gap-2 text-ios-caption text-label-secondary">
-        {sourceName && <span className="font-medium text-label-primary">{sourceName}</span>}
+        {sourceName && <span className={`font-medium ${sourceTextClass}`}>{sourceName}</span>}
         {sourceName && <span>·</span>}
         <time dateTime={entry.published_at ?? ''}>{timeAgo(entry.published_at)}</time>
+        {/* Action cluster. Every per-card button (summary chevron,
+            mark-read, star, hide, vote pair) lives in ONE flex row
+            so they lay out side by side regardless of how many are
+            wired up — previously the hide/vote buttons rendered as
+            siblings of the flex container instead of children of
+            it, and each one's own ``flex`` utility (used to center
+            its icon) blockified it into its own line, stacking
+            buttons vertically and adding extra rows of height to
+            every card, worst on mobile where width is tightest.
+            ``ml-auto`` lives on this wrapper (not on individual
+            buttons) so it pushes the whole cluster to the trailing
+            edge in one step regardless of which buttons are wired
+            up for a given card. */}
+        <div className="ml-auto flex items-center gap-1">
         {/* Per-card summary chevron. Sits inline on the meta row so
             it reads as part of the same toolbar as the ✓ button. Same
             ``data-card-interactive`` guard so a long-press / right-
@@ -747,7 +842,7 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             aria-label={expanded ? 'hide summary' : 'show summary'}
             aria-expanded={!!expanded}
             title={expanded ? 'hide summary (s)' : 'show summary (s)'}
-            className={`ml-auto w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
+            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
                         ${expanded ? 'opacity-100 text-accent' : 'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100'}`}
           >
             {/* Rotate 180° when expanded so the chevron flips up —
@@ -807,7 +902,6 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             aria-pressed={!unread}
             title="mark as read (m)"
             className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
-                        ${onToggleSummary ? '' : 'ml-auto'}
                         ${unread ? 'text-label-secondary' : 'text-accent'}`}
           >
             <CheckIcon className="w-4 h-4" filled={!unread} />
@@ -851,27 +945,14 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             <StarIcon className="w-4 h-4" filled={!!starred} />
           </button>
         )}
-      </div>
-        {/* Per-card hide (eye) button. Sits next to the
-            mark-read checkmark and the star, completing the
-            iOS-style three-button meta row. The button's
-            state reflects the entry's current ``hidden``
-            prop: open eye = visible, closed eye = hidden.
-
-            Click toggles via ``onHideToggle`` (App wires
-            this to a callback that ALSO marks the entry
-            read when hiding, so the entry moves to the
-            column's History section instead of just
-            disappearing). The keyboard ``h`` shortcut
-            can target this button via document.querySelector
-            + ``data-eye`` for the currently-selected card.
-
-            Always visible (same as check + star) so the
-            user can see the affordance and the current
-            state at a glance. The hidden state uses
-            ``text-accent`` (matching the star) so the
-            three meta-row buttons all recolour in the
-            same family. */}
+        {/* Per-card hide (eye) button. State reflects the entry's
+            current ``hidden`` prop: open eye = visible, closed eye
+            = hidden. Click toggles via ``onHideToggle`` (App wires
+            this to a callback that ALSO marks the entry read when
+            hiding, so the entry moves to the column's History
+            section instead of just disappearing). The keyboard
+            ``h`` shortcut targets this button via
+            document.querySelector + ``data-eye``. */}
         {onHideToggle && (
           <button
             type="button"
@@ -903,55 +984,8 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             <EyeIcon className="w-4 h-4" closed={!!hidden} />
           </button>
         )}
-        {/* Thumbs up/down. Pure taste signal — unlike star (which
-            also organizes the entry into Saved) and hide (which
-            also removes it from view), a thumb click has no
-            side effect beyond the interaction event itself. The
-            backend already weights ``thumb_up``/``thumb_down`` in
-            the preference-vector recompute (same magnitude as
-            bookmark/never) — this is just the missing UI to fire
-            them; nothing backend-side needed. Deliberately
-            stateless (no persisted "you already rated this"
-            highlight, unlike star/hidden) to avoid a new synced-
-            preference-set subsystem for what's meant to be a
-            lightweight, low-friction signal — a toast is
-            confirmation enough. Always rendered (no callback prop
-            gate) since firing the interaction doesn't depend on
-            any parent-owned state. */}
-        <button
-          type="button"
-          data-card-interactive
-          onMouseDown={(e) => e.stopPropagation()}
-          onTouchStart={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            recordImmediate({ entry_id: entry.id, type: 'thumb_up' })
-            toast('👍 Thanks — tuning toward more like this.', 'info')
-          }}
-          aria-label="thumbs up"
-          title="thumbs up"
-          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated active:text-accent"
-        >
-          <span aria-hidden="true" className="text-sm leading-none">👍</span>
-        </button>
-        <button
-          type="button"
-          data-card-interactive
-          onMouseDown={(e) => e.stopPropagation()}
-          onTouchStart={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            recordImmediate({ entry_id: entry.id, type: 'thumb_down' })
-            toast('👎 Got it — tuning down similar stories.', 'info')
-          }}
-          aria-label="thumbs down"
-          title="thumbs down"
-          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated active:text-accent"
-        >
-          <span aria-hidden="true" className="text-sm leading-none">👎</span>
-        </button>
+        </div>
+      </div>
       {/* Reddit cross-reference footer. Rendered between the meta row
           and the summary block so it reads as "extra metadata about
           the article", not "extra metadata about the source". Only
@@ -1078,6 +1112,84 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
                 : summary}
         </div>
       )}
+      {/* Vote footer. Deliberately its own full-width bar at the very
+          bottom of the card, separated from the top meta row's check/
+          star/eye cluster by real vertical distance and a hairline
+          divider — the previous layout crammed the vote pair in next
+          to those tightly-packed 28px icons, which read as one
+          indistinct row and invited mis-taps on mobile. Bigger
+          targets (h-9, generous horizontal padding) and its own
+          breathing room fix that.
+          ``vote`` is a persisted per-entry direction (App.tsx, synced
+          via the same server-backed preferences store hidden/starred
+          use) — clicking the currently-active direction again clears
+          it (toggle), clicking the other direction switches. The
+          active direction renders as a solid filled arrow on a
+          tinted pill background so the user can tell at a glance
+          which way (if any) they've already voted on this entry,
+          matching the persisted-state treatment star/hidden already
+          get. */}
+      {onVote && (
+        <div className="mt-3 pt-2.5 border-t border-hairline/70 flex items-center">
+          <div className="flex items-center rounded-full bg-bg-elevated/70 ring-1 ring-white/5 overflow-hidden">
+            <button
+              type="button"
+              data-card-interactive
+              onMouseDown={(e) => e.stopPropagation()}
+              onTouchStart={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                const next = vote === 'up' ? null : 'up'
+                for (const type of voteInteractionEvents(vote ?? null, next)) {
+                  recordImmediate({ entry_id: entry.id, type })
+                }
+                if (next === 'up') {
+                  toast('▲ Thanks — tuning toward more like this.', 'info')
+                }
+                onVote(next)
+              }}
+              aria-label={vote === 'up' ? 'remove upvote' : 'upvote — more like this'}
+              aria-pressed={vote === 'up'}
+              title="more like this"
+              className={`h-9 px-3 flex items-center justify-center transition-colors
+                          ${vote === 'up'
+                            ? 'bg-amber-400/15 text-amber-400'
+                            : 'text-label-secondary hover:text-amber-400 active:text-amber-400'}`}
+            >
+              <ArrowUpIcon className="w-4 h-4" filled={vote === 'up'} />
+            </button>
+            <div aria-hidden="true" className="w-px h-5 bg-white/10" />
+            <button
+              type="button"
+              data-card-interactive
+              onMouseDown={(e) => e.stopPropagation()}
+              onTouchStart={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                const next = vote === 'down' ? null : 'down'
+                for (const type of voteInteractionEvents(vote ?? null, next)) {
+                  recordImmediate({ entry_id: entry.id, type })
+                }
+                if (next === 'down') {
+                  toast('▼ Got it — tuning down similar stories.', 'info')
+                }
+                onVote(next)
+              }}
+              aria-label={vote === 'down' ? 'remove downvote' : 'downvote — less like this'}
+              aria-pressed={vote === 'down'}
+              title="less like this"
+              className={`h-9 px-3 flex items-center justify-center transition-colors
+                          ${vote === 'down'
+                            ? 'bg-sky-400/15 text-sky-400'
+                            : 'text-label-secondary hover:text-sky-400 active:text-sky-400'}`}
+            >
+              <ArrowDownIcon className="w-4 h-4" filled={vote === 'down'} />
+            </button>
+          </div>
+        </div>
+      )}
       </article>
     </div>
   )
@@ -1108,7 +1220,10 @@ function _cardPropsEqual(prev: Props, next: Props): boolean {
     prev.unread === next.unread &&
     prev.selected === next.selected &&
     prev.category === next.category &&
-    prev.expanded === next.expanded
+    prev.expanded === next.expanded &&
+    prev.starred === next.starred &&
+    prev.hidden === next.hidden &&
+    prev.vote === next.vote
   )
 }
 
@@ -1252,6 +1367,66 @@ function ChevronDownIcon({ className }: { className?: string }) {
   )
 }
 
+// Vote-pair arrows. A straight stem + chevron head (not a solid
+// Reddit-style triangle) so they read as siblings of the other
+// stroke-based icons here (Check/Eye/Star/Chevron) rather than a
+// visually foreign import. Slightly heavier stroke (2.5 vs the 2 the
+// other icons use) since these are the primary voting affordance and
+// benefit from a touch more presence at 16px.
+// ``filled`` swaps the open stem+chevron path (idle) for a solid
+// closed triangle (voted) — mirrors the outline-vs-filled pattern
+// StarIcon/CheckIcon already use, but needs a genuinely different
+// path rather than just toggling ``fill`` because the idle path is
+// an open stroke (a stem + a separate chevron), which has no
+// enclosed area for ``fill`` to do anything visible to.
+function ArrowUpIcon({ className, filled = false }: { className?: string; filled?: boolean }) {
+  if (filled) {
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden="true">
+        <path d="M12 4l8 14H4z" />
+      </svg>
+    )
+  }
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M12 19V5M5 12l7-7 7 7" />
+    </svg>
+  )
+}
+
+function ArrowDownIcon({ className, filled = false }: { className?: string; filled?: boolean }) {
+  if (filled) {
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden="true">
+        <path d="M12 20l-8-14h16z" />
+      </svg>
+    )
+  }
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M12 5v14M19 12l-7 7-7-7" />
+    </svg>
+  )
+}
+
 // Aspect-video thumbnail (16:9). Wider than the old 96×96 square so
 // the image fills more of the right side of the card — a real
 // thumbnail instead of a postage-stamp. ``bg-bg-elevated`` reserves
@@ -1309,7 +1484,9 @@ function Thumbnail({ path, title, url, entryId }: { path: string; title: string;
       onKeyDown={onKey}
       aria-label={`open ${title} in new tab`}
       title={title}
-      className="shrink-0 w-24 sm:w-32 aspect-video rounded-ios overflow-hidden bg-bg-elevated cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-accent/60"
+      className="shrink-0 w-28 sm:w-40 aspect-video rounded-ios overflow-hidden bg-bg-elevated cursor-zoom-in
+                 ring-1 ring-white/10 shadow-md
+                 focus:outline-none focus:ring-2 focus:ring-accent/60"
     >
       <img
         src={`/assets/${path}`}

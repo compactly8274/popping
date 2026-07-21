@@ -66,6 +66,10 @@ const REFRESH_PRESETS: Array<{ value: number; label: string }> = [
 // plain-RSS default.
 const PODCAST_DEFAULT_REFRESH = 21600
 
+// Mirrors the backend's _YOUTUBE_DEFAULT_REFRESH — same rationale as
+// podcasts, most channels post far less than hourly.
+const YOUTUBE_DEFAULT_REFRESH = 21600
+
 // Categories the user can pick from when adding a custom source.
 // Existing source categories + a couple of common extras the
 // recommendations list uses. Free-form text is also accepted in the
@@ -82,6 +86,7 @@ const CATEGORY_OPTIONS = [
   'longform',
   'deals',
   'podcast',
+  'video',
   'other',
 ]
 
@@ -733,6 +738,26 @@ function SourceRow({
             ⚠ {source.error_count > 1 ? source.error_count : ''}
           </span>
         )}
+        {/* Net vote score — sum(thumb_up) - sum(thumb_down) across
+            every entry from this source. Omitted at exactly 0 (never
+            voted on, or an even split — neither is actionable) so
+            most rows stay quiet; only sources the user has a real
+            opinion on get a badge. Negative (a source they keep
+            downvoting) is the one worth surfacing loudly — red, with
+            the minus sign JS already gives negative numbers.
+            Positive gets a quieter green; there's no "clean this up"
+            action implied by a source the user likes. */}
+        {source.net_vote_score !== 0 && (
+          <span
+            className={`shrink-0 text-ios-caption font-semibold ${
+              source.net_vote_score < 0 ? 'text-red-400' : 'text-emerald-400'
+            }`}
+            title={`net vote score: ${source.net_vote_score > 0 ? '+' : ''}${source.net_vote_score} (thumbs up minus thumbs down across this source's entries)`}
+          >
+            {source.net_vote_score > 0 ? '+' : ''}
+            {source.net_vote_score}
+          </span>
+        )}
       </div>
       <div className="flex items-center gap-2 mt-1">
         <button
@@ -1099,11 +1124,14 @@ function AddCustomTab({
   // ``"reddit"`` takes a subreddit reference (``r/python`` or full
   // ``https://www.reddit.com/r/python``); ``"podcast"`` also takes a
   // feed URL (podcast feeds are RSS-shaped — the backend extracts
-  // the episode audio + duration from the same fetch). The backend
-  // applies the same dispatch in
+  // the episode audio + duration from the same fetch); ``"youtube_channel"``
+  // takes any shape of YouTube link (channel, handle, custom, or
+  // video URL) — the backend resolves it to the channel's video RSS
+  // feed the same way it resolves Apple Podcasts show pages. The
+  // backend applies the same dispatch in
   // ``routes/sources.create_source_endpoint`` so the field reaches
   // ``POST /api/sources`` as ``type``.
-  const [sourceType, setSourceType] = useState<'rss' | 'reddit' | 'podcast'>('rss')
+  const [sourceType, setSourceType] = useState<'rss' | 'reddit' | 'podcast' | 'youtube_channel'>('rss')
   const [submitting, setSubmitting] = useState(false)
   // Test step. ``testing`` is true while the request is in flight;
   // ``testResult`` holds the last result so the user can see
@@ -1144,7 +1172,7 @@ function AddCustomTab({
       return 'name must be lowercase letters, digits, or underscore (1-120 chars)'
     }
     if (!trimmedUrl) return 'url is required'
-    if (sourceType === 'rss' || sourceType === 'podcast') {
+    if (sourceType === 'rss' || sourceType === 'podcast' || sourceType === 'youtube_channel') {
       try {
         new URL(trimmedUrl)
       } catch {
@@ -1167,7 +1195,7 @@ function AddCustomTab({
     const trimmedUrl = url.trim()
     if (!trimmedUrl) {
       setUrlError('url is required')
-    } else if (sourceType === 'rss' || sourceType === 'podcast') {
+    } else if (sourceType === 'rss' || sourceType === 'podcast' || sourceType === 'youtube_channel') {
       try {
         new URL(trimmedUrl)
         setUrlError(null)
@@ -1284,9 +1312,10 @@ function AddCustomTab({
           validator branch in ``submit``. Radios sit next to the URL
           field so the user sees the choice immediately — a dropdown
           would work but adds a click and hides the most common
-          choice (RSS). Picking "Podcast" also bumps the refresh
-          default to 6h (episodes are infrequent; polling hourly
-          just wastes requests — see _PODCAST_DEFAULT_REFRESH on the
+          choice (RSS). Picking "Podcast" or "YouTube" also bumps the
+          refresh default to 6h (episodes/videos are infrequent;
+          polling hourly just wastes requests — see
+          _PODCAST_DEFAULT_REFRESH / _YOUTUBE_DEFAULT_REFRESH on the
           backend) unless the user has already customized it away
           from the plain-RSS default. */}
       <fieldset className="flex items-center gap-3 flex-wrap">
@@ -1335,13 +1364,34 @@ function AddCustomTab({
           />
           Podcast
         </label>
+        <label className="flex items-center gap-1 text-ios-caption text-label-primary">
+          <input
+            type="radio"
+            name="fm-type"
+            value="youtube_channel"
+            checked={sourceType === 'youtube_channel'}
+            onChange={() => {
+              setSourceType('youtube_channel')
+              if (refresh === 3600) setRefresh(YOUTUBE_DEFAULT_REFRESH)
+              if (category === 'news') setCategory('video')
+            }}
+            className="accent-accent"
+          />
+          YouTube
+        </label>
       </fieldset>
       <div>
         <label
           className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1"
           htmlFor="fm-url"
         >
-          {sourceType === 'reddit' ? 'Subreddit' : sourceType === 'podcast' ? 'Podcast RSS URL' : 'RSS / Atom URL'}
+          {sourceType === 'reddit'
+            ? 'Subreddit'
+            : sourceType === 'podcast'
+              ? 'Podcast RSS URL'
+              : sourceType === 'youtube_channel'
+                ? 'YouTube channel URL'
+                : 'RSS / Atom URL'}
         </label>
         <input
           id="fm-url"
@@ -1353,7 +1403,9 @@ function AddCustomTab({
               ? 'r/python or https://www.reddit.com/r/python'
               : sourceType === 'podcast'
                 ? 'https://example.com/podcast/feed.xml'
-                : 'https://example.com/feed.xml'
+                : sourceType === 'youtube_channel'
+                  ? 'https://www.youtube.com/@handle'
+                  : 'https://example.com/feed.xml'
           }
           className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
         />
@@ -1408,7 +1460,7 @@ function AddCustomTab({
           </div>
           {testResult.resolvedUrl && (
             <div className="mt-1 text-ios-caption opacity-80 break-all">
-              Resolved Apple Podcasts link to the real feed: {testResult.resolvedUrl}
+              Resolved to the real feed: {testResult.resolvedUrl}
               {testResult.kind === 'ok' && ' — Add will use this URL.'}
             </div>
           )}
