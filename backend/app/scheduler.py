@@ -64,6 +64,7 @@ from app.sources.base import SourcePlugin
 from app.sources.dynamic_reddit import DynamicRedditPlugin
 from app.sources.dynamic_rss import DynamicRssPlugin
 from app.sources.podcast import DynamicPodcastPlugin
+from app.sources.youtube import DynamicYouTubePlugin
 
 logger = logging.getLogger("popping.scheduler")
 
@@ -1421,10 +1422,9 @@ async def start_scheduler(notifier: Optional[Notifier] = None) -> AsyncIOSchedul
         )
 
     # Phase 5: register scheduler jobs for ``Source`` rows that don't
-    # have a backing plugin class. Today the only such shape is
-    # ``type="rss"`` (served by ``DynamicRssPlugin``); future phases
-    # will add ``podcast`` and ``youtube_channel`` and the dispatcher
-    # below will pick the right plugin class per row.
+    # have a backing plugin class — ``rss``, ``reddit``, ``podcast``,
+    # and ``youtube_channel`` rows all dispatch through ``_plugin_for``
+    # below, which picks the right plugin class per row.
     try:
         await _register_dynamic_source_jobs(_scheduler, plugins)
     except Exception:
@@ -1615,10 +1615,10 @@ async def backfill_now() -> dict:
 # registry are "dynamic" — they have no class backing them and need a
 # runtime-constructed plugin to be fetched. Covers ``type="rss"``
 # (``DynamicRssPlugin``), ``type="reddit"`` (``DynamicRedditPlugin``),
-# and ``type="podcast"`` (``DynamicPodcastPlugin`` — podcast feeds are
-# RSS-shaped, so this is a thin wrapper around the same fetch path).
-# Phase 7 will add ``type="youtube_channel"`` as its own
-# ``_plugin_for(row)`` branch below.
+# ``type="podcast"`` (``DynamicPodcastPlugin``), and
+# ``type="youtube_channel"`` (``DynamicYouTubePlugin``) — podcast and
+# YouTube channel feeds are both RSS/Atom-shaped, so both are thin
+# wrappers around the same fetch path.
 #
 # Each dynamic row gets its own scheduler job keyed by
 # ``ingest:dynamic:{row.id}``. This id is what the routes use to
@@ -1650,7 +1650,8 @@ def _plugin_for(row: Source) -> SourcePlugin | None:
         return DynamicRedditPlugin(row)
     if row.type == "podcast":
         return DynamicPodcastPlugin(row)
-    # Phase 7 will add ``youtube_channel`` here.
+    if row.type == "youtube_channel":
+        return DynamicYouTubePlugin(row)
     logger.debug(
         "scheduler: no plugin for source %s (id=%d, type=%s) — skipping",
         row.name, row.id, row.type,

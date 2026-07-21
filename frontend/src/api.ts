@@ -318,7 +318,7 @@ export const api = {
    * re-running with curl. */
   testSource: (body: {
     name?: string
-    type?: 'rss' | 'reddit' | 'podcast'
+    type?: 'rss' | 'reddit' | 'podcast' | 'youtube_channel'
     category?: string
     url: string
     custom_headers?: Record<string, string> | null

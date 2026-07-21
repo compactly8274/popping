@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.apple_podcasts import PodcastResolutionError, resolve_feed_url
+from app.youtube import YouTubeResolutionError, resolve_channel_feed_url
 from app.auth.deps import current_user, require_user
 from app.config import settings
 from app.db import SessionLocal, get_session
@@ -126,6 +127,11 @@ _REDDIT_DEFAULT_REFRESH = 900
 # at a time between episodes. 6h is generous headroom for same-day
 # discovery without hammering the feed.
 _PODCAST_DEFAULT_REFRESH = 21_600
+
+# Default refresh for ``type="youtube_channel"`` rows. Same rationale
+# as podcasts — most channels post far less than hourly, so the
+# plain-RSS default would just poll a feed that isn't changing.
+_YOUTUBE_DEFAULT_REFRESH = 21_600
 
 # Mirrors ``Source.category``'s ``String(40)``. A PATCH / POST with a
 # longer string would crash on the DB layer with a Postgres
@@ -357,11 +363,10 @@ async def create_source_endpoint(
 ) -> SourceOut:
     """Add a new dynamic source.
 
-    v1 accepts ``type="rss"``, ``type="reddit"``, and
-    ``type="podcast"`` (podcast feeds are RSS-shaped — see
-    ``app.sources.podcast``). ``"youtube_channel"`` lands in a later
-    phase and routes to its own plugin dispatcher via
-    ``scheduler._plugin_for``.
+    v1 accepts ``type="rss"``, ``type="reddit"``, ``type="podcast"``
+    (podcast feeds are RSS-shaped — see ``app.sources.podcast``), and
+    ``type="youtube_channel"`` (a channel's video feed is Atom-shaped
+    RSS too — see ``app.sources.youtube``).
     """
     _validate_name(body.name)
     # Apple Podcasts catalog links (podcasts.apple.com/.../id<N>)
@@ -371,31 +376,44 @@ async def create_source_endpoint(
         body.url = await resolve_feed_url(body.url)
     except PodcastResolutionError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    # Same idea for any shape of YouTube link (channel, handle,
+    # custom, or video URL) — resolve to the channel's video RSS feed.
+    # No-op for anything that isn't a YouTube host.
+    try:
+        body.url = await resolve_channel_feed_url(body.url)
+    except YouTubeResolutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     # Type-aware URL validation. Reddit rows accept a subreddit
     # reference (``r/python``) and get rewritten to the canonical
-    # Reddit thread URL; RSS and podcast rows take a plain http(s)
-    # feed URL (a podcast feed IS an RSS feed).
+    # Reddit thread URL; RSS, podcast, and YouTube channel rows take
+    # a plain http(s) feed URL.
     if body.type == "reddit":
         url = _validate_reddit_url(body.url)
     else:
         _validate_url(body.url)
         url = body.url
-    if body.type not in ("rss", "reddit", "podcast"):
+    if body.type not in ("rss", "reddit", "podcast", "youtube_channel"):
         raise HTTPException(
             status_code=400,
-            detail=f"unsupported type {body.type!r} (only 'rss', 'reddit', and 'podcast' are accepted in this build)",
+            detail=(
+                f"unsupported type {body.type!r} (only 'rss', 'reddit', 'podcast', "
+                "and 'youtube_channel' are accepted in this build)"
+            ),
         )
     _validate_category(body.category)
     # ``refresh_interval_seconds`` is optional in the schema; default
     # to a per-type sensible value when absent. Reddit moves faster
     # than news RSS so 15 min vs 1h is the right baseline; podcasts
-    # are the opposite — episodes are infrequent, so 6h avoids
-    # polling a feed that won't change for days.
+    # and YouTube channels are the opposite — episodes/videos are
+    # infrequent, so 6h avoids polling a feed that won't change for
+    # days.
     if body.refresh_interval_seconds is None:
         if body.type == "reddit":
             refresh = _REDDIT_DEFAULT_REFRESH
         elif body.type == "podcast":
             refresh = _PODCAST_DEFAULT_REFRESH
+        elif body.type == "youtube_channel":
+            refresh = _YOUTUBE_DEFAULT_REFRESH
         else:
             refresh = _REFRESH_MIN * 60
     else:
@@ -472,6 +490,12 @@ async def update_source_endpoint(
         try:
             body.url = await resolve_feed_url(body.url)
         except PodcastResolutionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        # Same idea for any shape of YouTube link — no-op for
+        # anything that isn't a YouTube host.
+        try:
+            body.url = await resolve_channel_feed_url(body.url)
+        except YouTubeResolutionError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         # PATCH URL is also type-aware: re-validate as a subreddit
         # reference when the row is a Reddit row (so a typo'd edit
@@ -593,24 +617,28 @@ async def _test_source_impl(
     # validation here is intentionally a subset of the create flow's
     # (no DB write, no scheduler registration) so a Test never has
     # side effects beyond the upstream fetch.
-    if body.type not in ("rss", "reddit", "podcast"):
+    if body.type not in ("rss", "reddit", "podcast", "youtube_channel"):
         return SourceTestResult(
             ok=False,
             error_kind="unsupported_type",
-            error=f"unsupported type {body.type!r} (only 'rss', 'reddit', and 'podcast' are accepted)",
+            error=(
+                f"unsupported type {body.type!r} (only 'rss', 'reddit', 'podcast', "
+                "and 'youtube_channel' are accepted)"
+            ),
         )
 
-    # Apple Podcasts catalog links (podcasts.apple.com/.../id<N>)
-    # aren't a feed — resolve to the real RSS URL before anything
-    # below touches ``body.url``. A no-op for any URL that doesn't
-    # match the pattern (``resolved_url`` stays None). Every
-    # SourceTestResult returned past this point carries
+    # Apple Podcasts catalog links (podcasts.apple.com/.../id<N>) and
+    # any shape of YouTube link aren't feeds — resolve to the real
+    # RSS URL before anything below touches ``body.url``. A no-op for
+    # any URL that matches neither pattern (``resolved_url`` stays
+    # None). Every SourceTestResult returned past this point carries
     # ``resolved_url`` so the frontend can show / adopt the real URL
     # regardless of whether the rest of the test succeeds.
     resolved_url: str | None = None
     try:
         new_url = await resolve_feed_url(body.url)
-    except PodcastResolutionError as exc:
+        new_url = await resolve_channel_feed_url(new_url)
+    except (PodcastResolutionError, YouTubeResolutionError) as exc:
         return SourceTestResult(ok=False, error_kind="invalid_url", error=str(exc))
     if new_url != body.url:
         resolved_url = new_url
@@ -710,10 +738,12 @@ async def _test_source_impl(
     # same parse + normalize logic the live ingest uses — a
     # "works on test" result is a true "Add will work" signal.
     try:
-        if body.type in ("rss", "podcast"):
-            # Podcast feeds are RSS-shaped — same fetcher, which
-            # already extracts audio_url / duration_seconds when
-            # present (see app.sources.podcast).
+        if body.type in ("rss", "podcast", "youtube_channel"):
+            # Podcast feeds and YouTube channel feeds are both
+            # RSS/Atom-shaped — same fetcher, which already extracts
+            # audio_url / duration_seconds when present for podcasts
+            # (see app.sources.podcast) and picks up media:thumbnail
+            # generically for YouTube (see app.sources.youtube).
             from app.sources.rss import fetch_rss
             items = await fetch_rss(url, headers=headers)
         else:  # "reddit"

@@ -107,6 +107,7 @@ function categoryStripeClass(category: string | undefined): string {
     case 'longform': return 'bg-rose-500/70'
     case 'deals':    return 'bg-lime-500/70'
     case 'podcast':  return 'bg-orange-500/70'
+    case 'video':    return 'bg-pink-500/70'
     default:         return 'bg-neutral-600/70'
   }
 }
