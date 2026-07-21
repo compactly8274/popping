@@ -32,6 +32,8 @@ type Props = {
   hiddenSet?: Set<number>
   onStar?: (entryId: number) => void
   starredSet?: Set<number>
+  onVote?: (entryId: number, direction: 'up' | 'down' | null) => void
+  votedMap?: Map<number, 'up' | 'down'>
   expandedSummaries?: Set<number>
   onToggleSummary?: (entryId: number) => void
 }
@@ -50,6 +52,8 @@ export function SearchResults({
   hiddenSet,
   onStar,
   starredSet,
+  onVote,
+  votedMap,
   expandedSummaries,
   onToggleSummary,
 }: Props) {
@@ -92,6 +96,8 @@ export function SearchResults({
               hidden={hiddenSet?.has(e.id) ?? false}
               onStar={onStar ? () => onStar(e.id) : undefined}
               starred={starredSet?.has(e.id) ?? false}
+              onVote={onVote ? (dir) => onVote(e.id, dir) : undefined}
+              vote={votedMap?.get(e.id) ?? null}
             />
           ))
         )}

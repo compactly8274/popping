@@ -738,6 +738,26 @@ function SourceRow({
             ⚠ {source.error_count > 1 ? source.error_count : ''}
           </span>
         )}
+        {/* Net vote score — sum(thumb_up) - sum(thumb_down) across
+            every entry from this source. Omitted at exactly 0 (never
+            voted on, or an even split — neither is actionable) so
+            most rows stay quiet; only sources the user has a real
+            opinion on get a badge. Negative (a source they keep
+            downvoting) is the one worth surfacing loudly — red, with
+            the minus sign JS already gives negative numbers.
+            Positive gets a quieter green; there's no "clean this up"
+            action implied by a source the user likes. */}
+        {source.net_vote_score !== 0 && (
+          <span
+            className={`shrink-0 text-ios-caption font-semibold ${
+              source.net_vote_score < 0 ? 'text-red-400' : 'text-emerald-400'
+            }`}
+            title={`net vote score: ${source.net_vote_score > 0 ? '+' : ''}${source.net_vote_score} (thumbs up minus thumbs down across this source's entries)`}
+          >
+            {source.net_vote_score > 0 ? '+' : ''}
+            {source.net_vote_score}
+          </span>
+        )}
       </div>
       <div className="flex items-center gap-2 mt-1">
         <button

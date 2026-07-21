@@ -350,6 +350,7 @@ export function App() {
           t === 'history' ||
           t === 'hidden' ||
           t === 'starred' ||
+          t === 'voted' ||
           t === 'reset'
         ) {
           setSettingsTab(t)
@@ -507,6 +508,7 @@ export function App() {
   const columnSections = prefs.state.columnSections as ColumnSections
   const hiddenEntries = prefs.state.hiddenEntries
   const starredEntries = prefs.state.starredEntries
+  const votedEntries = prefs.state.votedEntries
   const filterPresets = prefs.state.filterPresets as FilterPreset[]
   const historyGroupBy = prefs.state.historyGroupBy
   // Stable references to the typed setters. Aliased locally so
@@ -533,6 +535,10 @@ export function App() {
   ) => void = prefs.setColumnSections
   const setHiddenEntries: (ids: number[]) => void = prefs.setHiddenEntries
   const setStarredEntries: (ids: number[]) => void = prefs.setStarredEntries
+  const setEntryVote: (
+    entryId: number,
+    direction: 'up' | 'down' | null,
+  ) => void = prefs.setEntryVote
   const setFilterPresets: (presets: FilterPresetValue[]) => void =
     prefs.setFilterPresets
   // Note: no local ``setHistoryGroupBy`` alias — Settings.tsx's
@@ -693,6 +699,27 @@ export function App() {
   // ``hiddenSet`` pattern: cheap to construct on every render,
   // saves a linear pass on each downstream filter.
   const starredSet = useMemo(() => new Set(starredEntries), [starredEntries])
+  // Build a Map for O(1) vote lookup. ``votedEntries`` is keyed by
+  // entry id as a string (JSON object keys are always strings); the
+  // Map here re-keys by number so Card's ``vote={votedMap?.get(e.id)}``
+  // lookup matches the number ids used everywhere else in this file.
+  const votedMap = useMemo(
+    () => new Map(Object.entries(votedEntries).map(([id, dir]) => [Number(id), dir])),
+    [votedEntries],
+  )
+  // Entries downvoted but not yet hidden — backs the Settings ->
+  // Voted tab's list + "Hide all downvoted" bulk action. Excludes
+  // already-hidden entries since hiding one is exactly what removes
+  // it from this backlog; without the exclusion, hidden-and-
+  // downvoted entries would linger in the list forever with no way
+  // to "complete" them.
+  const downvotedEntries = useMemo(
+    () =>
+      Object.entries(votedEntries)
+        .filter(([id, dir]) => dir === 'down' && !hiddenSet.has(Number(id)))
+        .map(([id]) => Number(id)),
+    [votedEntries, hiddenSet],
+  )
   // "Saved" column entries. The Saved column shows entries the
   // user has starred, in chronological order (most recent first).
   // Filter out hidden (a star + a hide is "I saved this but
@@ -2321,6 +2348,8 @@ export function App() {
               )
             }}
             starredSet={starredSet}
+            onVote={setEntryVote}
+            votedMap={votedMap}
           />
         </main>
       ) : columns.length === 0 ? (
@@ -2422,6 +2451,8 @@ export function App() {
                         )
                       }}
                       starred={starredSet.has(e.id)}
+                      onVote={(dir) => setEntryVote(e.id, dir)}
+                      vote={votedMap.get(e.id) ?? null}
                     />
                   )
                 })}
@@ -2482,6 +2513,8 @@ export function App() {
                         )
                     }}
                     starredSet={starredSet}
+                    onVoteEntry={setEntryVote}
+                    votedMap={votedMap}
                     prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
                     onPrefsChange={(next) => setPrefsFor(col.name, next)}
                     totalCount={col.totalCount}
@@ -2624,6 +2657,8 @@ export function App() {
                             )
                   }}
                   starredSet={starredSet}
+                  onVoteEntry={setEntryVote}
+                  votedMap={votedMap}
                   prefs={
                     columns[mobileCol]
                       ? columnPrefs[columns[mobileCol].name] ?? DEFAULT_PREFS
@@ -2715,6 +2750,19 @@ export function App() {
           // "Unsave" action.
           setStarredEntries(
             starredEntriesRef.current.filter((id) => id !== entryId),
+          )
+        }}
+        downvotedEntries={downvotedEntries}
+        onHideDownvoted={(entryId) => hideEntry(entryId)}
+        onHideAllDownvoted={() => {
+          const ids = downvotedEntries
+          if (ids.length === 0) return
+          setHiddenEntries(
+            [...hiddenEntriesRef.current, ...ids].slice(-MAX_HIDDEN),
+          )
+          toast(
+            `Hid ${ids.length} downvoted ${ids.length === 1 ? 'entry' : 'entries'}.`,
+            'info',
           )
         }}
       />

@@ -43,6 +43,7 @@ export type SettingsTab =
   | 'history'
   | 'hidden'
   | 'starred'
+  | 'voted'
   | 'reset'
 
 type Props = {
@@ -89,6 +90,16 @@ type Props = {
   onUnstarAll: () => void
   // Per-row actions for the list view.
   onUnstarEntry: (entryId: number) => void
+  // List of currently-downvoted, not-yet-hidden entry ids. Shown on
+  // the Voted tab so the user can review what they've downvoted and
+  // clear the backlog in one action — separate from the vote itself
+  // (voting is a pure taste signal, no view-state side effect;
+  // hiding is a distinct, deliberate "get this off my screen" action
+  // the user opts into from here, not something a downvote does
+  // automatically).
+  downvotedEntries: number[]
+  onHideDownvoted: (entryId: number) => void
+  onHideAllDownvoted: () => void
 }
 
 const TAB_META: Record<SettingsTab, { label: string; icon: string }> = {
@@ -98,6 +109,7 @@ const TAB_META: Record<SettingsTab, { label: string; icon: string }> = {
   history: { label: 'History', icon: 'history' },
   hidden: { label: 'Hidden', icon: 'eye-off' },
   starred: { label: 'Saved', icon: 'star' },
+  voted: { label: 'Voted', icon: 'arrow-down' },
   reset: { label: 'Reset', icon: 'reset' },
 }
 
@@ -120,6 +132,9 @@ export function Settings({
   starredEntries,
   onUnstarAll,
   onUnstarEntry,
+  downvotedEntries,
+  onHideDownvoted,
+  onHideAllDownvoted,
 }: Props) {
   // Live data fetched when the overlay opens. The Feeds tab reuses
   // the ``sources`` prop (App owns it), but the LLM and
@@ -208,7 +223,7 @@ export function Settings({
             primary. ``role="tablist"`` so screen readers
             announce it as a tab group. */}
         <div className="flex gap-1 mx-4 mt-3 rounded-ios overflow-hidden border border-hairline" role="tablist">
-          {(['feeds', 'llm', 'notifications', 'history', 'hidden', 'starred', 'reset'] as SettingsTab[]).map((t) => {
+          {(['feeds', 'llm', 'notifications', 'history', 'hidden', 'starred', 'voted', 'reset'] as SettingsTab[]).map((t) => {
             const active = t === tab
             return (
               <button
@@ -369,6 +384,14 @@ export function Settings({
             />
           )}
 
+          {tab === 'voted' && (
+            <DownvotedTabContent
+              ids={downvotedEntries}
+              onHide={onHideDownvoted}
+              onHideAll={onHideAllDownvoted}
+            />
+          )}
+
           {tab === 'history' && <HistoryTabContent onError={onError} />}
 
           {tab === 'reset' && (
@@ -466,6 +489,15 @@ function TabIcon({ name, active }: { name: string; active: boolean }) {
       return (
         <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <polygon points="10 2 12.5 7.5 18 8 14 12 15 18 10 15 5 18 6 12 2 8 7.5 7.5" />
+        </svg>
+      )
+    case 'arrow-down':
+      // Down-arrow tab icon for the Voted tab — mirrors the vote
+      // footer's downvote arrow (Card.tsx's ArrowDownIcon) so the
+      // tab reads as "the downvote thing" at a glance.
+      return (
+        <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M10 4v12M4 10l6 6 6-6" />
         </svg>
       )
     default:
@@ -1516,3 +1548,87 @@ function StarredTabContent({
   )
 }
 
+
+// Thin wrapper for the Voted tab. Same shape as HiddenTabContent/
+// StarredTabContent, but lists DOWNVOTED entries specifically (not
+// upvoted — an upvote is "keep showing me this," there's nothing to
+// clean up there) with a bulk "Hide all downvoted" action.
+//
+// Why this exists: voting and hiding are deliberately independent
+// signals — a downvote alone doesn't remove anything from view, so a
+// pattern of consistent downvotes on a source can otherwise pile up
+// invisibly. This tab is the release valve: review what you've
+// downvoted, then hide the backlog in one action instead of hunting
+// each card down individually. The vote itself isn't cleared by
+// hiding — a hidden entry that's still in this list just means "I
+// downvoted it AND hid it," which the row's absence after hiding
+// already communicates (hidden entries are excluded from ``ids``
+// upstream in App.tsx).
+function DownvotedTabContent({
+  ids,
+  onHide,
+  onHideAll,
+}: {
+  ids: number[]
+  onHide: (entryId: number) => void
+  onHideAll: () => void
+}) {
+  const [loaded, setLoaded] = useState<EntryIdListContentProps['loaded']>([])
+  const [loading, setLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // Depend on content, not array identity — see the identical comment
+  // in HiddenTabContent above.
+  const idsKey = useMemo(() => ids.join(','), [ids])
+  useEffect(() => {
+    if (ids.length === 0) {
+      setLoaded([])
+      setLoading(false)
+      setLoadError(null)
+      return
+    }
+    let alive = true
+    setLoading(true)
+    setLoadError(null)
+    api
+      .entriesByIds(ids)
+      .then((rows) => {
+        if (!alive) return
+        setLoaded(
+          rows.map((r) => ({
+            id: r.id,
+            title: r.title,
+            url: r.url,
+            source_name: r.source_name,
+            published_at: r.published_at,
+          })),
+        )
+      })
+      .catch((e: Error) => {
+        if (!alive) return
+        setLoadError(e.message)
+      })
+      .finally(() => {
+        if (!alive) return
+        setLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+    // Keyed on idsKey (content) deliberately instead of ids (reference).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idsKey])
+  return (
+    <EntryIdListContent
+      actionLabel="Hide"
+      emptyHint="Downvote a card (▼ in its footer, or right-click → Downvote) to tune the algorithm away from more like it. Entries you've downvoted but haven't hidden yet show up here."
+      populatedHint="Voting doesn't remove anything from view on its own — Hide (or Hide all downvoted) is the deliberate next step once you're sure you don't want to see more like these."
+      bulkLabel="Hide all downvoted"
+      onBulkAction={onHideAll}
+      onRowAction={onHide}
+      countNoun={ids.length === 1 ? 'downvoted entry' : 'downvoted entries'}
+      loaded={loaded}
+      loading={loading}
+      loadError={loadError}
+    />
+  )
+}

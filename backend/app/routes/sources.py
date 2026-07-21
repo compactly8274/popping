@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 import httpx
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +32,7 @@ from app.feed_recommendations import (
     recommendations_for_user,
     top_category_for_user,
 )
-from app.models import Source
+from app.models import Entry, Interaction, Source
 from app.schemas import (
     FeedDiscoverRequest,
     FeedDiscoverResult,
@@ -330,12 +330,51 @@ def _validate_custom_headers(value: dict | None) -> dict | None:
 # --- GETs (read-only, public) --------------------------------------------
 
 
+async def _net_vote_scores(session: AsyncSession) -> dict[int, int]:
+    """Net thumbs score per source: sum(thumb_up) - sum(thumb_down)
+    across all of a source's entries. Powers the FeedManager's
+    per-row score badge so the user can spot a source they
+    consistently downvote and clean it up — the exact "if I
+    downvote 5 times it's -5, upvote 5 more and it's back to 0"
+    semantics, computed straight off the same ``interactions`` log
+    the vote buttons already write to (no new table).
+
+    A source with no thumb_up/thumb_down interactions at all is
+    simply absent from the returned dict — callers default to 0.
+    One query, aggregated in SQL rather than pulled row-by-row.
+    """
+    stmt = (
+        select(
+            Entry.source_id,
+            func.sum(
+                case(
+                    (Interaction.type == "thumb_up", 1),
+                    (Interaction.type == "thumb_down", -1),
+                    else_=0,
+                )
+            ),
+        )
+        .select_from(Interaction)
+        .join(Entry, Entry.id == Interaction.entry_id)
+        .where(Interaction.type.in_(("thumb_up", "thumb_down")))
+        .group_by(Entry.source_id)
+    )
+    rows = (await session.execute(stmt)).all()
+    return {source_id: int(score or 0) for source_id, score in rows}
+
+
 @router.get("/sources", response_model=list[SourceOut])
 async def list_sources_endpoint(
     session: AsyncSession = Depends(get_session),
 ) -> list[SourceOut]:
     rows = (await session.scalars(select(Source).order_by(Source.category, Source.name))).all()
-    return [SourceOut.model_validate(r) for r in rows]
+    scores = await _net_vote_scores(session)
+    out: list[SourceOut] = []
+    for r in rows:
+        item = SourceOut.model_validate(r)
+        item.net_vote_score = scores.get(r.id, 0)
+        out.append(item)
+    return out
 
 
 @router.get("/sources/{source_id}", response_model=SourceOut)
