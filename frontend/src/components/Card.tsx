@@ -96,19 +96,23 @@ type Props = {
 // only consumer and we want it obvious from Card.tsx which colors
 // map to which categories. ``other`` falls through to a neutral
 // slate so unrecognized categories don't render without a stripe.
+// Full opacity (not the old /70) — paired with the wider 3px stripe
+// below, this reads as a deliberate accent rather than a faint tick
+// mark, closer to how Apollo's per-community color bar pops against
+// a dark background.
 function categoryStripeClass(category: string | undefined): string {
   switch (category) {
-    case 'news':     return 'bg-blue-500/70'
-    case 'tech':     return 'bg-violet-500/70'
-    case 'vulns':    return 'bg-red-500/70'
-    case 'science':  return 'bg-emerald-500/70'
-    case 'finance':  return 'bg-amber-500/70'
-    case 'policy':   return 'bg-cyan-500/70'
-    case 'longform': return 'bg-rose-500/70'
-    case 'deals':    return 'bg-lime-500/70'
-    case 'podcast':  return 'bg-orange-500/70'
-    case 'video':    return 'bg-pink-500/70'
-    default:         return 'bg-neutral-600/70'
+    case 'news':     return 'bg-blue-500'
+    case 'tech':     return 'bg-violet-500'
+    case 'vulns':    return 'bg-red-500'
+    case 'science':  return 'bg-emerald-500'
+    case 'finance':  return 'bg-amber-500'
+    case 'policy':   return 'bg-cyan-500'
+    case 'longform': return 'bg-rose-500'
+    case 'deals':    return 'bg-lime-500'
+    case 'podcast':  return 'bg-orange-500'
+    case 'video':    return 'bg-pink-500'
+    default:         return 'bg-neutral-600'
   }
 }
 
@@ -571,17 +575,17 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
       })
     }
     actions.push({
-      label: '👍 Thumbs up',
+      label: '▲ Upvote',
       onClick: () => {
         recordImmediate({ entry_id: entry.id, type: 'thumb_up' })
-        toast('👍 Thanks — tuning toward more like this.', 'info')
+        toast('▲ Thanks — tuning toward more like this.', 'info')
       },
     })
     actions.push({
-      label: '👎 Thumbs down',
+      label: '▼ Downvote',
       onClick: () => {
         recordImmediate({ entry_id: entry.id, type: 'thumb_down' })
-        toast('👎 Got it — tuning down similar stories.', 'info')
+        toast('▼ Got it — tuning down similar stories.', 'info')
       },
     })
     actions.push({ label: 'Copy link', onClick: () => copyUrl(entry.url) })
@@ -665,14 +669,14 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
                     transition-[box-shadow,border-color,opacity] duration-200
                     ${ringClass} ${dimClass}`}
       >
-      {/* Category stripe. 2px wide, full height of the card. Lives
+      {/* Category stripe. 3px wide, full height of the card. Lives
           outside the padding flow so it doesn't shift content when
           a category is/isn't known. ``aria-hidden`` because the
           color is decorative — the category name (if shown) carries
           the semantic. */}
       <div
         aria-hidden="true"
-        className={`absolute left-0 top-0 bottom-0 w-0.5 rounded-l-ios-lg ${stripeClass}`}
+        className={`absolute left-0 top-0 bottom-0 w-[3px] rounded-l-ios-lg ${stripeClass}`}
       />
       <div className="flex items-start justify-between gap-3 mb-2">
         <a
@@ -726,6 +730,20 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
         {sourceName && <span className="font-medium text-label-primary">{sourceName}</span>}
         {sourceName && <span>·</span>}
         <time dateTime={entry.published_at ?? ''}>{timeAgo(entry.published_at)}</time>
+        {/* Action cluster. Every per-card button (summary chevron,
+            mark-read, star, hide, vote pair) lives in ONE flex row
+            so they lay out side by side regardless of how many are
+            wired up — previously the hide/vote buttons rendered as
+            siblings of the flex container instead of children of
+            it, and each one's own ``flex`` utility (used to center
+            its icon) blockified it into its own line, stacking
+            buttons vertically and adding extra rows of height to
+            every card, worst on mobile where width is tightest.
+            ``ml-auto`` lives on this wrapper (not on individual
+            buttons) so it pushes the whole cluster to the trailing
+            edge in one step regardless of which buttons are wired
+            up for a given card. */}
+        <div className="ml-auto flex items-center gap-1">
         {/* Per-card summary chevron. Sits inline on the meta row so
             it reads as part of the same toolbar as the ✓ button. Same
             ``data-card-interactive`` guard so a long-press / right-
@@ -748,7 +766,7 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             aria-label={expanded ? 'hide summary' : 'show summary'}
             aria-expanded={!!expanded}
             title={expanded ? 'hide summary (s)' : 'show summary (s)'}
-            className={`ml-auto w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
+            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
                         ${expanded ? 'opacity-100 text-accent' : 'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100'}`}
           >
             {/* Rotate 180° when expanded so the chevron flips up —
@@ -808,7 +826,6 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             aria-pressed={!unread}
             title="mark as read (m)"
             className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
-                        ${onToggleSummary ? '' : 'ml-auto'}
                         ${unread ? 'text-label-secondary' : 'text-accent'}`}
           >
             <CheckIcon className="w-4 h-4" filled={!unread} />
@@ -852,27 +869,14 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             <StarIcon className="w-4 h-4" filled={!!starred} />
           </button>
         )}
-      </div>
-        {/* Per-card hide (eye) button. Sits next to the
-            mark-read checkmark and the star, completing the
-            iOS-style three-button meta row. The button's
-            state reflects the entry's current ``hidden``
-            prop: open eye = visible, closed eye = hidden.
-
-            Click toggles via ``onHideToggle`` (App wires
-            this to a callback that ALSO marks the entry
-            read when hiding, so the entry moves to the
-            column's History section instead of just
-            disappearing). The keyboard ``h`` shortcut
-            can target this button via document.querySelector
-            + ``data-eye`` for the currently-selected card.
-
-            Always visible (same as check + star) so the
-            user can see the affordance and the current
-            state at a glance. The hidden state uses
-            ``text-accent`` (matching the star) so the
-            three meta-row buttons all recolour in the
-            same family. */}
+        {/* Per-card hide (eye) button. State reflects the entry's
+            current ``hidden`` prop: open eye = visible, closed eye
+            = hidden. Click toggles via ``onHideToggle`` (App wires
+            this to a callback that ALSO marks the entry read when
+            hiding, so the entry moves to the column's History
+            section instead of just disappearing). The keyboard
+            ``h`` shortcut targets this button via
+            document.querySelector + ``data-eye``. */}
         {onHideToggle && (
           <button
             type="button"
@@ -904,55 +908,62 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             <EyeIcon className="w-4 h-4" closed={!!hidden} />
           </button>
         )}
-        {/* Thumbs up/down. Pure taste signal — unlike star (which
-            also organizes the entry into Saved) and hide (which
-            also removes it from view), a thumb click has no
-            side effect beyond the interaction event itself. The
-            backend already weights ``thumb_up``/``thumb_down`` in
-            the preference-vector recompute (same magnitude as
-            bookmark/never) — this is just the missing UI to fire
-            them; nothing backend-side needed. Deliberately
-            stateless (no persisted "you already rated this"
-            highlight, unlike star/hidden) to avoid a new synced-
-            preference-set subsystem for what's meant to be a
-            lightweight, low-friction signal — a toast is
-            confirmation enough. Always rendered (no callback prop
-            gate) since firing the interaction doesn't depend on
-            any parent-owned state. */}
-        <button
-          type="button"
-          data-card-interactive
-          onMouseDown={(e) => e.stopPropagation()}
-          onTouchStart={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            recordImmediate({ entry_id: entry.id, type: 'thumb_up' })
-            toast('👍 Thanks — tuning toward more like this.', 'info')
-          }}
-          aria-label="thumbs up"
-          title="thumbs up"
-          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated active:text-accent"
-        >
-          <span aria-hidden="true" className="text-sm leading-none">👍</span>
-        </button>
-        <button
-          type="button"
-          data-card-interactive
-          onMouseDown={(e) => e.stopPropagation()}
-          onTouchStart={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            recordImmediate({ entry_id: entry.id, type: 'thumb_down' })
-            toast('👎 Got it — tuning down similar stories.', 'info')
-          }}
-          aria-label="thumbs down"
-          title="thumbs down"
-          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated active:text-accent"
-        >
-          <span aria-hidden="true" className="text-sm leading-none">👎</span>
-        </button>
+        {/* Vote pair — up/down arrows in a single pill, Apollo/
+            Reddit-style, replacing the previous separate thumbs-up/
+            down emoji buttons. Grouping them in a shared pill (rather
+            than two independent circular buttons) reads as "one
+            control with two states" instead of two unrelated icons,
+            and the warm/cool hover tint (amber up, sky down) gives
+            the pair its own identity distinct from the accent-blue
+            used for read/star/hide so it doesn't blend into the rest
+            of the row.
+            Pure taste signal — unlike star (which also organizes
+            the entry into Saved) and hide (which also removes it
+            from view), a vote has no side effect beyond the
+            interaction event itself. Deliberately stateless (no
+            persisted "you already voted" highlight, unlike
+            star/hidden) — a toast is confirmation enough. Always
+            rendered (no callback prop gate) since firing the
+            interaction doesn't depend on any parent-owned state. */}
+        <div className="shrink-0 flex items-center rounded-full bg-bg-elevated/70 ring-1 ring-white/5 overflow-hidden">
+          <button
+            type="button"
+            data-card-interactive
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              recordImmediate({ entry_id: entry.id, type: 'thumb_up' })
+              toast('▲ Thanks — tuning toward more like this.', 'info')
+            }}
+            aria-label="upvote — more like this"
+            title="more like this"
+            className="w-7 h-7 flex items-center justify-center text-label-secondary hover:text-amber-400 active:text-amber-400 active:bg-white/10"
+          >
+            <ArrowUpIcon className="w-4 h-4" />
+          </button>
+          <div aria-hidden="true" className="w-px h-4 bg-white/10" />
+          <button
+            type="button"
+            data-card-interactive
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              recordImmediate({ entry_id: entry.id, type: 'thumb_down' })
+              toast('▼ Got it — tuning down similar stories.', 'info')
+            }}
+            aria-label="downvote — less like this"
+            title="less like this"
+            className="w-7 h-7 flex items-center justify-center text-label-secondary hover:text-sky-400 active:text-sky-400 active:bg-white/10"
+          >
+            <ArrowDownIcon className="w-4 h-4" />
+          </button>
+        </div>
+        </div>
+      </div>
       {/* Reddit cross-reference footer. Rendered between the meta row
           and the summary block so it reads as "extra metadata about
           the article", not "extra metadata about the source". Only
@@ -1249,6 +1260,46 @@ function ChevronDownIcon({ className }: { className?: string }) {
       aria-hidden="true"
     >
       <polyline points="6 9 12 15 18 9" />
+    </svg>
+  )
+}
+
+// Vote-pair arrows. A straight stem + chevron head (not a solid
+// Reddit-style triangle) so they read as siblings of the other
+// stroke-based icons here (Check/Eye/Star/Chevron) rather than a
+// visually foreign import. Slightly heavier stroke (2.5 vs the 2 the
+// other icons use) since these are the primary voting affordance and
+// benefit from a touch more presence at 16px.
+function ArrowUpIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M12 19V5M5 12l7-7 7 7" />
+    </svg>
+  )
+}
+
+function ArrowDownIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M12 5v14M19 12l-7 7-7-7" />
     </svg>
   )
 }

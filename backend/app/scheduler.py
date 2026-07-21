@@ -258,6 +258,14 @@ async def _ingest(plugin_cls: Any) -> dict:
     # pool starvation waiting to happen). The pass runs after the
     # entries commit and writes back via a single bulk UPDATE.
     thumbnail_jobs: list[tuple[int, str]] = []
+    # Entries that landed with NO feed-supplied image — deferred the
+    # same way ``thumbnail_jobs`` is, but probing the article's own
+    # page for an og:image fallback (see ``assets.fetch_og_image_fallback``)
+    # instead of downloading a URL we already have. Runs as its own
+    # pass, after the thumbnail pass, so a source with lots of
+    # image-less entries doesn't double the concurrency of the first
+    # pass.
+    og_image_jobs: list[tuple[int, str]] = []
     try:
         # Decide whether to fetch the favicon BEFORE opening the long
         # ingest transaction. ``fetch_favicon`` makes two network
@@ -369,6 +377,15 @@ async def _ingest(plugin_cls: Any) -> dict:
                         # Defer the network fetch to a single pass
                         # after the commit (see below).
                         thumbnail_jobs.append((inserted_id, remote_image_url))
+                    elif norm["url"]:
+                        # No image from the feed itself — queue an
+                        # og:image fallback probe against the
+                        # article's own page. Best-effort: many
+                        # entries still won't get one (paywalls, non-
+                        # HTML targets, sites with no og:image), but
+                        # this covers most ordinary news/blog
+                        # articles regardless of source type.
+                        og_image_jobs.append((inserted_id, norm["url"]))
                 else:
                     summary["duplicates"] += 1
             was_backed_off = (source.error_count or 0) > 0
@@ -494,6 +511,48 @@ async def _ingest(plugin_cls: Any) -> dict:
                     )
             except Exception:
                 logger.exception("thumbnail bulk update failed for %s", plugin_cls.name)
+
+    # og:image fallback pass. Same outside-the-session, gather-then-
+    # bulk-UPDATE shape as the thumbnail pass above, run afterward
+    # (not merged into the same gather) so entries that already have
+    # a perfectly good feed-supplied image never pay for the extra
+    # HTML probe. Unlike the thumbnail pass, both ``image_url`` (the
+    # discovered og:image URL, for provenance) and ``image_path``
+    # (the cached file) get written — these entries had NULL
+    # image_url going in.
+    if og_image_jobs:
+        results = await asyncio.gather(
+            *(assets.fetch_og_image_fallback(url, eid) for eid, url in og_image_jobs),
+            return_exceptions=True,
+        )
+        og_result_by_id: dict[int, tuple[str, str]] = {}
+        for (eid, _url), result in zip(og_image_jobs, results):
+            if isinstance(result, BaseException):
+                logger.debug("og:image fallback failed for entry %d", eid, exc_info=result)
+                continue
+            if result is not None:
+                og_result_by_id[eid] = result
+        if og_result_by_id:
+            try:
+                async with SessionLocal() as session:
+                    from sqlalchemy import case
+                    url_whens = {eid: remote for eid, (remote, _local) in og_result_by_id.items()}
+                    path_whens = {eid: local for eid, (_remote, local) in og_result_by_id.items()}
+                    ids = list(og_result_by_id.keys())
+                    url_expr = case(url_whens, value=Entry.id)
+                    path_expr = case(path_whens, value=Entry.id)
+                    await session.execute(
+                        Entry.__table__.update()
+                        .where(Entry.id.in_(ids))
+                        .values(image_url=url_expr, image_path=path_expr)
+                    )
+                    await session.commit()
+                    logger.info(
+                        "og:image fallback thumbnails cached for %s: %d / %d",
+                        plugin_cls.name, len(og_result_by_id), len(og_image_jobs),
+                    )
+            except Exception:
+                logger.exception("og:image fallback bulk update failed for %s", plugin_cls.name)
 
     # Post-ingest hook: high-CVSS CVE notifications. Only fires when
     # the scheduler actually inserted something (not on every duplicate

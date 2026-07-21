@@ -158,6 +158,29 @@ _LINK_ICON_RE = re.compile(
 )
 _REL_ATTR_RE = re.compile(r"""\brel\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 
+# Match any ``<meta ...>`` tag so we can inspect its attribute bag for
+# og:image / twitter:image regardless of attribute order (some sites
+# emit ``content`` before ``property``, others after) — same "capture
+# the whole tag, search within it" approach ``_LINK_ICON_RE`` uses for
+# favicons.
+_META_TAG_RE = re.compile(r"""<meta\b([^>]*?)/?>""", re.IGNORECASE | re.DOTALL)
+_META_PROPERTY_RE = re.compile(
+    r"""\b(?:property|name)\s*=\s*["']([^"']+)["']""", re.IGNORECASE
+)
+_META_CONTENT_RE = re.compile(r"""\bcontent\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+
+# Lower is better. og:image is the de-facto standard (set by nearly
+# every CMS for link-preview cards); secure_url is a same-image HTTPS
+# variant some sites also emit. twitter:image is the fallback for the
+# minority of sites that only implement Twitter Cards.
+_OG_IMAGE_PROPERTY_PRIORITY: dict[str, int] = {
+    "og:image": 0,
+    "og:image:secure_url": 0,
+    "og:image:url": 0,
+    "twitter:image": 1,
+    "twitter:image:src": 1,
+}
+
 
 def _ext_from_content_type(ct: str | None) -> Optional[str]:
     """Map a Content-Type header to a file extension. Returns None for
@@ -296,6 +319,91 @@ async def _pick_favicon_url(page_url: str) -> Optional[str]:
 
     if best_url is None:
         logger.debug("assets: no <link rel=icon> in %s", page_url)
+    return best_url
+
+
+async def _pick_og_image_url(page_url: str) -> Optional[str]:
+    """Fetch ``page_url`` and pick its og:image (or twitter:image)
+    meta tag, if any. Returns None if no tag is found OR the HTML
+    fetch itself fails — same shape and same SSRF guard as
+    ``_pick_favicon_url``, reused as the fallback thumbnail source
+    for entries whose feed didn't ship an image of its own (a large
+    share of non-RSS sources — HN, GitHub Releases, CISA/NVD
+    advisories — and plenty of RSS feeds that just don't bother with
+    media:thumbnail).
+
+    Never raises — caller (``fetch_og_image_fallback``) treats None
+    as "no fallback available", same as a missing feed image.
+    """
+    safe, _reason = check_url_safe(page_url)
+    if not safe:
+        logger.debug("assets: og:image probe rejected: %s", page_url)
+        return None
+    try:
+        client = _get_client()
+        async with client.stream(
+            "GET", page_url, headers={"Accept": _HTML_ACCEPT},
+        ) as resp:
+            if resp.status_code >= 400:
+                logger.debug("assets: %s → HTTP %s (og:image probe)", page_url, resp.status_code)
+                return None
+            # Same per-hop SSRF re-check as the favicon probe — the
+            # entry-time check above only covers ``page_url`` itself.
+            final_url = str(resp.url)
+            if final_url != page_url:
+                final_safe, _reason = check_url_safe(final_url)
+                if not final_safe:
+                    logger.debug(
+                        "assets: %s redirected to denied host %s", page_url, final_url,
+                    )
+                    return None
+            ct = resp.headers.get("content-type") or ""
+            if "html" not in ct.lower():
+                # Not an article page (e.g. the "link" is itself a
+                # PDF, a direct image, a video file) — no meta tags
+                # to find.
+                return None
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes(chunk_size=16 * 1024):
+                buf.extend(chunk)
+                if len(buf) >= _HTML_PROBE_BYTES:
+                    break
+    except (httpx.HTTPError, OSError) as exc:
+        logger.debug("assets: og:image probe %s failed: %s", page_url, exc)
+        return None
+
+    html = bytes(buf).decode("utf-8", errors="replace")
+    best_url = _extract_og_image_url(html, page_url)
+    if best_url is None:
+        logger.debug("assets: no og:image/twitter:image in %s", page_url)
+    return best_url
+
+
+def _extract_og_image_url(html: str, page_url: str) -> Optional[str]:
+    """Pure parsing step: scan ``html`` for the best og:image /
+    twitter:image meta tag and resolve it against ``page_url``.
+    Split out from ``_pick_og_image_url`` so the regex/priority logic
+    is unit-testable without a network fetch.
+    """
+    best_url: Optional[str] = None
+    best_priority = 999
+    for match in _META_TAG_RE.finditer(html):
+        attrs = match.group(1)
+        prop_match = _META_PROPERTY_RE.search(attrs)
+        if not prop_match:
+            continue
+        prop = prop_match.group(1).strip().lower()
+        priority = _OG_IMAGE_PROPERTY_PRIORITY.get(prop)
+        if priority is None or priority >= best_priority:
+            continue
+        content_match = _META_CONTENT_RE.search(attrs)
+        content = content_match.group(1).strip() if content_match else ""
+        if not content:
+            continue
+        best_url = urljoin(page_url, content)
+        best_priority = priority
+        if priority == 0:
+            break
     return best_url
 
 
@@ -476,6 +584,28 @@ async def fetch_thumbnail(remote_url: str, entry_id: int) -> Optional[str]:
             logger.debug("assets: thumbnail %s attempt 1 failed; retrying", remote_url)
     logger.debug("assets: thumbnail gave up after 2 attempts: %s (%s)", remote_url, last_err)
     return None
+
+
+async def fetch_og_image_fallback(article_url: str, entry_id: int) -> Optional[Tuple[str, str]]:
+    """Best-effort thumbnail for an entry whose feed didn't supply
+    ``image_url`` — probe the article's own page for an og:image (or
+    twitter:image) meta tag and, if found, download it through the
+    same ``fetch_thumbnail`` path a feed-supplied image uses.
+
+    Returns ``(remote_url, local_relative_path)`` on success, None if
+    no og:image tag was found or the download failed — the caller
+    treats this exactly like "no image available", not an error. Two
+    network round-trips (HTML probe, then the image itself) only
+    happen for entries that would otherwise render with no thumbnail
+    at all, so the extra cost only lands where it adds coverage.
+    """
+    og_url = await _pick_og_image_url(article_url)
+    if og_url is None:
+        return None
+    local = await fetch_thumbnail(og_url, entry_id)
+    if local is None:
+        return None
+    return og_url, local
 
 
 def ensure_dirs() -> None:
