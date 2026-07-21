@@ -62,16 +62,29 @@ async def get_settings() -> SettingsOut:
     ``app_settings`` if present and non-empty, else None — the frontend
     shows ``None`` as "using env default".
 
-    All three knobs are read in one DB round-trip (cached separately
-    in the runtime_settings module) so a stale-cache Drawer open
-    doesn't serialise three SELECTs."""
+    All knobs are read in one DB round-trip (cached separately in the
+    runtime_settings module) so a stale-cache Drawer open doesn't
+    serialise N SELECTs. API keys are collapsed to a bool (set/unset)
+    before leaving this function — see ``SettingsOut``'s docstring."""
     values = await runtime_settings.get_many(
-        ["llm.provider", "llm.model_brief", "llm.model_scoring"]
+        [
+            "llm.provider",
+            "llm.model_brief",
+            "llm.model_scoring",
+            "llm.anthropic_api_key",
+            "llm.openai_api_key",
+            "llm.groq_api_key",
+            "llm.ollama_cloud_api_key",
+        ]
     )
     return SettingsOut(
         llm_provider=values["llm.provider"],
         llm_model_brief=values["llm.model_brief"],
         llm_model_scoring=values["llm.model_scoring"],
+        anthropic_api_key_set=bool(values["llm.anthropic_api_key"]),
+        openai_api_key_set=bool(values["llm.openai_api_key"]),
+        groq_api_key_set=bool(values["llm.groq_api_key"]),
+        ollama_cloud_api_key_set=bool(values["llm.ollama_cloud_api_key"]),
     )
 
 
@@ -83,10 +96,12 @@ async def update_llm_settings(payload: LLMSettingsUpdate) -> SettingsOut:
     - ``""`` (empty string): delete the DB row → fall back to env.
     - any other string: upsert the row with that value.
 
-    The frontend always sends all three fields so the user can both
-    *set* and *reset* values; missing = null = "don't touch" is the
+    The frontend always sends every field so the user can both *set*
+    and *reset* values; missing = null = "don't touch" is the
     convention for non-UI callers (curl, scripts) that want to update
-    just one knob.
+    just one knob. The four ``*_api_key`` fields use the exact same
+    convention — an empty string reverts that provider to its env
+    var, same as clearing the provider/model fields does.
 
     Invalidating the tags cache on save so the picker doesn't show a
     stale list after the user has already committed to a model name
@@ -106,6 +121,10 @@ async def update_llm_settings(payload: LLMSettingsUpdate) -> SettingsOut:
         await _apply_field("llm.provider", payload.provider)
         await _apply_field("llm.model_brief", payload.model_brief)
         await _apply_field("llm.model_scoring", payload.model_scoring)
+        await _apply_field("llm.anthropic_api_key", payload.anthropic_api_key)
+        await _apply_field("llm.openai_api_key", payload.openai_api_key)
+        await _apply_field("llm.groq_api_key", payload.groq_api_key)
+        await _apply_field("llm.ollama_cloud_api_key", payload.ollama_cloud_api_key)
     except SQLAlchemyError as exc:
         logger.exception("settings: failed to persist")
         raise HTTPException(status_code=500, detail="failed to persist settings") from exc
@@ -115,9 +134,22 @@ async def update_llm_settings(payload: LLMSettingsUpdate) -> SettingsOut:
     # mapping; covers all cases since the Drawer reloads on save.
     llm_tags.invalidate_all()
 
+    # Never log key VALUES — only which ones this call touched, so an
+    # operator can audit "a key was changed" from the logs without the
+    # secret itself ever landing there.
+    touched_keys = [
+        name
+        for name, value in (
+            ("anthropic", payload.anthropic_api_key),
+            ("openai", payload.openai_api_key),
+            ("groq", payload.groq_api_key),
+            ("ollama_cloud", payload.ollama_cloud_api_key),
+        )
+        if value is not None
+    ]
     logger.info(
-        "settings: LLM updated provider=%s model_brief=%s model_scoring=%s",
-        payload.provider, payload.model_brief, payload.model_scoring,
+        "settings: LLM updated provider=%s model_brief=%s model_scoring=%s api_keys_touched=%s",
+        payload.provider, payload.model_brief, payload.model_scoring, touched_keys,
     )
 
     return await get_settings()

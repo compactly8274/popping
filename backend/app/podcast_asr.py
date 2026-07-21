@@ -25,7 +25,7 @@ import logging
 
 import httpx
 
-from app.config import settings
+from app import runtime_settings
 from app.url_safety import check_url_safe
 
 logger = logging.getLogger("popping.podcast_asr")
@@ -46,12 +46,20 @@ _GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 _GROQ_MODEL = "whisper-large-v3-turbo"
 
 
+def _groq_api_key() -> str:
+    """Resolve the Groq key: a Settings-UI override in runtime_settings
+    if the user has set one, else the env var. Same precedence
+    ``Router._api_key_for`` uses — kept as its own lookup here since
+    this module doesn't otherwise depend on ``app.llm``."""
+    return runtime_settings.snapshot_sync().get("llm.groq_api_key", "")
+
+
 def asr_available() -> bool:
     """True if a Groq API key is configured — the only gate on this
     feature. Checked by the route layer before attempting anything so
     a missing key degrades to "not available" (same as a missing
     transcript), not an error."""
-    return bool(settings.groq_api_key)
+    return bool(_groq_api_key())
 
 
 async def _download_audio(url: str) -> tuple[bytes, str] | None:
@@ -113,7 +121,7 @@ async def transcribe_audio(audio_url: str) -> str | None:
         return None
     audio_bytes, content_type = downloaded
 
-    headers = {"authorization": f"Bearer {settings.groq_api_key}"}
+    headers = {"authorization": f"Bearer {_groq_api_key()}"}
     files = {"file": ("episode.audio", audio_bytes, content_type)}
     data = {"model": _GROQ_MODEL, "response_format": "text"}
     try:

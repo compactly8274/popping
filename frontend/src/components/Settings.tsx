@@ -473,6 +473,30 @@ function TabIcon({ name, active }: { name: string; active: boolean }) {
   }
 }
 
+// The four providers that take an API key, in the same order the
+// provider <select> lists them (minus ollama, which needs no key).
+// Field names line up with SettingsOut / LLMSettingsUpdate exactly —
+// see api.ts.
+type ApiKeyProvider = 'anthropic' | 'openai' | 'groq' | 'ollama_cloud'
+const API_KEY_PROVIDERS: { id: ApiKeyProvider; label: string }[] = [
+  { id: 'anthropic', label: 'Anthropic' },
+  { id: 'openai', label: 'OpenAI' },
+  { id: 'groq', label: 'Groq' },
+  { id: 'ollama_cloud', label: 'Ollama Cloud' },
+]
+const emptyApiKeys: Record<ApiKeyProvider, string> = {
+  anthropic: '',
+  openai: '',
+  groq: '',
+  ollama_cloud: '',
+}
+const emptyApiKeySet: Record<ApiKeyProvider, boolean> = {
+  anthropic: false,
+  openai: false,
+  groq: false,
+  ollama_cloud: false,
+}
+
 // LLM section. Moved from Drawer.tsx, used inside the Settings
 // overlay. The LLM config (provider + model) is the most complex
 // piece of the Settings so it lives in its own function. The
@@ -501,6 +525,14 @@ function LLMSection({
   const [tagsLoading, setTagsLoading] = useState<boolean>(false)
   const [saving, setSaving] = useState<boolean>(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  // API-key inputs are write-only: blank by default (never prefilled
+  // with the real value, which the GET endpoint never sends anyway),
+  // typed text = "set to this" on the next Save, left blank = "don't
+  // touch". ``apiKeySet`` mirrors the *_api_key_set booleans so each
+  // row can show "configured" vs "not set" without knowing the value.
+  const [apiKeys, setApiKeys] = useState<Record<ApiKeyProvider, string>>(emptyApiKeys)
+  const [apiKeySet, setApiKeySet] = useState<Record<ApiKeyProvider, boolean>>(emptyApiKeySet)
+  const [clearingKey, setClearingKey] = useState<ApiKeyProvider | null>(null)
 
   const openPicker = async () => {
     setPickerOpen(true)
@@ -510,21 +542,29 @@ function LLMSection({
     try {
       const s = await api.settings()
       const prov = providerForTagsFetch(s)
+      let tb: LLMTagsResponse | null = null
+      let ts: LLMTagsResponse | null = null
       if (prov) {
-        const [tb, ts] = await Promise.all([
-          api.llmTags(prov, false, 'brief'),
-          api.llmTags(prov, false, 'scoring'),
-        ])
-        setTags(tb)
-        setScoringTags(ts)
-        applySettingsToForm(s, tb, ts)
-      } else {
-        setTags(null)
-        setScoringTags(null)
-        applySettingsToForm(s, null, null)
+        // Tags fetch failure (e.g. no Ollama Cloud key configured) is
+        // common and shouldn't block the form from reflecting current
+        // settings below — in particular, it must not leave a
+        // previously-typed API key sitting in the input because
+        // applySettingsToForm never ran.
+        try {
+          ;[tb, ts] = await Promise.all([
+            api.llmTags(prov, false, 'brief'),
+            api.llmTags(prov, false, 'scoring'),
+          ])
+        } catch (err) {
+          setTagsError((err as Error).message)
+        }
       }
+      setTags(tb)
+      setScoringTags(ts)
+      applySettingsToForm(s, tb, ts)
     } catch (err) {
-      setTagsError((err as Error).message)
+      // api.settings() itself failed — nothing to populate the form with.
+      setSaveError((err as Error).message)
     } finally {
       setTagsLoading(false)
     }
@@ -550,6 +590,13 @@ function LLMSection({
       Boolean(s.llm_model_brief) && tagNames.length > 0 && !tagNames.includes(s.llm_model_brief || '')
     setUseFreeText(isFreeText)
     setFreeTextBrief(isFreeText ? s.llm_model_brief || '' : '')
+    setApiKeySet({
+      anthropic: s.anthropic_api_key_set,
+      openai: s.openai_api_key_set,
+      groq: s.groq_api_key_set,
+      ollama_cloud: s.ollama_cloud_api_key_set,
+    })
+    setApiKeys(emptyApiKeys)
     void ts
   }
 
@@ -561,6 +608,14 @@ function LLMSection({
         provider: provider,
         model_brief: useFreeText ? freeTextBrief : modelBrief,
         model_scoring: modelScoring,
+        // Blank input = "don't touch" (omit); only typed values are
+        // sent. Clearing an already-set key is a separate action
+        // (the "clear" button below) so it takes effect immediately
+        // rather than being lost if the user forgets to hit Save.
+        anthropic_api_key: apiKeys.anthropic || undefined,
+        openai_api_key: apiKeys.openai || undefined,
+        groq_api_key: apiKeys.groq || undefined,
+        ollama_cloud_api_key: apiKeys.ollama_cloud || undefined,
       })
       const status = await api.llmStatus()
       onChange(status)
@@ -569,6 +624,26 @@ function LLMSection({
       setSaveError((err as Error).message)
     } finally {
       setSaving(false)
+    }
+  }
+
+  const clearApiKey = async (id: ApiKeyProvider) => {
+    setClearingKey(id)
+    setSaveError(null)
+    try {
+      const field = `${id}_api_key` as const
+      const s = await api.updateLLMSettings({ [field]: '' })
+      setApiKeySet({
+        anthropic: s.anthropic_api_key_set,
+        openai: s.openai_api_key_set,
+        groq: s.groq_api_key_set,
+        ollama_cloud: s.ollama_cloud_api_key_set,
+      })
+      setApiKeys((prev) => ({ ...prev, [id]: '' }))
+    } catch (err) {
+      setSaveError((err as Error).message)
+    } finally {
+      setClearingKey(null)
     }
   }
 
@@ -711,6 +786,43 @@ function LLMSection({
                 ★ marks models recommended for this task
               </div>
             )}
+          </div>
+          <div>
+            <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
+              API keys
+            </label>
+            <div className="text-ios-caption text-label-tertiary mb-2">
+              Optional — set a key here instead of editing .env. A key
+              you type is saved when you tap save below; clearing
+              takes effect immediately and reverts to the .env value.
+            </div>
+            <div className="space-y-2">
+              {API_KEY_PROVIDERS.map(({ id, label }) => (
+                <div key={id} className="flex items-center gap-2">
+                  <div className="w-24 shrink-0 text-ios-caption text-label-secondary truncate">
+                    {label}
+                  </div>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={apiKeys[id]}
+                    onChange={(e) => setApiKeys((prev) => ({ ...prev, [id]: e.target.value }))}
+                    placeholder={apiKeySet[id] ? 'configured — type to replace' : 'not set'}
+                    className="flex-1 min-w-0 min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
+                  />
+                  {apiKeySet[id] && (
+                    <button
+                      type="button"
+                      onClick={() => clearApiKey(id)}
+                      disabled={clearingKey === id}
+                      className="shrink-0 text-ios-caption text-red-400 active:opacity-60 disabled:opacity-40"
+                    >
+                      {clearingKey === id ? 'clearing…' : 'clear'}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
           {tagsLoading && (
             <div className="text-ios-caption text-label-secondary">loading models…</div>

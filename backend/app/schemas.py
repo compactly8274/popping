@@ -415,18 +415,39 @@ class LLMTagsResponse(BaseModel):
 
 class SettingsOut(BaseModel):
     """What ``GET /api/settings`` returns. All fields nullable — first
-    boot with no env seeds has everything blank."""
+    boot with no env seeds has everything blank.
+
+    The ``*_api_key_set`` fields are booleans, never the key value —
+    this endpoint must never echo a secret back to the browser. True
+    means a key is currently active for that backend, from EITHER a
+    Settings-UI override or the env var; the caller can't tell which
+    from this alone (matching how the model/provider fields already
+    don't distinguish DB-override from env-default)."""
     llm_provider: Optional[str] = None       # runtime_settings value of "llm.provider"
     llm_model_brief: Optional[str] = None   # runtime_settings value of "llm.model_brief"
     llm_model_scoring: Optional[str] = None  # runtime_settings value of "llm.model_scoring"
+    anthropic_api_key_set: bool = False
+    openai_api_key_set: bool = False
+    groq_api_key_set: bool = False
+    ollama_cloud_api_key_set: bool = False
 
 
 class LLMSettingsUpdate(BaseModel):
     """Body for ``PUT /api/settings/llm``. Each field is optional —
-    missing fields are left untouched (PUT but partial update)."""
+    missing fields are left untouched (PUT but partial update).
+
+    The ``*_api_key`` fields follow the same null/empty/value
+    convention every other field here does: omit (null) to leave
+    alone, ``""`` to clear the override and fall back to the env var,
+    any other string to set/replace it. Never returned by GET — write-
+    only from the client's perspective, same as a password field."""
     provider: Optional[str] = None           # ollama_cloud / ollama / anthropic / openai / groq / None
     model_brief: Optional[str] = None
     model_scoring: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    groq_api_key: Optional[str] = None
+    ollama_cloud_api_key: Optional[str] = None
 
 
 class HealthOut(BaseModel):
