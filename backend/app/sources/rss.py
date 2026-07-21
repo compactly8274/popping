@@ -135,7 +135,8 @@ def _pick_image_url(entry: Any) -> str | None:
       2. media:content with image/* type
       3. enclosure with image/* type (RSS 2.0)
       4. itunes:image (podcast artwork)
-      5. first <img src> regex over summary (HTML summaries)
+      5. first <img src> regex over the summary, then the full content
+         body (HTML summaries / Atom content)
 
     Relative ``<img src="/path/...">`` URLs are resolved against the
     entry's ``link`` field so the asset fetcher sends an absolute
@@ -147,6 +148,16 @@ def _pick_image_url(entry: Any) -> str | None:
     media:content / enclosure / itunes:image pass through unchanged
     (those branches already ship absolute URLs from real-world
     feeds).
+
+    Step 5 checks ``summary`` before ``content`` because the summary
+    is usually the shorter, more curated field when both exist — but
+    falls through to content because several real feeds (forum-style
+    ones especially, RFD's deal threads among them) only embed the
+    post's photo in the full content body, not the short teaser
+    summary. ``app.sources.rfd``'s engagement extractor already reads
+    both fields for the same reason (RFD's vote/reply counts can live
+    in either), so this mirrors an established pattern rather than
+    introducing a new one.
     """
     # 1. media:thumbnail
     mt = entry.get("media_thumbnail")
@@ -171,15 +182,36 @@ def _pick_image_url(entry: Any) -> str | None:
     ii = entry.get("image")
     if isinstance(ii, dict) and ii.get("href"):
         return ii["href"]
-    # 5. inline <img src> in summary — resolve relative paths
-    # against the entry's URL so the asset fetcher doesn't 404.
-    summary = entry.get("summary") or ""
-    if summary:
-        m = _IMG_SRC_RE.search(summary)
+    # 5. inline <img src> in summary, then content — resolve relative
+    # paths against the entry's URL so the asset fetcher doesn't 404.
+    for haystack in (entry.get("summary") or "", _content_text(entry)):
+        if not haystack:
+            continue
+        m = _IMG_SRC_RE.search(haystack)
         if m:
             entry_url = _entry_url(entry)
             return urljoin(entry_url, m.group(1)) if entry_url else m.group(1)
     return None
+
+
+def _content_text(entry: Any) -> str:
+    """Best-effort plain text out of a feedparser entry's ``content``
+    field. Atom-shaped: either a bare string or a list of
+    ``{value, type}`` dicts (feedparser's ``FeedParserDict``) — we
+    only need the first content block. Mirrors
+    ``app.sources.rfd._summary_from_raw``'s identical handling of the
+    same field for engagement-count extraction; duplicated here
+    rather than imported to keep ``rss.py`` (the generic path) free
+    of a dependency on ``rfd.py`` (one specific source's module).
+    """
+    content = entry.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content:
+        first = content[0]
+        if isinstance(first, dict):
+            return str(first.get("value") or "")
+    return ""
 
 
 def _pick_audio_enclosure(entry: Any) -> str | None:

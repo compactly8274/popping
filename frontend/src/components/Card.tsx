@@ -23,11 +23,18 @@
 import { memo, useEffect, useRef, useState, type MouseEvent, type TouchEvent } from 'react'
 import { api, type Entry } from '../api'
 import { recordBatched, recordImmediate } from '../lib/interactions'
+import { SourceIcon, stableHue } from './SourceIcon'
 import { toast } from './Toast'
 
 type Props = {
   entry: Entry
   sourceName?: string
+  // Source favicon path (relative to /assets), or null if not
+  // fetched yet. Used only as a thumbnail FALLBACK when the entry
+  // itself has no image — see ThumbnailFallback below. Undefined
+  // (prop omitted) and null (fetched-but-empty) both degrade the
+  // same way: a colored letter tile instead of the site's icon.
+  sourceFaviconPath?: string | null
   unread?: boolean
   // True when this card is the keyboard-selected card. Drives the
   // focus ring. Set by App's keyboard handler.
@@ -243,7 +250,7 @@ const SWIPE_DIRECTION_RATIO = 1.3
 const SWIPE_MAX_REVEAL_PX = 88
 const SWIPE_COMMIT_PX = 58
 
-export function CardInner({ entry, sourceName, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred, onHideToggle, hidden, vote, onVote }: Props) {
+export function CardInner({ entry, sourceName, sourceFaviconPath, unread, selected, cardRef, onActivate, category, onMarkRead, expanded, onToggleSummary, onHide, onStar, starred, onHideToggle, hidden, vote, onVote }: Props) {
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   const sourceTextClass = categorySourceTextClass(category)
@@ -783,13 +790,24 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
             ↗
           </span>
         </a>
-        {entry.image_path && (
+        {entry.image_path ? (
           <Thumbnail
             path={entry.image_path}
             title={entry.title}
             url={entry.url}
             entryId={entry.id}
           />
+        ) : (
+          // No feed-supplied or scraped photo (backend already tries
+          // media:thumbnail / og:image / etc. before giving up) —
+          // fall back to the source's favicon on a colored tile
+          // rather than leaving a blank gap. Only needs sourceName;
+          // ThumbnailFallback degrades to a plain colored letter if
+          // there's no favicon either, so every card with a known
+          // source gets SOME visual.
+          sourceName && (
+            <ThumbnailFallback sourceName={sourceName} faviconPath={sourceFaviconPath} />
+          )
         )}
         {/* Score badge. The gradient gives the badge a tiny bit of
             depth; ``ring-1 ring-white/10`` is a faint inner highlight
@@ -806,185 +824,6 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
         {sourceName && <span className={`font-medium ${sourceTextClass}`}>{sourceName}</span>}
         {sourceName && <span>·</span>}
         <time dateTime={entry.published_at ?? ''}>{timeAgo(entry.published_at)}</time>
-        {/* Action cluster. Every per-card button (summary chevron,
-            mark-read, star, hide, vote pair) lives in ONE flex row
-            so they lay out side by side regardless of how many are
-            wired up — previously the hide/vote buttons rendered as
-            siblings of the flex container instead of children of
-            it, and each one's own ``flex`` utility (used to center
-            its icon) blockified it into its own line, stacking
-            buttons vertically and adding extra rows of height to
-            every card, worst on mobile where width is tightest.
-            ``ml-auto`` lives on this wrapper (not on individual
-            buttons) so it pushes the whole cluster to the trailing
-            edge in one step regardless of which buttons are wired
-            up for a given card. */}
-        <div className="ml-auto flex items-center gap-1">
-        {/* Per-card summary chevron. Sits inline on the meta row so
-            it reads as part of the same toolbar as the ✓ button. Same
-            ``data-card-interactive`` guard so a long-press / right-
-            click on the card itself doesn't fire while the user is
-            targeting the chevron. Title alternates by state so the
-            hover hint matches the keyboard shortcut (``s``).
-            Visually mirrors the ✓'s hover-reveal treatment — hidden
-            until hover on desktop, always visible on touch. */}
-        {onToggleSummary && (
-          <button
-            type="button"
-            data-card-interactive
-            onMouseDown={(e) => e.stopPropagation()}
-            onTouchStart={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              onToggleSummary()
-            }}
-            aria-label={expanded ? 'hide summary' : 'show summary'}
-            aria-expanded={!!expanded}
-            title={expanded ? 'hide summary (s)' : 'show summary (s)'}
-            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
-                        ${expanded ? 'opacity-100 text-accent' : 'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100'}`}
-          >
-            {/* Rotate 180° when expanded so the chevron flips up —
-                standard iOS disclosure-indicator idiom. */}
-            <ChevronDownIcon className={`w-4 h-4 transition-transform ${expanded ? 'rotate-180' : ''}`} />
-          </button>
-        )}
-        {/* Per-card mark-read ✓. Sits on the trailing edge of the
-            meta row so it's visually associated with the read-state
-            line above it. ``opacity-0 group-hover:opacity-100``
-            keeps it out of the way on desktop until the user hovers;
-            the ``@media (hover: none)`` escape hatch makes it always
-            visible on touch where there's no hover state to discover
-            it. ``onMouseDown`` swallows the press so it doesn't
-            bubble into the article's long-press / context-menu
-            paths. Fires ``view`` so the ranker sees the same signal
-            it sees for headline and thumbnail clicks. */}
-        {onMarkRead && (
-          // The ✓ is ALWAYS visible so the user can see at a
-          // glance that the action is available. The previous
-          // hover-only treatment (“opacity-0 group-hover:opacity-100”)
-          // hid the affordance from anyone who didn't already
-          // know it existed. The visual weight is still muted
-          // (text-label-secondary for unread, text-accent for
-          // read) so it doesn't compete with the title. On read
-          // cards the checkmark is filled so the user can tell
-          // at a glance which cards are dimmed and which still
-          // need attention.
-          <button
-            type="button"
-            data-card-interactive
-            data-mark-read
-            onMouseDown={(e) => e.stopPropagation()}
-            onTouchStart={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              // "view" + manual read flip + dwell. Three signals
-              // in one click:
-              //   - "view": the ranker sees the same signal it
-              //     sees for headline and thumbnail clicks.
-              //   - "dwell": explicit read-time signal. The value
-              //     is capped at 5 minutes \u2014 a card on screen
-              //     for hours is no longer "dwell", just a
-              //     backgrounded tab. The 5-min cap matches the
-              //     typical per-card attention span and prevents
-              //     one abandoned tab from dominating the
-              //     ranker's read-time average.
-              //   - onMarkRead: flips the manual readEntries set
-              //     so the card dims.
-              const dwellMs = Math.min(Date.now() - mountTime.current, 5 * 60 * 1000)
-              recordImmediate({ entry_id: entry.id, type: 'view' })
-              recordBatched({ entry_id: entry.id, type: 'dwell', value: dwellMs })
-              onMarkRead()
-            }}
-            aria-label="mark this card as read"
-            aria-pressed={!unread}
-            title="mark as read (m)"
-            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
-                        ${unread ? 'text-label-secondary' : 'text-accent'}`}
-          >
-            <CheckIcon className="w-4 h-4" filled={!unread} />
-          </button>
-        )}
-        {/* Per-card star. Sits next to the mark-read checkmark
-            so both meta-row actions are visually grouped. Always
-            visible (same as the checkmark) so the user can see
-            the affordance and its current state at a glance.
-            ``data-star`` so the keyboard ``s`` shortcut in App
-            can target the button via document.querySelector
-            for the currently-selected card. The star icon
-            flips between outline (unstarred) and filled
-            (starred). The label is a verb in the present
-            tense — "Save" when unstarred, "Unsave" when
-            starred — so the action is unambiguous. */}
-        {onStar && (
-          <button
-            type="button"
-            data-card-interactive
-            data-star
-            onMouseDown={(e) => e.stopPropagation()}
-            onTouchStart={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              // ``bookmark`` is the engagement_events type that
-              // matches the ranker's existing "save" signal. The
-              // ranker treats it as a strong positive signal for
-              // the entry's source and topic; future per-user
-              // ML models can use it directly.
-              recordImmediate({ entry_id: entry.id, type: 'bookmark' })
-              onStar()
-            }}
-            aria-label={starred ? 'remove from saved' : 'save for later'}
-            aria-pressed={!!starred}
-            title="save for later (s)"
-            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
-                        ${starred ? 'text-accent' : 'text-label-secondary'}`}
-          >
-            <StarIcon className="w-4 h-4" filled={!!starred} />
-          </button>
-        )}
-        {/* Per-card hide (eye) button. State reflects the entry's
-            current ``hidden`` prop: open eye = visible, closed eye
-            = hidden. Click toggles via ``onHideToggle`` (App wires
-            this to a callback that ALSO marks the entry read when
-            hiding, so the entry moves to the column's History
-            section instead of just disappearing). The keyboard
-            ``h`` shortcut targets this button via
-            document.querySelector + ``data-eye``. */}
-        {onHideToggle && (
-          <button
-            type="button"
-            data-card-interactive
-            data-eye
-            onMouseDown={(e) => e.stopPropagation()}
-            onTouchStart={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              // ``never`` is the engagement type for
-              // "I never want to see this again" \u2014 a
-              // stronger signal than the ``view`` mark-read
-              // fires. The ranker treats it as a category
-              // penalty; future per-user ML models can
-              // subtract it from the user's preference
-              // for the entry's source / topic.
-              if (!hidden) {
-                recordImmediate({ entry_id: entry.id, type: 'never' })
-              }
-              onHideToggle()
-            }}
-            aria-label={hidden ? 'unhide' : 'hide'}
-            aria-pressed={!!hidden}
-            title="hide (h)"
-            className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
-                        ${hidden ? 'text-accent' : 'text-label-secondary'}`}
-          >
-            <EyeIcon className="w-4 h-4" closed={!!hidden} />
-          </button>
-        )}
-        </div>
       </div>
       {/* Reddit cross-reference footer. Rendered between the meta row
           and the summary block so it reads as "extra metadata about
@@ -1129,8 +968,9 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
           which way (if any) they've already voted on this entry,
           matching the persisted-state treatment star/hidden already
           get. */}
-      {onVote && (
+      {(onVote || onToggleSummary || onMarkRead || onStar || onHideToggle) && (
         <div className="mt-3 pt-2.5 border-t border-hairline/70 flex items-center">
+          {onVote && (
           <div className="flex items-center rounded-full bg-bg-elevated/70 ring-1 ring-white/5 overflow-hidden">
             <button
               type="button"
@@ -1188,6 +1028,152 @@ export function CardInner({ entry, sourceName, unread, selected, cardRef, onActi
               <ArrowDownIcon className="w-4 h-4" filled={vote === 'down'} />
             </button>
           </div>
+          )}
+          {/* Utility icon cluster — summary chevron, mark-read, star,
+              hide. Lives on the trailing edge of the SAME footer bar
+              the vote pair is in, per the "top of card is info,
+              bottom is interaction" split: the meta row above now
+              carries only source + timestamp, nothing clickable.
+              ``ml-auto`` pushes this cluster to the right regardless
+              of whether the vote pill rendered (e.g. a caller that
+              wires hide/star but not votes still gets the icons
+              flush right, not stranded at the left edge). */}
+          <div className="ml-auto flex items-center gap-1">
+            {/* Per-card summary chevron. Same ``data-card-interactive``
+                guard so a long-press / right-click on the card itself
+                doesn't fire while the user is targeting the chevron.
+                Title alternates by state so the hover hint matches the
+                keyboard shortcut (``s``). Visually mirrors the ✓'s
+                hover-reveal treatment — hidden until hover on desktop,
+                always visible on touch. */}
+            {onToggleSummary && (
+              <button
+                type="button"
+                data-card-interactive
+                onMouseDown={(e) => e.stopPropagation()}
+                onTouchStart={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onToggleSummary()
+                }}
+                aria-label={expanded ? 'hide summary' : 'show summary'}
+                aria-expanded={!!expanded}
+                title={expanded ? 'hide summary (s)' : 'show summary (s)'}
+                className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-label-secondary active:bg-bg-elevated
+                            ${expanded ? 'opacity-100 text-accent' : 'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100'}`}
+              >
+                {/* Rotate 180° when expanded so the chevron flips up —
+                    standard iOS disclosure-indicator idiom. */}
+                <ChevronDownIcon className={`w-4 h-4 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+              </button>
+            )}
+            {/* Per-card mark-read ✓. ``onMouseDown`` swallows the press
+                so it doesn't bubble into the article's long-press /
+                context-menu paths. Fires ``view`` so the ranker sees
+                the same signal it sees for headline and thumbnail
+                clicks. */}
+            {onMarkRead && (
+              // Always visible (not hover-only) so the user can see at
+              // a glance that the action is available. Muted weight
+              // (text-label-secondary for unread, text-accent for
+              // read) so it doesn't compete with the title. On read
+              // cards the checkmark is filled so the user can tell at
+              // a glance which cards are dimmed and which still need
+              // attention.
+              <button
+                type="button"
+                data-card-interactive
+                data-mark-read
+                onMouseDown={(e) => e.stopPropagation()}
+                onTouchStart={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  // "view" + manual read flip + dwell. Three signals in
+                  // one click: "view" (same signal headline/thumbnail
+                  // clicks send), "dwell" (read-time, capped at 5 min so
+                  // a backgrounded tab doesn't dominate the ranker's
+                  // read-time average), and the manual readEntries flip
+                  // that dims the card.
+                  const dwellMs = Math.min(Date.now() - mountTime.current, 5 * 60 * 1000)
+                  recordImmediate({ entry_id: entry.id, type: 'view' })
+                  recordBatched({ entry_id: entry.id, type: 'dwell', value: dwellMs })
+                  onMarkRead()
+                }}
+                aria-label="mark this card as read"
+                aria-pressed={!unread}
+                title="mark as read (m)"
+                className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
+                            ${unread ? 'text-label-secondary' : 'text-accent'}`}
+              >
+                <CheckIcon className="w-4 h-4" filled={!unread} />
+              </button>
+            )}
+            {/* Per-card star. ``data-star`` so the keyboard ``s``
+                shortcut in App can target the button via
+                document.querySelector for the currently-selected card.
+                Outline when unstarred, filled when starred. */}
+            {onStar && (
+              <button
+                type="button"
+                data-card-interactive
+                data-star
+                onMouseDown={(e) => e.stopPropagation()}
+                onTouchStart={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  // ``bookmark`` is the engagement_events type that
+                  // matches the ranker's existing "save" signal.
+                  recordImmediate({ entry_id: entry.id, type: 'bookmark' })
+                  onStar()
+                }}
+                aria-label={starred ? 'remove from saved' : 'save for later'}
+                aria-pressed={!!starred}
+                title="save for later (s)"
+                className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
+                            ${starred ? 'text-accent' : 'text-label-secondary'}`}
+              >
+                <StarIcon className="w-4 h-4" filled={!!starred} />
+              </button>
+            )}
+            {/* Per-card hide (eye) button. State reflects the entry's
+                current ``hidden`` prop: open eye = visible, closed eye
+                = hidden. Click toggles via ``onHideToggle`` (App wires
+                this to a callback that ALSO marks the entry read when
+                hiding, so the entry moves to the column's History
+                section instead of just disappearing). The keyboard
+                ``h`` shortcut targets this button via
+                document.querySelector + ``data-eye``. */}
+            {onHideToggle && (
+              <button
+                type="button"
+                data-card-interactive
+                data-eye
+                onMouseDown={(e) => e.stopPropagation()}
+                onTouchStart={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  // ``never`` is a stronger signal than the ``view``
+                  // mark-read fires — the ranker treats it as a
+                  // category penalty.
+                  if (!hidden) {
+                    recordImmediate({ entry_id: entry.id, type: 'never' })
+                  }
+                  onHideToggle()
+                }}
+                aria-label={hidden ? 'unhide' : 'hide'}
+                aria-pressed={!!hidden}
+                title="hide (h)"
+                className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-full active:bg-bg-elevated
+                            ${hidden ? 'text-accent' : 'text-label-secondary'}`}
+              >
+                <EyeIcon className="w-4 h-4" closed={!!hidden} />
+              </button>
+            )}
+          </div>
         </div>
       )}
       </article>
@@ -1217,6 +1203,7 @@ function _cardPropsEqual(prev: Props, next: Props): boolean {
   return (
     prev.entry === next.entry &&
     prev.sourceName === next.sourceName &&
+    prev.sourceFaviconPath === next.sourceFaviconPath &&
     prev.unread === next.unread &&
     prev.selected === next.selected &&
     prev.category === next.category &&
@@ -1424,6 +1411,35 @@ function ArrowDownIcon({ className, filled = false }: { className?: string; fill
     >
       <path d="M12 5v14M19 12l-7 7-7-7" />
     </svg>
+  )
+}
+
+// Thumbnail placeholder for entries with no photo — same footprint
+// as the real Thumbnail (so the title/badge row doesn't jump between
+// cards that have a photo and cards that don't) but shows the
+// source's favicon centered on a colored tile instead of stretching
+// a tiny icon full-bleed (which would look pixelated at this size).
+// The tile color is the SAME per-source hue SourceIcon's letter
+// fallback uses (``stableHue``, imported not reimplemented — see its
+// comment) so a source reads as "the same color" everywhere it
+// appears, not just in FeedManager/Drawer.
+//
+// Degrades in two steps: favicon present -> icon on a colored tile;
+// no favicon yet either -> SourceIcon's own letter-on-color fallback,
+// just scaled up. Either way the card never has a blank gap where a
+// thumbnail-having sibling has a photo — "media rich, even if it has
+// to cheat" per the brief this was built for.
+function ThumbnailFallback({ sourceName, faviconPath }: { sourceName: string; faviconPath?: string | null }) {
+  const hue = stableHue(sourceName)
+  return (
+    <div
+      aria-hidden="true"
+      title={sourceName}
+      className="shrink-0 w-28 sm:w-40 aspect-video rounded-ios overflow-hidden ring-1 ring-white/10 shadow-md flex items-center justify-center"
+      style={{ background: `hsl(${hue} 45% 18%)` }}
+    >
+      <SourceIcon src={faviconPath ?? null} name={sourceName} size={32} />
+    </div>
   )
 }
 

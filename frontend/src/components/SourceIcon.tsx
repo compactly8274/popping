@@ -37,7 +37,11 @@ type Props = {
 // djb2 — five lines, deterministic, no deps. Mod 360 keeps the hue in
 // the usable range; 45% saturation + 35% lightness give a slate-
 // friendly color that doesn't fight the dark theme.
-function stableHue(name: string): number {
+// Exported so other surfaces that want the SAME per-source color
+// without the full SourceIcon markup (Card.tsx's ThumbnailFallback,
+// which draws its own larger tile) stay in sync — two independent
+// hash implementations would drift the moment either one's tweaked.
+export function stableHue(name: string): number {
   let h = 5381
   for (let i = 0; i < name.length; i++) {
     h = ((h << 5) + h + name.charCodeAt(i)) & 0xffffffff

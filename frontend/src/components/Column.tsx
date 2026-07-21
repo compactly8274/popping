@@ -78,6 +78,11 @@ type Props = {
   // it can render the colored left stripe. Without it the cards just
   // skip the stripe.
   categoriesBySourceId?: Map<number, string>
+  // Optional map sourceId → favicon path. Passed through to each Card
+  // as a thumbnail fallback for entries with no photo of their own —
+  // see Card.tsx's ThumbnailFallback. Without it, image-less entries
+  // just render with no thumbnail (today's behavior).
+  faviconBySourceId?: Map<number, string | null>
   // Per-card summary expansion set + toggle callback. App owns both
   // so the keyboard ``s`` shortcut and the per-card chevron stay in
   // sync. Both optional — older callers (none today) just omit
@@ -141,6 +146,7 @@ export function Column({
   onPrefsChange,
   totalCount,
   categoriesBySourceId,
+  faviconBySourceId,
   expandedSummaries,
   onToggleSummary,
   onHideEntry,
@@ -478,6 +484,7 @@ export function Column({
                 cardRefs={cardRefs}
                 setCardRef={setCardRef}
                 categoriesBySourceId={categoriesBySourceId}
+                faviconBySourceId={faviconBySourceId}
                 onMarkEntryRead={onMarkEntryRead}
                 expandedSummaries={expandedSummaries}
                 onToggleSummary={onToggleSummary}
@@ -531,6 +538,7 @@ export function Column({
                 cardRefs={cardRefs}
                 setCardRef={setCardRef}
                 categoriesBySourceId={categoriesBySourceId}
+                faviconBySourceId={faviconBySourceId}
                 onMarkEntryRead={onMarkEntryRead}
                 expandedSummaries={expandedSummaries}
                 onToggleSummary={onToggleSummary}
@@ -572,6 +580,7 @@ type SectionProps = {
     | undefined
   setCardRef: (entryId: number) => (el: HTMLElement | null) => void
   categoriesBySourceId: Map<number, string> | undefined
+  faviconBySourceId: Map<number, string | null> | undefined
   onMarkEntryRead: ((entryId: number) => void) | undefined
   expandedSummaries: Set<number> | undefined
   onToggleSummary: ((entryId: number) => void) | undefined
@@ -596,6 +605,7 @@ function ColumnSection({
   cardRefs,
   setCardRef,
   categoriesBySourceId,
+  faviconBySourceId,
   onMarkEntryRead,
   expandedSummaries,
   onToggleSummary,
@@ -655,6 +665,7 @@ function ColumnSection({
                 key={e.id}
                 entry={e}
                 sourceName={sourcesById.get(e.source_id)}
+                sourceFaviconPath={faviconBySourceId?.get(e.source_id)}
                 unread={unreadForCard(e)}
                 selected={selectedId === e.id}
                 cardRef={cardRefs ? setCardRef(e.id) : undefined}
