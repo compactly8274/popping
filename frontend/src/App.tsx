@@ -661,6 +661,16 @@ export function App() {
     () => new Map(sources.map((s) => [s.id, s.category])),
     [sources],
   )
+  // Same shape, favicon path this time — lets Card fall back to the
+  // source's icon as a thumbnail placeholder when the entry itself
+  // has no photo (see Card.tsx's ThumbnailFallback). NULL is a valid
+  // value (favicon hasn't been fetched yet), distinct from "key
+  // absent" (source not found at all) — Card's ``.get()`` treats
+  // both the same way (render the letter-only fallback).
+  const faviconBySourceId = useMemo(
+    () => new Map(sources.map((s) => [s.id, s.favicon_path])),
+    [sources],
+  )
 
   // Build a Set for O(1) hidden-entry lookup. We recompute on
   // every render where ``hiddenEntries`` changes (the underlying
@@ -2306,6 +2316,7 @@ export function App() {
             error={searchError}
             searching={searching}
             categoriesBySourceId={categoriesBySourceId}
+            faviconBySourceId={faviconBySourceId}
             readIds={globalReadIds}
             expandedSummaries={expandedSummaries}
             onToggleSummary={toggleSummary}
@@ -2408,6 +2419,7 @@ export function App() {
                       key={e.id}
                       entry={e}
                       sourceName={sourcesById.get(e.source_id)}
+                      sourceFaviconPath={faviconBySourceId.get(e.source_id)}
                       category={categoriesBySourceId.get(e.source_id)}
                       unread={!isRead}
                       expanded={expandedSummaries.has(e.id)}
@@ -2519,6 +2531,7 @@ export function App() {
                     onPrefsChange={(next) => setPrefsFor(col.name, next)}
                     totalCount={col.totalCount}
                     categoriesBySourceId={categoriesBySourceId}
+                    faviconBySourceId={faviconBySourceId}
                     expandedSummaries={expandedSummaries}
                     onToggleSummary={toggleSummary}
                     sectionsCollapsed={sectionsCollapsedFor(col.name)}
@@ -2669,6 +2682,7 @@ export function App() {
                   }
                   totalCount={columns[mobileCol]?.totalCount}
                   categoriesBySourceId={categoriesBySourceId}
+                  faviconBySourceId={faviconBySourceId}
                   expandedSummaries={expandedSummaries}
                   onToggleSummary={toggleSummary}
                   sectionsCollapsed={sectionsCollapsedFor(columns[mobileCol]?.name ?? '')}

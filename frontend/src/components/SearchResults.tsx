@@ -23,6 +23,9 @@ type Props = {
   // owning column to mark read against. Callers should scope reads
   // under a shared pseudo-column key (App uses ``'Search'``).
   categoriesBySourceId?: Map<number, string>
+  // Same shape, favicon path — Card's thumbnail fallback for
+  // entries with no photo of their own.
+  faviconBySourceId?: Map<number, string | null>
   // Entries the user has already read anywhere on the dashboard
   // (App's ``globalReadIds``). Drives the dimmed/unread ring.
   readIds?: Set<number>
@@ -45,6 +48,7 @@ export function SearchResults({
   error,
   searching,
   categoriesBySourceId,
+  faviconBySourceId,
   readIds,
   onMarkRead,
   onHide,
@@ -86,6 +90,7 @@ export function SearchResults({
               key={e.id}
               entry={e}
               sourceName={sourcesById.get(e.source_id)}
+              sourceFaviconPath={faviconBySourceId?.get(e.source_id)}
               category={categoriesBySourceId?.get(e.source_id)}
               unread={readIds ? !readIds.has(e.id) : undefined}
               expanded={expandedSummaries?.has(e.id) ?? false}
