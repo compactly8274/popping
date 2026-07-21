@@ -790,35 +790,46 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
             ↗
           </span>
         </a>
-        {entry.image_path ? (
-          <Thumbnail
-            path={entry.image_path}
-            title={entry.title}
-            url={entry.url}
-            entryId={entry.id}
-          />
-        ) : (
-          // No feed-supplied or scraped photo (backend already tries
-          // media:thumbnail / og:image / etc. before giving up) —
-          // fall back to the source's favicon on a colored tile
-          // rather than leaving a blank gap. Only needs sourceName;
-          // ThumbnailFallback degrades to a plain colored letter if
-          // there's no favicon either, so every card with a known
-          // source gets SOME visual.
-          sourceName && (
-            <ThumbnailFallback sourceName={sourceName} faviconPath={sourceFaviconPath} />
-          )
-        )}
-        {/* Score badge. The gradient gives the badge a tiny bit of
-            depth; ``ring-1 ring-white/10`` is a faint inner highlight
-            that reads as "this is a label" rather than "this is a
-            button". Title shows the raw number for power users. */}
-        <span
-          className={`shrink-0 inline-flex items-center rounded-ios px-2 py-0.5 text-xs font-semibold text-white ring-1 ring-white/10 ${band.color}`}
-          title={`composite score ${entry.composite_score.toFixed(0)}`}
-        >
-          {entry.composite_score.toFixed(0)}
-        </span>
+        {/* Score badge + thumbnail, stacked in one column rather than
+            sitting side by side. Side by side wasted space two ways
+            at once: the badge ate horizontal width from the title
+            (more wrapped lines than necessary), and the combined
+            badge+thumbnail block was shorter than the wrapped title,
+            leaving a dead gap under the thumbnail where nothing
+            rendered. Stacking narrows the right-hand column to just
+            the thumbnail's width and lets it fill closer to the
+            title's actual wrapped height. */}
+        <div className="shrink-0 flex flex-col items-end gap-1.5">
+          {/* The gradient gives the badge a tiny bit of depth;
+              ``ring-1 ring-white/10`` is a faint inner highlight that
+              reads as "this is a label" rather than "this is a
+              button". Title shows the raw number for power users. */}
+          <span
+            className={`inline-flex items-center rounded-ios px-2 py-0.5 text-xs font-semibold text-white ring-1 ring-white/10 ${band.color}`}
+            title={`composite score ${entry.composite_score.toFixed(0)}`}
+          >
+            {entry.composite_score.toFixed(0)}
+          </span>
+          {entry.image_path ? (
+            <Thumbnail
+              path={entry.image_path}
+              title={entry.title}
+              url={entry.url}
+              entryId={entry.id}
+            />
+          ) : (
+            // No feed-supplied or scraped photo (backend already
+            // tries media:thumbnail / og:image / etc. before giving
+            // up) — fall back to the source's favicon on a colored
+            // tile rather than leaving a blank gap. Only needs
+            // sourceName; ThumbnailFallback degrades to a plain
+            // colored letter if there's no favicon either, so every
+            // card with a known source gets SOME visual.
+            sourceName && (
+              <ThumbnailFallback sourceName={sourceName} faviconPath={sourceFaviconPath} />
+            )
+          )}
+        </div>
       </div>
       <div className="flex items-center gap-2 text-ios-caption text-label-secondary">
         {sourceName && <span className={`font-medium ${sourceTextClass}`}>{sourceName}</span>}
