@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import Entry, Source
+from app.podcast_asr import asr_available, transcribe_audio
 from app.podcast_transcript import fetch_transcript_text, summarize_transcript
 from app.schemas import EntryListOut, EntryOut, EntryPodcastSummaryOut, EntrySummaryOut
 
@@ -438,23 +439,28 @@ async def entry_podcast_summary_endpoint(
     entry_id: int,
     session: AsyncSession = Depends(get_session),
 ) -> EntryPodcastSummaryOut:
-    """Return (or fetch the transcript + generate + cache) an
-    LLM-written summary of a podcast episode.
+    """Return (or fetch/transcribe + generate + cache) an LLM-written
+    summary of a podcast episode.
 
-    Only applicable to entries whose feed published a Podcasting 2.0
-    ``<podcast:transcript>`` tag (extracted at ingest time into
-    ``meta.transcript_url`` / ``meta.transcript_type`` — see
-    ``app.sources.rss``). Deliberately not real speech-to-text: this
-    reuses a transcript the podcast host already produced rather
-    than transcribing the audio ourselves, so it only works for feeds
-    that opt into the tag.
+    Two paths, tried in cost order:
+      1. Podcasting 2.0 ``<podcast:transcript>`` tag (extracted at
+         ingest time into ``meta.transcript_url`` / ``meta.
+         transcript_type`` — see ``app.sources.rss``). Free — reuses
+         a transcript the host already produced.
+      2. Real speech-to-text via Groq's hosted Whisper endpoint (see
+         ``app.podcast_asr``), when the feed has no transcript tag
+         but does have ``meta.audio_url`` (the episode's enclosure)
+         and a Groq API key is configured. Costs a fraction of a
+         cent per episode; only attempted when path 1 isn't
+         available.
 
     Cache semantics mirror ``/summary`` above:
       - ``podcast_transcript_summary is None``  → never attempted →
-        fetch transcript + summarize + persist.
+        try path 1, then path 2, summarize + persist.
       - ``podcast_transcript_summary == ""``    → attempted, no
-        usable result (fetch failed / no LLM configured / LLM
-        returned nothing) → return empty without re-attempting.
+        usable result (fetch/transcription failed / no LLM
+        configured / LLM returned nothing) → return empty without
+        re-attempting.
       - populated                                → return cached.
     """
     row = await session.get(Entry, entry_id)
@@ -469,14 +475,21 @@ async def entry_podcast_summary_endpoint(
     meta = row.meta or {}
     transcript_url = meta.get("transcript_url")
     transcript_type = meta.get("transcript_type") or ""
-    if not isinstance(transcript_url, str) or not transcript_url:
-        # No transcript published for this episode — nothing to
-        # cache (a future re-ingest of the feed could pick one up if
-        # the host adds one later, so we don't want to permanently
-        # record "unavailable" on the row).
+    audio_url = meta.get("audio_url")
+
+    transcript_text = None
+    if isinstance(transcript_url, str) and transcript_url:
+        transcript_text = await fetch_transcript_text(transcript_url, transcript_type)
+    elif isinstance(audio_url, str) and audio_url and asr_available():
+        transcript_text = await transcribe_audio(audio_url)
+    else:
+        # Neither a published transcript nor (audio_url + a
+        # configured ASR key) — nothing to cache (a future re-ingest
+        # or a later GROQ_API_KEY setup could make this available,
+        # so we don't want to permanently record "unavailable" on
+        # the row).
         return EntryPodcastSummaryOut(summary=None, cached=False, available=False)
 
-    transcript_text = await fetch_transcript_text(transcript_url, transcript_type)
     summary = None
     if transcript_text:
         summary = await summarize_transcript(row.title, transcript_text)

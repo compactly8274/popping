@@ -147,13 +147,27 @@ export interface SettingsOut {
   llm_provider: string | null
   llm_model_brief: string | null
   llm_model_scoring: string | null
+  // Whether a key is currently active for that provider (Settings-UI
+  // override OR env var) — never the key value itself. See
+  // LLMSettingsUpdate below for how to set/clear one.
+  anthropic_api_key_set: boolean
+  openai_api_key_set: boolean
+  groq_api_key_set: boolean
+  ollama_cloud_api_key_set: boolean
 }
 
 // PUT /api/settings/llm — all fields optional; missing = unchanged.
+// The *_api_key fields follow the same convention: omit to leave
+// alone, "" to clear the override (revert to env), any other string
+// to set/replace it. Write-only — never returned by GET.
 export interface LLMSettingsUpdate {
   provider?: string | null
   model_brief?: string | null
   model_scoring?: string | null
+  anthropic_api_key?: string | null
+  openai_api_key?: string | null
+  groq_api_key?: string | null
+  ollama_cloud_api_key?: string | null
 }
 
 // One row from /api/llm/tags — Ollama-style model record. Slim subset

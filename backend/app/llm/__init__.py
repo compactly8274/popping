@@ -117,32 +117,47 @@ class Router:
         return Router._env_model_for(task, backend)
 
     @staticmethod
+    def _api_key_for(backend: str) -> str:
+        """Resolve ``backend``'s API key: a Settings-UI override in
+        runtime_settings if the user has set one, else the env value.
+        ``snapshot_sync()`` already applies exactly this precedence
+        per key (same mechanism ``_model_for`` uses for model names)
+        — this is just the key-name translation."""
+        snap = runtime_settings.snapshot_sync()
+        return snap.get(f"llm.{backend}_api_key", "")
+
+    @staticmethod
     def _construct(backend: str, model: str) -> Provider | None:
         """Build a Provider instance for ``backend`` + ``model``.
 
         Returns None when the chosen backend has no usable auth (e.g.
-        user pinned "anthropic" but ANTHROPIC_API_KEY is unset) — we
-        don't 500, we just report "not configured" and let the caller
-        surface that to the UI.
+        user pinned "anthropic" but has no key configured, whether via
+        ANTHROPIC_API_KEY or the Settings UI) — we don't 500, we just
+        report "not configured" and let the caller surface that to
+        the UI.
         """
         if backend == "anthropic":
-            if not settings.anthropic_api_key:
+            api_key = Router._api_key_for("anthropic")
+            if not api_key:
                 return None
             from app.llm.anthropic import AnthropicProvider
 
-            return AnthropicProvider(model, settings.anthropic_api_key)
+            return AnthropicProvider(model, api_key)
         if backend == "openai":
-            if not settings.openai_api_key:
+            api_key = Router._api_key_for("openai")
+            if not api_key:
                 return None
-            return OpenAIProvider(model, settings.openai_api_key)
+            return OpenAIProvider(model, api_key)
         if backend == "groq":
-            if not settings.groq_api_key:
+            api_key = Router._api_key_for("groq")
+            if not api_key:
                 return None
-            return GroqProvider(model, settings.groq_api_key)
+            return GroqProvider(model, api_key)
         if backend == "ollama_cloud":
-            if not settings.ollama_cloud_api_key:
+            api_key = Router._api_key_for("ollama_cloud")
+            if not api_key:
                 return None
-            return OllamaCloudProvider(model, settings.ollama_cloud_api_key)
+            return OllamaCloudProvider(model, api_key)
         if backend == "ollama":
             return OllamaProvider(model)
         return None

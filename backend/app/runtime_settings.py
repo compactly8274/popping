@@ -86,7 +86,36 @@ _SETTINGS_FIELDS: dict[str, str] = {
     "llm.model_brief": "ollama_cloud_model_brief",
     "llm.model_scoring": "ollama_cloud_model_scoring",
     "brief.window_hours": "brief_window_hours",
+    # LLM provider API keys, settable from the Settings UI (LLMSection)
+    # as an alternative to editing .env + redeploying. Same DB-override-
+    # then-env-fallback resolution as every other key here; Router.
+    # _construct reads these via snapshot_sync() the same way it reads
+    # model names. See ``_SECRET_KEYS`` below for why these are
+    # excluded from ``seed_from_env``.
+    "llm.anthropic_api_key": "anthropic_api_key",
+    "llm.openai_api_key": "openai_api_key",
+    "llm.groq_api_key": "groq_api_key",
+    "llm.ollama_cloud_api_key": "ollama_cloud_api_key",
 }
+
+# API-key knobs are deliberately excluded from seed_from_env's
+# copy-into-DB step. Every OTHER setting benefits from seeding: it
+# lets a later .env edit lose to a user's UI choice, which is the
+# documented contract. For a secret specifically, the opposite is
+# usually what you want — if you rotate a compromised key in .env and
+# restart, that should take effect immediately, not be stuck behind a
+# stale copy an old first-boot silently froze into the DB. Leaving
+# these unseeded means the env value always applies live UNLESS the
+# user has explicitly set an override via the Settings UI (a real DB
+# row from a PUT, not a seed), which still wins as usual.
+_SECRET_KEYS: frozenset[str] = frozenset(
+    {
+        "llm.anthropic_api_key",
+        "llm.openai_api_key",
+        "llm.groq_api_key",
+        "llm.ollama_cloud_api_key",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +292,12 @@ async def seed_from_env() -> None:
         if not settings_field:
             # No env equivalent (e.g. ``llm.provider`` — user picks via
             # the chip). Skip.
+            continue
+        if runtime_key in _SECRET_KEYS:
+            # API keys stay env-live unless explicitly overridden via
+            # the Settings UI — see ``_SECRET_KEYS`` docstring. Also
+            # avoids ever writing a secret value into the info-level
+            # log line below.
             continue
         if runtime_key in existing:
             continue
