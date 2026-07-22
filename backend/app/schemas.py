@@ -223,11 +223,19 @@ class FeedDiscoverResult(BaseModel):
     ``category`` is the category actually searched (echoes the
     request's ``category``, or reports the inferred one). ``added``
     is how many new candidates were validated and persisted —
-    frequently 0 (the LLM had nothing new / nothing validated), which
-    is a normal outcome, not an error.
+    frequently 0, which is a normal outcome, not an error. ``note``
+    is None when ``added`` is 0 for the unremarkable reason ("the LLM
+    ran and genuinely had nothing new to suggest") and a short,
+    specific reason otherwise — no provider configured, a provider's
+    actual error, or "N suggestions, none passed validation". Without
+    this, every ``added=0`` looks identical to the user, and a real
+    config gap (no API key, wrong model, unreachable local Ollama)
+    reads as a silently broken button instead of something they can
+    fix in Settings.
     """
     category: str
     added: int
+    note: Optional[str] = None
 
 
 class EntrySummaryOut(BaseModel):
