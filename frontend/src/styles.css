@@ -44,3 +44,82 @@
     border-top-color: rgba(255, 255, 255, 0.08) !important;
   }
 }
+
+/* Ambient dashboard wallpaper (see components/Wallpaper.tsx). Fixed,
+   full-viewport, and painted with a very negative z-index so it sits
+   behind the app root's own background and every other element per
+   CSS stacking rules — a plain Tailwind ``-z-10`` class isn't
+   negative enough once other fixed/sticky layers (the header is
+   ``z-20``) enter the same stacking context, so this is hand-rolled
+   rather than a utility class. */
+.wallpaper-blob-layer {
+  position: fixed;
+  inset: 0;
+  z-index: -100;
+  overflow: hidden;
+  pointer-events: none;
+  background-color: #000000;
+}
+
+.wallpaper-blob {
+  position: absolute;
+  width: 60vmax;
+  height: 60vmax;
+  border-radius: 50%;
+  filter: blur(120px);
+  will-change: transform;
+}
+
+/* iOS systemBlue — matches the app's existing accent color. */
+.wallpaper-blob-a {
+  top: -15vmax;
+  left: -15vmax;
+  background: #0a84ff;
+  opacity: 0.16;
+  animation: wallpaperDriftA 70s ease-in-out infinite;
+}
+
+/* iOS systemPurple. */
+.wallpaper-blob-b {
+  bottom: -20vmax;
+  right: -15vmax;
+  background: #bf5af2;
+  opacity: 0.14;
+  animation: wallpaperDriftB 85s ease-in-out infinite;
+}
+
+/* iOS systemGreen — the dimmest of the three so the wash leans
+   blue/violet rather than reading as three equal RGB primaries. */
+.wallpaper-blob-c {
+  top: 25vh;
+  right: 15vw;
+  background: #30d158;
+  opacity: 0.10;
+  animation: wallpaperDriftC 95s ease-in-out infinite;
+}
+
+@keyframes wallpaperDriftA {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33%      { transform: translate(14vmax, 10vmax) scale(1.15); }
+  66%      { transform: translate(-6vmax, 16vmax) scale(0.95); }
+}
+
+@keyframes wallpaperDriftB {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  40%      { transform: translate(-16vmax, -10vmax) scale(1.1); }
+  75%      { transform: translate(8vmax, -8vmax) scale(0.92); }
+}
+
+@keyframes wallpaperDriftC {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50%      { transform: translate(-12vmax, 14vmax) scale(1.2); }
+}
+
+/* Same "freeze, don't hide" treatment as the splash spinner above —
+   the color wash still livens up the black shell, it just stops
+   drifting for users who've asked the OS to reduce motion. */
+@media (prefers-reduced-motion: reduce) {
+  .wallpaper-blob {
+    animation: none !important;
+  }
+}
