@@ -29,6 +29,7 @@ import { SearchResults } from './components/SearchResults'
 import { ShortcutsSheet } from './components/ShortcutsSheet'
 import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
+import { Wallpaper } from './components/Wallpaper'
 import { Settings, type SettingsTab } from './components/Settings'
 import { recordImmediate } from './lib/interactions'
 // Per-user server-backed preferences. Replaces the 8 localStorage
@@ -2074,8 +2075,19 @@ export function App() {
       // ``100vh`` is kept alongside as the fallback for browsers
       // that don't understand ``dvh`` (older Android WebView).
       style={{ backgroundColor: '#000000', minHeight: '100dvh' }}
-      className="h-full flex flex-col"
+      // ``isolate`` makes this div its own stacking context. Without
+      // it, this div's own inline black background — an in-flow,
+      // non-positioned box — paints *after* Wallpaper's negative
+      // z-index layer (which pops out to the nearest stacking
+      // context, i.e. the page root) per CSS painting order, so the
+      // opaque black would cover the wallpaper entirely. Isolating
+      // here means this element's own background is step one of
+      // *its* stacking context, with Wallpaper's negative z-index
+      // painting above that — correctly behind the header/columns,
+      // which are the later, non-negative-z-index children.
+      className="h-full flex flex-col isolate"
     >
+      <Wallpaper />
       {/* Large-title navigation bar. Mirrors Apple Mail / Music:
           the title is large (34pt, iOS ``largeTitle`` weight) when the
           bar is at the top of the scroll, and the row beneath it
