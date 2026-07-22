@@ -144,6 +144,30 @@ function categoryStripeClass(category: string | undefined): string {
 // shade (one step lighter than the stripe's 500) reads better as
 // body text against the dark background than the more saturated 500
 // would at this size.
+// Same category -> hue mapping again, this time as a low-opacity
+// border color so the card's edge itself carries a whisper of the
+// category identity instead of relying solely on the 3px stripe —
+// asked for alongside the stripe/source-text tinting so a card reads
+// as "this category" even at a glance from its silhouette. Kept
+// faint (/25) so it doesn't compete with the ring treatment used for
+// selected/unread state, which still needs to read as the stronger
+// signal.
+function categoryBorderClass(category: string | undefined): string {
+  switch (category) {
+    case 'news':     return 'border-blue-500/25'
+    case 'tech':     return 'border-violet-500/25'
+    case 'vulns':    return 'border-red-500/25'
+    case 'science':  return 'border-emerald-500/25'
+    case 'finance':  return 'border-amber-500/25'
+    case 'policy':   return 'border-cyan-500/25'
+    case 'longform': return 'border-rose-500/25'
+    case 'deals':    return 'border-lime-500/25'
+    case 'podcast':  return 'border-orange-500/25'
+    case 'video':    return 'border-pink-500/25'
+    default:         return 'border-hairline'
+  }
+}
+
 function categorySourceTextClass(category: string | undefined): string {
   switch (category) {
     case 'news':     return 'text-blue-400'
@@ -187,11 +211,17 @@ function formatDuration(totalSeconds: number): string {
 // colors in the previous config were serviceable but felt like
 // badges stuck on a sticker. Gradients give a tiny bit of depth
 // without crossing into skeuomorphism.
-function scoreBand(score: number): { color: string; label: string } {
-  if (score >= 75) return { color: 'bg-gradient-to-br from-red-500 to-red-700',   label: 'hot' }
-  if (score >= 50) return { color: 'bg-gradient-to-br from-amber-400 to-amber-600', label: 'warm' }
-  if (score >= 25) return { color: 'bg-gradient-to-br from-accent to-blue-700',   label: 'cool' }
-  return               { color: 'bg-gradient-to-br from-neutral-500 to-neutral-700',   label: 'cold' }
+// ``glow`` is a box-shadow class, non-empty only for the hot band —
+// a small red halo behind the badge so the highest-scoring entries
+// pop out of the list at a glance instead of needing the reader to
+// compare numbers card-by-card. Kept to the hot tier only (rather
+// than a glow per band) so it stays a "this one's notable" signal
+// instead of just recoloring every badge's edge.
+function scoreBand(score: number): { color: string; label: string; glow: string } {
+  if (score >= 75) return { color: 'bg-gradient-to-br from-red-500 to-red-700',   label: 'hot',  glow: 'shadow-[0_0_10px_2px_rgba(239,68,68,0.45)]' }
+  if (score >= 50) return { color: 'bg-gradient-to-br from-amber-400 to-amber-600', label: 'warm', glow: '' }
+  if (score >= 25) return { color: 'bg-gradient-to-br from-accent to-blue-700',   label: 'cool', glow: '' }
+  return               { color: 'bg-gradient-to-br from-neutral-500 to-neutral-700',   label: 'cold', glow: '' }
 }
 
 // There's no dedicated "un-vote" interaction type on the backend —
@@ -254,6 +284,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
   const band = scoreBand(entry.composite_score)
   const stripeClass = categoryStripeClass(category)
   const sourceTextClass = categorySourceTextClass(category)
+  const borderClass = categoryBorderClass(category)
   // Touch tracking for long-press → copy URL.
   // Kept in refs so the values don't trigger re-renders mid-press.
   const touchStart = useRef<{ x: number; y: number; t: number; id: number; onInteractiveChild: boolean } | null>(null)
@@ -703,8 +734,12 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
   // summary) fades together. ``opacity-60`` is heavy
   // enough to read as "seen at a glance" but light
   // enough that the user can still read the card body
-  // if they expand it.
-  const dimClass = unread || selected ? '' : 'opacity-60'
+  // if they expand it. ``saturate-50`` rides along so read
+  // cards lose color too, not just brightness — opacity alone
+  // still let a vivid category stripe/thumbnail pull the eye
+  // back to an already-read card; desaturating makes unread
+  // cards the only ones that still "pop" with full color.
+  const dimClass = unread || selected ? '' : 'opacity-60 saturate-50'
 
   return (
     <div className="relative">
@@ -747,10 +782,11 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchCancel}
         onContextMenu={onContextMenu}
-        className={`group relative rounded-ios-lg bg-bg-surface border border-hairline p-4 pl-5
+        className={`group relative rounded-ios-lg bg-bg-surface border p-4 pl-5
                     hover:-translate-y-px hover:shadow-glow-md
-                    transition-[box-shadow,border-color,opacity] duration-200
-                    ${ringClass} ${dimClass}`}
+                    active:scale-[0.985] active:shadow-glow-sm
+                    transition-[transform,box-shadow,border-color,opacity,filter] duration-200
+                    ${borderClass} ${ringClass} ${dimClass}`}
       >
       {/* Category stripe. 3px wide, full height of the card. Lives
           outside the padding flow so it doesn't shift content when
@@ -805,7 +841,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
               reads as "this is a label" rather than "this is a
               button". Title shows the raw number for power users. */}
           <span
-            className={`inline-flex items-center rounded-ios px-2 py-0.5 text-xs font-semibold text-white ring-1 ring-white/10 ${band.color}`}
+            className={`inline-flex items-center rounded-ios px-2 py-0.5 text-xs font-semibold text-white ring-1 ring-white/10 ${band.color} ${band.glow}`}
             title={`composite score ${entry.composite_score.toFixed(0)}`}
           >
             {entry.composite_score.toFixed(0)}

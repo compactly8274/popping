@@ -30,6 +30,7 @@ import { ShortcutsSheet } from './components/ShortcutsSheet'
 import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { Wallpaper } from './components/Wallpaper'
+import { SkeletonGrid } from './components/Skeleton'
 import { Settings, type SettingsTab } from './components/Settings'
 import { recordImmediate } from './lib/interactions'
 // Per-user server-backed preferences. Replaces the 8 localStorage
@@ -2376,9 +2377,20 @@ export function App() {
           />
         </main>
       ) : columns.length === 0 ? (
-        <div className="flex-1 flex items-center justify-center text-ios-body text-label-secondary px-4 text-center">
-          no entries yet — the scheduler will fetch the first batch shortly, or hit Refresh
-        </div>
+        refreshing ? (
+          // First load in flight — the empty-state copy below would
+          // otherwise flash for a moment before the very first
+          // response lands. Only shown pre-first-load: once any
+          // entries exist, ``columns.length`` is never 0 again, so a
+          // later in-flight refresh never re-triggers this.
+          <div className="flex-1 overflow-y-auto">
+            <SkeletonGrid />
+          </div>
+        ) : (
+          <div className="flex-1 flex items-center justify-center text-ios-body text-label-secondary px-4 text-center">
+            no entries yet — the scheduler will fetch the first batch shortly, or hit Refresh
+          </div>
+        )
       ) : (
         <>
           {/* Desktop. The view is two surfaces stacked:

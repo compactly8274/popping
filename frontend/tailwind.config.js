@@ -98,9 +98,10 @@ export default {
           '0%':   { transform: 'translateY(100%)' },
           '100%': { transform: 'translateY(0)' },
         },
-        // Reserved for future loading skeletons — defined here so the
-        // animation utility is purged-in instead of having to wire
-        // it up when we add the first skeleton surface.
+        // Used by the first-load skeleton cards (components/Skeleton.tsx)
+        // — a soft light band sweeps across a ``bg-gradient-to-r``
+        // placeholder via ``background-position``, the standard CSS-
+        // only shimmer technique (no JS animation loop needed).
         shimmer: {
           '0%':   { backgroundPosition: '-100% 0' },
           '100%': { backgroundPosition: '200% 0' },
@@ -113,6 +114,9 @@ export default {
         'fade-in': 'fadeIn 180ms ease-out',
         // Sheet open. ~320ms matches iOS modal presentation.
         'sheet-up': 'sheetUp 320ms cubic-bezier(0.32, 0.72, 0, 1)',
+        // Loading skeleton sweep. 1.6s is slow enough to read as
+        // "gently alive" rather than a flickering strobe.
+        'shimmer': 'shimmer 1.6s ease-in-out infinite',
       },
     },
   },
