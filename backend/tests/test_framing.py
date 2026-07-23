@@ -12,10 +12,12 @@ matching, and the tone response parser/prompt builder.
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 
 from app.framing import (
+    _extract_first_json_array,
     _parse_tone_response,
     cluster_recent_entries,
     detect_wire_source,
@@ -75,6 +77,95 @@ def test_parse_tone_response_invalid_label_rejected():
 
 def test_parse_tone_response_malformed_json_rejected():
     assert _parse_tone_response("not json at all", 1) is None
+
+
+def test_parse_tone_response_extracts_array_from_cot():
+    """Thinking models (gpt-oss, deepseek-r1, glm-5.2) wrap the JSON
+    answer in chain-of-thought prose. The provider substitutes the
+    ``thinking`` field for ``response`` on these models, so the parser
+    receives a CoT blob and must pull the array out of it. Without
+    the bracket-extractor fallback, every framing tone call to a
+    thinking model returns None and the warning fires."""
+    cot = (
+        "We need to classify the tone of each news headline below as "
+        "exactly one of: neutral, urgent, or alarmist. Headlines: 1. "
+        "\"Scientists Discover New Species\" 2. \"TERRIFYING: New Virus\". "
+        "Let me analyze each: 1. The first is matter-of-fact, so neutral. "
+        "2. The second uses fear language, so alarmist. So the answer is "
+        '["neutral", "alarmist"].'
+    )
+    assert _parse_tone_response(cot, 2) == ["neutral", "alarmist"]
+
+
+def test_parse_tone_response_extracts_short_cot():
+    """Even a one-line CoT with a trailing array should parse."""
+    assert _parse_tone_response(
+        'Let me think... The answer is ["neutral", "alarmist"].',
+        2,
+    ) == ["neutral", "alarmist"]
+
+
+def test_parse_tone_response_ignores_extra_arrays():
+    """If the model rambles past the first balanced array, the
+    parser should take the first one (deterministic) and let the
+    length / label checks catch the mismatch."""
+    # First array has 2 items (matches expected_len); second is bogus.
+    assert _parse_tone_response(
+        'Result: ["neutral", "alarmist"]. Bonus: [1, 2, 3].',
+        2,
+    ) == ["neutral", "alarmist"]
+
+
+def test_parse_tone_response_handles_escaped_quotes():
+    """Bracket-extractor must skip over string contents, including
+    escaped quotes that look like a closing-bracket but aren't.
+
+    The string below is the literal text ``["a \\"quoted\\" alarmist", "neutral"]`` —
+    i.e. standard JSON encoding of two tone labels, where the first
+    string contains a literal double-quote character (not a string
+    terminator — the backslash escapes it). Bracket-extractor must
+    keep ``in_string=True`` across the escape sequence and find the
+    real ``]`` at the end.
+
+    The validate step will then reject ``'a "quoted" alarmist'`` as
+    a tone label (not in ``_VALID_TONES``) — that's expected. This
+    test only proves the bracket-extractor itself doesn't terminate
+    on the backslash-quote and the resulting JSON round-trips.
+    """
+    extracted = _extract_first_json_array(
+        'Output: ["a \\"quoted\\" alarmist", "neutral"]',
+    )
+    # Round-trip: the extracted substring is valid JSON whose first
+    # item is the string ``a "quoted" alarmist`` (with a literal
+    # double-quote from the escape).
+    assert json.loads(extracted) == ['a "quoted" alarmist', "neutral"]
+
+
+def test_parse_tone_response_valid_tones_with_escaped_quote():
+    """End-to-end: a model response that includes an escaped quote
+    INSIDE a valid tone label. The text is ``["alarmist", "neu\\"tral"]``,
+    i.e. the second label is intentionally malformed to confirm the
+    parser rejects it (escaped quotes are a tokenizer issue, not
+    something we silently accept). A response with the escaped
+    quote but otherwise valid would be ``["alarmist", "neutral"]`` —
+    covered by the CoT tests above. This case confirms the parser
+    doesn't crash on backslash-quote input.
+    """
+    # malformed label -> parser returns None (validate rejects)
+    assert _parse_tone_response(
+        '["alarmist", "neu\\"tral"]',
+        2,
+    ) is None
+
+
+def test_parse_tone_response_truncated_array_returns_none():
+    """No closing bracket -> No balanced array -> None."""
+    assert _parse_tone_response('["neutral", "alarmist"', 2) is None
+
+
+def test_parse_tone_response_empty_input_returns_none():
+    assert _parse_tone_response("", 2) is None
+    assert _parse_tone_response(None, 2) is None  # type: ignore[arg-type]
 
 
 # --- cluster_recent_entries -------------------------------------------------

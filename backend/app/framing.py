@@ -271,14 +271,94 @@ def _build_tone_prompt(titles: list[str]) -> str:
 
 
 def _parse_tone_response(content: str, expected_len: int) -> Optional[list[str]]:
+    """Extract a tone label list from the model's reply.
+
+    Three input shapes, in order of preference:
+
+    1. Pure JSON: ``["neutral", "alarmist"]`` — works for non-thinking
+       models and for thinking models that emit a clean post-CoT
+       answer.
+    2. JSON inside a markdown fence: stripped via ``_CODE_FENCE_RE``.
+    3. JSON embedded in chain-of-thought: thinking models (gpt-oss,
+       deepseek-r1, glm-5.2) often return a JSON array at the end
+       of a longer reasoning trace. Try ``json.loads`` on the full
+       text; if that fails, scan for the first balanced ``[...]``
+       and try again. This keeps the parser simple while
+       tolerating the model putting the answer in ``thinking``
+       (which the provider substitutes into ``response`` via the
+       thinking-model fallback).
+    """
     text = _CODE_FENCE_RE.sub("", (content or "").strip()).strip()
+    if not text:
+        return None
+    # First try: whole text is JSON.
+    data = _try_parse_json_array(text)
+    if data is not None:
+        return _validate_tone_list(data, expected_len)
+    # Second try: extract the first balanced [...] substring.
+    bracket_text = _extract_first_json_array(text)
+    if bracket_text is not None:
+        data = _try_parse_json_array(bracket_text)
+        if data is not None:
+            return _validate_tone_list(data, expected_len)
+    return None
+
+
+def _try_parse_json_array(text: str) -> Optional[list]:
+    """``json.loads`` on ``text``, returning the list only if it parsed
+    as a JSON array. Anything else (object, scalar, parse error) is
+    None. The framing response is a list of tone strings; an object
+    means the model went off-script (e.g. wrapped the array in
+    ``{"tones": [...]}``) and we let the bracket-extractor handle it.
+    """
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return None
-    if not isinstance(data, list) or len(data) != expected_len:
+    return data if isinstance(data, list) else None
+
+
+def _extract_first_json_array(text: str) -> Optional[str]:
+    """Return the substring of the first balanced ``[...]`` in ``text``,
+    or None if no balanced array is present. Tolerates nested arrays
+    (e.g. an array of arrays) by tracking bracket depth and string
+    state. Used to pull a JSON array out of a CoT blob like:
+    ``"Let me think... The answer is [\\\\\"neutral\\\\\", \\\"alarmist\\\\"]."``
+    """
+    start = text.find("[")
+    if start == -1:
         return None
-    out = []
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _validate_tone_list(data: list, expected_len: int) -> Optional[list[str]]:
+    """Length check + per-item tone whitelist. Returns the cleaned list
+    of lowercase labels, or None on any mismatch.
+    """
+    if len(data) != expected_len:
+        return None
+    out: list[str] = []
     for item in data:
         label = str(item).strip().lower()
         if label not in _VALID_TONES:
