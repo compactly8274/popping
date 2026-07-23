@@ -48,7 +48,16 @@ logger = logging.getLogger("popping.runtime_settings")
 # of rows), so a flat dict is fine. Values are (value, expires_at).
 # ---------------------------------------------------------------------------
 
-_CACHE_TTL_SECONDS = 5.0
+_CACHE_TTL_SECONDS = 3600.0
+# A long TTL is correct here: the table is tiny and writes happen via
+# the Settings UI (rare, deliberate). On restart, ``warm_cache()``
+# rehydrates the cache from the DB, so a stale env value is never
+# served after boot. The previous 5s TTL caused ``snapshot_sync()``
+# (the sync LLM-router hot path) to miss on every cold read and fall
+# through to env — which meant a user-saved DB choice was only honored
+# for the first 5 seconds of uptime. Settings change rarely; a one-hour
+# TTL matches that cadence. ``set()`` still updates the cache in-process
+# so live edits remain immediately visible.
 _cache: dict[str, tuple[str, float]] = {}
 
 
