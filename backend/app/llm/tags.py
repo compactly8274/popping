@@ -140,6 +140,15 @@ _RECOMMENDED_NOTES: dict[str, str] = {
     "glm-5.2:cloud": "thinking",
     "deepseek-r1:671b": "thinking",
     "deepseek-r1:14b": "thinking",
+    # gpt-oss family: emits a clean ``response`` for short prompts but
+    # routes the answer into ``thinking`` when it has to reason
+    # (e.g. the framing tone classifier asks for a JSON array of
+    # classifications — non-trivial enough that the model goes into
+    # CoT mode and leaves ``response`` empty). Without these on the
+    # thinking list, every framing tone call returned
+    # ``ollama cloud returned empty response (model=gpt-oss:20b)``.
+    "gpt-oss:20b": "thinking",
+    "gpt-oss:120b": "thinking",
 }
 
 # Set of model names whose chain-of-thought lives in the ``thinking``
