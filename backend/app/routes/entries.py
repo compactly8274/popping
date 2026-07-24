@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import reddit_client
 from app.article_extract import fetch_article_text
 from app.article_summary import summarize_article
 from app.db import get_session
@@ -16,7 +17,14 @@ from app.llm import router as llm_router
 from app.models import Entry, Source
 from app.podcast_asr import asr_available, transcribe_audio
 from app.podcast_transcript import fetch_transcript_text, summarize_transcript
-from app.schemas import EntryListOut, EntryOut, EntryPodcastSummaryOut, EntrySummaryOut
+from app.reddit_comment_summary import summarize_comments
+from app.schemas import (
+    EntryListOut,
+    EntryOut,
+    EntryPodcastSummaryOut,
+    EntryRedditCommentSummaryOut,
+    EntrySummaryOut,
+)
 
 router = APIRouter(tags=["entries"])
 
@@ -530,4 +538,67 @@ async def entry_podcast_summary_endpoint(
     await session.commit()
 
     return EntryPodcastSummaryOut(summary=summary, cached=False, available=True)
+
+
+@router.post(
+    "/entries/{entry_id}/reddit_comment_summary",
+    response_model=EntryRedditCommentSummaryOut,
+)
+async def entry_reddit_comment_summary_endpoint(
+    entry_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> EntryRedditCommentSummaryOut:
+    """Return (or fetch + generate + cache) an LLM-written summary of
+    a Reddit thread's comment discussion.
+
+    Cache semantics mirror ``/podcast_summary``, with one addition:
+      - ``reddit_comment_summary is None`` → never attempted → fetch
+        the thread's comments and summarize + persist.
+      - ``reddit_comment_summary == ""``   → attempted, no usable
+        result (fetch/parse failed / no LLM configured / LLM
+        returned nothing) → return empty without re-attempting.
+      - populated                           → return cached.
+      - rate-limited right now (Reddit's direct-mode fetch allows
+        only ~1 request/75s — see ``app.reddit_client``) → NOT
+        cached, since a retry shortly after could succeed. Reported
+        via ``rate_limited=True`` rather than folded into the
+        ordinary "no summary" empty-string case, so the frontend can
+        tell the user to try again in a moment instead of implying
+        there's nothing to discuss.
+    """
+    row = await session.get(Entry, entry_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="entry not found")
+
+    if row.reddit_comment_summary is not None:
+        return EntryRedditCommentSummaryOut(
+            summary=row.reddit_comment_summary, cached=True, available=True,
+        )
+
+    meta = row.meta or {}
+    thread_url = meta.get("reddit_thread_url")
+    if not isinstance(thread_url, str) or not thread_url:
+        # Nothing to cache — a future cross-reference sweep tick
+        # could still stamp this entry with a thread URL later.
+        return EntryRedditCommentSummaryOut(summary=None, cached=False, available=False)
+
+    try:
+        comments = await reddit_client.fetch_thread_comments(thread_url)
+    except reddit_client.RedditRateLimited:
+        return EntryRedditCommentSummaryOut(
+            summary=None, cached=False, available=True, rate_limited=True,
+        )
+
+    summary = None
+    if comments:
+        summary = await summarize_comments(row.title, comments)
+
+    # Persist even on failure (empty string) — same rationale as the
+    # other summary caches. The rate-limited case above already
+    # returned before reaching here, so this only covers genuine
+    # failures (no thread found, malformed feed, no LLM configured).
+    row.reddit_comment_summary = summary or ""
+    await session.commit()
+
+    return EntryRedditCommentSummaryOut(summary=summary, cached=False, available=True)
 

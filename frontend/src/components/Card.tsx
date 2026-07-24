@@ -351,6 +351,21 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
   const [podcastSummaryError, setPodcastSummaryError] = useState(false)
   const [podcastSummaryUnavailable, setPodcastSummaryUnavailable] = useState(false)
 
+  // Reddit comment-discussion summary. Same shape as the podcast
+  // summary state above (independent toggle + cache, since an entry
+  // could have both a feed summary and a comment-discussion summary
+  // as distinct content). ``redditSummaryRateLimited`` is its own
+  // flag rather than folded into "unavailable" — Reddit's direct-
+  // mode fetch allows only ~1 request/75s (app.reddit_client), so a
+  // tap can lose that race against the scheduled ingest jobs; the
+  // backend deliberately does NOT cache that case, so re-expanding
+  // (collapse then re-expand) retries rather than being stuck.
+  const [redditSummaryExpanded, setRedditSummaryExpanded] = useState(false)
+  const [redditSummary, setRedditSummary] = useState<string | null>(null)
+  const [redditSummaryError, setRedditSummaryError] = useState(false)
+  const [redditSummaryUnavailable, setRedditSummaryUnavailable] = useState(false)
+  const [redditSummaryRateLimited, setRedditSummaryRateLimited] = useState(false)
+
   // Mount timestamp. Reset on every mount via useEffect so the
   // dwell counter starts at 0 for each card instance (not for
   // each unique entry id \u2014 a re-mount on the same entry after a
@@ -411,6 +426,42 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       cancelled = true
     }
   }, [podcastSummaryExpanded, entry.id, podcastSummary, podcastSummaryError, podcastSummaryUnavailable])
+
+  useEffect(() => {
+    if (!redditSummaryExpanded) return
+    if (redditSummary !== null) return
+    if (redditSummaryError) return
+    if (redditSummaryUnavailable) return
+    // Rate-limited is deliberately NOT a terminal state — the
+    // backend doesn't cache it, so re-collapsing and re-expanding
+    // (the button's onClick clears the flag) retries. Clear it here
+    // too, right as a fresh attempt starts, so a stale "rate
+    // limited" message doesn't linger under the new "summarizing…"
+    // state while this attempt is in flight.
+    setRedditSummaryRateLimited(false)
+    let cancelled = false
+    api
+      .redditCommentSummary(entry.id)
+      .then((r) => {
+        if (cancelled) return
+        if (r.rate_limited) {
+          setRedditSummaryRateLimited(true)
+          return
+        }
+        if (!r.available) {
+          setRedditSummaryUnavailable(true)
+          return
+        }
+        setRedditSummary(r.summary ?? '')
+      })
+      .catch(() => {
+        if (cancelled) return
+        setRedditSummaryError(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [redditSummaryExpanded, entry.id, redditSummary, redditSummaryError, redditSummaryUnavailable])
 
   // Record one ``view`` event per (entry, session). ``recordBatched``
   // dedups internally so even if React strict-mode mounts the card
@@ -812,7 +863,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
         aria-hidden="true"
         className={`absolute left-0 top-0 bottom-0 w-[3px] rounded-l-ios-lg ${stripeClass}`}
       />
-      <div className="flex items-start justify-between gap-3 mb-2">
+      <div className="flex items-center justify-between gap-3 mb-2">
         <a
           href={entry.url}
           target="_blank"
@@ -827,9 +878,22 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
             recordImmediate({ entry_id: entry.id, type: 'click' })
             onActivate?.()
           }}
-          className="flex-1 min-w-0 flex items-start gap-1.5 text-ios-body font-medium text-label-primary hover:text-white line-clamp-2"
+          className="flex-1 min-w-0 flex items-start gap-1.5 text-ios-body font-medium text-label-primary hover:text-white"
         >
-          <span className="min-w-0">{entry.title}</span>
+          {/* ``line-clamp-2`` lives on this inner span, not the ``<a>``
+              itself — line-clamp needs ``display: -webkit-box`` to do
+              anything, and that's silently overridden by the ``<a>``'s
+              own ``display: flex`` (same property, flex wins), so a
+              clamp class placed directly on a flex container is inert:
+              titles wrapped to 3+ lines with no cap. A span can carry
+              its own ``-webkit-box`` display while still being sized
+              as a normal flex item by its flex parent, so nesting the
+              clamp one level in actually enforces the 2-line cap this
+              was always meant to have — which in turn is what bounds
+              this row's height consistently, instead of a long title
+              growing tall enough to leave a gap under the (fixed-
+              height) badge/thumbnail column next to it. */}
+          <span className="min-w-0 line-clamp-2 font-headline font-semibold tracking-tight">{entry.title}</span>
           {/* "↗" affordance. Sits inline at the end of the title so it
               reads as part of the link, not a separate control. Group-
               hover brightens it on devices that have a hover state;
@@ -883,7 +947,11 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
         </div>
       </div>
       <div className="flex items-center gap-2 text-ios-caption text-label-secondary">
-        {sourceName && <span className={`font-medium ${sourceTextClass}`}>{sourceName}</span>}
+        {/* Uppercase + tracked, like a magazine section kicker — same
+            sans font as the rest of the meta row, just a different
+            case/tracking treatment, so the source reads as a label
+            rather than blending into the timestamp next to it. */}
+        {sourceName && <span className={`font-semibold uppercase tracking-wide text-[11px] ${sourceTextClass}`}>{sourceName}</span>}
         {sourceName && <span>·</span>}
         <time dateTime={entry.published_at ?? ''}>{timeAgo(entry.published_at)}</time>
       </div>
@@ -900,25 +968,63 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
           press / context-menu paths ignore the footer so a tap-and-
           hold for "copy Reddit link" still works as expected. */}
       {entry.reddit_thread_url && (
-        <a
-          href={entry.reddit_thread_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          data-card-interactive
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            recordImmediate({ entry_id: entry.id, type: 'click' })
-            window.open(entry.reddit_thread_url!, '_blank', 'noopener,noreferrer')
-          }}
-          className="mt-1.5 inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+        <div className="mt-1.5 flex items-center gap-3">
+          <a
+            href={entry.reddit_thread_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-card-interactive
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              recordImmediate({ entry_id: entry.id, type: 'click' })
+              window.open(entry.reddit_thread_url!, '_blank', 'noopener,noreferrer')
+            }}
+            className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+          >
+            <span aria-hidden="true">💬</span>
+            <span>Discussed on Reddit</span>
+            {typeof entry.reddit_comment_count === 'number' && entry.reddit_comment_count > 0 && (
+              <span className="text-label-secondary">· {entry.reddit_comment_count} comments</span>
+            )}
+          </a>
+          {/* On-demand LLM summary of the comment discussion — same
+              "computed on first tap, not preloaded" contract as the
+              podcast episode summary below. */}
+          <button
+            type="button"
+            data-card-interactive
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              setRedditSummaryExpanded((v) => !v)
+            }}
+            className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+          >
+            <span aria-hidden="true">📝</span>
+            <span>{redditSummaryExpanded ? 'Hide summary' : 'Summarize comments'}</span>
+          </button>
+        </div>
+      )}
+      {redditSummaryExpanded && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap"
         >
-          <span aria-hidden="true">💬</span>
-          <span>Discussed on Reddit</span>
-          {typeof entry.reddit_comment_count === 'number' && entry.reddit_comment_count > 0 && (
-            <span className="text-label-secondary">· {entry.reddit_comment_count} comments</span>
+          {redditSummaryError ? (
+            <span className="italic">couldn't generate a summary — try again later</span>
+          ) : redditSummaryRateLimited ? (
+            <span className="italic text-label-tertiary">rate limited by Reddit — try again in a moment</span>
+          ) : redditSummaryUnavailable ? (
+            <span className="italic text-label-tertiary">no Reddit discussion found for this entry</span>
+          ) : redditSummary === null ? (
+            <span className="italic text-label-tertiary">summarizing comments…</span>
+          ) : redditSummary === '' ? (
+            <span className="italic text-label-tertiary">couldn't generate a summary (no comments found or no LLM configured)</span>
+          ) : (
+            redditSummary
           )}
-        </a>
+        </div>
       )}
       {/* Podcast episode audio. Same footer treatment as the Reddit
           cross-reference above — only appears when the entry came
