@@ -48,7 +48,13 @@ _ARTICLE_CHAR_BUDGET = 12_000
 _MIN_USABLE_CHARS = 200
 
 
-async def _fetch_html(url: str) -> str | None:
+async def fetch_html(url: str) -> str | None:
+    """SSRF-guarded HTML fetch, public so other callers that need raw
+    HTML (rather than just extracted article text) can reuse the same
+    guarded fetch instead of duplicating it — see
+    ``app.sources.generic_scrape``, which needs the title trafilatura's
+    metadata extraction gives it, not just the body text
+    ``extract_text`` below returns."""
     safe, reason = check_url_safe(url)
     if not safe:
         logger.info("article_extract: %s rejected by URL safety check (%s)", url, reason)
@@ -109,7 +115,7 @@ async def fetch_article_text(url: str) -> str | None:
     any failure (network, SSRF rejection, empty body, extraction
     found nothing usable). Never raises — callers treat None as "fall
     back to the feed's own summary"."""
-    html = await _fetch_html(url)
+    html = await fetch_html(url)
     if html is None:
         return None
     return extract_text(html)

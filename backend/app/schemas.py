@@ -81,6 +81,35 @@ class SourceCreate(BaseModel):
     custom_headers: Optional[dict] = None
 
 
+class SourceAutoRequest(BaseModel):
+    """Body for ``POST /api/sources/auto`` — "auto feed": paste any
+    URL, the backend finds (or falls back to periodic scraping
+    without) a feed and creates the source in one step, rather than a
+    separate discover-then-create round trip through the regular
+    "Add custom" form. ``category`` defaults to "other" since there's
+    nothing to infer it from at this point — same default the "Add
+    custom" form's category picker starts on.
+    """
+    url: str
+    category: str = "other"
+
+
+class SourceAutoResult(BaseModel):
+    """Body of ``POST /api/sources/auto``.
+
+    ``found=False`` means neither an existing feed nor a usable
+    sitemap could be located for the URL — nothing was created.
+    ``kind`` is ``"rss"`` when a real feed was discovered (either the
+    URL itself, or a feed it linked to) or ``"generic_scrape"`` when
+    no feed exists but the site's sitemap produced at least one
+    extractable article, so periodic scraping was set up instead of a
+    feed subscription. ``source`` is the created row on success.
+    """
+    found: bool
+    kind: Optional[str] = None
+    source: Optional[SourceOut] = None
+
+
 class SourceUpdate(BaseModel):
     """Body for ``PATCH /api/sources/{id}``. All fields optional —
     missing fields are left untouched.

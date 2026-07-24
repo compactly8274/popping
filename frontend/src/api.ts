@@ -338,6 +338,23 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }),
+  /** "Auto feed" — paste any URL, get a source added in one step.
+   * Tries an existing RSS/Atom feed first (the URL itself, or one it
+   * links to); if none exists, falls back to a `type: 'generic_scrape'`
+   * source that periodically re-checks the site's sitemap and
+   * extracts new articles even though it never published a feed.
+   * `found: false` (not a thrown error) means neither path turned up
+   * anything — a dead URL or a site sitemap-based discovery just
+   * doesn't work on; nothing was created. */
+  autoAddSource: (url: string, category: string = 'other') =>
+    jsonFetch<{ found: boolean; kind: 'rss' | 'generic_scrape' | null; source: Source | null }>(
+      '/api/sources/auto',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, category }),
+      },
+    ),
   /** Partial update of a source. All fields optional.
    *
    * ``name`` and ``url`` are now editable for dynamic rows. The
