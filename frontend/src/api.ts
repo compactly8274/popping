@@ -473,6 +473,20 @@ export const api = {
       `/api/entries/${entryId}/podcast_summary`,
       { method: 'POST' },
     ),
+  /** LLM-written summary of a Reddit thread's comment discussion.
+   * Only applicable to entries with a known Reddit thread
+   * (``entry.reddit_thread_url`` non-null). ``available`` is false
+   * when there's no thread at all. ``rate_limited`` is true for the
+   * one failure mode worth telling apart from "no summary" —
+   * Reddit's fetch is throttled to ~1 request/75s, and an on-demand
+   * tap can lose that race; unlike every other failure case, this
+   * one is NOT cached server-side, so re-collapsing and
+   * re-expanding the card retries it. */
+  redditCommentSummary: (entryId: number) =>
+    jsonFetch<{ summary: string | null; cached: boolean; available: boolean; rate_limited: boolean }>(
+      `/api/entries/${entryId}/reddit_comment_summary`,
+      { method: 'POST' },
+    ),
 
   // ---- Engagement events (Phase 8) ----
   /** Record one engagement event immediately. The endpoint requires

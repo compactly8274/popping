@@ -351,6 +351,21 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
   const [podcastSummaryError, setPodcastSummaryError] = useState(false)
   const [podcastSummaryUnavailable, setPodcastSummaryUnavailable] = useState(false)
 
+  // Reddit comment-discussion summary. Same shape as the podcast
+  // summary state above (independent toggle + cache, since an entry
+  // could have both a feed summary and a comment-discussion summary
+  // as distinct content). ``redditSummaryRateLimited`` is its own
+  // flag rather than folded into "unavailable" — Reddit's direct-
+  // mode fetch allows only ~1 request/75s (app.reddit_client), so a
+  // tap can lose that race against the scheduled ingest jobs; the
+  // backend deliberately does NOT cache that case, so re-expanding
+  // (collapse then re-expand) retries rather than being stuck.
+  const [redditSummaryExpanded, setRedditSummaryExpanded] = useState(false)
+  const [redditSummary, setRedditSummary] = useState<string | null>(null)
+  const [redditSummaryError, setRedditSummaryError] = useState(false)
+  const [redditSummaryUnavailable, setRedditSummaryUnavailable] = useState(false)
+  const [redditSummaryRateLimited, setRedditSummaryRateLimited] = useState(false)
+
   // Mount timestamp. Reset on every mount via useEffect so the
   // dwell counter starts at 0 for each card instance (not for
   // each unique entry id \u2014 a re-mount on the same entry after a
@@ -411,6 +426,42 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       cancelled = true
     }
   }, [podcastSummaryExpanded, entry.id, podcastSummary, podcastSummaryError, podcastSummaryUnavailable])
+
+  useEffect(() => {
+    if (!redditSummaryExpanded) return
+    if (redditSummary !== null) return
+    if (redditSummaryError) return
+    if (redditSummaryUnavailable) return
+    // Rate-limited is deliberately NOT a terminal state — the
+    // backend doesn't cache it, so re-collapsing and re-expanding
+    // (the button's onClick clears the flag) retries. Clear it here
+    // too, right as a fresh attempt starts, so a stale "rate
+    // limited" message doesn't linger under the new "summarizing…"
+    // state while this attempt is in flight.
+    setRedditSummaryRateLimited(false)
+    let cancelled = false
+    api
+      .redditCommentSummary(entry.id)
+      .then((r) => {
+        if (cancelled) return
+        if (r.rate_limited) {
+          setRedditSummaryRateLimited(true)
+          return
+        }
+        if (!r.available) {
+          setRedditSummaryUnavailable(true)
+          return
+        }
+        setRedditSummary(r.summary ?? '')
+      })
+      .catch(() => {
+        if (cancelled) return
+        setRedditSummaryError(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [redditSummaryExpanded, entry.id, redditSummary, redditSummaryError, redditSummaryUnavailable])
 
   // Record one ``view`` event per (entry, session). ``recordBatched``
   // dedups internally so even if React strict-mode mounts the card
@@ -900,25 +951,63 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
           press / context-menu paths ignore the footer so a tap-and-
           hold for "copy Reddit link" still works as expected. */}
       {entry.reddit_thread_url && (
-        <a
-          href={entry.reddit_thread_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          data-card-interactive
-          onClick={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            recordImmediate({ entry_id: entry.id, type: 'click' })
-            window.open(entry.reddit_thread_url!, '_blank', 'noopener,noreferrer')
-          }}
-          className="mt-1.5 inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+        <div className="mt-1.5 flex items-center gap-3">
+          <a
+            href={entry.reddit_thread_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-card-interactive
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              recordImmediate({ entry_id: entry.id, type: 'click' })
+              window.open(entry.reddit_thread_url!, '_blank', 'noopener,noreferrer')
+            }}
+            className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+          >
+            <span aria-hidden="true">💬</span>
+            <span>Discussed on Reddit</span>
+            {typeof entry.reddit_comment_count === 'number' && entry.reddit_comment_count > 0 && (
+              <span className="text-label-secondary">· {entry.reddit_comment_count} comments</span>
+            )}
+          </a>
+          {/* On-demand LLM summary of the comment discussion — same
+              "computed on first tap, not preloaded" contract as the
+              podcast episode summary below. */}
+          <button
+            type="button"
+            data-card-interactive
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              setRedditSummaryExpanded((v) => !v)
+            }}
+            className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+          >
+            <span aria-hidden="true">📝</span>
+            <span>{redditSummaryExpanded ? 'Hide summary' : 'Summarize comments'}</span>
+          </button>
+        </div>
+      )}
+      {redditSummaryExpanded && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap"
         >
-          <span aria-hidden="true">💬</span>
-          <span>Discussed on Reddit</span>
-          {typeof entry.reddit_comment_count === 'number' && entry.reddit_comment_count > 0 && (
-            <span className="text-label-secondary">· {entry.reddit_comment_count} comments</span>
+          {redditSummaryError ? (
+            <span className="italic">couldn't generate a summary — try again later</span>
+          ) : redditSummaryRateLimited ? (
+            <span className="italic text-label-tertiary">rate limited by Reddit — try again in a moment</span>
+          ) : redditSummaryUnavailable ? (
+            <span className="italic text-label-tertiary">no Reddit discussion found for this entry</span>
+          ) : redditSummary === null ? (
+            <span className="italic text-label-tertiary">summarizing comments…</span>
+          ) : redditSummary === '' ? (
+            <span className="italic text-label-tertiary">couldn't generate a summary (no comments found or no LLM configured)</span>
+          ) : (
+            redditSummary
           )}
-        </a>
+        </div>
       )}
       {/* Podcast episode audio. Same footer treatment as the Reddit
           cross-reference above — only appears when the entry came

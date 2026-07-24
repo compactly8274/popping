@@ -132,6 +132,13 @@ _NS = {
     "media": "http://search.yahoo.com/mrss/",
 }
 
+# HTML-stripping helpers for comment bodies (``_parse_comment_entries``
+# below) — Reddit's comment ``<content>`` is HTML. Same tag-strip
+# regex used elsewhere in this codebase (routes/entries.py,
+# podcast_transcript.py) rather than a new dependency.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+
 # Shared clients — one for proxy mode, one for direct mode. Both
 # are ``None`` before ``init_client()`` and re-built on every
 # lifespan cycle. ``_get_client()`` constructs a defensive one-off
@@ -284,6 +291,34 @@ async def _take_token() -> None:
             deficit = 1.0 - _bucket_tokens
             wait_s = deficit / _DIRECT_RPS
         await asyncio.sleep(wait_s)
+
+
+async def _try_take_token() -> bool:
+    """Non-blocking variant of ``_take_token``: consume a token and
+    return True if one is available right now, or return False
+    immediately (no sleep) if not — never blocks.
+
+    Every existing caller (the scheduled subreddit ingests) is a
+    background job where blocking for up to ~75s is fine. An
+    on-demand, user-triggered fetch (``fetch_thread_comments``,
+    triggered by tapping "summarize comments" on a card) is not — a
+    75s hang on an interactive HTTP request is a bad experience, and
+    unlike a scheduled job there's no guarantee this request even
+    fires again if the tab closes. Same shared bucket state as
+    ``_take_token``, so this still counts fully against Reddit's
+    real per-IP limit; it just fails fast when the bucket is empty
+    instead of waiting for it to refill.
+    """
+    global _bucket_tokens, _bucket_last
+    async with _bucket_lock:
+        now = time.monotonic()
+        elapsed = now - _bucket_last
+        _bucket_tokens = min(_DIRECT_BURST, _bucket_tokens + elapsed * _DIRECT_RPS)
+        _bucket_last = now
+        if _bucket_tokens >= 1.0:
+            _bucket_tokens -= 1.0
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -664,3 +699,127 @@ async def search_thread_by_url(url: str) -> Optional[dict]:
             url,
         )
     return best
+
+
+# ---------------------------------------------------------------------------
+# Per-thread comment fetch (on-demand "summarize comments")
+# ---------------------------------------------------------------------------
+
+
+class RedditRateLimited(Exception):
+    """Raised by ``fetch_thread_comments`` when the direct-mode rate
+    bucket is empty right now. Distinct from every other failure
+    (network error, malformed feed, no comments) because it's the
+    one case where the caller should NOT cache a permanent "no
+    summary available" — retrying in under a minute could succeed.
+    See ``routes/entries.py``'s ``entry_reddit_comment_summary_endpoint``.
+    """
+
+
+# Cap on how many top-level comment entries we bother parsing out of
+# the feed. Reddit's comment .rss returns the whole visible comment
+# tree (which can run to hundreds of entries on a big thread); we
+# only need enough for a representative discussion summary, not
+# every reply-to-a-reply three levels deep.
+_MAX_COMMENT_ENTRIES = 40
+
+# Content budget handed to the LLM (app.reddit_comment_summary),
+# combining every parsed comment. Mirrors the same "bounded, no
+# chunking pass" trade-off as the article/podcast summarizers.
+_COMMENTS_CHAR_BUDGET = 12_000
+
+
+def _parse_comment_entries(atom_xml: str) -> list[dict]:
+    """Parse a Reddit thread's ``.../comments/<id>/<slug>/.rss`` Atom
+    feed into a flat list of ``{"author": str, "text": str}`` dicts.
+
+    Unverified against a live response (no network access in this
+    sandbox — see the module's other honest caveats about untestable
+    live paths); written defensively against the same Atom shape
+    ``_parse_atom_entries`` already handles for subreddit listings,
+    since Reddit's ``.rss`` feeds share one underlying format. The
+    first entry is typically the submission itself rather than a
+    comment — harmless either way, since it's still useful context
+    for "what is this thread about" and gets folded into the same
+    discussion summary.
+
+    Never raises on a single malformed entry — skips and keeps
+    going. A totally malformed feed raises (caller catches
+    ValueError), matching ``_parse_atom_entries``'s contract.
+    """
+    try:
+        root = ET.fromstring(atom_xml)
+    except ET.ParseError as exc:
+        raise ValueError(f"reddit_client: malformed comment Atom feed: {exc}") from exc
+
+    out: list[dict] = []
+    for entry in root.findall("atom:entry", _NS):
+        if len(out) >= _MAX_COMMENT_ENTRIES:
+            break
+        try:
+            author = (
+                entry.findtext("atom:author/atom:name", default="", namespaces=_NS) or ""
+            ).strip()
+            # Prefer <content>, the full comment body; some entries
+            # may only carry <summary>. Reddit's content is HTML.
+            raw = entry.findtext("atom:content", default="", namespaces=_NS)
+            if not raw:
+                raw = entry.findtext("atom:summary", default="", namespaces=_NS)
+            if not raw:
+                continue
+            text_only = _HTML_TAG_RE.sub(" ", raw)
+            text_only = _WHITESPACE_RE.sub(" ", text_only).strip()
+            if not text_only:
+                continue
+            out.append({"author": author or "unknown", "text": text_only})
+        except Exception:  # noqa: BLE001 - one bad entry shouldn't sink the whole parse
+            continue
+    return out
+
+
+async def fetch_thread_comments(thread_url: str) -> Optional[list[dict]]:
+    """Fetch and parse a Reddit thread's comments via its ``.rss``
+    feed. Returns a list of ``{"author", "text"}`` dicts, or ``None``
+    on any failure (network, malformed feed, nothing parsed).
+
+    Raises ``RedditRateLimited`` instead of returning ``None`` when
+    the direct-mode bucket is empty right now — this is an on-demand,
+    user-triggered call (unlike every other function in this module),
+    so it takes a token non-blockingly rather than queueing behind
+    the scheduled ingest jobs' traffic for up to ~75s.
+    """
+    if is_disabled() or not thread_url:
+        return None
+    if _direct_client is not None and _proxy_client is None:
+        if not await _try_take_token():
+            raise RedditRateLimited(
+                f"reddit_client: no rate-limit token available for {thread_url}"
+            )
+    path = thread_url.rstrip("/") + "/.rss"
+    # Direct-mode client is scoped to https://www.reddit.com — strip
+    # that prefix so ``path`` is relative, matching how every other
+    # caller in this module invokes ``client.stream("GET", path)``.
+    if path.startswith("https://www.reddit.com"):
+        path = path[len("https://www.reddit.com"):]
+    client = _get_client()
+    try:
+        async with client.stream("GET", path) as resp:
+            resp.raise_for_status()
+            cl = resp.headers.get("content-length")
+            if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
+                return None
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes():
+                buf.extend(chunk)
+                if len(buf) > _MAX_RESPONSE_BYTES:
+                    return None
+        body = bytes(buf).decode("utf-8", errors="replace")
+    except httpx.HTTPError as exc:
+        logger.debug("reddit_client: fetch_thread_comments %s failed: %s", thread_url, exc)
+        return None
+    try:
+        comments = _parse_comment_entries(body)
+    except ValueError as exc:
+        logger.debug("reddit_client: fetch_thread_comments %s parse failed: %s", thread_url, exc)
+        return None
+    return comments or None

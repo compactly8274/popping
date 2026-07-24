@@ -269,6 +269,26 @@ class EntryPodcastSummaryOut(BaseModel):
     available: bool = True
 
 
+class EntryRedditCommentSummaryOut(BaseModel):
+    """Body of ``POST /api/entries/{id}/reddit_comment_summary``.
+
+    ``available`` is False when the entry has no
+    ``meta.reddit_thread_url`` at all — there's no Reddit discussion
+    to summarize. ``rate_limited`` is True for the one failure mode
+    that's worth telling the user apart from "no summary" — Reddit's
+    direct-mode fetch allows only ~1 request/75s (see
+    ``app.reddit_client``), and an on-demand tap can lose that race
+    against the scheduled ingest jobs. It's never cached (a retry a
+    minute later can succeed), unlike every other ``summary=""``
+    case, which does persist so a tap doesn't re-attempt a fetch or
+    LLM call that already failed for a real reason.
+    """
+    summary: Optional[str] = None
+    cached: bool = False
+    available: bool = True
+    rate_limited: bool = False
+
+
 class EntryOut(BaseModel):
     id: int
     source_id: int

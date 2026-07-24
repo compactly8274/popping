@@ -149,6 +149,16 @@ class Entry(Base):
     # want both, and conflating them would make the UI unable to
     # tell which kind of text it's showing.
     podcast_transcript_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # LLM-generated summary of a Reddit thread's comment discussion.
+    # Populated by POST /api/entries/{id}/reddit_comment_summary the
+    # first time it's requested. Same NULL-vs-empty-string cache
+    # contract as the other summary columns, with one wrinkle: a
+    # transient rate-limit hit (Reddit's direct-Atom mode allows
+    # ~1 request/75s — see app.reddit_client) does NOT get cached as
+    # "" the way a genuine failure does, since retrying shortly after
+    # could succeed. See the route for the exact cases that do vs.
+    # don't persist.
+    reddit_comment_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Framing Watch (app.framing): which same-story cluster this entry
     # belongs to, if any. NULL = not part of a detected cluster (the
