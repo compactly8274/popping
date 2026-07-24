@@ -129,6 +129,11 @@ function categoryStripeClass(category: string | undefined): string {
     case 'deals':    return 'bg-lime-500'
     case 'podcast':  return 'bg-orange-500'
     case 'video':    return 'bg-pink-500'
+    case 'sports':       return 'bg-teal-500'
+    case 'entertainment': return 'bg-fuchsia-500'
+    case 'gaming':        return 'bg-indigo-500'
+    case 'food':          return 'bg-yellow-500'
+    case 'music':         return 'bg-sky-500'
     default:         return 'bg-neutral-600'
   }
 }
@@ -164,6 +169,11 @@ function categoryBorderClass(category: string | undefined): string {
     case 'deals':    return 'border-lime-500/25'
     case 'podcast':  return 'border-orange-500/25'
     case 'video':    return 'border-pink-500/25'
+    case 'sports':       return 'border-teal-500/25'
+    case 'entertainment': return 'border-fuchsia-500/25'
+    case 'gaming':        return 'border-indigo-500/25'
+    case 'food':          return 'border-yellow-500/25'
+    case 'music':         return 'border-sky-500/25'
     default:         return 'border-hairline'
   }
 }
@@ -180,6 +190,11 @@ function categorySourceTextClass(category: string | undefined): string {
     case 'deals':    return 'text-lime-400'
     case 'podcast':  return 'text-orange-400'
     case 'video':    return 'text-pink-400'
+    case 'sports':       return 'text-teal-400'
+    case 'entertainment': return 'text-fuchsia-400'
+    case 'gaming':        return 'text-indigo-400'
+    case 'food':          return 'text-yellow-400'
+    case 'music':         return 'text-sky-400'
     default:         return 'text-label-primary'
   }
 }

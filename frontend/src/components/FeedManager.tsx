@@ -87,6 +87,15 @@ const CATEGORY_OPTIONS = [
   'deals',
   'podcast',
   'video',
+  // Leisure categories (0019_leisure_feed_recommendations) — kept
+  // after the original work-adjacent set so the dropdown reads as
+  // "the usual suspects, then the fun stuff" rather than an
+  // alphabetical shuffle that'd bury either group.
+  'sports',
+  'entertainment',
+  'gaming',
+  'food',
+  'music',
   'other',
 ]
 
@@ -985,7 +994,9 @@ function RecommendedTab({
       setDiscoverMsg(
         result.added > 0
           ? `found ${result.added} new feed${result.added === 1 ? '' : 's'} in ${result.category}`
-          : `nothing new found for ${result.category} this time`,
+          : result.note
+            ? `couldn't find feeds for ${result.category}: ${result.note}`
+            : `nothing new found for ${result.category} this time`,
       )
       if (result.added > 0) await fetchRecs()
     } catch (err) {

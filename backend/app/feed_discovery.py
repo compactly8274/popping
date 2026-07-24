@@ -84,34 +84,54 @@ def _build_prompt(category: str, context: str, exclude_names: set[str], limit: i
     )
 
 
-async def _ask_llm_for_suggestions(category: str, context: str, exclude_names: set[str], limit: int) -> list[dict]:
+async def _ask_llm_for_suggestions(
+    category: str, context: str, exclude_names: set[str], limit: int
+) -> tuple[list[dict], str | None]:
+    """Returns ``(suggestions, note)``. ``note`` is None when a
+    provider actually produced usable output (even an empty list —
+    "the LLM ran and had nothing new to add" needs no further
+    explanation). Otherwise it's a short, specific reason why not —
+    "no LLM provider configured" (nothing to even try; note the env
+    chain always includes local Ollama as a final fallback, so this
+    only fires when a *pinned* provider has no usable auth) or the
+    last provider's actual error ("groq: 401 unauthorized", "ollama:
+    connection refused", ...). Surfacing the real reason instead of a
+    generic "nothing found" is what tells "you need to configure an
+    API key" apart from "this category is temporarily saturated" —
+    both look identical as a bare ``added=0`` otherwise.
+    """
     providers = router.providers_for("brief")
     if not providers:
         logger.info("feed_discovery: no LLM provider configured — skipping")
-        return []
+        return [], "no LLM provider configured"
     prompt = _build_prompt(category, context, exclude_names, limit)
+    last_note: str | None = None
     for candidate in providers:
         try:
             content = await candidate.complete(prompt, max_tokens=_LLM_MAX_TOKENS)
         except ProviderError as exc:
             logger.warning("feed_discovery: LLM call failed on %s: %s — trying next provider", candidate.name, exc)
+            last_note = f"{candidate.name}: {exc}"
             continue
         content = _strip_code_fence(content or "")
         if not content:
+            last_note = f"{candidate.name}: returned an empty response"
             continue
         try:
             parsed = json.loads(content)
         except (json.JSONDecodeError, ValueError):
             logger.warning("feed_discovery: %s returned non-JSON output, skipping", candidate.name)
+            last_note = f"{candidate.name}: returned non-JSON output"
             continue
         if isinstance(parsed, dict):
             # Some providers wrap the array in {"feeds": [...]}. despite the prompt.
             parsed = parsed.get("feeds") or parsed.get("suggestions") or []
         if not isinstance(parsed, list):
+            last_note = f"{candidate.name}: returned an unexpected response shape"
             continue
-        return [item for item in parsed if isinstance(item, dict)]
+        return [item for item in parsed if isinstance(item, dict)], None
     logger.warning("feed_discovery: all configured LLM providers failed or returned unusable output")
-    return []
+    return [], last_note or "all configured providers failed"
 
 
 async def _validate_feed_url(url: str) -> bool:
@@ -159,16 +179,23 @@ async def discover_candidates(
     context: str,
     discovered_from_source_id: int | None = None,
     limit: int = _MAX_SUGGESTIONS_REQUESTED,
-) -> list[FeedRecommendationCandidate]:
+) -> tuple[list[FeedRecommendationCandidate], str | None]:
     """Ask the LLM for feed suggestions in ``category``, validate each
     with a real fetch, and persist the ones that check out as
-    ``source="llm"`` candidates. Returns the rows actually created
-    (validation failures and name/url collisions are silently
-    dropped — this is best-effort enrichment, not a user-facing
-    error path).
+    ``source="llm"`` candidates.
+
+    Returns ``(created, note)``. ``created`` is the rows actually
+    created (validation failures and name/url collisions are
+    silently dropped — this is best-effort enrichment, not a
+    user-facing error path). ``note`` is None when everything worked
+    as well as it reasonably could (created some rows, or the LLM
+    itself reported nothing new); otherwise a short, specific reason
+    ``created`` is empty — see ``_ask_llm_for_suggestions`` for the
+    provider-failure notes, or below for "provider worked but nothing
+    survived validation".
     """
     existing_names, existing_urls = await _existing_names_and_urls(session)
-    suggestions = await _ask_llm_for_suggestions(category, context, existing_names, limit)
+    suggestions, note = await _ask_llm_for_suggestions(category, context, existing_names, limit)
 
     created: list[FeedRecommendationCandidate] = []
     seen_names = set(existing_names)
@@ -203,4 +230,15 @@ async def discover_candidates(
         for row in created:
             await session.refresh(row)
         logger.info("feed_discovery: added %d llm candidate(s) for category=%s", len(created), category)
-    return created
+        return created, None
+    if note is not None:
+        # Provider-level failure — already a specific note.
+        return created, note
+    if suggestions:
+        # The provider worked and suggested something, but every
+        # suggestion was malformed, a duplicate, or failed the
+        # fetch-validation probe — distinct from "the LLM said there
+        # was nothing new" (which is ``suggestions == []`` with
+        # ``note is None``, and needs no explanation at all).
+        return created, f"got {len(suggestions)} suggestion(s) but none passed validation"
+    return created, None

@@ -119,12 +119,15 @@ async def test_recent_llm_candidate_count_excludes_old_rows(db_session):
 
 
 async def test_discover_candidates_returns_empty_without_crashing(db_session):
-    # Test env has no LLM API keys set, so this exercises the real
-    # "every provider failed / unusable" path rather than a mock.
-    created = await discover_candidates(
+    # Test env has no cloud LLM API keys set, so this exercises the
+    # real "every provider failed / unusable" path rather than a mock
+    # (local Ollama is still attempted per the router's unconditional
+    # fallback, but isn't reachable in this sandbox).
+    created, note = await discover_candidates(
         db_session, category="tech", context="test context"
     )
     assert created == []
+    assert note
 
 
 # --- POST /api/feed-recommendations/discover ---------------------------------
@@ -145,6 +148,23 @@ async def test_discover_route_uses_named_category(app_client):
     body = resp.json()
     assert body["category"] == "science"
     assert isinstance(body["added"], int)
+
+
+async def test_discover_route_reports_a_note_when_added_is_zero(app_client):
+    # Test env has no cloud LLM API keys set, so the env chain falls
+    # through to local Ollama (always attempted, per the router's
+    # design) — which isn't reachable in this sandbox, so every call
+    # fails with a transport error. ``added`` is 0 here for a
+    # specific, actionable reason, not "the LLM ran and found nothing
+    # new" — the response needs to say so or "find more feeds" looks
+    # silently broken rather than unconfigured/unreachable.
+    resp = await app_client.post(
+        "/api/feed-recommendations/discover", json={"category": "tech"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["added"] == 0
+    assert body["note"]
 
 
 async def test_discover_route_falls_back_to_default_category_cold_start(app_client):

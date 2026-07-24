@@ -928,10 +928,10 @@ async def feed_recommendations_discover_endpoint(
             session, aggregation_user_ids(user)
         ) or _DISCOVER_DEFAULT_CATEGORY
 
-    created = await discover_candidates(
+    created, note = await discover_candidates(
         session,
         category=category,
         context="The user tapped \"find more feeds\" for this category in their dashboard.",
     )
-    return FeedDiscoverResult(category=category, added=len(created))
+    return FeedDiscoverResult(category=category, added=len(created), note=note)
 

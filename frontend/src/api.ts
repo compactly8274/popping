@@ -401,10 +401,13 @@ export const api = {
    * fetch-validate a few more feeds for a category (the named one,
    * or the user's top-engagement category if omitted), then persist
    * any that check out into the recommendation pool. ``added`` may
-   * legitimately be 0 (no provider configured, or nothing new
-   * validated) — not an error. */
+   * legitimately be 0 — ``note`` is null when that's unremarkable
+   * ("the LLM ran and had nothing new"), or a short specific reason
+   * otherwise (no provider configured, a provider error, nothing
+   * passed validation) so "add an API key" doesn't look identical to
+   * "try again later". */
   discoverFeeds: (category?: string) =>
-    jsonFetch<{ category: string; added: number }>('/api/feed-recommendations/discover', {
+    jsonFetch<{ category: string; added: number; note: string | null }>('/api/feed-recommendations/discover', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ category: category ?? null }),
