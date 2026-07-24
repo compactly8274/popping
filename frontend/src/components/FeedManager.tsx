@@ -1116,6 +1116,103 @@ function RecommendedTab({
 }
 
 // ---------------------------------------------------------------------------
+// Auto feed — one URL in, one source out. Sits above the manual
+// "Add custom" form as a shortcut: paste any site's URL (not
+// necessarily a feed URL) and the backend finds its real feed, or
+// falls back to periodic sitemap-based scraping if it doesn't have
+// one. Deliberately its own tiny form with its own state — a true
+// one-click flow, not a "prefill the manual form and let the user
+// review" step, matching what was asked for ("I put in a url, and it
+// goes and finds the RSS feed automatically then adds it"). The
+// resulting source's name is auto-derived from the feed's hostname;
+// rename it afterward from the row list like any other source.
+// ---------------------------------------------------------------------------
+
+function AutoFeedBlock({
+  onAdded,
+  onError,
+}: {
+  onAdded: () => Promise<void>
+  onError: (msg: string) => void
+}) {
+  const [autoUrl, setAutoUrl] = useState('')
+  const [autoSubmitting, setAutoSubmitting] = useState(false)
+  const [autoMessage, setAutoMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+
+  const autoAdd = async () => {
+    const trimmed = autoUrl.trim()
+    if (!trimmed) {
+      setAutoMessage({ kind: 'err', text: 'paste a URL first' })
+      return
+    }
+    setAutoSubmitting(true)
+    setAutoMessage(null)
+    try {
+      const result = await api.autoAddSource(trimmed)
+      if (result.found && result.source) {
+        const note = result.kind === 'generic_scrape'
+          ? ' — no native feed found, tracking via periodic scraping instead'
+          : ''
+        toast(`Feed added: ${result.source.name}${note}`, 'info')
+        setAutoUrl('')
+        await onAdded()
+      } else {
+        setAutoMessage({
+          kind: 'err',
+          text: "couldn't find a feed (or anything scrapeable) at that URL",
+        })
+      }
+    } catch (err) {
+      onError(parseApiError(err, 'auto feed failed'))
+    } finally {
+      setAutoSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="rounded-ios border border-hairline bg-bg-elevated p-3 space-y-2 mb-4">
+      <div className="flex items-center gap-1.5">
+        <span aria-hidden="true">✨</span>
+        <span className="text-ios-caption uppercase tracking-wide text-label-tertiary">Auto feed</span>
+      </div>
+      <p className="text-ios-caption text-label-secondary">
+        Paste any site's URL — we'll find its RSS feed automatically, or track it via
+        periodic scraping if it doesn't have one.
+      </p>
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          value={autoUrl}
+          onChange={(e) => setAutoUrl(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              void autoAdd()
+            }
+          }}
+          placeholder="https://example.com"
+          disabled={autoSubmitting}
+          className="flex-1 min-h-[36px] rounded-ios bg-bg-surface border border-hairline px-2 text-label-primary placeholder:text-label-tertiary disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={() => void autoAdd()}
+          disabled={autoSubmitting}
+          className="shrink-0 min-h-[36px] rounded-ios bg-accent text-white px-3 text-ios-caption font-medium active:opacity-70 disabled:opacity-40"
+        >
+          {autoSubmitting ? 'Looking…' : 'Auto-add'}
+        </button>
+      </div>
+      {autoMessage && (
+        <p className={`text-ios-caption ${autoMessage.kind === 'err' ? 'text-red-400' : 'text-label-secondary'}`}>
+          {autoMessage.text}
+        </p>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Add custom — paste-a-URL form
 // ---------------------------------------------------------------------------
 
@@ -1304,7 +1401,9 @@ function AddCustomTab({
   }
 
   return (
-    <form onSubmit={submit} className="space-y-3 text-ios-body">
+    <>
+      <AutoFeedBlock onAdded={onAdded} onError={onError} />
+      <form onSubmit={submit} className="space-y-3 text-ios-body">
       <div>
         <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-name">Name</label>
         <input
@@ -1506,7 +1605,8 @@ function AddCustomTab({
           {submitting ? 'adding…' : 'Add feed'}
         </button>
       </div>
-    </form>
+      </form>
+    </>
   )
 }
 

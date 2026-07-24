@@ -21,7 +21,7 @@
 //     backup for anyone who doesn't want to use the gesture.
 
 import { memo, useEffect, useRef, useState, type MouseEvent, type TouchEvent } from 'react'
-import { api, type Entry } from '../api'
+import { api, type Entry, type FramingCluster } from '../api'
 import { recordBatched, recordImmediate } from '../lib/interactions'
 import { SourceIcon, stableHue } from './SourceIcon'
 import { toast } from './Toast'
@@ -106,6 +106,17 @@ type Props = {
   // (App.tsx) doesn't need matching toggle logic.
   vote?: 'up' | 'down' | null
   onVote?: (direction: 'up' | 'down' | null) => void
+}
+
+// Same tone -> style map as FramingWatch.tsx's standalone section —
+// duplicated rather than imported (small, UI-local, and importing a
+// component file's internal const to reuse four lines isn't worth
+// the coupling). Reuses the score-hot/warm vocabulary already
+// established for the composite-score gradient — alarmist reads as
+// "hot", urgent as "warm", neutral stays unstyled.
+const RELATED_TONE_STYLES: Record<string, string> = {
+  urgent: 'text-score-warm border-score-warm/40',
+  alarmist: 'text-score-hot border-score-hot/40',
 }
 
 // Map a category name to a Tailwind background class for the left
@@ -366,6 +377,16 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
   const [redditSummaryUnavailable, setRedditSummaryUnavailable] = useState(false)
   const [redditSummaryRateLimited, setRedditSummaryRateLimited] = useState(false)
 
+  // Related coverage (Framing Watch, re-surfaced per-card). ``related``
+  // is ``undefined`` before the first fetch, ``null`` once fetched and
+  // confirmed empty (shouldn't normally happen — the button is only
+  // shown when ``entry.story_cluster_id`` is already known non-null —
+  // but the cluster could have lost its other members between the
+  // list poll and this tap), or the cluster payload once loaded.
+  const [relatedExpanded, setRelatedExpanded] = useState(false)
+  const [related, setRelated] = useState<FramingCluster | null | undefined>(undefined)
+  const [relatedError, setRelatedError] = useState(false)
+
   // Mount timestamp. Reset on every mount via useEffect so the
   // dwell counter starts at 0 for each card instance (not for
   // each unique entry id \u2014 a re-mount on the same entry after a
@@ -462,6 +483,26 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       cancelled = true
     }
   }, [redditSummaryExpanded, entry.id, redditSummary, redditSummaryError, redditSummaryUnavailable])
+
+  useEffect(() => {
+    if (!relatedExpanded) return
+    if (related !== undefined) return
+    if (relatedError) return
+    let cancelled = false
+    api
+      .entryRelated(entry.id)
+      .then((r) => {
+        if (cancelled) return
+        setRelated(r)
+      })
+      .catch(() => {
+        if (cancelled) return
+        setRelatedError(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [relatedExpanded, entry.id, related, relatedError])
 
   // Record one ``view`` event per (entry, session). ``recordBatched``
   // dedups internally so even if React strict-mode mounts the card
@@ -1093,6 +1134,78 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
             <span className="italic text-label-tertiary">couldn't generate a summary (no transcript text or no LLM configured)</span>
           ) : (
             podcastSummary
+          )}
+        </div>
+      )}
+      {/* Related coverage — re-surfaces the same Framing Watch
+          clustering the standalone section (App.tsx, desktop-only)
+          already shows, scoped to just this entry's siblings so the
+          comparison is available without scrolling up and cross-
+          referencing manually. Only rendered when the list payload
+          already told us this entry is clustered
+          (``story_cluster_id`` non-null) — same on/off gating as the
+          Reddit/podcast affordances above, so there's no button that
+          predictably does nothing when tapped. */}
+      {entry.story_cluster_id != null && (
+        <div className="mt-1.5 flex items-center gap-3">
+          <button
+            type="button"
+            data-card-interactive
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              setRelatedExpanded((v) => !v)
+            }}
+            className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
+          >
+            <span aria-hidden="true">🔗</span>
+            <span>{relatedExpanded ? 'Hide related coverage' : 'Related coverage'}</span>
+          </button>
+        </div>
+      )}
+      {relatedExpanded && (
+        <div onClick={(e) => e.stopPropagation()} className="mt-2 space-y-1.5">
+          {relatedError ? (
+            <p className="text-ios-caption text-label-secondary italic">couldn't load related coverage — try again later</p>
+          ) : related === undefined ? (
+            <p className="text-ios-caption text-label-tertiary italic">looking for related coverage…</p>
+          ) : related === null ? (
+            <p className="text-ios-caption text-label-tertiary italic">no other coverage found</p>
+          ) : (
+            related.articles.map((a) => (
+              <a
+                key={a.entry_id}
+                href={a.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-card-interactive
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  window.open(a.url, '_blank', 'noopener,noreferrer')
+                }}
+                className="flex items-start gap-2 group"
+              >
+                <span className="mt-0.5 shrink-0">
+                  <SourceIcon src={a.favicon_path} name={a.source_name} size={16} />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-ios-caption text-label-primary group-hover:underline">
+                    {a.title}
+                  </span>
+                  <span className="flex items-center gap-1.5 mt-0.5">
+                    <span className="text-[11px] text-label-tertiary truncate">{a.source_name}</span>
+                    {a.framing_tone && a.framing_tone !== 'neutral' && (
+                      <span
+                        className={`shrink-0 text-[9px] uppercase tracking-wide border rounded-full px-1 ${RELATED_TONE_STYLES[a.framing_tone] ?? ''}`}
+                      >
+                        {a.framing_tone}
+                      </span>
+                    )}
+                  </span>
+                </span>
+              </a>
+            ))
           )}
         </div>
       )}

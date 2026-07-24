@@ -63,6 +63,7 @@ from app.sources import list_sources
 from app.sources.base import SourcePlugin
 from app.sources.dynamic_reddit import DynamicRedditPlugin
 from app.sources.dynamic_rss import DynamicRssPlugin
+from app.sources.generic_scrape import GenericScrapePlugin
 from app.sources.podcast import DynamicPodcastPlugin
 from app.sources.youtube import DynamicYouTubePlugin
 
@@ -1711,6 +1712,8 @@ def _plugin_for(row: Source) -> SourcePlugin | None:
         return DynamicPodcastPlugin(row)
     if row.type == "youtube_channel":
         return DynamicYouTubePlugin(row)
+    if row.type == "generic_scrape":
+        return GenericScrapePlugin(row)
     logger.debug(
         "scheduler: no plugin for source %s (id=%d, type=%s) — skipping",
         row.name, row.id, row.type,

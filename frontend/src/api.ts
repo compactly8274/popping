@@ -42,6 +42,11 @@ export interface Entry {
   // Non-null gates the card's "Summarize episode" affordance (see
   // api.podcastSummary).
   transcript_url: string | null
+  // Framing Watch cluster membership (see FramingCluster below).
+  // Non-null only when the hourly clustering job has grouped this
+  // entry with 2+ other outlets' coverage of the same story — gates
+  // the card's "Related coverage" affordance (see api.entryRelated).
+  story_cluster_id: number | null
 }
 
 // Full row with source name. Returned by the
@@ -333,6 +338,23 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }),
+  /** "Auto feed" — paste any URL, get a source added in one step.
+   * Tries an existing RSS/Atom feed first (the URL itself, or one it
+   * links to); if none exists, falls back to a `type: 'generic_scrape'`
+   * source that periodically re-checks the site's sitemap and
+   * extracts new articles even though it never published a feed.
+   * `found: false` (not a thrown error) means neither path turned up
+   * anything — a dead URL or a site sitemap-based discovery just
+   * doesn't work on; nothing was created. */
+  autoAddSource: (url: string, category: string = 'other') =>
+    jsonFetch<{ found: boolean; kind: 'rss' | 'generic_scrape' | null; source: Source | null }>(
+      '/api/sources/auto',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, category }),
+      },
+    ),
   /** Partial update of a source. All fields optional.
    *
    * ``name`` and ``url`` are now editable for dynamic rows. The
@@ -487,6 +509,16 @@ export const api = {
       `/api/entries/${entryId}/reddit_comment_summary`,
       { method: 'POST' },
     ),
+  /** Other outlets' coverage of the same story as this entry, if
+   * any — reuses Framing Watch's clustering (see FramingCluster /
+   * api.framingClusters), scoped to just this entry's siblings
+   * (self excluded) rather than the full cluster listing. Null when
+   * the entry isn't part of a detected cluster — gated client-side
+   * on `entry.story_cluster_id` first so this is only called when
+   * there's actually something to show. A GET (not a POST like the
+   * summary endpoints) since it's a plain read, nothing to cache. */
+  entryRelated: (entryId: number) =>
+    jsonFetch<FramingCluster | null>(`/api/entries/${entryId}/related`),
 
   // ---- Engagement events (Phase 8) ----
   /** Record one engagement event immediately. The endpoint requires

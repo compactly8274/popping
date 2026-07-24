@@ -81,6 +81,35 @@ class SourceCreate(BaseModel):
     custom_headers: Optional[dict] = None
 
 
+class SourceAutoRequest(BaseModel):
+    """Body for ``POST /api/sources/auto`` — "auto feed": paste any
+    URL, the backend finds (or falls back to periodic scraping
+    without) a feed and creates the source in one step, rather than a
+    separate discover-then-create round trip through the regular
+    "Add custom" form. ``category`` defaults to "other" since there's
+    nothing to infer it from at this point — same default the "Add
+    custom" form's category picker starts on.
+    """
+    url: str
+    category: str = "other"
+
+
+class SourceAutoResult(BaseModel):
+    """Body of ``POST /api/sources/auto``.
+
+    ``found=False`` means neither an existing feed nor a usable
+    sitemap could be located for the URL — nothing was created.
+    ``kind`` is ``"rss"`` when a real feed was discovered (either the
+    URL itself, or a feed it linked to) or ``"generic_scrape"`` when
+    no feed exists but the site's sitemap produced at least one
+    extractable article, so periodic scraping was set up instead of a
+    feed subscription. ``source`` is the created row on success.
+    """
+    found: bool
+    kind: Optional[str] = None
+    source: Optional[SourceOut] = None
+
+
 class SourceUpdate(BaseModel):
     """Body for ``PATCH /api/sources/{id}``. All fields optional —
     missing fields are left untouched.
@@ -382,6 +411,15 @@ class EntryListOut(BaseModel):
     # Drives the "Summarize episode" affordance — see
     # POST /entries/{id}/podcast_summary.
     transcript_url: Optional[str] = None
+    # Framing Watch cluster membership (app.framing). Non-null only
+    # for entries the hourly clustering job has grouped with 2+
+    # other outlets' coverage of the same story. A real column, not
+    # pulled from meta — the card only renders the "Related
+    # coverage" affordance when this is non-null, same on/off
+    # pattern as reddit_thread_url / transcript_url above. The
+    # sibling articles themselves are fetched on demand via
+    # GET /entries/{id}/related, not shipped in the list payload.
+    story_cluster_id: Optional[int] = None
 
     class Config:
         from_attributes = True

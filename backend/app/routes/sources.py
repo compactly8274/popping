@@ -26,6 +26,7 @@ from app.youtube import YouTubeResolutionError, resolve_channel_feed_url
 from app.auth.deps import current_user, require_user
 from app.config import settings
 from app.db import SessionLocal, get_session
+from app.feed_autodiscovery import discover_feed_url, discover_sitemap_urls
 from app.feed_discovery import discover_candidates, recent_llm_candidate_count
 from app.feed_recommendations import (
     aggregation_user_ids,
@@ -37,6 +38,8 @@ from app.schemas import (
     FeedDiscoverRequest,
     FeedDiscoverResult,
     FeedRecommendation,
+    SourceAutoRequest,
+    SourceAutoResult,
     SourceCreate,
     SourceOut,
     SourceTestRequest,
@@ -132,6 +135,15 @@ _PODCAST_DEFAULT_REFRESH = 21_600
 # as podcasts — most channels post far less than hourly, so the
 # plain-RSS default would just poll a feed that isn't changing.
 _YOUTUBE_DEFAULT_REFRESH = 21_600
+
+# Default refresh for ``type="generic_scrape"`` rows (see
+# app.sources.generic_scrape). A single poll can mean up to
+# _MAX_NEW_PER_POLL real page fetches against the target site, not
+# just one lightweight feed request — considerably heavier per-tick
+# than every other source type, so this defaults much longer (2h)
+# out of courtesy to sites that never opted into being polled the
+# way a real feed's operator implicitly did.
+_GENERIC_SCRAPE_DEFAULT_REFRESH = 7_200
 
 # Mirrors ``Source.category``'s ``String(40)``. A PATCH / POST with a
 # longer string would crash on the DB layer with a Postgres
@@ -431,12 +443,12 @@ async def create_source_endpoint(
     else:
         _validate_url(body.url)
         url = body.url
-    if body.type not in ("rss", "reddit", "podcast", "youtube_channel"):
+    if body.type not in ("rss", "reddit", "podcast", "youtube_channel", "generic_scrape"):
         raise HTTPException(
             status_code=400,
             detail=(
                 f"unsupported type {body.type!r} (only 'rss', 'reddit', 'podcast', "
-                "and 'youtube_channel' are accepted in this build)"
+                "'youtube_channel', and 'generic_scrape' are accepted in this build)"
             ),
         )
     _validate_category(body.category)
@@ -453,6 +465,8 @@ async def create_source_endpoint(
             refresh = _PODCAST_DEFAULT_REFRESH
         elif body.type == "youtube_channel":
             refresh = _YOUTUBE_DEFAULT_REFRESH
+        elif body.type == "generic_scrape":
+            refresh = _GENERIC_SCRAPE_DEFAULT_REFRESH
         else:
             refresh = _REFRESH_MIN * 60
     else:
@@ -481,6 +495,112 @@ async def create_source_endpoint(
         )
         _DISCOVERY_TASKS.add(task)
     return SourceOut.model_validate(row)
+
+
+def _slugify_hostname(url: str) -> str:
+    """Turn a URL's hostname into a ``^[a-z0-9_]{1,120}$`` source
+    name — the same shape ``_validate_name`` requires. Used only by
+    the auto-feed flow below, where there's no user-supplied name to
+    work with yet (unlike the regular "Add custom" form)."""
+    host = (urlparse(url).hostname or "site").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    slug = re.sub(r"[^a-z0-9]+", "_", host).strip("_")
+    return slug[:100] or "site"
+
+
+async def _free_source_name(session: AsyncSession, base: str) -> str:
+    """``base``, or ``base_2``, ``base_3``, ... — whichever is the
+    first not already taken by an existing row or a built-in plugin
+    name. ``scheduler.add_source`` is idempotent-on-name (a colliding
+    name silently returns the EXISTING row instead of creating a new
+    one), which is the right behavior for a literal retry but wrong
+    here: two different sites whose hostnames happen to slugify the
+    same way would otherwise silently collapse into one source."""
+    candidate = base
+    suffix = 2
+    reserved = set(registered_plugin_names())
+    while True:
+        if candidate not in reserved:
+            existing = await session.scalar(select(Source).where(Source.name == candidate))
+            if existing is None:
+                return candidate
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+
+
+@router.post(
+    "/sources/auto",
+    response_model=SourceAutoResult,
+    dependencies=_write_deps,
+)
+async def source_auto_endpoint(
+    body: SourceAutoRequest,
+    session: AsyncSession = Depends(get_session),
+) -> SourceAutoResult:
+    """"Auto feed" — paste any URL, get a source added in one step.
+
+    Tries, in order:
+      1. An existing RSS/Atom feed, either the URL itself or one it
+         links to (``app.feed_autodiscovery.discover_feed_url``). If
+         found, creates a normal ``type="rss"`` source — indistinguishable
+         from one the user found and added manually.
+      2. The site's sitemap (``app.feed_autodiscovery.
+         discover_sitemap_urls``) — if it yields at least one URL,
+         creates a ``type="generic_scrape"`` source instead, which
+         periodically re-checks the sitemap and extracts new articles
+         via ``app.sources.generic_scrape`` even though the site never
+         published a feed at all.
+
+    Returns ``found=False`` (not an error status) when neither path
+    turns up anything — a dead URL, an unreachable host, or a site
+    genuinely too dynamic/unusual for sitemap-based discovery to
+    work on isn't a bug in this endpoint, just an honest "couldn't
+    find anything here."
+
+    The source name is derived from the URL's hostname (there's
+    nothing else to name it from at this point) and de-duplicated
+    against existing rows — see ``_free_source_name``. The user can
+    rename it afterward from the My feeds tab like any other source.
+    """
+    _validate_url(body.url)
+    _validate_category(body.category)
+
+    feed_url = await discover_feed_url(body.url)
+    if feed_url:
+        name = await _free_source_name(session, _slugify_hostname(feed_url))
+        row = await scheduler.add_source(
+            session,
+            name=name,
+            type_="rss",
+            category=body.category,
+            url=feed_url,
+            refresh=_REFRESH_MIN * 60,
+        )
+        task = asyncio.create_task(
+            _run_auto_discovery(
+                category=row.category,
+                context=f"For context, the user just auto-added a feed named {row.name!r} ({row.url}).",
+                discovered_from_source_id=row.id,
+            )
+        )
+        _DISCOVERY_TASKS.add(task)
+        return SourceAutoResult(found=True, kind="rss", source=SourceOut.model_validate(row))
+
+    sitemap_urls = await discover_sitemap_urls(body.url, limit=1)
+    if sitemap_urls:
+        name = await _free_source_name(session, _slugify_hostname(body.url))
+        row = await scheduler.add_source(
+            session,
+            name=name,
+            type_="generic_scrape",
+            category=body.category,
+            url=body.url,
+            refresh=_GENERIC_SCRAPE_DEFAULT_REFRESH,
+        )
+        return SourceAutoResult(found=True, kind="generic_scrape", source=SourceOut.model_validate(row))
+
+    return SourceAutoResult(found=False)
 
 
 @router.patch(
@@ -656,13 +776,13 @@ async def _test_source_impl(
     # validation here is intentionally a subset of the create flow's
     # (no DB write, no scheduler registration) so a Test never has
     # side effects beyond the upstream fetch.
-    if body.type not in ("rss", "reddit", "podcast", "youtube_channel"):
+    if body.type not in ("rss", "reddit", "podcast", "youtube_channel", "generic_scrape"):
         return SourceTestResult(
             ok=False,
             error_kind="unsupported_type",
             error=(
                 f"unsupported type {body.type!r} (only 'rss', 'reddit', 'podcast', "
-                "and 'youtube_channel' are accepted)"
+                "'youtube_channel', and 'generic_scrape' are accepted)"
             ),
         )
 
@@ -785,6 +905,17 @@ async def _test_source_impl(
             # generically for YouTube (see app.sources.youtube).
             from app.sources.rss import fetch_rss
             items = await fetch_rss(url, headers=headers)
+        elif body.type == "generic_scrape":
+            # No Source row to construct a real GenericScrapePlugin
+            # from yet — probe() is the row-free equivalent of its
+            # fetch(), sitemap-discovering and extracting a small
+            # sample directly. custom_headers isn't honored here
+            # (the underlying fetch is app.article_extract.fetch_html,
+            # not this route's httpx client) — a rare enough need for
+            # a scrape-fallback source that it's not worth threading
+            # through yet.
+            from app.sources.generic_scrape import probe as probe_generic_scrape
+            items = await probe_generic_scrape(url)
         else:  # "reddit"
             from app.sources.reddit import fetch_subreddit
             items = await fetch_subreddit(url, headers=headers)
