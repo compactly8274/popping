@@ -31,7 +31,10 @@ logger = logging.getLogger("popping.article_extract")
 # text, but there's no way to know how large the markup is before
 # downloading it.
 _MAX_HTML_BYTES = 3 * 1024 * 1024
-_FETCH_TIMEOUT = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=15.0)
+# Tap-and-wait UI affordance (see app.article_summary._LLM_CALL_TIMEOUT_S)
+# — a slow article host shouldn't eat a big chunk of the interactive
+# budget before the LLM step even starts.
+_FETCH_TIMEOUT = httpx.Timeout(connect=6.0, read=10.0, write=10.0, pool=10.0)
 
 # Article text budget fed to the LLM (app.article_summary). A typical
 # news article is 500-1500 words (~3-9k characters); this cap covers
