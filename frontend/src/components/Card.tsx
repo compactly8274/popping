@@ -863,7 +863,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
         aria-hidden="true"
         className={`absolute left-0 top-0 bottom-0 w-[3px] rounded-l-ios-lg ${stripeClass}`}
       />
-      <div className="flex items-start justify-between gap-3 mb-2">
+      <div className="flex items-center justify-between gap-3 mb-2">
         <a
           href={entry.url}
           target="_blank"
@@ -878,9 +878,22 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
             recordImmediate({ entry_id: entry.id, type: 'click' })
             onActivate?.()
           }}
-          className="flex-1 min-w-0 flex items-start gap-1.5 text-ios-body font-medium text-label-primary hover:text-white line-clamp-2"
+          className="flex-1 min-w-0 flex items-start gap-1.5 text-ios-body font-medium text-label-primary hover:text-white"
         >
-          <span className="min-w-0">{entry.title}</span>
+          {/* ``line-clamp-2`` lives on this inner span, not the ``<a>``
+              itself — line-clamp needs ``display: -webkit-box`` to do
+              anything, and that's silently overridden by the ``<a>``'s
+              own ``display: flex`` (same property, flex wins), so a
+              clamp class placed directly on a flex container is inert:
+              titles wrapped to 3+ lines with no cap. A span can carry
+              its own ``-webkit-box`` display while still being sized
+              as a normal flex item by its flex parent, so nesting the
+              clamp one level in actually enforces the 2-line cap this
+              was always meant to have — which in turn is what bounds
+              this row's height consistently, instead of a long title
+              growing tall enough to leave a gap under the (fixed-
+              height) badge/thumbnail column next to it. */}
+          <span className="min-w-0 line-clamp-2 font-headline font-semibold tracking-tight">{entry.title}</span>
           {/* "↗" affordance. Sits inline at the end of the title so it
               reads as part of the link, not a separate control. Group-
               hover brightens it on devices that have a hover state;
@@ -934,7 +947,11 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
         </div>
       </div>
       <div className="flex items-center gap-2 text-ios-caption text-label-secondary">
-        {sourceName && <span className={`font-medium ${sourceTextClass}`}>{sourceName}</span>}
+        {/* Uppercase + tracked, like a magazine section kicker — same
+            sans font as the rest of the meta row, just a different
+            case/tracking treatment, so the source reads as a label
+            rather than blending into the timestamp next to it. */}
+        {sourceName && <span className={`font-semibold uppercase tracking-wide text-[11px] ${sourceTextClass}`}>{sourceName}</span>}
         {sourceName && <span>·</span>}
         <time dateTime={entry.published_at ?? ''}>{timeAgo(entry.published_at)}</time>
       </div>

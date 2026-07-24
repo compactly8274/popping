@@ -66,17 +66,33 @@
   width: 60vmax;
   height: 60vmax;
   border-radius: 50%;
-  filter: blur(120px);
-  will-change: transform;
+  will-change: transform, filter;
 }
 
-/* iOS systemBlue — matches the app's existing accent color. */
+/* iOS systemBlue — matches the app's existing accent color. Each
+   blob runs TWO animations at once: the original position/scale
+   drift, plus a slow ``hue-rotate`` cycling the blob's own color
+   over a couple of minutes. hue-rotate is a compositor-only filter
+   (no layout, no repaint of surrounding content) — same cost class
+   as the transform drift already here — so this adds visible "the
+   wallpaper is alive" color movement without the resource cost a
+   canvas/WebGL treatment would carry. Every keyframe step must
+   restate ``blur(120px)`` alongside ``hue-rotate`` — animating
+   ``filter`` replaces the whole value, not just one function in it,
+   so omitting the blur would make it flicker sharp on each cycle
+   boundary. Durations are staggered (110s/140s/170s, all coprime-ish
+   with the drift durations) so the three blobs drift in and out of
+   color-sync with each other rather than shifting in lockstep, which
+   is what actually reads as "dancing" instead of a flat overall tint
+   change.
+*/
 .wallpaper-blob-a {
   top: -15vmax;
   left: -15vmax;
   background: #0a84ff;
   opacity: 0.16;
-  animation: wallpaperDriftA 70s ease-in-out infinite;
+  animation: wallpaperDriftA 70s ease-in-out infinite,
+             wallpaperHueA 110s linear infinite;
 }
 
 /* iOS systemPurple. */
@@ -85,7 +101,8 @@
   right: -15vmax;
   background: #bf5af2;
   opacity: 0.14;
-  animation: wallpaperDriftB 85s ease-in-out infinite;
+  animation: wallpaperDriftB 85s ease-in-out infinite,
+             wallpaperHueB 140s linear infinite;
 }
 
 /* iOS systemGreen — the dimmest of the three so the wash leans
@@ -95,7 +112,8 @@
   right: 15vw;
   background: #30d158;
   opacity: 0.10;
-  animation: wallpaperDriftC 95s ease-in-out infinite;
+  animation: wallpaperDriftC 95s ease-in-out infinite,
+             wallpaperHueC 170s linear infinite;
 }
 
 @keyframes wallpaperDriftA {
@@ -113,6 +131,21 @@
 @keyframes wallpaperDriftC {
   0%, 100% { transform: translate(0, 0) scale(1); }
   50%      { transform: translate(-12vmax, 14vmax) scale(1.2); }
+}
+
+@keyframes wallpaperHueA {
+  0%   { filter: blur(120px) hue-rotate(0deg); }
+  100% { filter: blur(120px) hue-rotate(360deg); }
+}
+
+@keyframes wallpaperHueB {
+  0%   { filter: blur(120px) hue-rotate(0deg); }
+  100% { filter: blur(120px) hue-rotate(-360deg); }
+}
+
+@keyframes wallpaperHueC {
+  0%   { filter: blur(120px) hue-rotate(0deg); }
+  100% { filter: blur(120px) hue-rotate(360deg); }
 }
 
 /* Same "freeze, don't hide" treatment as the splash spinner above —
