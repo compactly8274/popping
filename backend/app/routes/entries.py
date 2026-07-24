@@ -9,7 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.article_extract import fetch_article_text
+from app.article_summary import summarize_article
 from app.db import get_session
+from app.llm import router as llm_router
 from app.models import Entry, Source
 from app.podcast_asr import asr_available, transcribe_audio
 from app.podcast_transcript import fetch_transcript_text, summarize_transcript
@@ -352,6 +355,35 @@ async def entries_by_ids(
     return out
 
 
+def _truncate_summary(text: str) -> str:
+    """Cap at ``_SUMMARY_MAX_CHARS``, truncating on a word boundary
+    rather than mid-word. Applied to both summary paths below — the
+    LLM path is prompted for 3-4 sentences (usually well under the
+    cap) but this is the safety net against a model that ignores the
+    instruction, same as the old extract-only path always had."""
+    if len(text) <= _SUMMARY_MAX_CHARS:
+        return text
+    truncated = text[:_SUMMARY_MAX_CHARS]
+    if " " in truncated:
+        truncated = truncated.rsplit(" ", 1)[0]
+    return truncated.rstrip() + "…"
+
+
+def _extract_fallback_summary(row: Entry) -> str:
+    """The original, LLM-free summary: the feed's own blurb (or
+    ``body_text``, though that column is never populated anywhere in
+    this schema today — see ``app.article_extract``'s module
+    docstring), cleaned and truncated. Used when no LLM provider is
+    configured, the article fetch fails, or the LLM call itself
+    fails — this always has *something* to fall back to, unlike the
+    LLM path which can legitimately come back empty."""
+    meta = row.meta or {}
+    raw = meta.get("summary") if isinstance(meta.get("summary"), str) else ""
+    if not raw and row.body_text:
+        raw = row.body_text
+    return _truncate_summary(_clean_summary(raw))
+
+
 @router.post(
     "/entries/{entry_id}/summary",
     response_model=EntrySummaryOut,
@@ -365,27 +397,32 @@ async def entry_summary_endpoint(
     Tap-the-chevron-from-the-dashboard path. The frontend calls this
     on the first expansion of a card; the result lands inline under
     the card title. Subsequent calls hit the ``cached_summary``
-    column without re-extracting.
+    column without re-extracting or re-fetching.
 
     Cache semantics:
       - ``cached_summary is None``   → first call for this row → run
-                                       the extract path → persist.
+                                       the summary path → persist.
       - ``cached_summary == ""``     → asked before, no usable text
-                                       (feed shipped nothing). Return
-                                       empty without re-extracting.
+                                       (feed shipped nothing AND the
+                                       article couldn't be fetched).
+                                       Return empty without retrying.
       - ``cached_summary == "..."``  → asked before, return verbatim.
 
-    Text extraction order (first non-empty wins):
-      1. ``Entry.meta.summary`` — the feed's own deck, what the user
-         saw when they tapped the chevron the first time.
-      2. ``Entry.body_text`` — populated by the LLM embedder when it
-         walked the article. Fall back here when the feed shipped
-         no summary (HN top stories, Wikipedia OTD entries).
+    Summary path (first that produces text wins):
+      1. LLM summary of the article's own full text — fetch the
+         entry's URL, extract the readable body
+         (``app.article_extract``), and summarize it in 3-4 sentences
+         (``app.article_summary``). Skipped entirely (no fetch) when
+         no LLM provider is configured, since it can't be used
+         either way.
+      2. The feed's own short blurb, cleaned and truncated — the
+         original behavior, and the permanent fallback for entries
+         whose article can't be fetched (paywalled, blocked, 404'd)
+         or when no LLM is configured at all.
 
     Truncation: cap at ``_SUMMARY_MAX_CHARS`` per the card layout —
-    3-line clamp needs ~250-300 chars on a 320px column; 800 leaves
-    headroom for richer feeds (Verge, NYT deck paragraphs) without
-    forcing the user past the next headline.
+    the LLM path is prompted for 3-4 sentences, comfortably under
+    this; it's a safety net, not the normal path to hitting the cap.
     """
     row = await session.get(Entry, entry_id)
     if row is None:
@@ -402,33 +439,24 @@ async def entry_summary_endpoint(
         # loaded".
         return EntrySummaryOut(summary=row.cached_summary, cached=True)
 
-    # First call: build the text. ``meta`` can be None for entries
-    # ingested before the JSONB column existed; default to {} so
-    # the chained .get() doesn't AttributeError. ``body_text``
-    # fallback is in the same try-block so an empty ``meta.summary``
-    # doesn't immediately give up.
-    meta = row.meta or {}
-    raw = meta.get("summary") if isinstance(meta.get("summary"), str) else ""
-    if not raw and row.body_text:
-        raw = row.body_text
+    final = ""
+    if llm_router.providers_for("brief"):
+        article_text = await fetch_article_text(row.url)
+        if article_text:
+            llm_summary = await summarize_article(row.title, article_text)
+            if llm_summary:
+                final = _truncate_summary(llm_summary.strip())
 
-    cleaned = _clean_summary(raw)
-    # Cap at the dashboard's visual budget. Truncating on a word
-    # boundary reads better than mid-word cutoff so we walk back to
-    # the last space if we'd land mid-word.
-    if len(cleaned) > _SUMMARY_MAX_CHARS:
-        cleaned = cleaned[:_SUMMARY_MAX_CHARS]
-        if " " in cleaned:
-            cleaned = cleaned.rsplit(" ", 1)[0]
-        cleaned = cleaned.rstrip() + "…"
+    if not final:
+        final = _extract_fallback_summary(row)
 
     # Persist even when empty — that's the cache-hit signal for
     # next time. Without the persist, every chevron tap would
-    # re-run the regex / fallback chain.
-    row.cached_summary = cleaned
+    # re-run the fetch / extract / LLM chain.
+    row.cached_summary = final
     await session.commit()
 
-    return EntrySummaryOut(summary=cleaned, cached=False)
+    return EntrySummaryOut(summary=final, cached=False)
 
 
 @router.post(

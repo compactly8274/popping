@@ -27,6 +27,16 @@ dependencies = [
     # Phase 4 — notifications (preferred backend; Pushover uses httpx
     # directly, no extra dep needed)
     "apprise>=1.8",
+    # Article full-text extraction for LLM summarization (see
+    # app/article_extract.py) — readability-style "strip nav/ads/
+    # related-links, keep the article body" extraction from raw
+    # HTML. The rest of the codebase deliberately avoids HTML-
+    # parsing dependencies (see app/assets.py's og:image regex
+    # comment), but that convention covers narrow, well-defined
+    # patterns (a single meta tag); genuine article-body extraction
+    # across arbitrary site layouts is not something a regex can do
+    # reliably, so this is a deliberate, scoped exception.
+    "trafilatura>=2.0",
 ]
 
 [project.optional-dependencies]
