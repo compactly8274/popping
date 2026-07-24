@@ -382,6 +382,15 @@ class EntryListOut(BaseModel):
     # Drives the "Summarize episode" affordance — see
     # POST /entries/{id}/podcast_summary.
     transcript_url: Optional[str] = None
+    # Framing Watch cluster membership (app.framing). Non-null only
+    # for entries the hourly clustering job has grouped with 2+
+    # other outlets' coverage of the same story. A real column, not
+    # pulled from meta — the card only renders the "Related
+    # coverage" affordance when this is non-null, same on/off
+    # pattern as reddit_thread_url / transcript_url above. The
+    # sibling articles themselves are fetched on demand via
+    # GET /entries/{id}/related, not shipped in the list payload.
+    story_cluster_id: Optional[int] = None
 
     class Config:
         from_attributes = True

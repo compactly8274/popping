@@ -42,6 +42,11 @@ export interface Entry {
   // Non-null gates the card's "Summarize episode" affordance (see
   // api.podcastSummary).
   transcript_url: string | null
+  // Framing Watch cluster membership (see FramingCluster below).
+  // Non-null only when the hourly clustering job has grouped this
+  // entry with 2+ other outlets' coverage of the same story — gates
+  // the card's "Related coverage" affordance (see api.entryRelated).
+  story_cluster_id: number | null
 }
 
 // Full row with source name. Returned by the
@@ -487,6 +492,16 @@ export const api = {
       `/api/entries/${entryId}/reddit_comment_summary`,
       { method: 'POST' },
     ),
+  /** Other outlets' coverage of the same story as this entry, if
+   * any — reuses Framing Watch's clustering (see FramingCluster /
+   * api.framingClusters), scoped to just this entry's siblings
+   * (self excluded) rather than the full cluster listing. Null when
+   * the entry isn't part of a detected cluster — gated client-side
+   * on `entry.story_cluster_id` first so this is only called when
+   * there's actually something to show. A GET (not a POST like the
+   * summary endpoints) since it's a plain read, nothing to cache. */
+  entryRelated: (entryId: number) =>
+    jsonFetch<FramingCluster | null>(`/api/entries/${entryId}/related`),
 
   // ---- Engagement events (Phase 8) ----
   /** Record one engagement event immediately. The endpoint requires

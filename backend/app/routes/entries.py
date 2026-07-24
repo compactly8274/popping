@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
@@ -14,7 +15,7 @@ from app.article_extract import fetch_article_text
 from app.article_summary import summarize_article
 from app.db import get_session
 from app.llm import router as llm_router
-from app.models import Entry, Source
+from app.models import Entry, Source, StoryCluster
 from app.podcast_asr import asr_available, transcribe_audio
 from app.podcast_transcript import fetch_transcript_text, summarize_transcript
 from app.reddit_comment_summary import summarize_comments
@@ -24,6 +25,8 @@ from app.schemas import (
     EntryPodcastSummaryOut,
     EntryRedditCommentSummaryOut,
     EntrySummaryOut,
+    FramingArticleOut,
+    FramingClusterOut,
 )
 
 router = APIRouter(tags=["entries"])
@@ -146,6 +149,11 @@ async def list_entries(
         Entry.cached_summary,
         Entry.image_url,
         Entry.image_path,
+        # Framing Watch cluster membership — a real column, no JSONB
+        # extraction needed. Non-null only for entries grouped with
+        # 2+ other outlets' coverage of the same story (see
+        # app.framing). Drives the card's "Related coverage" button.
+        Entry.story_cluster_id,
         # Reddit cross-reference footer. Pulled out of the JSONB blob
         # via the ``->>`` operator so the list payload doesn't have to
         # ship ``meta`` itself — the rest of meta is unused by the
@@ -601,4 +609,86 @@ async def entry_reddit_comment_summary_endpoint(
     await session.commit()
 
     return EntryRedditCommentSummaryOut(summary=summary, cached=False, available=True)
+
+
+@router.get(
+    "/entries/{entry_id}/related",
+    response_model=Optional[FramingClusterOut],
+)
+async def entry_related_endpoint(
+    entry_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> FramingClusterOut | None:
+    """Other outlets' coverage of the same story as this entry, if
+    any — reuses Framing Watch's existing clustering
+    (``app.framing.cluster_recent_entries``, the same hourly job that
+    powers the standalone Framing Watch section) rather than a
+    separate "related articles" algorithm or a live similarity
+    search. This is the same data, just re-surfaced per-card so a
+    reader doesn't have to scroll up and cross-reference the Framing
+    Watch section themselves to see how other outlets are covering
+    (and titling) the story they're currently reading.
+
+    A GET, not a POST like the summary endpoints — this is a plain
+    read (a join against already-computed clustering state), not
+    something that fetches, calls an LLM, or writes a cache column,
+    so there's nothing to distinguish "cached" from "fresh" and no
+    reason to require a mutating verb.
+
+    Returns ``None`` (not 404) when this entry isn't part of a
+    detected cluster — the overwhelming majority of entries, since
+    clustering only fires for stories multiple configured outlets
+    happen to cover in the same window. The frontend uses this to
+    hide the "Related coverage" affordance entirely rather than
+    showing an empty panel. The current entry itself is excluded
+    from the returned ``articles`` — the reader is already looking
+    at it; showing it again in its own "other coverage" list would
+    be redundant.
+    """
+    row = await session.get(Entry, entry_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="entry not found")
+    if row.story_cluster_id is None:
+        return None
+
+    stmt = (
+        select(
+            Entry.id,
+            Entry.title,
+            Entry.url,
+            Entry.published_at,
+            Entry.framing_tone,
+            Source.name.label("source_name"),
+            Source.favicon_path,
+            StoryCluster.wire_source,
+            StoryCluster.first_seen_at,
+        )
+        .join(Source, Entry.source_id == Source.id)
+        .join(StoryCluster, Entry.story_cluster_id == StoryCluster.id)
+        .where(Entry.story_cluster_id == row.story_cluster_id, Entry.id != entry_id)
+        .order_by(Entry.published_at.asc().nullslast())
+    )
+    rows = (await session.execute(stmt)).all()
+    if not rows:
+        # A cluster technically exists but every other member has
+        # since been deleted/purged — nothing left to show.
+        return None
+
+    return FramingClusterOut(
+        cluster_id=row.story_cluster_id,
+        wire_source=rows[0].wire_source,
+        first_seen_at=rows[0].first_seen_at,
+        articles=[
+            FramingArticleOut(
+                entry_id=r.id,
+                title=r.title,
+                url=r.url,
+                source_name=r.source_name,
+                favicon_path=r.favicon_path,
+                published_at=r.published_at,
+                framing_tone=r.framing_tone,
+            )
+            for r in rows
+        ],
+    )
 
