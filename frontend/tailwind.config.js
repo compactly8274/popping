@@ -59,18 +59,6 @@ export default {
           '-apple-system', 'BlinkMacSystemFont', '"SF Pro Display"',
           '"SF Pro Text"', '"Helvetica Neue"', 'system-ui', 'sans-serif',
         ],
-        // Editorial serif for card headlines only (Card.tsx's title
-        // span) — everything else (source names, timestamps, buttons,
-        // body copy) stays on the sans UI stack above, so the serif
-        // reads as "this is the story" the way a newspaper masthead
-        // sets headlines apart from captions, matching the same
-        // convention NYT/Guardian-style readers use. System fonts
-        // only (no webfont fetch) — Georgia is the widest-available
-        // serif that still reads well at small sizes, unlike thinner
-        // serifs that get muddy under ~17px.
-        headline: [
-          'Georgia', '"Iowan Old Style"', '"Times New Roman"', 'ui-serif', 'serif',
-        ],
       },
       fontSize: {
         // Apple large title. Slightly tighter than Tailwind's

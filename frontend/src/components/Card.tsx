@@ -934,7 +934,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
               this row's height consistently, instead of a long title
               growing tall enough to leave a gap under the (fixed-
               height) badge/thumbnail column next to it. */}
-          <span className="min-w-0 line-clamp-2 font-headline font-semibold tracking-tight">{entry.title}</span>
+          <span className="min-w-0 line-clamp-2">{entry.title}</span>
           {/* "↗" affordance. Sits inline at the end of the title so it
               reads as part of the link, not a separate control. Group-
               hover brightens it on devices that have a hover state;

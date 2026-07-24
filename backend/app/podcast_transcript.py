@@ -13,6 +13,7 @@ don't publish a transcript tag.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -164,6 +165,12 @@ def _plain_text_from_captions(body: str) -> str:
 _TRANSCRIPT_CHAR_BUDGET = 40_000
 _SUMMARY_MAX_TOKENS = 500
 
+# Same reasoning as app.article_summary._LLM_CALL_TIMEOUT_S — this is
+# a tap-and-wait UI affordance, not a background job, so it needs a
+# much tighter bound than the provider clients' own timeouts (up to
+# 120s for Ollama Cloud).
+_LLM_CALL_TIMEOUT_S = 20.0
+
 
 def _build_prompt(episode_title: str, transcript_text: str) -> str:
     truncated = transcript_text[:_TRANSCRIPT_CHAR_BUDGET]
@@ -189,11 +196,20 @@ async def summarize_transcript(episode_title: str, transcript_text: str) -> str 
     prompt = _build_prompt(episode_title, transcript_text)
     for candidate in providers:
         try:
-            content = await candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS)
+            content = await asyncio.wait_for(
+                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS),
+                timeout=_LLM_CALL_TIMEOUT_S,
+            )
         except ProviderError as exc:
             logger.warning(
                 "podcast_transcript: LLM call failed on %s: %s — trying next provider",
                 candidate.name, exc,
+            )
+            continue
+        except asyncio.TimeoutError:
+            logger.warning(
+                "podcast_transcript: %s took longer than %.0fs — trying next provider",
+                candidate.name, _LLM_CALL_TIMEOUT_S,
             )
             continue
         content = (content or "").strip()

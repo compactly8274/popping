@@ -12,6 +12,7 @@ fallback when no provider is configured or the article fetch fails.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.llm import ProviderError, router
@@ -22,6 +23,17 @@ logger = logging.getLogger("popping.article_summary")
 # every model in the provider chain; generous headroom in case a
 # model runs verbose.
 _SUMMARY_MAX_TOKENS = 200
+
+# This is a user-triggered, interactive tap (the card's chevron) —
+# not a background job. The provider clients' own timeouts are tuned
+# for the Brief generator's much longer generation task (up to 120s
+# for Ollama Cloud — see app/llm/ollama_cloud.py), which is fine to
+# wait on in the background but reads as "broken" on a tap-and-wait
+# UI affordance. Bounding each provider attempt here separately (on
+# top of, not instead of, the client's own timeout) keeps a slow or
+# overloaded provider from turning "summarize this" into a 2-minute
+# hang before the feed-blurb fallback ever kicks in.
+_LLM_CALL_TIMEOUT_S = 20.0
 
 
 def _build_prompt(title: str, article_text: str) -> str:
@@ -47,11 +59,20 @@ async def summarize_article(title: str, article_text: str) -> str | None:
     prompt = _build_prompt(title, article_text)
     for candidate in providers:
         try:
-            content = await candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS)
+            content = await asyncio.wait_for(
+                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS),
+                timeout=_LLM_CALL_TIMEOUT_S,
+            )
         except ProviderError as exc:
             logger.warning(
                 "article_summary: LLM call failed on %s: %s — trying next provider",
                 candidate.name, exc,
+            )
+            continue
+        except asyncio.TimeoutError:
+            logger.warning(
+                "article_summary: %s took longer than %.0fs — trying next provider",
+                candidate.name, _LLM_CALL_TIMEOUT_S,
             )
             continue
         content = (content or "").strip()
