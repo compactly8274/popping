@@ -145,7 +145,7 @@ async def foryou(
 
     boosted: list[tuple[float, _Row]] = []
     for entry in candidates:
-        base = composite_scorer.score_entry(entry, entry.source, profile)
+        base = composite_scorer.score(entry, entry.source, profile)
         slug = composite_scorer.title_slug(entry.title)
         mult = composite_scorer.convergence_multiplier(conv.get(slug, 1))
         boosted.append((base * mult, entry))

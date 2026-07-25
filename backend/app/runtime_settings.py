@@ -35,7 +35,6 @@ import time
 from typing import Any, Optional
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
 from app.db import SessionLocal
@@ -167,20 +166,10 @@ async def _db_set(key: str, value: str) -> None:
     """
     if not isinstance(value, str):
         value = str(value)
-    # Atomic INSERT-or-UPDATE: avoids the SELECT-then-INSERT race
-    # that session.merge() introduces under READ COMMITTED. Two
-    # concurrent _db_set() calls for the same key would both pass
-    # the merge's SELECT and then race on the INSERT; the unique
-    # constraint on (key) then produces a 500. on_conflict_do_update
-    # is a single round-trip with a server-side UPSERT.
     async with SessionLocal() as session:
         async with session.begin():
-            stmt = pg_insert(AppSetting).values(key=key, value=value)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=[AppSetting.key],
-                set_={"value": stmt.excluded.value},
-            )
-            await session.execute(stmt)
+            row = AppSetting(key=key, value=value)
+            await session.merge(row)
 
 
 async def _db_delete(key: str) -> None:

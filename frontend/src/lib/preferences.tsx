@@ -90,7 +90,17 @@ export type LastViewedValue = string
  * circular import (App imports this module, this module would
  * have to import App's ColumnPrefs otherwise).
  */
-export type { ColumnPrefsValue, ColumnSectionsValue } from './types'
+export type ColumnPrefsValue = {
+  sort: 'top' | 'newest' | 'oldest'
+  minScore: number
+  maxAgeHours: number | null
+}
+
+/** One column's Fresh/History section collapse state. */
+export type ColumnSectionsValue = {
+  newCollapsed: boolean
+  historyCollapsed: boolean
+}
 
 /** The History tab's group-by mode. */
 export type HistoryGroupByValue = 'entry' | 'none'
@@ -176,9 +186,7 @@ const DEFAULT_STATE: PreferencesState = {
 // API shapes (server contract).
 // ---------------------------------------------------------------------------
 
-// Exported so test files can construct rows for ``applyRowToState``.
-// (The server response shape is the only thing this is used for.)
-export interface PreferenceRow {
+interface PreferenceRow {
   key: string
   value: unknown
   updated_at: string
@@ -243,18 +251,6 @@ function seedFromLocalStorage(): PreferencesState | null {
   if (typeof window === 'undefined') return null
   if (safeGetItem(SEED_FLAG_KEY) === '1') return null
 
-  // NOTE: the original review called out that the synchronous
-  // JSON.parse + 8+ POSTs here can block first paint by ~1.6s
-  // for a heavy user. The current architecture uses
-  // ``useState(() => seedFromLocalStorage())`` specifically to
-  // avoid a flash of empty columns (the docstring below spells
-  // this out). Moving the seed into ``useEffect`` would re-introduce
-  // that flash. The right long-term fix is a Service Worker that
-  // pre-warms the localStorage values OR migrating the seed into
-  // an inline <script> that writes the parsed JSON into a
-  // window.__POPPING_SEED__ global before React mounts. Both
-  // are larger changes than this pass; the trade is left in
-  // place here with a comment so the next reader knows.
   const out: PreferencesState = { ...DEFAULT_STATE }
 
   // Per-column maps. The old keys stored a single JSON blob; we
@@ -798,10 +794,8 @@ export const MAX_PRESETS = 50
  * reliable insertion-order enumeration once its keys look numeric —
  * they get reordered ascending — so "oldest entry id" is the only
  * cheap ordering available here).
- *
- * Exported for tests.
  */
-export function trimVotedEntries(votes: VotedEntriesValue): VotedEntriesValue {
+function trimVotedEntries(votes: VotedEntriesValue): VotedEntriesValue {
   const ids = Object.keys(votes)
   if (ids.length <= MAX_VOTED) return votes
   const sorted = ids.map(Number).sort((a, b) => a - b)
@@ -815,10 +809,8 @@ export function trimVotedEntries(votes: VotedEntriesValue): VotedEntriesValue {
  * Decode one server row into the right field of a PreferencesState.
  * Unknown keys are ignored -- forward-compat for future
  * preference types.
- *
- * Exported for tests.
  */
-export function applyRowToState(out: PreferencesState, row: PreferenceRow) {
+function applyRowToState(out: PreferencesState, row: PreferenceRow) {
   const { key, value } = row
   if (key.startsWith(`${PREFERENCE_KEYS.readEntries}:`)) {
     const columnId = key.slice(`${PREFERENCE_KEYS.readEntries}:`.length)
@@ -878,10 +870,8 @@ export function applyRowToState(out: PreferencesState, row: PreferenceRow) {
  * (seeded) view. Used on first mount to reconcile the seed with
  * the server's response. Server wins on key collision; seed
  * wins on keys the server doesn't have.
- *
- * Exported for tests.
  */
-export function mergeStateFromServer(
+function mergeStateFromServer(
   seed: PreferencesState,
   server: PreferencesState,
 ): PreferencesState {

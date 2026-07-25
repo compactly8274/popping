@@ -1,248 +1,192 @@
-"""Tests for the LLM-response parser in app.feed_discovery.
+"""Tests for app.feed_discovery: the LLM-based expansion of the
+recommendation pool (app.feed_recommendations).
 
-The thinking-model fix mirrors ``app.framing._parse_tone_response``:
-two-stage parser that tries ``json.loads`` on the whole text first
-(clean responses, non-thinking models) and falls back to a
-bracket-extractor for chain-of-thought blobs (gpt-oss,
-deepseek-r1, glm-5.2, ...).
-
-The bracket-extractor is the part that breaks without these tests:
-a naive ``re.findall(r"\\[.*?\\]")`` would stop at the first
-``]`` inside a string literal. The hand-rolled scanner tracks
-bracket depth AND string state. This file covers the realistic
-CoT shapes an LLM might produce.
-
-All tests are pure-function — no DB, no httpx, no LLM.
+The full "LLM suggests a URL, we fetch-validate it, persist it" happy
+path needs a real LLM provider and a real feed to fetch — not
+something a unit test should depend on (same call the podcast-
+transcript summarizer's tests made — see test_podcast_transcript.py's
+module docstring). Covered directly instead: the deterministic
+sanitization helpers, the recency-count query the auto-trigger
+cooldown relies on, and the route's category validation / inference,
+which don't need a live provider to exercise.
 """
+
 from __future__ import annotations
 
-import os
-import sys
-import tempfile
-from typing import Any
-
-os.environ.setdefault("POSTGRES_HOST", "127.0.0.1")
-os.environ.setdefault("POSTGRES_PORT", "5432")
-os.environ.setdefault("POSTGRES_USER", "x")
-os.environ.setdefault("POSTGRES_PASSWORD", "x")
-os.environ.setdefault("POSTGRES_DB", "x")
-os.environ.setdefault("EMBEDDING_ENABLED", "false")
-os.environ.setdefault("ASSETS_DIR", tempfile.mkdtemp(prefix="smoke-"))
-
-sys.path.insert(0, "/tmp/popping-review/backend")
+import datetime as dt
 
 import pytest
 
-from app.feed_discovery import _extract_first_json_array, _try_parse_suggestion_list
+from app.feed_discovery import (
+    _slugify,
+    _strip_code_fence,
+    discover_candidates,
+    recent_llm_candidate_count,
+)
+from app.models import FeedRecommendationCandidate
 
 
-# --- _extract_first_json_array ------------------------------------------
-
-class TestExtractFirstJsonArray:
-    def test_returns_balanced_array(self) -> None:
-        text = 'reasoning here [1, 2, 3] and more text'
-        assert _extract_first_json_array(text) == "[1, 2, 3]"
-
-    def test_handles_quote_inside_string(self) -> None:
-        # The whole point of the hand-rolled scanner. A naive
-        # regex would stop at the first ] inside the string.
-        text = '["a]b", "c"]'
-        result = _extract_first_json_array(text)
-        assert result == '["a]b", "c"]'
-
-    def test_handles_escaped_quote(self) -> None:
-        text = r'["a\"b", "c"]'
-        result = _extract_first_json_array(text)
-        assert result == r'["a\"b", "c"]'
-
-    def test_handles_nested_arrays(self) -> None:
-        text = '[[1, 2], [3, 4]]'
-        assert _extract_first_json_array(text) == "[[1, 2], [3, 4]]"
-
-    def test_handles_object_in_array(self) -> None:
-        # The real-world feed_discovery shape: each element is a
-        # dict with name/url/blurb.
-        text = 'reasoning [{"name": "x", "url": "https://x", "blurb": "y"}]'
-        result = _extract_first_json_array(text)
-        assert result is not None
-        assert '"name": "x"' in result
-        assert '"url": "https://x"' in result
-
-    def test_returns_none_when_no_array(self) -> None:
-        assert _extract_first_json_array("just plain text") is None
-
-    def test_returns_none_for_unbalanced(self) -> None:
-        # Never finds a balanced [ ... ]. Trailing text after the
-        # unclosed bracket means the depth never returns to 0.
-        assert _extract_first_json_array("[1, 2, 3") is None
-
-    def test_returns_none_for_empty_input(self) -> None:
-        assert _extract_first_json_array("") is None
-
-    def test_handles_multiple_arrays_takes_first(self) -> None:
-        text = "first [1, 2] then [3, 4]"
-        assert _extract_first_json_array(text) == "[1, 2]"
+# --- _slugify ----------------------------------------------------------------
 
 
-# --- _try_parse_suggestion_list -----------------------------------------
-
-class TestTryParseSuggestionList:
-    def test_clean_json_array(self) -> None:
-        text = '[{"name": "x", "url": "https://x", "blurb": "y"}]'
-        result = _try_parse_suggestion_list(text)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["name"] == "x"
-
-    def test_empty_array(self) -> None:
-        text = "[]"
-        result = _try_parse_suggestion_list(text)
-        assert result == []
-
-    def test_dict_wrapped_in_object(self) -> None:
-        # Some providers wrap the array in {"feeds": [...]} despite
-        # the prompt.
-        text = '{"feeds": [{"name": "x", "url": "https://x", "blurb": "y"}]}'
-        result = _try_parse_suggestion_list(text)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["name"] == "x"
-
-    def test_dict_wrapped_in_suggestions(self) -> None:
-        text = '{"suggestions": [{"name": "x", "url": "https://x", "blurb": "y"}]}'
-        result = _try_parse_suggestion_list(text)
-        assert result is not None
-        assert len(result) == 1
-
-    def test_code_fenced_json(self) -> None:
-        # The code-fence stripper in _ask_llm_for_suggestions runs
-        # before this. _try_parse_suggestion_list itself doesn't
-        # strip — the caller does. But verify it parses what
-        # passes through.
-        text = '[{"name": "x", "url": "https://x", "blurb": "y"}]'
-        result = _try_parse_suggestion_list(text)
-        assert result is not None
-
-    def test_cot_with_trailing_array(self) -> None:
-        # The real bug: thinking model returns CoT then a JSON
-        # array at the end. Without the bracket-extractor, the
-        # whole text fails to parse and the call is treated as
-        # "non-JSON output".
-        text = (
-            "Let me think about this. The user is in the deals "
-            "category. I should suggest feeds that are similar. "
-            "Let me consider: slickdeals, dealnews, etc.\n\n"
-            'The answer is [{"name": "slickdeals", "url": "https://slickdeals.net/feed.xml", "blurb": "Daily deals"}]'
-        )
-        result = _try_parse_suggestion_list(text)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["name"] == "slickdeals"
-
-    def test_cot_with_nested_quote(self) -> None:
-        # The CoT contains a quote inside a string literal —
-        # the same edge case the framing.py tests cover.
-        text = (
-            "Reasoning: I should look at feeds that cover this. "
-            "Like [\"foo's deals\", \"bar's best\"]...\n\n"
-            "Wait let me reconsider. The answer is:\n"
-            '[{"name": "foo", "url": "https://foo.com/feed", "blurb": "Foo\'s deals"}]'
-        )
-        result = _try_parse_suggestion_list(text)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["name"] == "foo"
-
-    def test_returns_none_for_garbage(self) -> None:
-        # No JSON anywhere — should return None, not raise.
-        result = _try_parse_suggestion_list(
-            "I cannot answer this question. There are no real feeds."
-        )
-        assert result is None
-
-    def test_returns_none_for_scalar(self) -> None:
-        # LLM returned a number, not a list. The whole-text parse
-        # succeeds but the result is not a list; the bracket
-        # extractor finds nothing; return None.
-        result = _try_parse_suggestion_list("5")
-        assert result is None
-
-    def test_returns_none_for_unbalanced_cot(self) -> None:
-        # CoT that mentions a [ but never closes it. The
-        # bracket-extractor should return None, not loop.
-        result = _try_parse_suggestion_list(
-            "Reasoning: I'm looking for feeds [unclosed here"
-        )
-        assert result is None
-
-    def test_handles_multiple_arrays_in_cot_picks_list_of_dicts(self) -> None:
-        # The framing.py parser stops at the first balanced
-        # array, which works for it (one list of strings per
-        # call). feed_discovery wants a list of dicts, so the
-        # parser here scans ALL balanced arrays and picks the
-        # first one whose contents are dicts — the CoT's
-        # bracketed strings (a list of strings) is ignored.
-        text = (
-            'Let me think: ["first thought", "second"] '
-            "Then the answer: "
-            '[{"name": "x", "url": "https://x", "blurb": "y"}]'
-        )
-        result = _try_parse_suggestion_list(text)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["name"] == "x"
+def test_slugify_lowercases_and_replaces_punctuation():
+    assert _slugify("The Verge Tech News!") == "the_verge_tech_news"
 
 
-# --- Integration: full _ask_llm_for_suggestions with mock --------------
-
-class TestAskLlmForSuggestions:
-    """Verify the full code path: provider returns text, _ask_llm
-    parses it, returns the right tuple. The provider is mocked
-    at the LLM provider-chain level so we don't need any
-    real LLM."""
-
-    def test_cot_blurb_parses_via_bracket_extractor(self) -> None:
-        # End-to-end: a thinking model returns CoT + JSON array.
-        # The provider is mocked to return that as its text.
-        from unittest.mock import AsyncMock, patch
-        from app.feed_discovery import _ask_llm_for_suggestions
-
-        cot_response = (
-            "Let me think about this. The user is in the tech "
-            "category. I should suggest RSS feeds that cover "
-            "technology news.\n\n"
-            'The answer is [{"name": "ars_technica", "url": "https://feeds.arstechnica.com/arstechnica/index", "blurb": "Technology news and analysis"}]'
-        )
-
-        # Mock provider: .complete returns the CoT text, .name is
-        # the label, model is on _THINKING_MODELS so the
-        # OllamaCloudProvider fallback would have already
-        # substituted the thinking field. We're testing the
-        # _ask_llm_for_suggestions parser, not the provider
-        # substitution — so just return the final content
-        # directly here.
-        mock_provider = AsyncMock()
-        mock_provider.name = "mock"
-        mock_provider.complete = AsyncMock(return_value=cot_response)
-
-        with patch("app.feed_discovery.router") as mock_router:
-            mock_router.providers_for = lambda task: [mock_provider]
-            suggestions, note = asyncio_run(
-                _ask_llm_for_suggestions(
-                    category="tech",
-                    context="user just added a feed",
-                    exclude_names=set(),
-                    limit=5,
-                )
-            )
-
-        assert note is None
-        assert len(suggestions) == 1
-        assert suggestions[0]["name"] == "ars_technica"
-        assert "arstechnica" in suggestions[0]["url"]
+def test_slugify_strips_leading_trailing_underscores():
+    assert _slugify("  --hello world--  ") == "hello_world"
 
 
-def asyncio_run(coro):
-    """Helper for the single async integration test."""
-    import asyncio
-    return asyncio.run(coro)
+def test_slugify_empty_input_returns_empty():
+    assert _slugify("   ") == ""
+
+
+def test_slugify_truncates_to_120_chars():
+    assert len(_slugify("a" * 200)) == 120
+
+
+# --- _strip_code_fence ---------------------------------------------------
+
+
+def test_strip_code_fence_removes_json_fence():
+    text = '```json\n[{"name": "x"}]\n```'
+    assert _strip_code_fence(text) == '[{"name": "x"}]'
+
+
+def test_strip_code_fence_removes_bare_fence():
+    text = '```\n[1, 2, 3]\n```'
+    assert _strip_code_fence(text) == "[1, 2, 3]"
+
+
+def test_strip_code_fence_passthrough_when_no_fence():
+    assert _strip_code_fence('[{"name": "x"}]') == '[{"name": "x"}]'
+
+
+# --- recent_llm_candidate_count ----------------------------------------------
+
+
+async def test_recent_llm_candidate_count_only_counts_llm_source(db_session):
+    db_session.add_all([
+        FeedRecommendationCandidate(
+            name="editorial_one", category="tech", url="https://example.com/e1",
+            blurb="b", source="editorial",
+        ),
+        FeedRecommendationCandidate(
+            name="llm_one", category="tech", url="https://example.com/l1",
+            blurb="b", source="llm",
+        ),
+    ])
+    await db_session.commit()
+
+    assert await recent_llm_candidate_count(db_session, "tech") == 1
+
+
+async def test_recent_llm_candidate_count_scoped_to_category(db_session):
+    db_session.add_all([
+        FeedRecommendationCandidate(
+            name="llm_tech", category="tech", url="https://example.com/lt",
+            blurb="b", source="llm",
+        ),
+        FeedRecommendationCandidate(
+            name="llm_news", category="news", url="https://example.com/ln",
+            blurb="b", source="llm",
+        ),
+    ])
+    await db_session.commit()
+
+    assert await recent_llm_candidate_count(db_session, "tech") == 1
+    assert await recent_llm_candidate_count(db_session, "news") == 1
+    assert await recent_llm_candidate_count(db_session, "science") == 0
+
+
+async def test_recent_llm_candidate_count_excludes_old_rows(db_session):
+    old = FeedRecommendationCandidate(
+        name="llm_old", category="tech", url="https://example.com/lo",
+        blurb="b", source="llm",
+    )
+    db_session.add(old)
+    await db_session.commit()
+    await db_session.refresh(old)
+    # Backdate past the 7-day lookback window the function uses.
+    old.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)
+    db_session.add(old)
+    await db_session.commit()
+
+    assert await recent_llm_candidate_count(db_session, "tech") == 0
+
+
+# --- discover_candidates: no provider configured -----------------------------
+
+
+async def test_discover_candidates_returns_empty_without_crashing(db_session):
+    # Test env has no cloud LLM API keys set, so this exercises the
+    # real "every provider failed / unusable" path rather than a mock
+    # (local Ollama is still attempted per the router's unconditional
+    # fallback, but isn't reachable in this sandbox).
+    created, note = await discover_candidates(
+        db_session, category="tech", context="test context"
+    )
+    assert created == []
+    assert note
+
+
+# --- POST /api/feed-recommendations/discover ---------------------------------
+
+
+async def test_discover_route_rejects_empty_category(app_client):
+    resp = await app_client.post(
+        "/api/feed-recommendations/discover", json={"category": "   "}
+    )
+    assert resp.status_code == 422
+
+
+async def test_discover_route_uses_named_category(app_client):
+    resp = await app_client.post(
+        "/api/feed-recommendations/discover", json={"category": "science"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["category"] == "science"
+    assert isinstance(body["added"], int)
+
+
+async def test_discover_route_reports_a_note_when_added_is_zero(app_client):
+    # Test env has no cloud LLM API keys set, so the env chain falls
+    # through to local Ollama (always attempted, per the router's
+    # design) — which isn't reachable in this sandbox, so every call
+    # fails with a transport error. ``added`` is 0 here for a
+    # specific, actionable reason, not "the LLM ran and found nothing
+    # new" — the response needs to say so or "find more feeds" looks
+    # silently broken rather than unconfigured/unreachable.
+    resp = await app_client.post(
+        "/api/feed-recommendations/discover", json={"category": "tech"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["added"] == 0
+    assert body["note"]
+
+
+async def test_discover_route_falls_back_to_default_category_cold_start(app_client):
+    # No category given, no interaction history in this test's DB
+    # state — falls back to the fixed cold-start default.
+    resp = await app_client.post("/api/feed-recommendations/discover", json={})
+    assert resp.status_code == 200
+    assert resp.json()["category"] == "tech"
+
+
+# --- POST /api/sources: auto-discovery trigger doesn't break Add -------------
+
+
+async def test_create_source_still_succeeds_with_auto_discovery_wired_up(app_client):
+    resp = await app_client.post(
+        "/api/sources",
+        json={
+            "name": "auto_discovery_probe",
+            "type": "rss",
+            "category": "tech",
+            "url": "https://example.com/auto_discovery_probe.xml",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "auto_discovery_probe"

@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app import assets
-from app.config import _readable_env_file, settings
+from app.config import settings
 from app.embeddings import close_embedder, embedder
 from app.notify import build_notifier
 from app import reddit_client
@@ -47,67 +47,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("popping")
-
-
-def _warn_on_duplicate_env_keys(path: "Path") -> None:
-    """Scan ``path`` (the env file pydantic-settings is reading)
-    for keys that appear more than once and warn on each
-    duplicate. The OS-level ``os.environ`` set semantics make
-    the LAST occurrence win, so a duplicate with conflicting
-    values is a silent override — exactly the failure mode
-    that produced the ``REDDIT_DIRECT_DISABLED=true`` shadowing
-    a ``false`` and stopping the Reddit direct-Atom fetches.
-
-    Line-numbered, one log per key, so the operator can fix
-    the .env in seconds. Confirmed-value (different effective
-    values across the duplicates) is escalated to WARNING;
-    same-value duplicates are noted at INFO so a clean
-    duplicate after a config-rearrange still shows up in the
-    log without being a real problem.
-    """
-    seen: dict[str, tuple[int, str]] = {}
-    duplicates: dict[str, list[tuple[int, str]]] = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line_no, raw in enumerate(f, start=1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip()
-            # Strip matching single or double quotes from
-            # the value so ``KEY="abc"`` and ``KEY=abc``
-            # compare equal (pydantic-settings itself
-            # strips quotes on read).
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-                value = value[1:-1]
-            if key in seen:
-                duplicates.setdefault(key, []).append((line_no, value))
-            else:
-                seen[key] = (line_no, value)
-    for key, occurrences in duplicates.items():
-        first_line, first_value = seen[key]
-        all_occurrences = [(first_line, first_value)] + occurrences
-        values = [v for _, v in all_occurrences]
-        conflicting = len(set(values)) > 1
-        if conflicting:
-            line_list = ", ".join(
-                f"line {ln}={v!r}" for ln, v in all_occurrences
-            )
-            logger.warning(
-                "env file: %s appears %d times with CONFLICTING values "
-                "(%s); the LAST occurrence wins (effective=%r). "
-                "Fix the duplicate in %s.",
-                key, len(all_occurrences), line_list, values[-1], path,
-            )
-        else:
-            logger.info(
-                "env file: %s appears %d times with the same value "
-                "(%r) — harmless, but consider deduplicating",
-                key, len(all_occurrences), values[0],
-            )
 
 
 @asynccontextmanager
@@ -137,23 +76,6 @@ async def lifespan(app: FastAPI):
     # because (a) the bearer token shouldn't leak to the thumbnail
     # fetcher, (b) per-call timeouts diverge (Hydra wants short).
     reddit_client.init_client()
-    # Scan the env file for duplicate keys. pydantic-settings
-    # processes the file line-by-line and ``os.environ`` set
-    # semantics take the last write, so a duplicate key with
-    # conflicting values (e.g. ``REDDIT_DIRECT_DISABLED=false``
-    # followed later by ``REDDIT_DIRECT_DISABLED=true``) silently
-    # behaves as if only the last one was set, with no warning.
-    # That's bitten us before (Reddit fetches stopping because
-    # a stale "true" won). Loud, line-numbered log so the
-    # operator can find and fix the duplicate in 5 seconds.
-    if _readable_env_file is not None:
-        try:
-            _warn_on_duplicate_env_keys(_readable_env_file)
-        except Exception:
-            logger.exception(
-                "env file: duplicate-key scan failed for %s",
-                _readable_env_file,
-            )
     # Build the Redis pool up-front so the first request doesn't pay
     # the connect round-trip. ``init_redis`` is a no-op if the URL
     # is unset (pure file-system deploy), so we don't gate it on
@@ -229,37 +151,9 @@ app = FastAPI(
 # via Vite's dev proxy). The dev proxy makes /api/* same-origin so cookies
 # flow naturally; with `credentials` set on the fetch wrapper, the
 # session cookie rides on every API call.
-#
-# Lock ``allow_origins`` to the configured public URL (when set) so a
-# misconfigured reverse-proxy deploy — e.g. a Caddy in front with the
-# backend on a different port — doesn't fail the cookie flow silently
-# with a 401 the user can't debug. The previous ``["*"]`` was technically
-# correct with ``credentials=False`` but failed every time the same-origin
-# assumption broke in practice. The fallback to ``["*"]`` is preserved
-# for the dev case where no public_url is set (e.g. a fresh local clone).
-#
-# ``settings.extra_cors_origins`` adds additional origins on top of
-# ``public_url`` — typically used for LAN access on a different
-# host/port. Comma-separated, treated as literal origins (no
-# wildcards). Empty by default.
-_public_cors_origins: list[str] = []
-if settings.public_url:
-    _public_cors_origins.append(settings.public_url.rstrip("/"))
-if settings.extra_cors_origins:
-    for origin in settings.extra_cors_origins.split(","):
-        origin = origin.strip()
-        if origin and origin not in _public_cors_origins:
-            _public_cors_origins.append(origin)
-if not _public_cors_origins:
-    # No public_url AND no extra_cors_origins — fall back to the
-    # dev wildcard so a fresh local clone (no env config at all)
-    # still works. A misconfiguration here is "CORS errors on the
-    # user's browser with no clear cause"; the env vars are documented
-    # in the README so this is the safe default.
-    _public_cors_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_public_cors_origins,
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

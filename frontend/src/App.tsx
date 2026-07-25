@@ -19,10 +19,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type Brief, type CurrentUser, type Entry, type Health, type Source } from './api'
 import { BriefCard } from './components/BriefCard'
-import { ColumnGrid, type ColumnGridHandlers } from './components/ColumnGrid'
-import { DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
-import { ForYouSection, type ForYouHandlers } from './components/ForYouSection'
-import { MobileColumnView, BRIEF_TAB_INDEX } from './components/MobileColumnView'
+import { Card } from './components/Card'
+import { Column, DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
+import { Drawer } from './components/Drawer'
 import { FramingWatch } from './components/FramingWatch'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
@@ -32,21 +31,7 @@ import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { Wallpaper } from './components/Wallpaper'
 import { SkeletonGrid } from './components/Skeleton'
-
-// Lazy-loaded modals. These are the two biggest components in
-// the app (Settings is 1600+ lines, Drawer is 600+) but the
-// user only opens them on explicit action — keeping them out
-// of the initial bundle cuts the first-paint JS payload. The
-// fallback is null (the modals render nothing when closed, so
-// Suspense shows nothing while the chunk loads on first open).
-//
-// NOT lazy: BriefCard (always visible on desktop) and
-// FramingWatch (rendered in 'all' view). Lazy-loading them
-// would mean a chunk fetch + Suspense fallback on every
-// initial page load — strictly worse than the savings.
-const Settings = React.lazy(() => import('./components/Settings'))
-const Drawer = React.lazy(() => import('./components/Drawer'))
-type SettingsTab = import('./components/Settings').SettingsTab
+import { Settings, type SettingsTab } from './components/Settings'
 import { recordImmediate } from './lib/interactions'
 // Per-user server-backed preferences. Replaces the 8 localStorage
 // keys the dashboard used to write (readEntries, lastViewed,
@@ -134,14 +119,13 @@ function loadMobileCol(): number {
 const MAX_PER_COLUMN = 200
 
 
-// Per-column Fresh/History section collapse state. Imported
-// from ``lib/types`` (canonical location — see the docstring
-// there for the dedup rationale). The shape is forgiving on
-// read: a missing column name, a missing field, or a
-// non-boolean value silently falls back to "expanded" so a
-// future shape change can't strand the user with
+// Per-column Fresh/History section collapse state. The
+// shape is forgiving on read: a missing column name, a
+// missing field, or a non-boolean value silently falls back to
+// "expanded" so a future shape change can't strand the user with
 // permanently-collapsed sections.
-import type { ColumnSectionsValue } from './lib/types'
+type SectionCollapse = { newCollapsed: boolean; historyCollapsed: boolean }
+type ColumnSections = Record<string, SectionCollapse>
 
 // User-saved filter preset. Captures a complete dashboard
 // view: which sources are filtered, and the per-column
@@ -523,10 +507,6 @@ export function App() {
   const readEntries = prefs.state.readEntries
   const lastViewed = prefs.state.lastViewed
   const columnPrefs = prefs.state.columnPrefs as Record<string, ColumnPrefs>
-  // ``ColumnSections`` here is the per-column map (Record), not
-  // the per-column value (ColumnSectionsValue, the imported
-  // single-column shape). The Record wraps the per-column value.
-  type ColumnSections = Record<string, ColumnSectionsValue>
   const columnSections = prefs.state.columnSections as ColumnSections
   const hiddenEntries = prefs.state.hiddenEntries
   const starredEntries = prefs.state.starredEntries
@@ -664,49 +644,35 @@ export function App() {
   const columnRefs = useRef<Map<string, HTMLElement | null>>(new Map())
   const cardRefs = useRef<Map<number, HTMLElement | null>>(new Map())
 
-  // Derived source maps. Previously four separate ``useMemo`` calls
-  // (``sourcesByName``, ``sourcesById``, ``categoriesBySourceId``,
-  // ``faviconBySourceId``) each iterating the same ``sources`` array.
-  // Consolidated into a single pass — one useMemo, one iteration.
-  // ``byId`` carries the full Source row so the render path can
-  // resolve a source by id without a follow-up name→row lookup
-  // (the previous ``sourcesById`` only carried the name, forcing
-  // every per-entry render to do a second map lookup for the
-  // category — see ``byCategory`` below). The individual
-  // ``sourcesByName`` / ``sourcesById`` / ``categoriesBySourceId``
-  // / ``faviconBySourceId`` names are re-exported as direct
-  // references for downstream components that destructure them
-  // (Column, SearchResults, Card) — no extra memo, no extra iteration.
-  const sourceMaps = useMemo(() => {
-    const byId = new Map<number, Source>()
-    const byName = new Map<string, Source>()
-    const categoryById = new Map<number, string | null>()
-    const faviconById = new Map<number, string | null>()
-    for (const s of sources) {
-      byId.set(s.id, s)
-      byName.set(s.name, s)
-      categoryById.set(s.id, s.category ?? null)
-      faviconById.set(s.id, s.favicon_path ?? null)
-    }
-    return { byId, byName, categoryById, faviconById }
-  }, [sources])
-  // Back-compat aliases — same shape as the previous individual
-  // useMemo results, but pointing at the consolidated maps. Zero
-  // extra iterations; these are just const references.
-  // ``sourcesById`` is name-only (consumers do ``sourcesById.get(id)``
-  // to get a name string); build that one tiny map inline.
-  const sourcesById = useMemo(
-    () => new Map(sources.map((s) => [s.id, s.name] as [number, string])),
+  // sourcesByName: Map<source_name, Source>. Lets us resolve an
+  // entry's category in O(1) instead of the previous O(N) ``sources.find``.
+  const sourcesByName = useMemo(
+    () => new Map(sources.map((s) => [s.name, s])),
     [sources],
   )
-  // ``categoriesBySourceId`` and ``faviconBySourceId`` are direct
-  // references to the consolidated maps — same shape as before
-  // (Map<number, string|null>), zero extra iterations.
-  const categoriesBySourceId = sourceMaps.categoryById
-  const faviconBySourceId = sourceMaps.faviconById
-  // ``sourcesByName`` was a Map<name, Source> before; the
-  // consolidated sourceMaps.byName is the same thing.
-  const sourcesByName = sourceMaps.byName
+  const sourcesById = useMemo(
+    () => new Map(sources.map((s) => [s.id, s.name])),
+    [sources],
+  )
+  // Same key as ``sourcesById`` but the value is the source's
+  // category. Passed down to Column → Card so each card can render
+  // its category-colored left stripe. Optional because older source
+  // rows (pre-Phase-5) have no category in the DB until they're
+  // touched — we just skip the stripe for those.
+  const categoriesBySourceId = useMemo(
+    () => new Map(sources.map((s) => [s.id, s.category])),
+    [sources],
+  )
+  // Same shape, favicon path this time — lets Card fall back to the
+  // source's icon as a thumbnail placeholder when the entry itself
+  // has no photo (see Card.tsx's ThumbnailFallback). NULL is a valid
+  // value (favicon hasn't been fetched yet), distinct from "key
+  // absent" (source not found at all) — Card's ``.get()`` treats
+  // both the same way (render the letter-only fallback).
+  const faviconBySourceId = useMemo(
+    () => new Map(sources.map((s) => [s.id, s.favicon_path])),
+    [sources],
+  )
 
   // Build a Set for O(1) hidden-entry lookup. We recompute on
   // every render where ``hiddenEntries`` changes (the underlying
@@ -726,14 +692,15 @@ export function App() {
   const byCategory = useMemo(() => {
     const grouped = new Map<string, Entry[]>()
     for (const e of visibleEntries) {
-      const src = sourceMaps.byId.get(e.source_id)
+      const sourceName = sourcesById.get(e.source_id)
+      const src = sourceName != null ? sourcesByName.get(sourceName) : undefined
       const cat = src?.category ?? 'other'
       const arr = grouped.get(cat) ?? []
       arr.push(e)
       grouped.set(cat, arr)
     }
     return grouped
-  }, [visibleEntries, sourceMaps])
+  }, [visibleEntries, sourcesByName, sourcesById])
 
   const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
   const visibleForYou = useMemo(
@@ -1069,12 +1036,6 @@ export function App() {
         for (const id of newSeen) merged.add(id)
         seenEntryIdsRef.current = merged
       }
-      // The ref alone wouldn't trigger a re-render — ``newCountByColumn``
-      // reads ``seenEntryIdsRef.current`` (line 918) but the useMemo's
-      // deps don't include the ref, so the "+N new" chip would stay
-      // stale until the next state change elsewhere. Bump the same
-      // timeTick the 30s poller bumps to force the re-render.
-      setTimeTick((n) => n + 1)
       hiddenAtRef.current = null
       setEntries(e)
       setSources(s)
@@ -1462,7 +1423,6 @@ export function App() {
         const merged = new Set(seenEntryIdsRef.current)
         for (const id of ids) merged.delete(id)
         seenEntryIdsRef.current = merged
-        setTimeTick((n) => n + 1)
       }
     },
     [setReadEntries, clearLastViewed],
@@ -1903,7 +1863,6 @@ export function App() {
         const merged = new Set(seenEntryIdsRef.current)
         for (const e of col.entries) merged.add(e.id)
         seenEntryIdsRef.current = merged
-        setTimeTick((n) => n + 1)
       }
     }
     // Surface the action as an Undo-able toast.
@@ -1996,7 +1955,7 @@ export function App() {
   const setColumnSection = (columnName: string, key: 'new' | 'history') => {
     const cur = columnSectionsRef.current[columnName] ?? { newCollapsed: false, historyCollapsed: false }
     const flag = key === 'new' ? 'newCollapsed' : 'historyCollapsed'
-    const next: ColumnSectionsValue = { ...cur, [flag]: !cur[flag] }
+    const next: SectionCollapse = { ...cur, [flag]: !cur[flag] }
     if (!next.newCollapsed && !next.historyCollapsed) {
       // Both bits are back to false. Persist an empty
       // object so the loader treats the column as
@@ -2097,229 +2056,6 @@ export function App() {
   }
 
   const showSearchView = searchQuery.trim().length > 0
-
-  // Stable bundle of callbacks the ForYouSection consumes. Without
-  // this, every App-level state change (health poller, time tick,
-  // search query) would re-allocate the callbacks and defeat the
-  // React.memo on ForYouSection. The functions are stable
-  // themselves (defined inline once via useCallback upstream
-  // where applicable, or stable references in this module), so
-  // memoizing the bundle by [function refs] is enough to keep
-  // its identity stable across renders.
-  const forYouHandlers = useMemo<ForYouHandlers>(
-    () => ({
-      markEntryRead,
-      unmarkEntryRead,
-      hideEntry,
-      restoreHiddenEntry,
-      toggleHideEntry,
-      toggleStarEntry,
-      setEntryVote,
-      toggleSummary,
-      // Toast wrappers. The toast library lives in App; the
-      // section calls into the wrapper to fire the "Marked as
-      // read" / "Entry hidden" / "Saved for later" toasts.
-      toastEntryMarked: (colName, entryId) => {
-        toast('Marked as read', {
-          kind: 'info',
-          action: { label: 'Undo', onClick: () => unmarkEntryRead(colName, entryId) },
-        })
-      },
-      toastEntryHidden: (entryId) => {
-        toast('Entry hidden.', {
-          kind: 'info',
-          action: { label: 'Undo', onClick: () => restoreHiddenEntry(entryId) },
-        })
-      },
-      toastEntryStarred: (entryId, wasStarred) => {
-        toast(
-          wasStarred
-            ? 'Removed from Saved.'
-            : 'Saved for later — see the Saved column.',
-          {
-            kind: 'info',
-            action: { label: 'Undo', onClick: () => toggleStarEntry(entryId) },
-          },
-        )
-      },
-    }),
-    [
-      markEntryRead,
-      unmarkEntryRead,
-      hideEntry,
-      restoreHiddenEntry,
-      toggleHideEntry,
-      toggleStarEntry,
-      setEntryVote,
-      toggleSummary,
-    ],
-  )
-
-  // Stable callback bundle for the column grid. Same pattern
-  // as ``forYouHandlers`` above — the bundle identity is what
-  // keeps the React.memo on ColumnGrid from re-running on every
-  // App-level state change. The 8 underlying functions are
-  // stable references in this module; useMemo on the array
-  // is enough.
-  const columnGridHandlers = useMemo<ColumnGridHandlers>(
-    () => ({
-      refresh,
-      markColumnRead,
-      markEntryRead,
-      toggleHideEntry,
-      hideEntry,
-      restoreHiddenEntry,
-      toggleStarEntry,
-      setEntryVote,
-      toggleSummary,
-      setColumnSection,
-      setPrefsFor,
-      unmarkEntryRead,
-      toastEntryMarked: (colName, entryId) => {
-        toast('Marked as read', {
-          kind: 'info',
-          action: { label: 'Undo', onClick: () => unmarkEntryRead(colName, entryId) },
-        })
-      },
-      toastEntryHidden: (entryId) => {
-        toast('Entry hidden.', {
-          kind: 'info',
-          action: { label: 'Undo', onClick: () => restoreHiddenEntry(entryId) },
-        })
-      },
-      toastEntryStarred: (entryId, wasStarred) => {
-        toast(
-          wasStarred
-            ? 'Removed from Saved.'
-            : 'Saved for later — see the Saved column.',
-          {
-            kind: 'info',
-            action: { label: 'Undo', onClick: () => toggleStarEntry(entryId) },
-          },
-        )
-      },
-    }),
-    [
-      refresh,
-      markColumnRead,
-      markEntryRead,
-      toggleHideEntry,
-      hideEntry,
-      restoreHiddenEntry,
-      toggleStarEntry,
-      setEntryVote,
-      toggleSummary,
-      setColumnSection,
-      setPrefsFor,
-      unmarkEntryRead,
-    ],
-  )
-
-  // Stable callback bundle for the mobile column view. Same
-  // pattern as ``forYouHandlers`` and ``columnGridHandlers``
-  // above. The mobile view has a slightly larger prop surface
-  // than the desktop grid (it also includes the brief card
-  // props, the mobileCol state, and the setMobileCol setter),
-  // but the same shape: useMemo on a function ref array keeps
-  // the bundle identity stable so the React.memo on
-  // MobileColumnView actually skips re-renders.
-  const mobileHandlers = useMemo<MobileColumnHandlers>(
-    () => ({
-      mobileCol,
-      setMobileCol,
-      columns,
-      newCountByColumn,
-      sectionsByColumn,
-      columnPrefs,
-      sourcesById,
-      categoriesBySourceId,
-      faviconBySourceId,
-      hiddenSet,
-      starredSet,
-      votedMap,
-      expandedSummaries,
-      sectionsCollapsedFor,
-      selectedColumnIndex,
-      selectedCardId,
-      cardRefs,
-      brief,
-      onBriefChange: setBrief,
-      briefTone,
-      onBriefToneChange: setBriefTone,
-      triggerBriefGenerate,
-      refresh,
-      markColumnRead,
-      markEntryRead,
-      toggleHideEntry,
-      hideEntry,
-      restoreHiddenEntry,
-      toggleStarEntry,
-      setEntryVote,
-      toggleSummary,
-      setColumnSection,
-      setPrefsFor,
-      unmarkEntryRead,
-      toastEntryMarked: (colName, entryId) => {
-        toast('Marked as read', {
-          kind: 'info',
-          action: { label: 'Undo', onClick: () => unmarkEntryRead(colName, entryId) },
-        })
-      },
-      toastEntryHidden: (entryId) => {
-        toast('Entry hidden.', {
-          kind: 'info',
-          action: { label: 'Undo', onClick: () => restoreHiddenEntry(entryId) },
-        })
-      },
-      toastEntryStarred: (entryId, wasStarred) => {
-        toast(
-          wasStarred
-            ? 'Removed from Saved.'
-            : 'Saved for later — see the Saved column.',
-          {
-            kind: 'info',
-            action: { label: 'Undo', onClick: () => toggleStarEntry(entryId) },
-          },
-        )
-      },
-    }),
-    [
-      mobileCol,
-      setMobileCol,
-      columns,
-      newCountByColumn,
-      sectionsByColumn,
-      columnPrefs,
-      sourcesById,
-      categoriesBySourceId,
-      faviconBySourceId,
-      hiddenSet,
-      starredSet,
-      votedMap,
-      expandedSummaries,
-      sectionsCollapsedFor,
-      selectedColumnIndex,
-      selectedCardId,
-      cardRefs,
-      brief,
-      setBrief,
-      briefTone,
-      setBriefTone,
-      triggerBriefGenerate,
-      refresh,
-      markColumnRead,
-      markEntryRead,
-      toggleHideEntry,
-      hideEntry,
-      restoreHiddenEntry,
-      toggleStarEntry,
-      setEntryVote,
-      toggleSummary,
-      setColumnSection,
-      setPrefsFor,
-      unmarkEntryRead,
-    ],
-  )
 
   return (
     <div
@@ -2665,47 +2401,323 @@ export function App() {
                  'multisub' view because the multi-sub column is the
                  whole dashboard there. */}
           {viewKind === 'all' && visibleForYou.length > 0 && (
-            <ForYouSection
-              visibleForYou={visibleForYou}
-              sourcesById={sourcesById}
-              categoriesBySourceId={categoriesBySourceId}
-              faviconBySourceId={faviconBySourceId}
-              globalReadIds={globalReadIds}
-              hiddenSet={hiddenSet}
-              starredSet={starredSet}
-              votedMap={votedMap}
-              expandedSummaries={expandedSummaries}
-              handlers={forYouHandlers}
-            />
+            <section className="hidden md:block px-4 pt-4 pb-3 border-b border-hairline">
+              <header className="flex items-center justify-between mb-2">
+                <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
+                  For You
+                </h2>
+                <span className="text-ios-caption text-label-tertiary">
+                  {visibleForYou.length} {visibleForYou.length === 1 ? 'entry' : 'entries'}
+                </span>
+              </header>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {visibleForYou.map((e) => {
+                  // Per-card engagement props. The For You
+                  // row was previously read-only — no
+                  // mark-read, no hide, no star. The user
+                  // could see the personal feed but
+                  // couldn't engage with it. Now every
+                  // card has the full set of per-card
+                  // actions wired to App-level callbacks
+                  // so the user can mark-read, hide, or
+                  // star a For You card the same way
+                  // they would in a category column.
+                  //
+                  // ``unread`` reflects ``globalReadIds``, the
+                  // union of every column's manual read-set —
+                  // so marking this card read here also dims
+                  // it in its category column, and marking it
+                  // read there dims it here too. The per-column
+                  // lastViewed isn't used here (the For You row
+                  // has no "mark all read" button).
+                  //
+                  // ``selected`` / ``onActivate`` /
+                  // ``cardRef`` are not passed because
+                  // keyboard nav is per-column, not
+                  // per-row, and the For You row is
+                  // not a "column" the user can scroll
+                  // into.
+                  const isRead = globalReadIds.has(e.id)
+                  return (
+                    <Card
+                      key={e.id}
+                      entry={e}
+                      sourceName={sourcesById.get(e.source_id)}
+                      sourceFaviconPath={faviconBySourceId.get(e.source_id)}
+                      category={categoriesBySourceId.get(e.source_id)}
+                      unread={!isRead}
+                      expanded={expandedSummaries.has(e.id)}
+                      onToggleSummary={() => toggleSummary(e.id)}
+                      onMarkRead={() => {
+                        markEntryRead('For You', e.id)
+                        toast('Marked as read', {
+                          kind: 'info',
+                          action: {
+                            label: 'Undo',
+                            onClick: () => unmarkEntryRead('For You', e.id),
+                          },
+                        })
+                      }}
+                      onHide={() => {
+                        hideEntry(e.id)
+                        toast('Entry hidden.', {
+                          kind: 'info',
+                          action: {
+                            label: 'Undo',
+                            onClick: () => restoreHiddenEntry(e.id),
+                          },
+                        })
+                      }}
+                      onHideToggle={() => toggleHideEntry('For You', e.id)}
+                      hidden={hiddenSet.has(e.id)}
+                      onStar={() => {
+                        const wasStarred = starredSet.has(e.id)
+                        toggleStarEntry(e.id)
+                        toast(
+                          wasStarred
+                            ? 'Removed from Saved.'
+                            : 'Saved for later — see the Saved column.',
+                          {
+                            kind: 'info',
+                            action: {
+                              label: 'Undo',
+                              onClick: () => toggleStarEntry(e.id),
+                            },
+                          },
+                        )
+                      }}
+                      starred={starredSet.has(e.id)}
+                      onVote={(dir) => setEntryVote(e.id, dir)}
+                      vote={votedMap.get(e.id) ?? null}
+                    />
+                  )
+                })}
+              </div>
+            </section>
           )}
           {viewKind === 'all' && <FramingWatch />}
-          <ColumnGrid
-            columns={columns}
-            viewKind={viewKind}
-            sourcesById={sourcesById}
-            categoriesBySourceId={categoriesBySourceId}
-            faviconBySourceId={faviconBySourceId}
-            sectionsByColumn={sectionsByColumn}
-            newCountByColumn={newCountByColumn}
-            columnPrefs={columnPrefs}
-            defaultPrefs={DEFAULT_PREFS}
-            hiddenSet={hiddenSet}
-            starredSet={starredSet}
-            votedMap={votedMap}
-            expandedSummaries={expandedSummaries}
-            selectedColumnIndex={selectedColumnIndex}
-            selectedCardId={selectedCardId}
-            cardRefs={cardRefs}
-            setColumnRef={setColumnRef}
-            sectionsCollapsedFor={sectionsCollapsedFor}
-            handlers={columnGridHandlers}
-          />
+          <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
+            {columns
+              .filter((col) => viewKind === 'multisub' || col.name !== 'For You')
+              .map((col, ci) => (
+                <div key={col.name} ref={setColumnRef(col.name)} className="contents">
+                  <Column
+                    name={col.name}
+                    sections={sectionsByColumn.get(col.name) ?? { new: [], history: [] }}
+                    sourcesById={sourcesById}
+                    newCount={newCountByColumn.get(col.name)}
+                    onRefresh={refresh}
+                    selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
+                    cardRefs={cardRefs}
+                    onMarkRead={() => markColumnRead(col.name)}
+                    onMarkEntryRead={(entryId) => {
+                      markEntryRead(col.name, entryId)
+                      toast('Marked as read', {
+                        kind: 'info',
+                        action: {
+                          label: 'Undo',
+                          onClick: () => unmarkEntryRead(col.name, entryId),
+                        },
+                      })
+                    }}
+                    onHideEntry={(entryId) => {
+                      hideEntry(entryId)
+                      toast('Entry hidden.', {
+                        kind: 'info',
+                        action: {
+                          label: 'Undo',
+                          onClick: () => restoreHiddenEntry(entryId),
+                        },
+                      })
+                    }}
+                    onHideToggle={(entryId) => toggleHideEntry(col.name, entryId)}
+                    hiddenSet={hiddenSet}
+                    onStarEntry={(entryId) => {
+                      const wasStarred = starredSet.has(entryId)
+                      toggleStarEntry(entryId)
+                      toast(
+                          wasStarred
+                            ? 'Removed from Saved.'
+                            : 'Saved for later — see the Saved column.',
+                          {
+                            kind: 'info',
+                            action: {
+                              label: 'Undo',
+                              onClick: () => toggleStarEntry(entryId),
+                            },
+                          },
+                        )
+                    }}
+                    starredSet={starredSet}
+                    onVoteEntry={setEntryVote}
+                    votedMap={votedMap}
+                    prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
+                    onPrefsChange={(next) => setPrefsFor(col.name, next)}
+                    totalCount={col.totalCount}
+                    categoriesBySourceId={categoriesBySourceId}
+                    faviconBySourceId={faviconBySourceId}
+                    expandedSummaries={expandedSummaries}
+                    onToggleSummary={toggleSummary}
+                    sectionsCollapsed={sectionsCollapsedFor(col.name)}
+                    onToggleSection={(key) => setColumnSection(col.name, key)}
+                  />
+                </div>
+              ))}
+          </main>
 
-          <MobileColumnView handlers={mobileHandlers} />
+          <main className="md:hidden flex-1 min-h-0 flex flex-col p-3">
+            {/* Tab bar. Replaces the old swipe-to-change-column
+                gesture — that gesture had no direction lock (any
+                60px-plus horizontal touch delta fired it, scroll
+                wobble included) and it collided with the new
+                per-card swipe actions in Card.tsx, which now own
+                the horizontal-drag gesture on mobile. Tabs are the
+                explicit, discoverable replacement; "Brief" is a tab
+                here (not inline above the column, like on desktop)
+                so it doesn't push the column below the fold on a
+                small screen. Horizontally scrollable — a source
+                list with 6+ categories won't fit every tab label on
+                a phone-width screen. */}
+            <div
+              role="tablist"
+              aria-label="dashboard sections"
+              className="shrink-0 flex gap-1.5 overflow-x-auto pb-2 -mx-1 px-1"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mobileCol === -1}
+                onClick={() => setMobileCol(-1)}
+                className={`shrink-0 rounded-full px-3 py-1.5 text-ios-caption font-medium whitespace-nowrap transition ${
+                  mobileCol === -1
+                    ? 'bg-accent text-white'
+                    : 'bg-bg-surface text-label-secondary active:bg-bg-elevated'
+                }`}
+              >
+                Brief
+              </button>
+              {columns.map((c, i) => {
+                const newCount = newCountByColumn.get(c.name)
+                return (
+                  // Navigation, not mark-read. Merely peeking at a
+                  // column shouldn't drop its "+N new" chip — that
+                  // violates the universal-inbox rule. The column
+                  // header (desktop) and the per-card ✓ button are
+                  // the explicit mark-read affordances.
+                  <button
+                    type="button"
+                    key={c.name}
+                    role="tab"
+                    aria-selected={i === mobileCol}
+                    onClick={() => setMobileCol(i)}
+                    className={`shrink-0 flex items-center gap-1 rounded-full px-3 py-1.5 text-ios-caption font-medium whitespace-nowrap transition ${
+                      i === mobileCol
+                        ? 'bg-accent text-white'
+                        : 'bg-bg-surface text-label-secondary active:bg-bg-elevated'
+                    }`}
+                  >
+                    {c.name}
+                    {!!newCount && (
+                      <span
+                        className={`rounded-full px-1.5 text-[10px] leading-4 font-semibold ${
+                          i === mobileCol ? 'bg-white/25 text-white' : 'bg-accent-soft text-accent'
+                        }`}
+                      >
+                        {newCount}
+                      </span>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="flex-1 min-h-0 overflow-y-auto">
+              {mobileCol === -1 ? (
+                <BriefCard
+                  brief={brief}
+                  onBriefChange={setBrief}
+                  tone={briefTone}
+                  onToneChange={setBriefTone}
+                  triggerGenerate={triggerBriefGenerate}
+                />
+              ) : (
+                <Column
+                  name={columns[mobileCol]?.name ?? ''}
+                  sections={
+                    sectionsByColumn.get(columns[mobileCol]?.name ?? '') ?? { new: [], history: [] }
+                  }
+                  sourcesById={sourcesById}
+                  newCount={newCountByColumn.get(columns[mobileCol]?.name ?? '')}
+                  onRefresh={refresh}
+                  selectedId={
+                    mobileCol === selectedColumnIndex ? selectedCardId ?? undefined : undefined
+                  }
+                  cardRefs={cardRefs}
+                  onMarkRead={() => markColumnRead(columns[mobileCol]?.name ?? '')}
+                  onMarkEntryRead={(entryId) => {
+                    const col = columns[mobileCol]?.name ?? ''
+                    markEntryRead(col, entryId)
+                    toast('Marked as read', {
+                      kind: 'info',
+                      action: {
+                        label: 'Undo',
+                        onClick: () => unmarkEntryRead(col, entryId),
+                      },
+                    })
+                  }}
+                  onHideEntry={(entryId) => {
+                    hideEntry(entryId)
+                    toast('Entry hidden.', {
+                      kind: 'info',
+                      action: {
+                        label: 'Undo',
+                        onClick: () => restoreHiddenEntry(entryId),
+                      },
+                    })
+                  }}
+                  onHideToggle={(entryId) => toggleHideEntry(columns[mobileCol]?.name ?? '', entryId)}
+                  hiddenSet={hiddenSet}
+                  onStarEntry={(entryId) => {
+                    const wasStarred = starredSet.has(entryId)
+                    toggleStarEntry(entryId)
+                    toast(
+                              wasStarred
+                                ? 'Removed from Saved.'
+                                : 'Saved for later — see the Saved column.',
+                              {
+                                kind: 'info',
+                                action: {
+                                  label: 'Undo',
+                                  onClick: () => toggleStarEntry(entryId),
+                                },
+                              },
+                            )
+                  }}
+                  starredSet={starredSet}
+                  onVoteEntry={setEntryVote}
+                  votedMap={votedMap}
+                  prefs={
+                    columns[mobileCol]
+                      ? columnPrefs[columns[mobileCol].name] ?? DEFAULT_PREFS
+                      : DEFAULT_PREFS
+                  }
+                  onPrefsChange={(next) =>
+                    columns[mobileCol] && setPrefsFor(columns[mobileCol].name, next)
+                  }
+                  totalCount={columns[mobileCol]?.totalCount}
+                  categoriesBySourceId={categoriesBySourceId}
+                  faviconBySourceId={faviconBySourceId}
+                  expandedSummaries={expandedSummaries}
+                  onToggleSummary={toggleSummary}
+                  sectionsCollapsed={sectionsCollapsedFor(columns[mobileCol]?.name ?? '')}
+                  onToggleSection={(key) => setColumnSection(columns[mobileCol]?.name ?? '', key)}
+                />
+              )}
+            </div>
+          </main>
         </>
       )}
 
-      <Suspense fallback={null}>
       <Drawer
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
@@ -2792,7 +2804,6 @@ export function App() {
           )
         }}
       />
-      </Suspense>
 
       <ShortcutsSheet
         open={shortcutsOpen}

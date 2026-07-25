@@ -48,7 +48,7 @@ import re
 from collections import defaultdict
 from typing import Optional
 
-from sqlalchemy import case, delete, func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -153,43 +153,18 @@ async def cluster_recent_entries(session: AsyncSession) -> dict:
     # Pairwise union-find. O(n^2) cosine comparisons — fine at the
     # entry counts a personal dashboard's 48h window produces (low
     # hundreds); would need a pgvector ANN index to scale further.
-    # The pairwise matrix is built with one numpy matmul instead of
-    # N^2 Python-level ``_cosine`` calls — ~100x faster at N=200.
-    import numpy as np
-    from app.scoring.personal import pairwise_cosine_matrix
-    embeddings = [r.embedding for r in rows]
-    sim = pairwise_cosine_matrix(embeddings)
-    if sim.shape[0] == 0:
-        return {"entries_considered": len(rows), "clusters": 0, "tone_calls": 0}
-    # Build a boolean mask of which (i,j) pairs are "similar enough AND
-    # in window" — the union-find consumes the upper triangle.
-    published = [r.published_at for r in rows]
-    window_delta = dt.timedelta(hours=window_hours)
     uf = _UnionFind([r.id for r in rows])
-    n = sim.shape[0]
-    # Vectorize the window check. ``np.abs(a - b) <= window_delta`` is
-    # elementwise on the (N, N) grid; in_window is the same shape.
-    if all(p is not None for p in published):
-        pub_arr = np.array([np.datetime64(p) for p in published], dtype="datetime64[ns]")
-        delta = np.abs(pub_arr[:, None] - pub_arr[None, :])
-        window_ns = np.timedelta64(int(window_delta.total_seconds() * 1e9), "ns")
-        in_window = delta <= window_ns
-    else:
-        # Any None published_at → fall back to per-pair Python check.
-        in_window = np.zeros((n, n), dtype=bool)
-        for i in range(n):
-            for j in range(i + 1, n):
-                a, b = published[i], published[j]
-                if a is None or b is None:
-                    continue
-                if abs(a - b) <= window_delta:
-                    in_window[i, j] = in_window[j, i] = True
-    # Threshold + window. The matrix is symmetric; only walk the
-    # upper triangle to avoid double-unioning.
-    iu = np.triu_indices(n, k=1)
-    similar = (sim[iu] >= threshold) & in_window[iu]
-    for ii, jj in zip(iu[0][similar], iu[1][similar]):
-        uf.union(rows[int(ii)].id, rows[int(jj)].id)
+    window_delta = dt.timedelta(hours=window_hours)
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a, b = rows[i], rows[j]
+            if a.published_at is None or b.published_at is None:
+                continue
+            if abs(a.published_at - b.published_at) > window_delta:
+                continue
+            sim = _cosine(a.embedding, b.embedding)
+            if sim is not None and sim >= threshold:
+                uf.union(a.id, b.id)
 
     groups: dict[int, list] = defaultdict(list)
     for r in rows:
@@ -437,47 +412,16 @@ async def _tag_untagged_clusters(session: AsyncSession) -> int:
     for r in rows:
         by_cluster[r.story_cluster_id].append(r)
 
-    # Fire one LLM call per cluster in parallel. Each call covers
-    # the entire cluster's untagged headlines in a single prompt;
-    # running clusters concurrently means a 5-cluster tick is
-    # ~5s (one slow LLM call) instead of ~25s (5 sequential
-    # round-trips). asyncio.gather() with return_exceptions=True
-    # so a single cluster's provider failure doesn't kill the
-    # rest of the batch. Bulk-tag per cluster (one UPDATE with
-    # CASE on Entry.id IN (member_ids)) instead of one UPDATE
-    # per member; single commit at the end.
-    import asyncio
-    cluster_titles: dict[int, list[str]] = {
-        cid: [m.title for m in members] for cid, members in by_cluster.items()
-    }
-    results = await asyncio.gather(
-        *(_classify_tones(titles) for titles in cluster_titles.values()),
-        return_exceptions=True,
-    )
-    tone_labels: dict[int, list[str]] = {}
-    for cid, result in zip(cluster_titles.keys(), results):
-        if isinstance(result, BaseException):
-            logger.warning("framing: tone tag for cluster %s raised: %s", cid, result)
-            continue
-        if result is not None:
-            tone_labels[cid] = result
-
-    calls = len(tone_labels)
-    if not tone_labels:
-        return 0
-
+    calls = 0
     for cluster_id, members in by_cluster.items():
-        labels = tone_labels.get(cluster_id)
+        titles = [m.title for m in members]
+        labels = await _classify_tones(titles)
+        calls += 1
         if labels is None:
             continue
-        member_ids = [m.id for m in members]
-        await session.execute(
-            update(Entry)
-            .where(Entry.id.in_(member_ids))
-            .values(framing_tone=case(
-                {member.id: label for member, label in zip(members, labels)},
-                value=Entry.framing_tone,
-            ))
-        )
-    await session.commit()
+        for member, label in zip(members, labels):
+            await session.execute(
+                update(Entry).where(Entry.id == member.id).values(framing_tone=label)
+            )
+        await session.commit()
     return calls

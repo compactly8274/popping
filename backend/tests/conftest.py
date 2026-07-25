@@ -68,40 +68,9 @@ async def _schema():
     run. Assumes the ``vector`` extension already exists in the target
     database (a one-time ``CREATE EXTENSION vector``, not something
     that needs to happen per test run).
-
-    Skips gracefully if Postgres isn't reachable. Tests that
-    don't need a DB (e.g. ``test_http_smoke.py`` with mocked
-    deps, ``test_url_safety.py`` with no app.* imports) can
-    still run in an environment without Postgres. The fixture
-    yields a no-op when the connection fails, and the per-test
-    ``_clean_tables`` fixture (below) is similarly a no-op.
     """
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    try:
-        # Engine is module-level; just probe it. engine is
-        # already configured with the POSTGRES_* env vars via
-        # the module's top-level execution.
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-    except Exception as exc:
-        # No DB. The pytest collection may still pass if
-        # other tests are marked skip-on-no-db, but for the
-        # DB-needing tests this is fatal — pytest's
-        # collection will surface the error and the test
-        # session ends. We log here so the operator knows.
-        import sys
-        print(
-            f"WARNING: tests/conftest._schema: Postgres unreachable ({exc!r}). "
-            "DB-needing tests will fail; pure-function tests can still run.",
-            file=sys.stderr,
-        )
-        # Yield anyway so the per-test fixture's truncate is
-        # also a no-op. Tests that need a real DB will fail
-        # in their own bodies (e.g. INSERTs against a closed
-        # pool); tests that don't will pass.
-        yield
-        return
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     yield
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
@@ -118,24 +87,11 @@ async def _clean_tables():
     connection than whatever a nested-transaction fixture would hand
     the test, so it wouldn't see uncommitted test data anyway. Truncate
     real, committed rows after the fact instead.
-
-    Skips gracefully if the schema fixture didn't manage to
-    connect (see ``_schema``). Tests that don't need a DB
-    (e.g. ``test_url_safety.py``, ``test_http_smoke.py`` with
-    mocked deps) shouldn't trigger DB connection attempts
-    here either.
     """
     yield
-    try:
-        async with engine.begin() as conn:
-            tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
-            await conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
-    except Exception as exc:
-        # No DB. The test didn't actually use one. Silent skip
-        # is the right behavior — the test that triggered
-        # this fixture is doing unit-level work.
-        import sys
-        print(f"DEBUG: _clean_tables: skip (no DB): {exc!r}", file=sys.stderr)
+    async with engine.begin() as conn:
+        tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
+        await conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
 
 
 @pytest_asyncio.fixture

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import html
 import re
 from typing import Optional
@@ -38,17 +37,6 @@ router = APIRouter(tags=["entries"])
 # unscoped ILIKE across millions of rows is a future footgun. 50 is
 # also enough that "search for X, scroll a page" feels responsive.
 _SEARCH_LIMIT_CAP = 50
-
-# Pre-ILIKE scan cap. The windowed subquery in the ``q`` branch
-# ranks every entry by recency and only ILIKEs the top
-# ``_SEARCH_INTERNAL_CAP`` of them. The trade is documented at the
-# call site: a very old entry that would have matched won't
-# surface in a deep result set, in exchange for the search
-# staying fast on multi-million-row tables. 5000 is well above
-# what a personal dashboard ever ingests; bump it only if a
-# user is searching across 6+ months of "this exact substring
-# appeared in an old story" cases.
-_SEARCH_INTERNAL_CAP = 5000
 
 # Per-card summary length cap. ~800 chars is ~3-4 lines in the
 # dashboard card with line-clamp-3, which is the right balance
@@ -221,33 +209,6 @@ async def list_entries(
         # make the backslash literal — see
         # https://www.postgresql.org/docs/current/functions-matching.html).
         pattern = f"%{_escape_like(q)}%"
-        # Cap the ILIKE scan at ``_SEARCH_INTERNAL_CAP`` rows so a
-        # common-substring query ("the", "a", ...) doesn't seq-scan
-        # the entire entries table. The pre-ILIKE cap is set via a
-        # windowed subquery: rank every row by recency, take the
-        # top ``_SEARCH_INTERNAL_CAP`` (so a multi-million-row
-        # table doesn't crawl), then ILIKE within that window.
-        # The user-visible ``limit`` is then applied to the
-        # post-ILIKE result set (the search-quality rows). This
-        # means a very old entry that would have matched won't
-        # surface in a deep result set — an acceptable trade
-        # for not making the user's "search for X" hang on a
-        # 10M-row table. The cap is per-request and bypasses
-        # the user-supplied ``limit`` (which becomes a clamp
-        # on the *returned* set).
-        rn = func.row_number().over(
-            order_by=Entry.published_at.desc().nullslast()
-        ).label("rn")
-        candidates = (
-            select(Entry.id.label("entry_id"), rn)
-            .where(Entry.published_at.isnot(None))
-            .subquery()
-        )
-        stmt = stmt.where(
-            Entry.id.in_(
-                select(candidates.c.entry_id).where(candidates.c.rn <= _SEARCH_INTERNAL_CAP)
-            )
-        )
         stmt = stmt.where(
             or_(
                 Entry.title.ilike(pattern, escape="\\"),
@@ -460,23 +421,8 @@ async def entry_summary_endpoint(
       - ``cached_summary == ""``     → asked before, no usable text
                                        (feed shipped nothing AND the
                                        article couldn't be fetched).
-                                       Return empty without retrying,
-                                       UNLESS the entry has been
-                                       re-ingested since the cache
-                                       write (see ``cached_summary_fetched_at``).
-      - ``cached_summary == "..."``  → asked before, return verbatim,
-                                       subject to the same staleness
-                                       check as the empty case.
-
-    Cache invalidation: a summary attempt older than
-    ``entry.fetched_at`` is considered stale. The entry has been
-    re-ingested (the source plugin fetched new data) since we
-    last tried to summarise it, so the old "asked but nothing
-    useful" or "got this text" answer is no longer trustworthy.
-    Re-run the summary path. ``cached_summary_fetched_at`` is
-    backfilled to ``fetched_at`` for already-cached rows in
-    migration 0021, so the staleness check is correct from the
-    moment the migration runs.
+                                       Return empty without retrying.
+      - ``cached_summary == "..."``  → asked before, return verbatim.
 
     Summary path (first that produces text wins):
       1. LLM summary of the article's own full text — fetch the
@@ -506,18 +452,8 @@ async def entry_summary_endpoint(
         # Cache hit. ``""`` means we already determined the source
         # shipped nothing usable — return that as ``summary=""`` so
         # the frontend can distinguish "no summary" from "summary
-        # loaded". BUT if the entry has been re-ingested since the
-        # cache write, the cached answer is stale (the source
-        # might now ship a summary it didn't before, or the URL
-        # might have changed). Treat as a miss in that case.
-        cache_is_fresh = (
-            row.cached_summary_fetched_at is None
-            or row.fetched_at is None
-            or row.cached_summary_fetched_at >= row.fetched_at
-        )
-        if cache_is_fresh:
-            return EntrySummaryOut(summary=row.cached_summary, cached=True)
-        # Otherwise fall through to re-run the summary path.
+        # loaded".
+        return EntrySummaryOut(summary=row.cached_summary, cached=True)
 
     final = ""
     if llm_router.providers_for("brief"):
@@ -534,7 +470,6 @@ async def entry_summary_endpoint(
     # next time. Without the persist, every chevron tap would
     # re-run the fetch / extract / LLM chain.
     row.cached_summary = final
-    row.cached_summary_fetched_at = dt.datetime.now(dt.timezone.utc)
     await session.commit()
 
     return EntrySummaryOut(summary=final, cached=False)

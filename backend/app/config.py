@@ -81,24 +81,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
 
     # --- LLM (phase 2+, listed here so the env file has one home) ----------
-    # Default ``host.docker.internal`` works on Mac/Windows Docker Desktop
-    # but not on Linux + custom networks (the network namespace the
-    # container runs in can't see the host). Set OLLAMA_BASE_URL
-    # explicitly to a routable address, or set
-    # OLLAMA_DISABLE_LOCAL_FALLBACK=true to drop the local Ollama
-    # candidate from the chain entirely (Cloud / Anthropic / OpenAI
-    # then become the only options).
     ollama_base_url: str = "http://host.docker.internal:11434"
     ollama_model_scoring: str = "llama3.1:8b"
     ollama_model_brief: str = "llama3.1:8b"
     ollama_model_embedding: str = "all-minilm"
-    # When true, never append the local Ollama fallback to the
-    # provider chain. Use when OLLAMA_CLOUD_API_KEY is set and
-    # the default ``host.docker.internal`` doesn't resolve (the
-    # Cloud provider will be the actual fallback instead of the
-    # dead local one — avoids the per-call transport error in
-    # the logs).
-    ollama_disable_local_fallback: bool = False
 
     # Ollama Cloud (https://ollama.com) — paid SaaS that fronts the same
     # /api/generate endpoint as local Ollama. Select via OLLAMA_CLOUD_API_KEY;
@@ -172,14 +158,6 @@ class Settings(BaseSettings):
     oidc_client_id: str = ""
     oidc_scopes: str = "openid email profile"
     public_url: str = ""             # e.g. https://popping.example.com
-    # Additional CORS origins beyond ``public_url``. Use for LAN
-    # access on a different host/port (e.g. http://192.168.1.x:8000
-    # while public_url is the HTTPS reverse-proxy URL). Comma-separated.
-    # Empty by default — every CORS request must match ``public_url``
-    # (or fall through to the dev wildcard if public_url is also
-    # empty). Each entry is treated as a literal origin; wildcards
-    # aren't supported.
-    extra_cors_origins: str = ""
     session_secret: str = ""         # required when oidc_enabled (openssl rand -hex 32)
     session_ttl_seconds: int = 28800  # 8 h
     session_cookie_name: str = "popping_session"

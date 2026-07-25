@@ -33,30 +33,20 @@ from app.scoring import engagement, personal, recency, source as source_helper
 
 
 def score(
-    published_at,
-    raw_score: float,
-    embedding,
-    meta: dict | None,
+    entry: Entry,
     source: Source | None,
     profile: UserProfile | None,
     now: dt.datetime | None = None,
 ) -> float:
-    """Compute composite_score from the fields the formula actually reads.
-
-    Fields, not an ``Entry`` ORM row, so the ingest hot path can
-    call this between INSERT and commit without fabricating a
-    transient Entry (see ``scheduler._stub_entry`` — this refactor
-    makes that workaround unnecessary). The wrapper below
-    preserves the old ``(entry, source, profile)`` signature for
-    the rescore hot path and the ``/api/foryou`` route, which
-    pass real ORM rows.
-    """
-    r = recency.score(published_at, source.category if source else None, now=now)
-    p = personal.score(embedding, source, profile)
+    """Compute composite_score for one entry."""
+    r = recency.score(entry.published_at, source.category if source else None, now=now)
+    p = personal.score(entry, source, profile)
     sw = source_helper.weight(source)
-    raw = float(raw_score or 0.0)
+    # raw_score is the recency-at-ingest stored value; source_weight tilts
+    # entire sources up or down. Both default to neutral.
+    raw = float(entry.raw_score or 0.0)
     s = raw * sw
-    e = engagement.score_from_meta(meta, source)
+    e = engagement.score(entry, source)
     total = (
         settings.scoring_weight_recency * r
         + settings.scoring_weight_personal * p
@@ -64,31 +54,6 @@ def score(
         + settings.scoring_weight_engagement * e
     )
     return round(total, 2)
-
-
-def score_entry(
-    entry: Entry,
-    source: Source | None,
-    profile: UserProfile | None,
-    now: dt.datetime | None = None,
-) -> float:
-    """Backwards-compatible wrapper for callers that pass a real Entry
-    (the rescore hot path, the ``/api/foryou`` route). Just unwraps
-    the fields the formula needs and delegates to ``score()``.
-
-    Kept as a separate function (not a default-argument shim) so the
-    call site is explicit and the field-passing path is the one
-    that shows up in profilers / type hints.
-    """
-    return score(
-        published_at=entry.published_at,
-        raw_score=entry.raw_score or 0.0,
-        embedding=getattr(entry, "embedding", None),
-        meta=getattr(entry, "meta", None),
-        source=source,
-        profile=profile,
-        now=now,
-    )
 
 
 def title_slug(title: str | None, n_words: int = 8) -> str:

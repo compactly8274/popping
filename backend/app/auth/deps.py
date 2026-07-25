@@ -51,9 +51,9 @@ _BYPASS_SYNTHETIC = {
 }
 
 # Networks considered "local" for the bypass. Loaded from the
-# ``local_bypass_allowed_cidrs`` setting (comma-separated CIDRs).
-# Default is loopback-only; LAN operators opt in explicitly by
-# setting ``LOCAL_BYPASS_ALLOWED_CIDRS``.
+# ``local_bypass_allowed_cidrs`` setting (comma-separated CIDRs) at
+# import time. Default is loopback-only; LAN operators opt in
+# explicitly by setting ``LOCAL_BYPASS_ALLOWED_CIDRS``.
 #
 # We deliberately do NOT include RFC1918 / link-local / ULA by
 # default — those CIDRs cover Docker bridge networks, k8s pod
@@ -61,62 +61,24 @@ _BYPASS_SYNTHETIC = {
 # request from any of those would have been silently auto-granted
 # under the old default; see config.py ``local_auth_bypass`` for the
 # full threat model.
-#
-# Cache the parsed list keyed by the raw env-var string. Pydantic
-# settings re-reads env on every attribute access (no per-process
-# freeze), so an operator who updates LOCAL_BYPASS_ALLOWED_CIDRS
-# and bounces the process gets the new value, but a *running*
-# process that mutates the env in flight still needs a fresh
-# parse — handled by the cache key. Caching avoids reparsing the
-# CIDR list (each ``ipaddress.ip_network()`` call is non-trivial)
-# on every request.
-_BYPASS_NETS_CACHE: dict[str, tuple] = {}
+def _load_bypass_nets() -> tuple:
+    out: list = []
+    for cidr in (settings.local_bypass_allowed_cidrs or "").split(","):
+        cidr = cidr.strip()
+        if not cidr:
+            continue
+        try:
+            out.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError as exc:
+            # Misconfiguration should be loud at startup, not on every
+            # request. We log once via the module logger and skip.
+            logger.warning(
+                "local_bypass: ignoring invalid CIDR %r (%s)", cidr, exc,
+            )
+    return tuple(out)
 
 
-def _bypass_nets() -> tuple:
-    raw = settings.local_bypass_allowed_cidrs or ""
-    if raw not in _BYPASS_NETS_CACHE:
-        out: list = []
-        for cidr in raw.split(","):
-            cidr = cidr.strip()
-            if not cidr:
-                continue
-            try:
-                out.append(ipaddress.ip_network(cidr, strict=False))
-            except ValueError as exc:
-                # Misconfiguration should be loud at startup, not on every
-                # request. We log once via the module logger and skip.
-                logger.warning(
-                    "local_bypass: ignoring invalid CIDR %r (%s)", cidr, exc,
-                )
-        _BYPASS_NETS_CACHE[raw] = tuple(out)
-    return _BYPASS_NETS_CACHE[raw]
-
-
-# Back-compat shim — kept as a module-level constant so existing
-# ``from app.auth.deps import _BYPASS_NETS`` imports still work.
-# Initialized to the parsed default so the first import doesn't
-# pay the parse cost. ``_is_private_address`` calls ``_bypass_nets()``
-# instead, so this constant is effectively read-only documentation.
-_BYPASS_NETS: tuple = _bypass_nets()
-
-
-def invalidate_bypass_cache() -> None:
-    """Clear the parsed-CIDR cache. Used by tests; exposed for
-    future use by an admin endpoint if the operator wants to
-    rotate LOCAL_BYPASS_ALLOWED_CIDRS without a process restart.
-
-    Note: pydantic-settings re-reads env on every attribute access,
-    so this is a no-op in normal operation — the cache key
-    (``settings.local_bypass_allowed_cidrs``) changes when the env
-    var changes, and the next call parses the new value. This
-    function is for tests that monkeypatch the cache directly.
-    """
-    _BYPASS_NETS_CACHE.clear()
-    # Refresh the back-compat shim too, so ``_BYPASS_NETS`` imports
-    # see the new value.
-    global _BYPASS_NETS
-    _BYPASS_NETS = _bypass_nets()
+_BYPASS_NETS: tuple = _load_bypass_nets()
 
 
 def _client_ip(request: Request) -> Optional[str]:
@@ -148,7 +110,7 @@ def _is_private_address(ip_str: str) -> bool:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    return any(ip in net for net in _bypass_nets())
+    return any(ip in net for net in _BYPASS_NETS)
 
 
 def _maybe_bypass_user(request: Request) -> Optional[dict]:

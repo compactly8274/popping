@@ -9,11 +9,9 @@ only one most of them touch.
 """
 
 from app.scoring import engagement, personal, recency, source
-from app.scoring.composite import convergence_multiplier, score, score_entry, title_slug
+from app.scoring.composite import convergence_multiplier, score, title_slug
 from app.scoring.engagement import score as engagement_score
-from app.scoring.engagement import score_from_meta
 from app.scoring.personal import score as personal_score
-from app.scoring.personal import score_embedding
 from app.scoring.recency import half_life_hours, score as recency_score
 from app.scoring.source import weight as source_weight
 
@@ -27,9 +25,6 @@ __all__ = [
     "recency",
     "recency_score",
     "score",
-    "score_entry",
-    "score_embedding",
-    "score_from_meta",
     "source",
     "source_weight",
     "title_slug",
