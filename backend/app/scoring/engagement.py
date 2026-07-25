@@ -177,7 +177,21 @@ def score(entry: Entry, source: Any = None) -> float:
     is read-side; engagement has already been folded into
     ``composite_score`` at ingest, which is what the dashboard
     actually ranks on)."""
-    meta = getattr(entry, "meta", None) or {}
+    return score_from_meta(getattr(entry, "meta", None), source)
+
+
+def score_from_meta(meta: Any, source: Any = None) -> float:
+    """Engagement score directly from a meta dict.
+
+    The field-passing variant the new ``composite.score``
+    signature calls. Splits the score's dependency on the
+    ``Entry`` ORM row so the ingest hot path can score
+    without building a transient Entry. ``source`` is kept
+    for future per-source engagement normalization (e.g.
+    RFD's vote counts mean something different than HN's);
+    today it's unused.
+    """
+    meta = meta if isinstance(meta, dict) else {}
 
     votes = _read_meta(meta, *ENGAGEMENT_VOTE_KEYS)
     comments = _read_meta(meta, *ENGAGEMENT_COMMENT_KEYS)

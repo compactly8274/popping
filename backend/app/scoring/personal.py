@@ -54,7 +54,40 @@ def _cosine(a, b) -> Optional[float]:
         nb += y * y
     if na == 0.0 or nb == 0.0:
         return None
-    return dot / (math.sqrt(na) * math.sqrt(nb))
+    return dot / math.sqrt(na * nb)
+
+
+def pairwise_cosine_matrix(embeddings) -> "np.ndarray":
+    """Return the (N, N) symmetric cosine-similarity matrix for a
+    stacked-embedding matrix.
+
+    Used by ``framing.cluster_recent_entries`` to replace the
+    O(N^2) Python loop in the union-find with one BLAS matrix
+    multiply + a few elementwise ops. The pre-normalize trick
+    (``sim = a·b / (|a||b|)``) means we only do one matmul + one
+    clip; rows that turned out to be zero-vectors become a row of
+    NaNs (caught by the ``np.isnan`` mask in the caller).
+
+    Input shape: (N, D). Output shape: (N, N). Diagonal is 1.0 by
+    construction (a vector is similar to itself).
+    """
+    import numpy as np  # local import — keeps cold-import path off numpy
+    arr = np.asarray(embeddings, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        return np.empty((0, 0), dtype=np.float32)
+    # L2-normalize each row so the dot product IS the cosine. This
+    # is the standard "cosine via inner product" trick.
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    # Zero-vector rows would produce NaN on divide; replace the
+    # zero norm with 1 so the row stays all-zeros (and gets
+    # caught by the caller's NaN/zero mask).
+    safe_norms = np.where(norms == 0, 1.0, norms)
+    normalized = arr / safe_norms
+    sim = normalized @ normalized.T
+    # Clip the floating-point noise so the diagonal is exactly 1.0
+    # (matmul of a normalized vector with itself is 1.0 ± eps).
+    np.fill_diagonal(sim, 1.0)
+    return np.clip(sim, -1.0, 1.0)
 
 
 def vector_score(entry_emb, pref_vec) -> float:
@@ -101,8 +134,33 @@ def score(entry: Entry, source: Source | None, profile: UserProfile | None) -> f
     from their SELECT (the For You slim projection does, to keep
     ~3KB of vector data off every candidate row) still get the
     documented "NULL embedding → neutral 50" behaviour instead of
-    an ``AttributeError`` that 500s the whole endpoint."""
-    embedding = getattr(entry, "embedding", None)
+    an ``AttributeError`` that 500s the whole endpoint.
+
+    Thin wrapper around ``score_embedding`` so the field-passing
+    variant is the canonical implementation. Callers that already
+    have the embedding in hand (e.g. ``composite.score``) can
+    call ``score_embedding`` directly and skip the getattr.
+    """
+    return score_embedding(
+        embedding=getattr(entry, "embedding", None),
+        source=source,
+        profile=profile,
+    )
+
+
+def score_embedding(
+    embedding,
+    source: Source | None,
+    profile: UserProfile | None,
+) -> float:
+    """Field-passing personal score. Embedding is the only field the
+    formula needs from the entry; the rest is the source's category
+    and the user's profile.
+
+    Same return range as ``score()``. ``embedding`` accepts a
+    list, a numpy.ndarray (pgvector read-back), or None — the
+    same contract as ``vector_score``.
+    """
     vec = vector_score(embedding, profile.preference_vector if profile else None)
     cat_mult = _category_multiplier(
         source.category if source else None,

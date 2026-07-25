@@ -27,47 +27,45 @@
 /// <reference types="vite/client" />
 
 import { api } from '../api'
+import {
+  enqueue as enqueuePure,
+  drainBatch,
+  newInteractionQueue,
+  MAX_QUEUE,
+  type InteractionQueue,
+} from './interactions_helpers'
 
-export type InteractionType =
-  | 'view'
-  | 'click'
-  | 'dwell'
-  | 'thumb_up'
-  | 'thumb_down'
-  | 'bookmark'
-  | 'share'
-  | 'never'
-
-export interface InteractionEvent {
-  entry_id: number
-  type: InteractionType
-  value?: number
-}
+// Re-export the public types from the type-only module so
+// existing consumers don't need to update their imports.
+export type { InteractionType, InteractionEvent } from './interactions_types'
+import type { InteractionEvent } from './interactions_types'
 
 // ---- module-level state ----
 
-// Buffered events awaiting a flush. Synchronized only on the
-// main thread, so a plain array is fine — no locking needed.
-const queue: InteractionEvent[] = []
+// Buffered events awaiting a flush. The shape comes from
+// interactions_helpers.newInteractionQueue; the helpers in
+// that module do the dedup + cap math. We hold the instance
+// at module scope so the queue survives across component
+// mounts (a remount shouldn't re-record every visible event).
+const queue: InteractionQueue = newInteractionQueue()
 
-// Already-seen entries in this session. A Set fits both fast lookup
-// and frequent insertion.
-const seen = new Set<number>()
-
-let flushScheduled = false
 const uninstalled = false
-
-// Cap matches the backend's _BATCH_MAX so a queued flush never 422s.
-const MAX_QUEUE = 50
 
 // ---- flushing ----
 
 async function flush(): Promise<void> {
-  flushScheduled = false
-  if (queue.length === 0) return
+  if (queue.pending.length === 0) return
   // Drain atomically. Anything appended during the request goes into
   // a fresh buffer the next flush picks up.
-  const batch = queue.splice(0, queue.length)
+  const { queue: next, batch } = drainBatch(queue)
+  // Update the module-level reference. The drainBatch helper
+  // returns a new object; assign back so the singleton's
+  // pending list reflects the drain. We also clear the
+  // flushScheduled flag — the flush just ran; the next
+  // enqueue re-arms it via scheduleFlush.
+  queue.pending = next.pending
+  queue.seen = next.seen
+  queue.flushScheduled = false
   try {
     await api.recordInteractionBatch(batch)
   } catch (err) {
@@ -79,8 +77,8 @@ async function flush(): Promise<void> {
 }
 
 function scheduleFlush(): void {
-  if (flushScheduled) return
-  flushScheduled = true
+  if (queue.flushScheduled) return
+  queue.flushScheduled = true
   // Wait for a quiet period before flushing so a fast scroll past
   // 30 cards coalesces into one POST. ``requestIdleCallback`` honors
   // this; the setTimeout fallback uses a 250ms budget, which is short
@@ -107,14 +105,16 @@ function scheduleFlush(): void {
 // drain the queue before knowing the beacon succeeded — the
 // fallback path then needs the events.
 function onPageHide(): void {
-  if (queue.length === 0) return
+  if (queue.pending.length === 0) return
   // Drain into a local snapshot BEFORE attempting any send, so a
   // failed sendBeacon still has the events to fall back to. We swap
   // the queue with a fresh empty array rather than clearing in
   // place so any in-flight ``recordBatched`` between the splice and
   // the send lands in the new (now-abandoned) array. Those events
   // are lost on tab close anyway — the user is leaving.
-  const batch = queue.splice(0, queue.length)
+  const { batch } = drainBatch(queue)
+  queue.pending = []
+  queue.flushScheduled = false
   try {
     const payload = JSON.stringify({ events: batch })
     const blob = new Blob([payload], { type: 'application/json' })
@@ -155,21 +155,25 @@ if (typeof window !== 'undefined' && !uninstalled) {
  * events where many fire in a short window and the synchronous
  * round-trip is wasted bandwidth. */
 export function recordBatched(event: InteractionEvent): void {
-  // View dedup — only one ``view`` per entry per session. Re-mounts
-  // (theme switches, filter toggles) shouldn't multiply.
-  if (event.type === 'view') {
-    if (seen.has(event.entry_id)) return
-    seen.add(event.entry_id)
-  }
-  queue.push(event)
+  // The pure-helper module owns the dedup + cap math. The
+  // module-level queue is mutated in place (the helper
+  // returns a new object, but we re-assign back so the
+  // singleton's identity is preserved across the call).
+  const before = queue.pending.length
+  const r = enqueuePure(queue, event)
+  queue.pending = r.queue.pending
+  queue.seen = r.queue.seen
+  if (r.result === 'duplicate-view') return
   // Safety net: if the queue is full, flush synchronously rather than
   // growing without bound. Reaching this means the rIC / setTimeout
   // scheduling got starved (e.g. a long-running script on the page).
-  if (queue.length >= MAX_QUEUE) {
+  if (r.result === 'flush-immediately') {
     void flush()
     return
   }
-  scheduleFlush()
+  // An event was actually added (not a dedup hit). Schedule
+  // a flush if the queue transitioned from empty to non-empty.
+  if (before === 0) scheduleFlush()
 }
 
 /** Fire an event immediately, bypassing the batch queue. Used for
@@ -197,5 +201,5 @@ export function flushNow(): Promise<void> {
 
 /** For tests: number of events currently buffered. */
 export function pendingCount(): number {
-  return queue.length
+  return queue.pending.length
 }

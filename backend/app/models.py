@@ -138,6 +138,16 @@ class Entry(Base):
     # so a future LLM-summary path can populate the same column
     # under a different source without another migration.
     cached_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # When ``cached_summary`` was last populated. NULL means "never
+    # asked yet" (treated as equal to ``fetched_at`` by the route's
+    # cache-invalidation check, so the first read still hits the
+    # summary path). Populated by the route on every successful
+    # cache write; used to invalidate the cache when the entry
+    # has been re-ingested since the last summary attempt. See
+    # migration 0021 for the backfill strategy.
+    cached_summary_fetched_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # LLM-generated summary of a podcast episode's transcript.
     # Populated by POST /api/entries/{id}/podcast_summary the first
     # time it's requested — same NULL-vs-empty-string cache contract

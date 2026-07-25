@@ -39,6 +39,7 @@ import re
 from typing import Any, Optional
 
 import httpx
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -376,10 +377,17 @@ async def _ingest(plugin_cls: Any) -> dict:
                 # as "how fresh was this when it arrived".
                 raw_score = recency.score(norm["published_at"], source.category)
                 embedding = await _embed_text(norm)
+                # Field-passing composite score — no transient Entry.
+                # The rescore / foryou hot paths still go through
+                # ``composite_scorer.score_entry`` for callers that
+                # already have a real Entry.
                 composite = composite_scorer.score(
-                    _stub_entry(norm, raw_score, embedding),
-                    source,
-                    profile,
+                    published_at=norm["published_at"],
+                    raw_score=raw_score,
+                    embedding=embedding,
+                    meta=meta,
+                    source=source,
+                    profile=profile,
                 )
                 stmt = (
                     pg_insert(Entry)
@@ -603,10 +611,16 @@ async def _ingest(plugin_cls: Any) -> dict:
 
 
 def _stub_entry(norm: dict, raw_score: float, embedding: list[float] | None) -> Entry:
-    """Build a transient Entry with only the fields composite_score touches.
+    """Deprecated: pass the fields to ``composite_scorer.score``
+    directly. Kept as a thin shim for any external caller that
+    imports it; new code should not use it.
 
-    Saves us round-tripping to the DB between insert and composite.
-    composite_score is later overwritten anyway.
+    Was: build a transient Entry with only the fields
+    composite_score touches, so the ingest path between INSERT
+    and commit could call ``composite_scorer.score`` without
+    round-tripping to the DB. The refactor that took
+    ``composite_scorer.score`` off the ``Entry`` ORM type
+    (commit review/2026-07-24) made this workaround unnecessary.
     """
     e = Entry()
     e.title = norm.get("title") or ""
@@ -615,6 +629,7 @@ def _stub_entry(norm: dict, raw_score: float, embedding: list[float] | None) -> 
     e.raw_score = raw_score
     e.personal_score = 0.0
     e.embedding = embedding
+    e.meta = norm.get("meta")
     return e
 
 
@@ -724,25 +739,16 @@ _INTERACTION_WEIGHTS: dict[str, float] = {
 # matches the bypass list -- e.g. via a port-forward or
 # reverse proxy). For the homelab case we aggregate over
 # all three ids so the recompute doesn't miss events.
+# NOTE: was wrapped in a ``_resolve_aggregation_user_ids``
+# helper that always returned this constant. The helper
+# was a no-op, inlined here; when OIDC multi-user lands
+# (TODO in the comment), this constant becomes a function
+# call again.
 _AGGREGATION_USER_IDS_ALL: tuple[str, ...] = (
     "anonymous",
     "local-bypass",
     "default",  # pre-soft-auth events tagged with the column default
 )
-
-
-async def _resolve_aggregation_user_ids(
-    session: AsyncSession,
-) -> tuple[str, ...]:
-    """Return the user_ids whose interactions feed the recompute.
-
-    Today this is the same tuple regardless of OIDC state
-    (the homelab case). When OIDC is enabled in a future
-    deployment, this would scope to the OIDC user's sub
-    instead. See the function docstring on
-    ``_recompute_preference_vector`` for the rationale.
-    """
-    return _AGGREGATION_USER_IDS_ALL
 
 
 async def _recompute_preference_vector() -> None:
@@ -839,9 +845,11 @@ async def _recompute_preference_vector() -> None:
             # out. We resolve the right user set at query
             # time: if there's a resolved OIDC user, scope
             # to their sub; otherwise aggregate everything
-            # (single-user homelab). ``_resolve_aggregation_user_id``
-            # picks one.
-            user_ids = await _resolve_aggregation_user_ids(session)
+            # (single-user homelab). Inline the constant
+            # here (was a helper that always returned the
+            # same value) — when OIDC multi-user lands,
+            # this becomes a function call again.
+            user_ids = _AGGREGATION_USER_IDS_ALL
             if not user_ids:
                 logger.debug("pref vector: no user_ids to aggregate, keeping current")
                 return
@@ -862,54 +870,67 @@ async def _recompute_preference_vector() -> None:
             dim = len(rows[0][1]) if rows[0][1] is not None else 0
             if dim == 0:
                 return
-            agg = [0.0] * dim
-            n_used = 0
+            # Build a (N, D) matrix of the in-window embeddings and a
+            # (N,) weight vector from the interaction type. Both done
+            # in numpy — the previous version was a Python double-loop
+            # over ``range(dim)`` per row, which on a 10k-interactions
+            # window is 3.8M Python float ops per tick. Vectorized
+            # version is a single matmul-shaped reduction.
+            import numpy as np
+            embs: list[list[float]] = []
+            weights: list[float] = []
             for _entry_id, emb, itype in rows:
                 if emb is None:
                     continue
                 w = _INTERACTION_WEIGHTS.get(itype, 0.0)
                 if w == 0.0:
                     continue
-                for i in range(dim):
-                    agg[i] += w * float(emb[i])
-                n_used += 1
+                embs.append(emb)
+                weights.append(w)
+            n_used = len(embs)
             if n_used == 0:
                 return
+            arr = np.asarray(embs, dtype=np.float32)
+            w = np.asarray(weights, dtype=np.float32)
+            agg = (w[:, None] * arr).sum(axis=0)  # (D,)
             # L2-normalize the aggregated vector so the
             # cosine math in personal.py is meaningful.
-            norm_sq = sum(x * x for x in agg)
+            norm_sq = float(np.dot(agg, agg))
             if norm_sq == 0.0:
                 return
-            inv = 1.0 / math.sqrt(norm_sq)
-            agg = [x * inv for x in agg]
+            agg = agg / math.sqrt(norm_sq)  # still a numpy array
             # Load the current vector and blend. NULL →
             # zero vector; the blend collapses to
             # ``blend_new * agg``.
             profile = await _load_profile(session)
-            old = profile.preference_vector or [0.0] * dim
-            if len(old) != dim:
+            old_raw = profile.preference_vector
+            if old_raw is None or len(old_raw) != dim:
                 # Embedder dim changed between the old
                 # vector and now. Drop the old vector
                 # rather than crash on the blend; the
                 # next tick (10 min later) re-stabilises.
-                logger.warning(
-                    "pref vector: dim mismatch (old=%d, new=%d), discarding old",
-                    len(old),
-                    dim,
-                )
-                old = [0.0] * dim
+                if old_raw is not None and len(old_raw) != dim:
+                    logger.warning(
+                        "pref vector: dim mismatch (old=%d, new=%d), discarding old",
+                        len(old_raw),
+                        dim,
+                    )
+                old = np.zeros(dim, dtype=np.float32)
+            else:
+                old = np.asarray(old_raw, dtype=np.float32)
             blend = max(0.0, min(1.0, settings.pref_vector_blend_new))
-            blended = [blend * a + (1.0 - blend) * o for a, o in zip(agg, old)]
+            blended = blend * agg + (1.0 - blend) * old
             # Re-normalize the blend too, so the persisted
             # vector is always unit length.
-            sq = sum(x * x for x in blended)
+            sq = float(np.dot(blended, blended))
             if sq > 0.0:
-                inv = 1.0 / math.sqrt(sq)
-                blended = [x * inv for x in blended]
+                blended = blended / math.sqrt(sq)
+            # Cast to a plain Python list for the JSONB column.
+            blended_list = blended.astype(float).tolist()
             await session.execute(
                 UserProfile.__table__.update()
                 .where(UserProfile.id == profile.id)
-                .values(preference_vector=blended)
+                .values(preference_vector=blended_list)
             )
             await session.commit()
             logger.info(
@@ -988,8 +1009,20 @@ async def _rescore_recent_entries() -> None:
                 return
             updates: list[dict] = []
             for entry in rows:
-                new_composite = composite_scorer.score(entry, entry.source, profile)
+                new_composite = composite_scorer.score_entry(entry, entry.source, profile)
                 new_personal = personal_scorer.score(entry, entry.source, profile)
+                # Guard against NaN/Inf: a div-by-zero in personal_scorer
+                # (preference_vector=None) used to silently write NaN
+                # into the FLOAT column, which then breaks ORDER BY
+                # and shows up as "score is null-ish" in the UI. Replace
+                # with the existing value so the row at least keeps a
+                # sensible sort key.
+                if not math.isfinite(new_composite):
+                    logger.warning("rescore: non-finite composite for entry_id=%s; keeping existing", entry.id)
+                    new_composite = entry.composite_score
+                if not math.isfinite(new_personal):
+                    logger.warning("rescore: non-finite personal for entry_id=%s; keeping existing", entry.id)
+                    new_personal = entry.personal_score
                 if new_composite != entry.composite_score or new_personal != entry.personal_score:
                     updates.append(
                         {"_id": entry.id, "composite_score": new_composite, "personal_score": new_personal}
@@ -1277,17 +1310,39 @@ async def _crossref_sweep() -> None:
         # Silent skip; the startup log already mentioned the posture.
         return
 
+    # Short-circuit when the crossref cache is empty. The sweep can
+    # only match when the URL was posted in a *configured subreddit*
+    # in the last 15 min (see reddit_client.py docstring lines
+    # 38-48). If no subreddit fetches have happened recently, the
+    # cache is empty and every call returns None — burning 5s of
+    # wall time per tick on a 100ms-sleep loop that does nothing.
+    # The size check prunes stale entries as a side effect, so the
+    # next call (post-fetch) sees an accurate count.
+    if reddit_client.crossref_cache_size() == 0:
+        logger.debug("crossref sweep: cache empty, skipping")
+        return
+
     try:
         async with SessionLocal() as session:
-            # Pull all candidate entries. We do an in-Python filter for
-            # "no reddit_thread_url" + "not from a Reddit source"
-            # rather than a GIN-indexed ``NOT (meta ? 'reddit_thread_url')``
-            # predicate — the rows-to-stamp set is small after the
-            # first sweep, so the scan is cheap. The GIN index added
-            # in migration 0012 still helps when the entry count
-            # climbs into the tens of thousands.
+            # Pull only the candidate set: entries that DON'T already
+            # have a ``reddit_thread_url`` in their meta. The previous
+            # version pulled ``_CROSSREF_BATCH * 4 = 200`` rows and
+            # filtered in Python; on a 50k-row table that's 50ms of
+            # seq scan per tick even when most rows already have the
+            # meta key set. The GIN index on ``Entry.meta`` (migration
+            # 0012) makes the ``NOT meta @> ...`` check an index lookup,
+            # so we only walk the rows that actually need stamping.
             stmt = (
                 select(Entry.id, Entry.url, Entry.source_id, Entry.meta)
+                # ``meta @> '{"reddit_thread_url": "..."}'::jsonb`` is
+                # the containment check the GIN index understands. The
+                # negative is ``NOT (meta @> ...)`` which the index
+                # can also use (GIN indexes support both directions
+                # of containment). We don't actually need the value,
+                # just the key's presence — but ``@>`` is the only
+                # operator the GIN index accelerates for this case
+                # (the ``?`` operator is hash-backed, not GIN).
+                .where(~Entry.meta.op("@>")(text("'{\"reddit_thread_url\": \"x\"}'::jsonb")))
                 .order_by(Entry.id.desc())
                 .limit(_CROSSREF_BATCH * 4)
             )
@@ -1503,6 +1558,31 @@ async def start_scheduler(notifier: Optional[Notifier] = None) -> AsyncIOSchedul
     _brief_generator = BriefGenerator(notifier)
 
     _scheduler = AsyncIOScheduler(timezone="UTC")
+
+    # Visibility into scheduler slip-ups. ``event_job_missed`` fires when
+    # APScheduler drops a run because it's past the misfire grace
+    # time; ``event_job_max_instances`` fires when a new run is
+    # rejected because the previous one is still in flight. Both were
+    # previously silent — combined with ``coalesce=True``, a slow
+    # ingest would silently merge the next tick into the current one
+    # and the operator had no way to know the scheduler was falling
+    # behind. Now both surface as WARNING so a dashboarding layer
+    # can alert on ``scheduler_missed``/``scheduler_overlap`` events.
+    def _on_missed(event) -> None:
+        logger.warning(
+            "scheduler: job missed (past misfire grace) job_id=%s scheduled_at=%s",
+            event.job_id,
+            event.scheduled_run_time,
+        )
+
+    def _on_max_instances(event) -> None:
+        logger.warning(
+            "scheduler: job overlap (max_instances=1; previous run still in flight) job_id=%s",
+            event.job_id,
+        )
+
+    _scheduler.add_listener(_on_missed, EVENT_JOB_MISSED)
+    _scheduler.add_listener(_on_max_instances, EVENT_JOB_MAX_INSTANCES)
     plugins = list_sources()
     logger.info("scheduler: discovered %d source plugin(s): %s", len(plugins), ", ".join(plugins))
 
@@ -2017,6 +2097,20 @@ async def update_source(
     # without awaiting.
     registered_names = set(list_sources().keys())
     if row.name in registered_names:
+        # The row-level URL change committed above, but the class-driven
+        # plugin's URL is a CLASS attribute, not a row attribute — the
+        # PATCH has no effect on what the next ingest fetches. Warn
+        # loudly so the operator doesn't ship a "fix" that silently
+        # does nothing. The right move for a class-driven source is to
+        # fork it into a custom source (rename + add as a row-driven
+        # entry) or open a PR against the plugin's URL constant.
+        if url_changed:
+            logger.warning(
+                "scheduler: PATCHed URL on class-driven source %r (id=%d) but the "
+                "class plugin still owns the URL constant; the next ingest will "
+                "fetch the original URL. Fork the source or PR the plugin to change it.",
+                row.name, source_id,
+            )
         return row
 
     if active is False:
