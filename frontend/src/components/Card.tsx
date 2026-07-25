@@ -921,20 +921,14 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
           }}
           className="flex-1 min-w-0 flex items-start gap-1.5 text-ios-body font-medium text-label-primary hover:text-white"
         >
-          {/* ``line-clamp-2`` lives on this inner span, not the ``<a>``
-              itself — line-clamp needs ``display: -webkit-box`` to do
-              anything, and that's silently overridden by the ``<a>``'s
-              own ``display: flex`` (same property, flex wins), so a
-              clamp class placed directly on a flex container is inert:
-              titles wrapped to 3+ lines with no cap. A span can carry
-              its own ``-webkit-box`` display while still being sized
-              as a normal flex item by its flex parent, so nesting the
-              clamp one level in actually enforces the 2-line cap this
-              was always meant to have — which in turn is what bounds
-              this row's height consistently, instead of a long title
-              growing tall enough to leave a gap under the (fixed-
-              height) badge/thumbnail column next to it. */}
-          <span className="min-w-0 line-clamp-2">{entry.title}</span>
+          {/* Full title, no line-clamp — a long headline just wraps
+              and grows the card rather than getting cut off with an
+              ellipsis. The row's height follows the title; the score
+              badge/thumbnail column (a separate flex item) simply
+              renders at its own natural height alongside it, so there's
+              no fixed-height box for a tall title to overflow or leave
+              a gap under. */}
+          <span className="min-w-0">{entry.title}</span>
           {/* "↗" affordance. Sits inline at the end of the title so it
               reads as part of the link, not a separate control. Group-
               hover brightens it on devices that have a hover state;
