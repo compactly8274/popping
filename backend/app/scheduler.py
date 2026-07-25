@@ -1277,6 +1277,16 @@ async def _crossref_sweep() -> None:
         # Silent skip; the startup log already mentioned the posture.
         return
 
+    # Short-circuit when the crossref cache is empty: the sweep can
+    # only match URLs posted in a configured subreddit in the last
+    # 15 min. In direct-Atom mode without active fetches, the cache
+    # is empty and every ``search_thread_by_url`` call returns None
+    # after 100ms of polite sleep — a 5s/tick of pure wait, every
+    # hour, for no work. Bail before the candidate scan so a quiet
+    # week doesn't burn 80 scheduler seconds.
+    if not getattr(reddit_client, "_crossref_cache", None):
+        return
+
     try:
         async with SessionLocal() as session:
             # Pull all candidate entries. We do an in-Python filter for

@@ -91,16 +91,26 @@ _RUNNING_TASKS: set[asyncio.Task] = set()
 _JOBS_MAX = 200
 
 
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
 async def _record_job(job: _Job) -> None:
     async with _JOBS_LOCK:
         _JOBS[job.id] = job
-        # Prune oldest entries when over cap. List values + sort by
-        # ``started_at`` (ascending — oldest first) and trim. The
-        # cap is generous so this rarely fires; the cost is linear
-        # in the ledger size, fine for hundreds of entries.
+        # Prune oldest TERMINAL entries when over cap. A naive
+        # ``sorted by started_at`` eviction can silently evict an
+        # in-flight (pending/running) job while keeping a pile of
+        # long-finished completed jobs around — the caller's
+        # polling endpoint then 404s on a job that IS still
+        # running. We only evict jobs in a terminal state; running
+        # and pending jobs are kept regardless of age. The cap is
+        # generous so this rarely fires; the cost is linear in
+        # the ledger size, fine for hundreds of entries.
         if len(_JOBS) > _JOBS_MAX:
-            victims = sorted(_JOBS.values(), key=lambda j: j.started_at)[: len(_JOBS) - _JOBS_MAX]
-            for v in victims:
+            terminal = [j for j in _JOBS.values() if j.status in _TERMINAL_STATUSES]
+            terminal.sort(key=lambda j: j.started_at)
+            excess = len(_JOBS) - _JOBS_MAX
+            for v in terminal[:excess]:
                 _JOBS.pop(v.id, None)
 
 
