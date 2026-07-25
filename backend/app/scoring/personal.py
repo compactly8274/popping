@@ -134,8 +134,33 @@ def score(entry: Entry, source: Source | None, profile: UserProfile | None) -> f
     from their SELECT (the For You slim projection does, to keep
     ~3KB of vector data off every candidate row) still get the
     documented "NULL embedding → neutral 50" behaviour instead of
-    an ``AttributeError`` that 500s the whole endpoint."""
-    embedding = getattr(entry, "embedding", None)
+    an ``AttributeError`` that 500s the whole endpoint.
+
+    Thin wrapper around ``score_embedding`` so the field-passing
+    variant is the canonical implementation. Callers that already
+    have the embedding in hand (e.g. ``composite.score``) can
+    call ``score_embedding`` directly and skip the getattr.
+    """
+    return score_embedding(
+        embedding=getattr(entry, "embedding", None),
+        source=source,
+        profile=profile,
+    )
+
+
+def score_embedding(
+    embedding,
+    source: Source | None,
+    profile: UserProfile | None,
+) -> float:
+    """Field-passing personal score. Embedding is the only field the
+    formula needs from the entry; the rest is the source's category
+    and the user's profile.
+
+    Same return range as ``score()``. ``embedding`` accepts a
+    list, a numpy.ndarray (pgvector read-back), or None — the
+    same contract as ``vector_score``.
+    """
     vec = vector_score(embedding, profile.preference_vector if profile else None)
     cat_mult = _category_multiplier(
         source.category if source else None,

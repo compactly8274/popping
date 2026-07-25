@@ -339,10 +339,17 @@ async def _ingest(plugin_cls: Any) -> dict:
                 # as "how fresh was this when it arrived".
                 raw_score = recency.score(norm["published_at"], source.category)
                 embedding = await _embed_text(norm)
+                # Field-passing composite score — no transient Entry.
+                # The rescore / foryou hot paths still go through
+                # ``composite_scorer.score_entry`` for callers that
+                # already have a real Entry.
                 composite = composite_scorer.score(
-                    _stub_entry(norm, raw_score, embedding),
-                    source,
-                    profile,
+                    published_at=norm["published_at"],
+                    raw_score=raw_score,
+                    embedding=embedding,
+                    meta=meta,
+                    source=source,
+                    profile=profile,
                 )
                 stmt = (
                     pg_insert(Entry)
@@ -566,10 +573,16 @@ async def _ingest(plugin_cls: Any) -> dict:
 
 
 def _stub_entry(norm: dict, raw_score: float, embedding: list[float] | None) -> Entry:
-    """Build a transient Entry with only the fields composite_score touches.
+    """Deprecated: pass the fields to ``composite_scorer.score``
+    directly. Kept as a thin shim for any external caller that
+    imports it; new code should not use it.
 
-    Saves us round-tripping to the DB between insert and composite.
-    composite_score is later overwritten anyway.
+    Was: build a transient Entry with only the fields
+    composite_score touches, so the ingest path between INSERT
+    and commit could call ``composite_scorer.score`` without
+    round-tripping to the DB. The refactor that took
+    ``composite_scorer.score`` off the ``Entry`` ORM type
+    (commit review/2026-07-24) made this workaround unnecessary.
     """
     e = Entry()
     e.title = norm.get("title") or ""
@@ -578,6 +591,7 @@ def _stub_entry(norm: dict, raw_score: float, embedding: list[float] | None) -> 
     e.raw_score = raw_score
     e.personal_score = 0.0
     e.embedding = embedding
+    e.meta = norm.get("meta")
     return e
 
 
@@ -957,7 +971,7 @@ async def _rescore_recent_entries() -> None:
                 return
             updates: list[dict] = []
             for entry in rows:
-                new_composite = composite_scorer.score(entry, entry.source, profile)
+                new_composite = composite_scorer.score_entry(entry, entry.source, profile)
                 new_personal = personal_scorer.score(entry, entry.source, profile)
                 # Guard against NaN/Inf: a div-by-zero in personal_scorer
                 # (preference_vector=None) used to silently write NaN
