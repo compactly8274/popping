@@ -90,17 +90,54 @@ _RUNNING_TASKS: set[asyncio.Task] = set()
 # clicks); drop the rest on every insert.
 _JOBS_MAX = 200
 
+# Concurrency cap on in-flight brief generations. Without this, a
+# script or impatient user can spawn 20 simultaneous LLM calls in a
+# few seconds, each 3-10s on Ollama, and OOM the local LLM host.
+# 2 is the sweet spot for a homelab single-user install: one
+# generating, one queued; anything more just starves the local
+# Ollama. A larger deploy with a paid LLM endpoint may want to
+# raise this. The semaphore is a module-level singleton (not
+# per-user) — fine for the single-user case; if multi-user is
+# ever added, scope this to a user-keyed dict.
+_GENERATION_SEMAPHORE = asyncio.Semaphore(2)
+
+
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+class _Job(BaseModel):
+    """Process-local record for an in-flight brief generation.
+
+    Lives in ``_JOBS`` — not persisted to the DB. Survives across
+    requests so the BriefCard's poll lands against the same UUID
+    the POST returned. ``uvicorn --reload`` or a process restart
+    drops the ledger; the job is then "lost". On a real deploy
+    with multi-pod fan-in, swap this for a Redis-backed ledger —
+    the public API contract doesn't change.
+    """
+    id: str
+    tone: str
+    status: str  # "pending" | "running" | "completed" | "failed"
+    brief: Optional[BriefOut] = None
+    error: Optional[str] = None
+    started_at: float  # time.monotonic() — diagnostic only
+
 
 async def _record_job(job: _Job) -> None:
     async with _JOBS_LOCK:
         _JOBS[job.id] = job
-        # Prune oldest entries when over cap. List values + sort by
-        # ``started_at`` (ascending — oldest first) and trim. The
-        # cap is generous so this rarely fires; the cost is linear
-        # in the ledger size, fine for hundreds of entries.
+        # Prune oldest *terminal* entries when over cap. Evicting by
+        # started_at alone (the previous behaviour) would happily
+        # kill a long-running 5-min narrative job that happens to
+        # be the oldest running one, while pinning hundreds of
+        # completed jobs that nobody polls anymore. Keep all
+        # running/pending jobs regardless of age; only evict the
+        # terminal ones, oldest first.
         if len(_JOBS) > _JOBS_MAX:
-            victims = sorted(_JOBS.values(), key=lambda j: j.started_at)[: len(_JOBS) - _JOBS_MAX]
-            for v in victims:
+            terminal = [j for j in _JOBS.values() if j.status in _TERMINAL_STATUSES]
+            terminal.sort(key=lambda j: j.started_at)
+            n_to_drop = len(_JOBS) - _JOBS_MAX
+            for v in terminal[:n_to_drop]:
                 _JOBS.pop(v.id, None)
 
 
@@ -111,42 +148,47 @@ async def _run_job(job_id: str, tone: str) -> None:
     useful instead of hanging forever."""
     notifier = current_notifier()
     gen = BriefGenerator(notifier)
+    # Wrap the whole run in ``try/finally`` so the strong reference
+    # in ``_RUNNING_TASKS`` is dropped even on a crash. The semaphore
+    # acquire/release is *inside* the try so a failed acquire (e.g.
+    # task cancellation mid-wait) still cleans up.
+    task = asyncio.current_task()
     try:
-        async with SessionLocal() as session:
-            try:
-                brief = await gen.generate(session=session, tone=tone)
-                if brief is None:
-                    # ``generate`` returns None for either "no provider" or
-                    # "no entries" or "LLM returned empty". Surface the
-                    # skip reason as the user-visible error message.
+        async with _GENERATION_SEMAPHORE:
+            async with SessionLocal() as session:
+                try:
+                    brief = await gen.generate(session=session, tone=tone)
+                    if brief is None:
+                        # ``generate`` returns None for either "no provider" or
+                        # "no entries" or "LLM returned empty". Surface the
+                        # skip reason as the user-visible error message.
+                        async with _JOBS_LOCK:
+                            job = _JOBS.get(job_id)
+                            if job is not None:
+                                job.status = "failed"
+                                job.error = BriefGenerator.skip_reason()
+                        return
+                    await session.commit()
+                    await session.refresh(brief)
+                    async with _JOBS_LOCK:
+                        job = _JOBS.get(job_id)
+                        if job is not None:
+                            job.status = "completed"
+                            job.brief = BriefOut.model_validate(brief)
+                    logger.info("brief job: completed id=%s tone=%s brief_id=%d", job_id, tone, brief.id)
+                except Exception:
+                    logger.exception("brief job: failed id=%s", job_id)
                     async with _JOBS_LOCK:
                         job = _JOBS.get(job_id)
                         if job is not None:
                             job.status = "failed"
-                            job.error = BriefGenerator.skip_reason()
-                    return
-                await session.commit()
-                await session.refresh(brief)
-                async with _JOBS_LOCK:
-                    job = _JOBS.get(job_id)
-                    if job is not None:
-                        job.status = "completed"
-                        job.brief = BriefOut.model_validate(brief)
-                logger.info("brief job: completed id=%s tone=%s brief_id=%d", job_id, tone, brief.id)
-            except Exception:
-                logger.exception("brief job: failed id=%s", job_id)
-                async with _JOBS_LOCK:
-                    job = _JOBS.get(job_id)
-                    if job is not None:
-                        job.status = "failed"
-                        job.error = "brief generation failed (see backend logs)"
+                            job.error = "brief generation failed (see backend logs)"
     finally:
         # Drop the strong reference regardless of outcome so a
         # crashed job doesn't pin the task object forever. The
         # weakref from create_task's add_done_callback would do
         # this anyway, but doing it explicitly here makes the
         # lifecycle obvious to anyone reading the code.
-        task = asyncio.current_task()
         if task is not None:
             _RUNNING_TASKS.discard(task)
 

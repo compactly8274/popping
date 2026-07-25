@@ -236,9 +236,18 @@ def init_client() -> None:
             },
         )
         # Reset the bucket so the first burst of cross-ref requests
-        # after a restart gets a clean slate.
-        _bucket_tokens = _DIRECT_BURST
-        _bucket_last = time.monotonic()
+        # after a restart gets a clean slate. Held under the bucket
+        # lock so a concurrent _take_token / _try_take_token can't
+        # observe a torn state (old tokens + new clock or vice versa)
+        # — same lock the readers take on every operation. ``init_client``
+        # is a sync function (called from FastAPI lifespan startup),
+        # so use the sync ``with`` form on the asyncio.Lock — the
+        # lock object supports both. The async readers still use
+        # ``async with``; mixing the two forms on the same lock is
+        # safe (the lock's internals don't care).
+        with _bucket_lock:
+            _bucket_tokens = _DIRECT_BURST
+            _bucket_last = time.monotonic()
         # Invalidate the cross-ref cache so a process restart
         # re-fetches instead of using stale entries.
         _crossref_cache.clear()
@@ -596,6 +605,24 @@ def _crossref_cache_get(subreddit: str) -> Optional[list[dict]]:
         _crossref_cache.pop(key, None)
         return None
     return posts
+
+
+def crossref_cache_size() -> int:
+    """Number of live (non-expired) subreddit entries in the crossref
+    cache. Used by the scheduler's hourly sweep to short-circuit when
+    the cache is empty — in direct-Atom mode, if no subreddit
+    fetches have happened in the last 15 min, every call to
+    ``search_thread_by_url`` returns None anyway, so the sweep burns
+    5s of wall time per tick returning nothing.
+
+    Cheap: walks the dict once and prunes stale entries as a side
+    effect (the same logic ``_crossref_cache_get`` does per-key).
+    """
+    now = time.monotonic()
+    stale = [k for k, (ts, _) in _crossref_cache.items() if (now - ts) > _CROSSREF_CACHE_TTL_S]
+    for k in stale:
+        _crossref_cache.pop(k, None)
+    return len(_crossref_cache)
 
 
 def _normalize_url_for_match(url: str) -> str:

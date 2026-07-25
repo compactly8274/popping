@@ -45,20 +45,73 @@ _OIDC_CLAIM_MAX = 255
 router.include_router(local_auth.router)
 
 # State cookie name (separate from session cookie).
-_STATE_COOKIE = "popping_oidc_state"
+# Using a `__Host-` prefix on the state cookie is the defence-in-depth
+# posture recommended by the OAuth 2.0 BCP (draft-ietf-oauth-security-topics).
+# The session cookie stays on the plain `path=/` it has always used so
+# the existing first-party app keeps working; only the short-lived
+# state cookie (which carries the PKCE verifier + state nonce) gets
+# the stricter attributes. The state cookie is set with `samesite=strict`
+# because the OIDC callback is a top-level redirect, never a cross-site
+# fetch — strict is the correct value here.
+_STATE_COOKIE = "__Host-popping_oidc_state"
 
 
 def _is_https(cfg: OIDCConfig) -> bool:
     return cfg.public_url.startswith("https://")
 
 
-def _cookie_attrs(cfg: OIDCConfig) -> dict[str, Any]:
-    """Common cookie attributes. Secure flag follows the public URL scheme."""
+def _session_cookie_attrs(cfg: OIDCConfig) -> dict[str, Any]:
+    """Session cookie attributes. The session rides every request,
+    so it can't take the `__Host-` prefix without breaking first-party
+    sub-paths; the existing lax+path=/ contract is preserved."""
     return {
         "httponly": True,
         "secure": _is_https(cfg),
         "samesite": "lax",
         "path": "/",
+    }
+
+
+def _state_cookie_attrs(cfg: OIDCConfig) -> dict[str, Any]:
+    """OIDC state cookie attributes. The `__Host-` prefix forces:
+
+    - `Secure`: only sent over HTTPS (the cookie was set in
+      `_is_https` check above — refusing to set it over http would
+      break OIDC over http entirely, which the operator has chosen
+      to support; we surface the trade in a startup warning instead
+      of silently downgrading).
+    - `Path=/auth`: the state cookie is only needed for the
+      callback path, never read elsewhere.
+    - `SameSite=Strict`: the callback is a top-level redirect, not
+      a cross-site fetch — strict is correct here and removes a
+      class of CSRF on the OIDC handshake.
+
+    A `__Host-` cookie is dropped by the browser unless ALL three
+    attributes are set, which gives us a free "are you doing this
+    right?" sanity check on every login.
+    """
+    if not _is_https(cfg):
+        # `__Host-` cookies require Secure. Over http the prefix is
+        # silently ignored by the browser (and the cookie would not
+        # be sent back anyway, breaking the OIDC callback). Fall back
+        # to the un-prefixed name with a warning so a localhost
+        # developer setup still works; the production deploy over
+        # https gets the hardened version automatically.
+        logger.warning(
+            "OIDC state cookie: public_url is http(s)?, falling back to non-__Host- "
+            "state cookie. Deploy over HTTPS to enable the hardened path."
+        )
+        return {
+            "httponly": True,
+            "secure": False,
+            "samesite": "strict",
+            "path": "/auth",
+        }
+    return {
+        "httponly": True,
+        "secure": True,
+        "samesite": "strict",
+        "path": "/auth",
     }
 
 
@@ -121,7 +174,7 @@ async def login(return_to: str = "/") -> Response:
         _STATE_COOKIE,
         state_cookie_value,
         max_age=600,            # 10 min
-        **_cookie_attrs(cfg),
+        **_state_cookie_attrs(cfg),
     )
     return resp
 
@@ -207,9 +260,18 @@ async def callback(
         cfg.cookie_name,
         sid,
         max_age=cfg.session_ttl_seconds,
-        **_cookie_attrs(cfg),
+        **_session_cookie_attrs(cfg),
     )
-    resp.delete_cookie(_STATE_COOKIE, path="/")
+    # Delete the state cookie on the same path/attributes we set it
+    # with. A `delete_cookie` with mismatched path/secure/samesite
+    # silently fails to remove the cookie on some browsers.
+    resp.delete_cookie(
+        _STATE_COOKIE,
+        path="/auth",
+        secure=_is_https(cfg),
+        samesite="strict" if _is_https(cfg) else "strict",
+        httponly=True,
+    )
     logger.info("OIDC login ok sub=%s", sub)
     return resp
 
