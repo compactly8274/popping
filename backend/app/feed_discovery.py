@@ -117,21 +117,152 @@ async def _ask_llm_for_suggestions(
         if not content:
             last_note = f"{candidate.name}: returned an empty response"
             continue
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, ValueError):
+        parsed = _try_parse_suggestion_list(content)
+        if parsed is None:
             logger.warning("feed_discovery: %s returned non-JSON output, skipping", candidate.name)
             last_note = f"{candidate.name}: returned non-JSON output"
-            continue
-        if isinstance(parsed, dict):
-            # Some providers wrap the array in {"feeds": [...]}. despite the prompt.
-            parsed = parsed.get("feeds") or parsed.get("suggestions") or []
-        if not isinstance(parsed, list):
-            last_note = f"{candidate.name}: returned an unexpected response shape"
             continue
         return [item for item in parsed if isinstance(item, dict)], None
     logger.warning("feed_discovery: all configured LLM providers failed or returned unusable output")
     return [], last_note or "all configured providers failed"
+
+
+def _try_parse_suggestion_list(content: str) -> list | None:
+    """Parse a provider's reply as a JSON array of feed suggestions.
+
+    Two input shapes, in order of preference:
+
+    1. Pure JSON: ``[{"name": "...", "url": "...", "blurb": "..."}]``
+       — the happy path for non-thinking models and for thinking
+       models that emit a clean post-CoT answer.
+    2. JSON embedded in a chain-of-thought blob: thinking models
+       (gpt-oss, deepseek-r1, glm-5.2) often return a JSON array at
+       the end of a longer reasoning trace when ``OllamaCloudProvider``
+       substitutes the ``thinking`` field for ``response``. Try
+       ``json.loads`` on the whole text; if that fails, scan for the
+       first balanced ``[...]`` and try again.
+
+    Same two-stage strategy as ``app.framing._parse_tone_response``
+    (which has the full design rationale and the bracketed-string
+    edge cases handled in unit tests). The scanner is a duplicate of
+    ``framing._extract_first_json_array`` rather than an import —
+    feed_discovery is loaded ahead of framing by the settings
+    drawer, and a shared helper module would be over-engineering
+    for one 15-line function.
+    """
+    # First try: whole text is JSON.
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        # Some providers wrap the array in {"feeds": [...]} or
+        # {"suggestions": [...]} despite the prompt.
+        for key in ("feeds", "suggestions"):
+            inner = parsed.get(key)
+            if isinstance(inner, list):
+                return inner
+        return None
+    # Second try: scan all balanced arrays, try each, prefer
+    # ones whose elements are dicts (the shape we asked for in
+    # the prompt). A thinking model often starts with a
+    # bracketed sentence in its CoT (a list of strings); that's
+    # not what we want even though it parses as JSON. We
+    # collect every balanced array in the text, json-parse
+    # each, and return the first one that yields a list of
+    # dicts. Falls through to the first parseable list if no
+    # list-of-dicts shows up.
+    candidates = _extract_all_json_arrays(content)
+    best_list_of_dicts: list | None = None
+    first_parseable_list: list | None = None
+    for bracket_text in candidates:
+        try:
+            parsed = json.loads(bracket_text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, list) and parsed and all(isinstance(x, dict) for x in parsed):
+            # Best case: list of dicts. Return immediately.
+            return parsed
+        if isinstance(parsed, list) and first_parseable_list is None:
+            first_parseable_list = parsed
+        if isinstance(parsed, dict):
+            for key in ("feeds", "suggestions"):
+                inner = parsed.get(key)
+                if isinstance(inner, list) and inner and all(isinstance(x, dict) for x in inner):
+                    return inner
+                if isinstance(inner, list) and first_parseable_list is None:
+                    first_parseable_list = inner
+    if best_list_of_dicts is not None:
+        return best_list_of_dicts
+    if first_parseable_list is not None:
+        return first_parseable_list
+    return None
+
+
+def _extract_all_json_arrays(text: str) -> list[str]:
+    """Return every balanced ``[...]`` substring in ``text``, in order
+    of appearance. Used to scan a CoT blob for the actual answer
+    when the first balanced array is just the CoT's bracketed
+    sentence.
+
+    Tracks bracket depth AND string state (including backslash
+    escapes) so it doesn't terminate on a quote inside a string.
+    A naive ``re.findall(r"\\[.*?\\]")`` would stop at the first
+    ``]`` inside a string literal (e.g. ``["a]b", "c"]``); the
+    hand-rolled scanner is the only way to get this right without
+    pulling in a JSON streaming parser.
+    """
+    out: list[str] = []
+    start_idx = 0
+    while True:
+        start = text.find("[", start_idx)
+        if start == -1:
+            return out
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_string = False
+                continue
+            if c == '"':
+                in_string = True
+            elif c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    out.append(text[start : i + 1])
+                    start_idx = i + 1
+                    break
+        else:
+            # The inner loop didn't break (no balanced ] for this
+            # [). Move past it and continue scanning.
+            start_idx = start + 1
+
+
+def _extract_first_json_array(text: str) -> str | None:
+    """Return the first balanced ``[...]`` substring in ``text``,
+    or None if no balanced array is present.
+
+    Convenience wrapper around ``_extract_all_json_arrays`` for
+    callers that want the first match regardless of contents
+    (e.g. unit tests). Kept as a separate function so the test
+    surface documents the "take the first array" behaviour
+    explicitly; the live parser uses ``_extract_all_json_arrays``
+    because feed_discovery needs a list of dicts, not just any
+    list.
+    """
+    all_arrays = _extract_all_json_arrays(text)
+    return all_arrays[0] if all_arrays else None
 
 
 async def _validate_feed_url(url: str) -> bool:
