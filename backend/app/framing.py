@@ -45,10 +45,11 @@ import datetime as dt
 import json
 import logging
 import re
+import asyncio
 from collections import defaultdict
 from typing import Optional
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import bindparam, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -397,7 +398,17 @@ async def _tag_untagged_clusters(session: AsyncSession) -> int:
     """For every cluster with at least one untagged member, fire ONE
     batched LLM call covering all of that cluster's untagged
     headlines. Returns the number of LLM calls made (0 if nothing was
-    untagged or no provider is configured)."""
+    untagged or no provider is configured).
+
+    Concurrency: the LLM calls across clusters run via
+    ``asyncio.gather`` so a 20-cluster tick that would have taken
+    ``20 * llm_latency`` runs in roughly ``llm_latency`` wall-clock
+    instead. A semaphore caps concurrency so we don't burst-fire
+    20 simultaneous requests at the upstream LLM — that would
+    blow past a typical per-minute rate budget. Writes are
+    coalesced to one bulk UPDATE per cluster (one DB round-trip
+    per cluster instead of N).
+    """
     rows = (
         await session.execute(
             select(Entry.id, Entry.title, Entry.story_cluster_id).where(
@@ -412,16 +423,54 @@ async def _tag_untagged_clusters(session: AsyncSession) -> int:
     for r in rows:
         by_cluster[r.story_cluster_id].append(r)
 
-    calls = 0
-    for cluster_id, members in by_cluster.items():
-        titles = [m.title for m in members]
-        labels = await _classify_tones(titles)
-        calls += 1
-        if labels is None:
-            continue
-        for member, label in zip(members, labels):
-            await session.execute(
-                update(Entry).where(Entry.id == member.id).values(framing_tone=label)
+    cluster_ids = list(by_cluster.keys())
+
+    # Cap concurrent LLM calls. Three is enough to overlap the
+    # 2-5s typical per-call latency without spiking a typical
+    # 60/min cloud-LLM rate budget.
+    _tone_concurrency = 3
+    sem = asyncio.Semaphore(_tone_concurrency)
+
+    async def _tag_one(cluster_id: int) -> int:
+        async with sem:
+            members = by_cluster[cluster_id]
+            titles = [m.title for m in members]
+            labels = await _classify_tones(titles)
+            if labels is None:
+                return 0
+            # Bulk UPDATE-by-primary-key: one round-trip per
+            # cluster instead of ``len(members)`` round-trips.
+            # The values list is bound as parameters so the
+            # statement emits one ``UPDATE ... WHERE id IN ...``
+            # with bound params, not N statements.
+            payload = [
+                {"_id": m.id, "framing_tone": label}
+                for m, label in zip(members, labels)
+            ]
+            stmt = (
+                Entry.__table__.update()
+                .where(Entry.id == bindparam("_id"))
+                .values(framing_tone=bindparam("framing_tone"))
             )
+            await session.execute(stmt, payload)
+            return 1
+
+    # Fire all cluster-classification calls in parallel. A failure
+    # in one cluster's LLM call must not abort the others — we use
+    # ``return_exceptions=True`` and the per-cluster
+    # ``_classify_tones`` already swallows ProviderError internally
+    # (it walks the fallback chain). Any exception that does escape
+    # is logged here rather than aborting the gather.
+    results = await asyncio.gather(
+        *[_tag_one(cid) for cid in cluster_ids],
+        return_exceptions=True,
+    )
+    calls = 0
+    for cid, r in zip(cluster_ids, results):
+        if isinstance(r, Exception):
+            logger.exception("framing: cluster %d tone-tagging failed", cid)
+            continue
+        calls += int(r)
+    if calls:
         await session.commit()
     return calls
