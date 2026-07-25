@@ -990,6 +990,22 @@ async def _rescore_recent_entries() -> None:
             for entry in rows:
                 new_composite = composite_scorer.score(entry, entry.source, profile)
                 new_personal = personal_scorer.score(entry, entry.source, profile)
+                # Guard against NaN/inf in the scorer's output. A
+                # single NaN in a column silently breaks
+                # ``composite_score >= N`` filters across the whole
+                # feed (NaN comparisons return False) and would
+                # poison ranking + recommendation queries that
+                # depend on a finite score. The scorers' public
+                # contract is to return a finite float; if one
+                # doesn't, log a WARNING and skip the row rather
+                # than write a corrupt value.
+                if not math.isfinite(new_composite) or not math.isfinite(new_personal):
+                    logger.warning(
+                        "rescore: non-finite score for entry id=%s "
+                        "(composite=%r, personal=%r) — skipping",
+                        entry.id, new_composite, new_personal,
+                    )
+                    continue
                 if new_composite != entry.composite_score or new_personal != entry.personal_score:
                     updates.append(
                         {"_id": entry.id, "composite_score": new_composite, "personal_score": new_personal}
