@@ -19,8 +19,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type Brief, type CurrentUser, type Entry, type Health, type Source } from './api'
 import { BriefCard } from './components/BriefCard'
-import { Card } from './components/Card'
-import { Column, DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
+import { ColumnGrid, type ColumnGridHandlers } from './components/ColumnGrid'
+import { DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
 import { Drawer } from './components/Drawer'
 import { ForYouSection, type ForYouHandlers } from './components/ForYouSection'
 import { FramingWatch } from './components/FramingWatch'
@@ -2141,6 +2141,66 @@ export function App() {
     ],
   )
 
+  // Stable callback bundle for the column grid. Same pattern
+  // as ``forYouHandlers`` above — the bundle identity is what
+  // keeps the React.memo on ColumnGrid from re-running on every
+  // App-level state change. The 8 underlying functions are
+  // stable references in this module; useMemo on the array
+  // is enough.
+  const columnGridHandlers = useMemo<ColumnGridHandlers>(
+    () => ({
+      refresh,
+      markColumnRead,
+      markEntryRead,
+      toggleHideEntry,
+      hideEntry,
+      restoreHiddenEntry,
+      toggleStarEntry,
+      setEntryVote,
+      toggleSummary,
+      setColumnSection,
+      setPrefsFor,
+      unmarkEntryRead,
+      toastEntryMarked: (colName, entryId) => {
+        toast('Marked as read', {
+          kind: 'info',
+          action: { label: 'Undo', onClick: () => unmarkEntryRead(colName, entryId) },
+        })
+      },
+      toastEntryHidden: (entryId) => {
+        toast('Entry hidden.', {
+          kind: 'info',
+          action: { label: 'Undo', onClick: () => restoreHiddenEntry(entryId) },
+        })
+      },
+      toastEntryStarred: (entryId, wasStarred) => {
+        toast(
+          wasStarred
+            ? 'Removed from Saved.'
+            : 'Saved for later — see the Saved column.',
+          {
+            kind: 'info',
+            action: { label: 'Undo', onClick: () => toggleStarEntry(entryId) },
+          },
+        )
+      },
+    }),
+    [
+      refresh,
+      markColumnRead,
+      markEntryRead,
+      toggleHideEntry,
+      hideEntry,
+      restoreHiddenEntry,
+      toggleStarEntry,
+      setEntryVote,
+      toggleSummary,
+      setColumnSection,
+      setPrefsFor,
+      unmarkEntryRead,
+    ],
+  )
+
   return (
     <div
       // Inline-styled black background on the dashboard root so the
@@ -2499,74 +2559,27 @@ export function App() {
             />
           )}
           {viewKind === 'all' && <FramingWatch />}
-          <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
-            {columns
-              .filter((col) => viewKind === 'multisub' || col.name !== 'For You')
-              .map((col, ci) => (
-                <div key={col.name} ref={setColumnRef(col.name)} className="contents">
-                  <Column
-                    name={col.name}
-                    sections={sectionsByColumn.get(col.name) ?? { new: [], history: [] }}
-                    sourcesById={sourcesById}
-                    newCount={newCountByColumn.get(col.name)}
-                    onRefresh={refresh}
-                    selectedId={ci === selectedColumnIndex ? selectedCardId ?? undefined : undefined}
-                    cardRefs={cardRefs}
-                    onMarkRead={() => markColumnRead(col.name)}
-                    onMarkEntryRead={(entryId) => {
-                      markEntryRead(col.name, entryId)
-                      toast('Marked as read', {
-                        kind: 'info',
-                        action: {
-                          label: 'Undo',
-                          onClick: () => unmarkEntryRead(col.name, entryId),
-                        },
-                      })
-                    }}
-                    onHideEntry={(entryId) => {
-                      hideEntry(entryId)
-                      toast('Entry hidden.', {
-                        kind: 'info',
-                        action: {
-                          label: 'Undo',
-                          onClick: () => restoreHiddenEntry(entryId),
-                        },
-                      })
-                    }}
-                    onHideToggle={(entryId) => toggleHideEntry(col.name, entryId)}
-                    hiddenSet={hiddenSet}
-                    onStarEntry={(entryId) => {
-                      const wasStarred = starredSet.has(entryId)
-                      toggleStarEntry(entryId)
-                      toast(
-                          wasStarred
-                            ? 'Removed from Saved.'
-                            : 'Saved for later — see the Saved column.',
-                          {
-                            kind: 'info',
-                            action: {
-                              label: 'Undo',
-                              onClick: () => toggleStarEntry(entryId),
-                            },
-                          },
-                        )
-                    }}
-                    starredSet={starredSet}
-                    onVoteEntry={setEntryVote}
-                    votedMap={votedMap}
-                    prefs={columnPrefs[col.name] ?? DEFAULT_PREFS}
-                    onPrefsChange={(next) => setPrefsFor(col.name, next)}
-                    totalCount={col.totalCount}
-                    categoriesBySourceId={categoriesBySourceId}
-                    faviconBySourceId={faviconBySourceId}
-                    expandedSummaries={expandedSummaries}
-                    onToggleSummary={toggleSummary}
-                    sectionsCollapsed={sectionsCollapsedFor(col.name)}
-                    onToggleSection={(key) => setColumnSection(col.name, key)}
-                  />
-                </div>
-              ))}
-          </main>
+          <ColumnGrid
+            columns={columns}
+            viewKind={viewKind}
+            sourcesById={sourcesById}
+            categoriesBySourceId={categoriesBySourceId}
+            faviconBySourceId={faviconBySourceId}
+            sectionsByColumn={sectionsByColumn}
+            newCountByColumn={newCountByColumn}
+            columnPrefs={columnPrefs}
+            defaultPrefs={DEFAULT_PREFS}
+            hiddenSet={hiddenSet}
+            starredSet={starredSet}
+            votedMap={votedMap}
+            expandedSummaries={expandedSummaries}
+            selectedColumnIndex={selectedColumnIndex}
+            selectedCardId={selectedCardId}
+            cardRefs={cardRefs}
+            setColumnRef={setColumnRef}
+            sectionsCollapsedFor={sectionsCollapsedFor}
+            handlers={columnGridHandlers}
+          />
 
           <main className="md:hidden flex-1 min-h-0 flex flex-col p-3">
             {/* Tab bar. Replaces the old swipe-to-change-column
