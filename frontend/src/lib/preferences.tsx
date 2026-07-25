@@ -176,7 +176,9 @@ const DEFAULT_STATE: PreferencesState = {
 // API shapes (server contract).
 // ---------------------------------------------------------------------------
 
-interface PreferenceRow {
+// Exported so test files can construct rows for ``applyRowToState``.
+// (The server response shape is the only thing this is used for.)
+export interface PreferenceRow {
   key: string
   value: unknown
   updated_at: string
@@ -796,8 +798,10 @@ export const MAX_PRESETS = 50
  * reliable insertion-order enumeration once its keys look numeric —
  * they get reordered ascending — so "oldest entry id" is the only
  * cheap ordering available here).
+ *
+ * Exported for tests.
  */
-function trimVotedEntries(votes: VotedEntriesValue): VotedEntriesValue {
+export function trimVotedEntries(votes: VotedEntriesValue): VotedEntriesValue {
   const ids = Object.keys(votes)
   if (ids.length <= MAX_VOTED) return votes
   const sorted = ids.map(Number).sort((a, b) => a - b)
@@ -811,8 +815,10 @@ function trimVotedEntries(votes: VotedEntriesValue): VotedEntriesValue {
  * Decode one server row into the right field of a PreferencesState.
  * Unknown keys are ignored -- forward-compat for future
  * preference types.
+ *
+ * Exported for tests.
  */
-function applyRowToState(out: PreferencesState, row: PreferenceRow) {
+export function applyRowToState(out: PreferencesState, row: PreferenceRow) {
   const { key, value } = row
   if (key.startsWith(`${PREFERENCE_KEYS.readEntries}:`)) {
     const columnId = key.slice(`${PREFERENCE_KEYS.readEntries}:`.length)
@@ -872,8 +878,10 @@ function applyRowToState(out: PreferencesState, row: PreferenceRow) {
  * (seeded) view. Used on first mount to reconcile the seed with
  * the server's response. Server wins on key collision; seed
  * wins on keys the server doesn't have.
+ *
+ * Exported for tests.
  */
-function mergeStateFromServer(
+export function mergeStateFromServer(
   seed: PreferencesState,
   server: PreferencesState,
 ): PreferencesState {
