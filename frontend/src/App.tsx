@@ -22,6 +22,7 @@ import { BriefCard } from './components/BriefCard'
 import { ColumnGrid, type ColumnGridHandlers } from './components/ColumnGrid'
 import { DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
 import { ForYouSection, type ForYouHandlers } from './components/ForYouSection'
+import { MobileColumnView, BRIEF_TAB_INDEX } from './components/MobileColumnView'
 import { FramingWatch } from './components/FramingWatch'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
@@ -2214,6 +2215,112 @@ export function App() {
     ],
   )
 
+  // Stable callback bundle for the mobile column view. Same
+  // pattern as ``forYouHandlers`` and ``columnGridHandlers``
+  // above. The mobile view has a slightly larger prop surface
+  // than the desktop grid (it also includes the brief card
+  // props, the mobileCol state, and the setMobileCol setter),
+  // but the same shape: useMemo on a function ref array keeps
+  // the bundle identity stable so the React.memo on
+  // MobileColumnView actually skips re-renders.
+  const mobileHandlers = useMemo<MobileColumnHandlers>(
+    () => ({
+      mobileCol,
+      setMobileCol,
+      columns,
+      newCountByColumn,
+      sectionsByColumn,
+      columnPrefs,
+      sourcesById,
+      categoriesBySourceId,
+      faviconBySourceId,
+      hiddenSet,
+      starredSet,
+      votedMap,
+      expandedSummaries,
+      sectionsCollapsedFor,
+      selectedColumnIndex,
+      selectedCardId,
+      cardRefs,
+      brief,
+      onBriefChange: setBrief,
+      briefTone,
+      onBriefToneChange: setBriefTone,
+      triggerBriefGenerate,
+      refresh,
+      markColumnRead,
+      markEntryRead,
+      toggleHideEntry,
+      hideEntry,
+      restoreHiddenEntry,
+      toggleStarEntry,
+      setEntryVote,
+      toggleSummary,
+      setColumnSection,
+      setPrefsFor,
+      unmarkEntryRead,
+      toastEntryMarked: (colName, entryId) => {
+        toast('Marked as read', {
+          kind: 'info',
+          action: { label: 'Undo', onClick: () => unmarkEntryRead(colName, entryId) },
+        })
+      },
+      toastEntryHidden: (entryId) => {
+        toast('Entry hidden.', {
+          kind: 'info',
+          action: { label: 'Undo', onClick: () => restoreHiddenEntry(entryId) },
+        })
+      },
+      toastEntryStarred: (entryId, wasStarred) => {
+        toast(
+          wasStarred
+            ? 'Removed from Saved.'
+            : 'Saved for later — see the Saved column.',
+          {
+            kind: 'info',
+            action: { label: 'Undo', onClick: () => toggleStarEntry(entryId) },
+          },
+        )
+      },
+    }),
+    [
+      mobileCol,
+      setMobileCol,
+      columns,
+      newCountByColumn,
+      sectionsByColumn,
+      columnPrefs,
+      sourcesById,
+      categoriesBySourceId,
+      faviconBySourceId,
+      hiddenSet,
+      starredSet,
+      votedMap,
+      expandedSummaries,
+      sectionsCollapsedFor,
+      selectedColumnIndex,
+      selectedCardId,
+      cardRefs,
+      brief,
+      setBrief,
+      briefTone,
+      setBriefTone,
+      triggerBriefGenerate,
+      refresh,
+      markColumnRead,
+      markEntryRead,
+      toggleHideEntry,
+      hideEntry,
+      restoreHiddenEntry,
+      toggleStarEntry,
+      setEntryVote,
+      toggleSummary,
+      setColumnSection,
+      setPrefsFor,
+      unmarkEntryRead,
+    ],
+  )
+
   return (
     <div
       // Inline-styled black background on the dashboard root so the
@@ -2594,156 +2701,7 @@ export function App() {
             handlers={columnGridHandlers}
           />
 
-          <main className="md:hidden flex-1 min-h-0 flex flex-col p-3">
-            {/* Tab bar. Replaces the old swipe-to-change-column
-                gesture — that gesture had no direction lock (any
-                60px-plus horizontal touch delta fired it, scroll
-                wobble included) and it collided with the new
-                per-card swipe actions in Card.tsx, which now own
-                the horizontal-drag gesture on mobile. Tabs are the
-                explicit, discoverable replacement; "Brief" is a tab
-                here (not inline above the column, like on desktop)
-                so it doesn't push the column below the fold on a
-                small screen. Horizontally scrollable — a source
-                list with 6+ categories won't fit every tab label on
-                a phone-width screen. */}
-            <div
-              role="tablist"
-              aria-label="dashboard sections"
-              className="shrink-0 flex gap-1.5 overflow-x-auto pb-2 -mx-1 px-1"
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={mobileCol === -1}
-                onClick={() => setMobileCol(-1)}
-                className={`shrink-0 rounded-full px-3 py-1.5 text-ios-caption font-medium whitespace-nowrap transition ${
-                  mobileCol === -1
-                    ? 'bg-accent text-white'
-                    : 'bg-bg-surface text-label-secondary active:bg-bg-elevated'
-                }`}
-              >
-                Brief
-              </button>
-              {columns.map((c, i) => {
-                const newCount = newCountByColumn.get(c.name)
-                return (
-                  // Navigation, not mark-read. Merely peeking at a
-                  // column shouldn't drop its "+N new" chip — that
-                  // violates the universal-inbox rule. The column
-                  // header (desktop) and the per-card ✓ button are
-                  // the explicit mark-read affordances.
-                  <button
-                    type="button"
-                    key={c.name}
-                    role="tab"
-                    aria-selected={i === mobileCol}
-                    onClick={() => setMobileCol(i)}
-                    className={`shrink-0 flex items-center gap-1 rounded-full px-3 py-1.5 text-ios-caption font-medium whitespace-nowrap transition ${
-                      i === mobileCol
-                        ? 'bg-accent text-white'
-                        : 'bg-bg-surface text-label-secondary active:bg-bg-elevated'
-                    }`}
-                  >
-                    {c.name}
-                    {!!newCount && (
-                      <span
-                        className={`rounded-full px-1.5 text-[10px] leading-4 font-semibold ${
-                          i === mobileCol ? 'bg-white/25 text-white' : 'bg-accent-soft text-accent'
-                        }`}
-                      >
-                        {newCount}
-                      </span>
-                    )}
-                  </button>
-                )
-              })}
-            </div>
-
-            <div className="flex-1 min-h-0 overflow-y-auto">
-              {mobileCol === -1 ? (
-                <BriefCard
-                  brief={brief}
-                  onBriefChange={setBrief}
-                  tone={briefTone}
-                  onToneChange={setBriefTone}
-                  triggerGenerate={triggerBriefGenerate}
-                />
-              ) : (
-                <Column
-                  name={columns[mobileCol]?.name ?? ''}
-                  sections={
-                    sectionsByColumn.get(columns[mobileCol]?.name ?? '') ?? { new: [], history: [] }
-                  }
-                  sourcesById={sourcesById}
-                  newCount={newCountByColumn.get(columns[mobileCol]?.name ?? '')}
-                  onRefresh={refresh}
-                  selectedId={
-                    mobileCol === selectedColumnIndex ? selectedCardId ?? undefined : undefined
-                  }
-                  cardRefs={cardRefs}
-                  onMarkRead={() => markColumnRead(columns[mobileCol]?.name ?? '')}
-                  onMarkEntryRead={(entryId) => {
-                    const col = columns[mobileCol]?.name ?? ''
-                    markEntryRead(col, entryId)
-                    toast('Marked as read', {
-                      kind: 'info',
-                      action: {
-                        label: 'Undo',
-                        onClick: () => unmarkEntryRead(col, entryId),
-                      },
-                    })
-                  }}
-                  onHideEntry={(entryId) => {
-                    hideEntry(entryId)
-                    toast('Entry hidden.', {
-                      kind: 'info',
-                      action: {
-                        label: 'Undo',
-                        onClick: () => restoreHiddenEntry(entryId),
-                      },
-                    })
-                  }}
-                  onHideToggle={(entryId) => toggleHideEntry(columns[mobileCol]?.name ?? '', entryId)}
-                  hiddenSet={hiddenSet}
-                  onStarEntry={(entryId) => {
-                    const wasStarred = starredSet.has(entryId)
-                    toggleStarEntry(entryId)
-                    toast(
-                              wasStarred
-                                ? 'Removed from Saved.'
-                                : 'Saved for later — see the Saved column.',
-                              {
-                                kind: 'info',
-                                action: {
-                                  label: 'Undo',
-                                  onClick: () => toggleStarEntry(entryId),
-                                },
-                              },
-                            )
-                  }}
-                  starredSet={starredSet}
-                  onVoteEntry={setEntryVote}
-                  votedMap={votedMap}
-                  prefs={
-                    columns[mobileCol]
-                      ? columnPrefs[columns[mobileCol].name] ?? DEFAULT_PREFS
-                      : DEFAULT_PREFS
-                  }
-                  onPrefsChange={(next) =>
-                    columns[mobileCol] && setPrefsFor(columns[mobileCol].name, next)
-                  }
-                  totalCount={columns[mobileCol]?.totalCount}
-                  categoriesBySourceId={categoriesBySourceId}
-                  faviconBySourceId={faviconBySourceId}
-                  expandedSummaries={expandedSummaries}
-                  onToggleSummary={toggleSummary}
-                  sectionsCollapsed={sectionsCollapsedFor(columns[mobileCol]?.name ?? '')}
-                  onToggleSection={(key) => setColumnSection(columns[mobileCol]?.name ?? '', key)}
-                />
-              )}
-            </div>
-          </main>
+          <MobileColumnView handlers={mobileHandlers} />
         </>
       )}
 
