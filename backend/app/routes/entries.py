@@ -38,6 +38,17 @@ router = APIRouter(tags=["entries"])
 # also enough that "search for X, scroll a page" feels responsive.
 _SEARCH_LIMIT_CAP = 50
 
+# Pre-ILIKE scan cap. The windowed subquery in the ``q`` branch
+# ranks every entry by recency and only ILIKEs the top
+# ``_SEARCH_INTERNAL_CAP`` of them. The trade is documented at the
+# call site: a very old entry that would have matched won't
+# surface in a deep result set, in exchange for the search
+# staying fast on multi-million-row tables. 5000 is well above
+# what a personal dashboard ever ingests; bump it only if a
+# user is searching across 6+ months of "this exact substring
+# appeared in an old story" cases.
+_SEARCH_INTERNAL_CAP = 5000
+
 # Per-card summary length cap. ~800 chars is ~3-4 lines in the
 # dashboard card with line-clamp-3, which is the right balance
 # between "useful digest" and "wall of text the user has to
@@ -209,6 +220,33 @@ async def list_entries(
         # make the backslash literal — see
         # https://www.postgresql.org/docs/current/functions-matching.html).
         pattern = f"%{_escape_like(q)}%"
+        # Cap the ILIKE scan at ``_SEARCH_INTERNAL_CAP`` rows so a
+        # common-substring query ("the", "a", ...) doesn't seq-scan
+        # the entire entries table. The pre-ILIKE cap is set via a
+        # windowed subquery: rank every row by recency, take the
+        # top ``_SEARCH_INTERNAL_CAP`` (so a multi-million-row
+        # table doesn't crawl), then ILIKE within that window.
+        # The user-visible ``limit`` is then applied to the
+        # post-ILIKE result set (the search-quality rows). This
+        # means a very old entry that would have matched won't
+        # surface in a deep result set — an acceptable trade
+        # for not making the user's "search for X" hang on a
+        # 10M-row table. The cap is per-request and bypasses
+        # the user-supplied ``limit`` (which becomes a clamp
+        # on the *returned* set).
+        rn = func.row_number().over(
+            order_by=Entry.published_at.desc().nullslast()
+        ).label("rn")
+        candidates = (
+            select(Entry.id.label("entry_id"), rn)
+            .where(Entry.published_at.isnot(None))
+            .subquery()
+        )
+        stmt = stmt.where(
+            Entry.id.in_(
+                select(candidates.c.entry_id).where(candidates.c.rn <= _SEARCH_INTERNAL_CAP)
+            )
+        )
         stmt = stmt.where(
             or_(
                 Entry.title.ilike(pattern, escape="\\"),

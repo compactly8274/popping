@@ -69,6 +69,43 @@ logger = logging.getLogger("popping.routes.preferences")
 router = APIRouter(tags=["preferences"])
 
 
+# Per-key allowlist. The frontend uses namespaced keys
+# (``read_entries:<source_id>``, ``last_viewed:<source_id>``,
+# ``column_prefs:<source_id>``, ``column_sections:<source_id>``,
+# ``hidden_entries``, ``starred_entries``, ``voted_entries``,
+# ``filter_presets``, ``history_group_by``) and the key is opaque
+# to the server. Without an allowlist, an attacker who can write
+# to /api/preferences (anon in soft-auth mode, or a logged-in user)
+# can fill the table with arbitrary JSONB blobs — each row a
+# separate key, each key a fresh INSERT. The pattern is ``<ns>``
+# or ``<ns>:<id>`` where ``<id>`` is a non-negative integer.
+# Reject anything that doesn't match — log + 400.
+import re as _re
+_VALID_KEY_RE = _re.compile(r"^(read_entries|last_viewed|column_prefs|column_sections|hidden_entries|starred_entries|voted_entries|filter_presets|history_group_by)(:[0-9]+)?$")
+
+
+def _validate_key(key: str) -> None:
+    """Raise 400 if ``key`` isn't in the allowlist namespace shape.
+
+    The check is intentionally loose on the value side
+    (any non-negative integer id, or no id at all for the
+    singleton prefs) but strict on the namespace. New
+    preference types should be added here AND to the
+    frontend's ``PREFERENCE_KEYS`` constant in
+    ``lib/preferences.tsx`` — see the docstring there.
+    """
+    if not _VALID_KEY_RE.match(key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"preference key {key!r} not in allowlist; expected one of "
+                "read_entries[:N], last_viewed[:N], column_prefs[:N], "
+                "column_sections[:N], hidden_entries, starred_entries, "
+                "voted_entries, filter_presets, history_group_by"
+            ),
+        )
+
+
 @router.get("/preferences", response_model=UserPreferenceListOut)
 async def list_preferences(
     user: dict | None = Depends(current_user),
@@ -157,6 +194,7 @@ async def put_preference(
     one card read on every visible-card-scroll would otherwise
     burn 2x the round-trips.
     """
+    _validate_key(key)
     user_id = resolve_user_id(user)
     stmt = (
         pg_insert(UserPreference)
@@ -195,6 +233,7 @@ async def delete_preference(
     so a future "reset all preferences" button or per-key clear
     action has a server-side target.
     """
+    _validate_key(key)
     user_id = resolve_user_id(user)
     await session.execute(
         delete(UserPreference).where(

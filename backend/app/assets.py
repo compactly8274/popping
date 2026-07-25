@@ -40,6 +40,35 @@ from app.url_safety import check_url_safe
 
 logger = logging.getLogger("popping.assets")
 
+
+async def _abort_on_denied_redirect(request: httpx.Request) -> None:
+    """Per-hop SSRF guard for the shared httpx client.
+
+    Fires for every request, including the initial one and every
+    redirect target. The initial URL has already been through
+    ``check_url_safe`` at the call site, so this hook is a
+    no-op for that hop — but it catches the *intermediate*
+    hops in a public→private→public chain that the
+    post-response recheck would miss.
+
+    The hook raises ``httpx.RequestError`` to abort the
+    request before the connection is made. The caller catches
+    the exception (already has an ``httpx.HTTPError`` handler
+    in place) and falls through to ``None`` / a re-raise.
+    """
+    safe, _reason = check_url_safe(str(request.url))
+    if not safe:
+        # Raise inside the hook — httpx surfaces this as a
+        # transport error in the caller's ``async with`` block.
+        # Use a message that names the URL so the operator's
+        # log is actionable; the caller's debug-level log adds
+        # the page_url context.
+        raise httpx.RequestError(
+            f"redirect target blocked by URL safety check: {request.url}",
+            request=request,
+        )
+
+
 _ASSETS_DIR = Path(settings.assets_dir)
 _FAVICON_DIR = _ASSETS_DIR / "favicons"
 _THUMBNAIL_DIR = _ASSETS_DIR / "thumbnails"
@@ -66,6 +95,18 @@ def init_client() -> None:
         timeout=_TIMEOUT,
         follow_redirects=True,
         headers={"User-Agent": _APP_UA},
+        # Per-hop SSRF guard. Fires for every redirect target before
+        # the connection is made. Without this, ``follow_redirects=True``
+        # would let a public→private chain (e.g. ``public.example.com
+        # → 169.254.169.254/``) open a TCP connection to the
+        # metadata service — the post-response ``check_url_safe``
+        # in the caller fires too late to prevent the side channel.
+        # The previous post-status-code recheck (in _download and
+        # _pick_favicon_url) still runs as defense-in-depth for the
+        # *final* URL; this hook catches the intermediate hops.
+        event_hooks={
+            "request": [_abort_on_denied_redirect],
+        },
     )
 
 

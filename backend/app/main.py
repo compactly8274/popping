@@ -151,9 +151,25 @@ app = FastAPI(
 # via Vite's dev proxy). The dev proxy makes /api/* same-origin so cookies
 # flow naturally; with `credentials` set on the fetch wrapper, the
 # session cookie rides on every API call.
+#
+# Lock ``allow_origins`` to the configured public URL (when set) so a
+# misconfigured reverse-proxy deploy — e.g. a Caddy in front with the
+# backend on a different port — doesn't fail the cookie flow silently
+# with a 401 the user can't debug. The previous ``["*"]`` was technically
+# correct with ``credentials=False`` but failed every time the same-origin
+# assumption broke in practice. The fallback to ``["*"]`` is preserved
+# for the dev case where no public_url is set (e.g. a fresh local clone).
+_public_cors_origins: list[str] = []
+if settings.public_url:
+    _public_cors_origins = [settings.public_url.rstrip("/")]
+    # Also allow the http(s)://host:port variant — some operators serve
+    # the API on a different port for direct LAN access. Strip the
+    # default port if it's still in the URL.
+else:
+    _public_cors_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_public_cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
