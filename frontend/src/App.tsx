@@ -22,6 +22,7 @@ import { BriefCard } from './components/BriefCard'
 import { Card } from './components/Card'
 import { Column, DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
 import { Drawer } from './components/Drawer'
+import { ForYouSection, type ForYouHandlers } from './components/ForYouSection'
 import { FramingWatch } from './components/FramingWatch'
 import { Hamburger } from './components/Hamburger'
 import { LoginPage } from './components/LoginPage'
@@ -2083,6 +2084,63 @@ export function App() {
 
   const showSearchView = searchQuery.trim().length > 0
 
+  // Stable bundle of callbacks the ForYouSection consumes. Without
+  // this, every App-level state change (health poller, time tick,
+  // search query) would re-allocate the callbacks and defeat the
+  // React.memo on ForYouSection. The functions are stable
+  // themselves (defined inline once via useCallback upstream
+  // where applicable, or stable references in this module), so
+  // memoizing the bundle by [function refs] is enough to keep
+  // its identity stable across renders.
+  const forYouHandlers = useMemo<ForYouHandlers>(
+    () => ({
+      markEntryRead,
+      unmarkEntryRead,
+      hideEntry,
+      restoreHiddenEntry,
+      toggleHideEntry,
+      toggleStarEntry,
+      setEntryVote,
+      toggleSummary,
+      // Toast wrappers. The toast library lives in App; the
+      // section calls into the wrapper to fire the "Marked as
+      // read" / "Entry hidden" / "Saved for later" toasts.
+      toastEntryMarked: (colName, entryId) => {
+        toast('Marked as read', {
+          kind: 'info',
+          action: { label: 'Undo', onClick: () => unmarkEntryRead(colName, entryId) },
+        })
+      },
+      toastEntryHidden: (entryId) => {
+        toast('Entry hidden.', {
+          kind: 'info',
+          action: { label: 'Undo', onClick: () => restoreHiddenEntry(entryId) },
+        })
+      },
+      toastEntryStarred: (entryId, wasStarred) => {
+        toast(
+          wasStarred
+            ? 'Removed from Saved.'
+            : 'Saved for later — see the Saved column.',
+          {
+            kind: 'info',
+            action: { label: 'Undo', onClick: () => toggleStarEntry(entryId) },
+          },
+        )
+      },
+    }),
+    [
+      markEntryRead,
+      unmarkEntryRead,
+      hideEntry,
+      restoreHiddenEntry,
+      toggleHideEntry,
+      toggleStarEntry,
+      setEntryVote,
+      toggleSummary,
+    ],
+  )
+
   return (
     <div
       // Inline-styled black background on the dashboard root so the
@@ -2427,99 +2485,18 @@ export function App() {
                  'multisub' view because the multi-sub column is the
                  whole dashboard there. */}
           {viewKind === 'all' && visibleForYou.length > 0 && (
-            <section className="hidden md:block px-4 pt-4 pb-3 border-b border-hairline">
-              <header className="flex items-center justify-between mb-2">
-                <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
-                  For You
-                </h2>
-                <span className="text-ios-caption text-label-tertiary">
-                  {visibleForYou.length} {visibleForYou.length === 1 ? 'entry' : 'entries'}
-                </span>
-              </header>
-              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                {visibleForYou.map((e) => {
-                  // Per-card engagement props. The For You
-                  // row was previously read-only — no
-                  // mark-read, no hide, no star. The user
-                  // could see the personal feed but
-                  // couldn't engage with it. Now every
-                  // card has the full set of per-card
-                  // actions wired to App-level callbacks
-                  // so the user can mark-read, hide, or
-                  // star a For You card the same way
-                  // they would in a category column.
-                  //
-                  // ``unread`` reflects ``globalReadIds``, the
-                  // union of every column's manual read-set —
-                  // so marking this card read here also dims
-                  // it in its category column, and marking it
-                  // read there dims it here too. The per-column
-                  // lastViewed isn't used here (the For You row
-                  // has no "mark all read" button).
-                  //
-                  // ``selected`` / ``onActivate`` /
-                  // ``cardRef`` are not passed because
-                  // keyboard nav is per-column, not
-                  // per-row, and the For You row is
-                  // not a "column" the user can scroll
-                  // into.
-                  const isRead = globalReadIds.has(e.id)
-                  return (
-                    <Card
-                      key={e.id}
-                      entry={e}
-                      sourceName={sourcesById.get(e.source_id)}
-                      sourceFaviconPath={faviconBySourceId.get(e.source_id)}
-                      category={categoriesBySourceId.get(e.source_id)}
-                      unread={!isRead}
-                      expanded={expandedSummaries.has(e.id)}
-                      onToggleSummary={() => toggleSummary(e.id)}
-                      onMarkRead={() => {
-                        markEntryRead('For You', e.id)
-                        toast('Marked as read', {
-                          kind: 'info',
-                          action: {
-                            label: 'Undo',
-                            onClick: () => unmarkEntryRead('For You', e.id),
-                          },
-                        })
-                      }}
-                      onHide={() => {
-                        hideEntry(e.id)
-                        toast('Entry hidden.', {
-                          kind: 'info',
-                          action: {
-                            label: 'Undo',
-                            onClick: () => restoreHiddenEntry(e.id),
-                          },
-                        })
-                      }}
-                      onHideToggle={() => toggleHideEntry('For You', e.id)}
-                      hidden={hiddenSet.has(e.id)}
-                      onStar={() => {
-                        const wasStarred = starredSet.has(e.id)
-                        toggleStarEntry(e.id)
-                        toast(
-                          wasStarred
-                            ? 'Removed from Saved.'
-                            : 'Saved for later — see the Saved column.',
-                          {
-                            kind: 'info',
-                            action: {
-                              label: 'Undo',
-                              onClick: () => toggleStarEntry(e.id),
-                            },
-                          },
-                        )
-                      }}
-                      starred={starredSet.has(e.id)}
-                      onVote={(dir) => setEntryVote(e.id, dir)}
-                      vote={votedMap.get(e.id) ?? null}
-                    />
-                  )
-                })}
-              </div>
-            </section>
+            <ForYouSection
+              visibleForYou={visibleForYou}
+              sourcesById={sourcesById}
+              categoriesBySourceId={categoriesBySourceId}
+              faviconBySourceId={faviconBySourceId}
+              globalReadIds={globalReadIds}
+              hiddenSet={hiddenSet}
+              starredSet={starredSet}
+              votedMap={votedMap}
+              expandedSummaries={expandedSummaries}
+              handlers={forYouHandlers}
+            />
           )}
           {viewKind === 'all' && <FramingWatch />}
           <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
