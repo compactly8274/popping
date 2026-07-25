@@ -107,6 +107,16 @@ _DENIED_NETWORKS: list[ipaddress._BaseNetwork] = [
         "224.0.0.0/4",
         "240.0.0.0/4",
         "::1/128",
+        # IPv6 unspecified address. ``::`` is the IPv6 equivalent
+        # of ``0.0.0.0`` — RFC 4291 §2.2. It binds to "any
+        # address" on the listening side, and on the connecting
+        # side it routes to the loopback in most stacks. Without
+        # this entry, ``http://[::]/`` URLs would pass the
+        # ``::1/128`` check (different address) and hit the local
+        # daemon on a system where IPv6 is enabled and a service
+        # binds to ``::``. The SSRF guard must treat it the same
+        # as ``0.0.0.0/8``.
+        "::/128",
         "fc00::/7",
         "fe80::/10",
         "::ffff:0:0/96",

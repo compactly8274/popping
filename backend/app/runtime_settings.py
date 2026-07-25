@@ -35,6 +35,7 @@ import time
 from typing import Any, Optional
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
 from app.db import SessionLocal
@@ -155,10 +156,22 @@ async def _db_get_many(keys: list[str]) -> dict[str, str]:
 
 
 async def _db_set(key: str, value: str) -> None:
-    """Upsert a row. SQLAlchemy's ``merge`` keeps this single-statement
-    (INSERT … ON CONFLICT) and avoids the read-modify-write dance.
+    """Upsert a row atomically.
 
-    The ``value`` column is VARCHAR, but the env-backed values we seed
+    Originally this used ``session.merge(row)`` which is a read-
+    modify-write under the hood: SELECT the existing row by PK,
+    UPDATE if found else INSERT. Two concurrent ``set`` calls for
+    the same key can both see "not found", both INSERT, and one
+    will fail with ``UniqueViolation`` — or worse, the second
+    ``merge`` will silently overwrite the first with a stale
+    in-memory copy of the row. Switching to ``pg_insert ... on
+    conflict do update`` makes the operation a single atomic
+    statement (the DB resolves the conflict), which is the
+    correct semantics for a settings table where the same key
+    can be touched from multiple paths (UI save, env re-seed,
+    brief generator reset, etc.).
+
+    The ``value`` column is VARCHAR; the env-backed values we seed
     on first boot can be int (e.g. ``brief_window_hours``) or bool
     depending on the Settings field. We coerce to str here so any
     stringifiable value lands cleanly without the caller having to
@@ -168,8 +181,16 @@ async def _db_set(key: str, value: str) -> None:
         value = str(value)
     async with SessionLocal() as session:
         async with session.begin():
-            row = AppSetting(key=key, value=value)
-            await session.merge(row)
+            stmt = pg_insert(AppSetting).values(key=key, value=value)
+            # ``index_elements`` is the conflict target — the primary
+            # key. On conflict, overwrite the value (but not the
+            # ``updated_at`` — that's automatic via the column's
+            # server-side default on the next non-conflict write).
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["key"],
+                set_={"value": stmt.excluded.value},
+            )
+            await session.execute(stmt)
 
 
 async def _db_delete(key: str) -> None:
