@@ -251,6 +251,18 @@ function seedFromLocalStorage(): PreferencesState | null {
   if (typeof window === 'undefined') return null
   if (safeGetItem(SEED_FLAG_KEY) === '1') return null
 
+  // NOTE: the original review called out that the synchronous
+  // JSON.parse + 8+ POSTs here can block first paint by ~1.6s
+  // for a heavy user. The current architecture uses
+  // ``useState(() => seedFromLocalStorage())`` specifically to
+  // avoid a flash of empty columns (the docstring below spells
+  // this out). Moving the seed into ``useEffect`` would re-introduce
+  // that flash. The right long-term fix is a Service Worker that
+  // pre-warms the localStorage values OR migrating the seed into
+  // an inline <script> that writes the parsed JSON into a
+  // window.__POPPING_SEED__ global before React mounts. Both
+  // are larger changes than this pass; the trade is left in
+  // place here with a comment so the next reader knows.
   const out: PreferencesState = { ...DEFAULT_STATE }
 
   // Per-column maps. The old keys stored a single JSON blob; we

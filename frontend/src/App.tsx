@@ -644,35 +644,49 @@ export function App() {
   const columnRefs = useRef<Map<string, HTMLElement | null>>(new Map())
   const cardRefs = useRef<Map<number, HTMLElement | null>>(new Map())
 
-  // sourcesByName: Map<source_name, Source>. Lets us resolve an
-  // entry's category in O(1) instead of the previous O(N) ``sources.find``.
-  const sourcesByName = useMemo(
-    () => new Map(sources.map((s) => [s.name, s])),
-    [sources],
-  )
+  // Derived source maps. Previously four separate ``useMemo`` calls
+  // (``sourcesByName``, ``sourcesById``, ``categoriesBySourceId``,
+  // ``faviconBySourceId``) each iterating the same ``sources`` array.
+  // Consolidated into a single pass — one useMemo, one iteration.
+  // ``byId`` carries the full Source row so the render path can
+  // resolve a source by id without a follow-up name→row lookup
+  // (the previous ``sourcesById`` only carried the name, forcing
+  // every per-entry render to do a second map lookup for the
+  // category — see ``byCategory`` below). The individual
+  // ``sourcesByName`` / ``sourcesById`` / ``categoriesBySourceId``
+  // / ``faviconBySourceId`` names are re-exported as direct
+  // references for downstream components that destructure them
+  // (Column, SearchResults, Card) — no extra memo, no extra iteration.
+  const sourceMaps = useMemo(() => {
+    const byId = new Map<number, Source>()
+    const byName = new Map<string, Source>()
+    const categoryById = new Map<number, string | null>()
+    const faviconById = new Map<number, string | null>()
+    for (const s of sources) {
+      byId.set(s.id, s)
+      byName.set(s.name, s)
+      categoryById.set(s.id, s.category ?? null)
+      faviconById.set(s.id, s.favicon_path ?? null)
+    }
+    return { byId, byName, categoryById, faviconById }
+  }, [sources])
+  // Back-compat aliases — same shape as the previous individual
+  // useMemo results, but pointing at the consolidated maps. Zero
+  // extra iterations; these are just const references.
+  // ``sourcesById`` is name-only (consumers do ``sourcesById.get(id)``
+  // to get a name string); build that one tiny map inline.
   const sourcesById = useMemo(
-    () => new Map(sources.map((s) => [s.id, s.name])),
+    () => new Map(sources.map((s) => [s.id, s.name] as [number, string])),
     [sources],
   )
-  // Same key as ``sourcesById`` but the value is the source's
-  // category. Passed down to Column → Card so each card can render
-  // its category-colored left stripe. Optional because older source
-  // rows (pre-Phase-5) have no category in the DB until they're
-  // touched — we just skip the stripe for those.
-  const categoriesBySourceId = useMemo(
-    () => new Map(sources.map((s) => [s.id, s.category])),
-    [sources],
-  )
-  // Same shape, favicon path this time — lets Card fall back to the
-  // source's icon as a thumbnail placeholder when the entry itself
-  // has no photo (see Card.tsx's ThumbnailFallback). NULL is a valid
-  // value (favicon hasn't been fetched yet), distinct from "key
-  // absent" (source not found at all) — Card's ``.get()`` treats
-  // both the same way (render the letter-only fallback).
-  const faviconBySourceId = useMemo(
-    () => new Map(sources.map((s) => [s.id, s.favicon_path])),
-    [sources],
-  )
+  // ``categoriesBySourceId`` and ``faviconBySourceId`` are direct
+  // references to the consolidated maps — same shape as before
+  // (Map<number, string|null>), zero extra iterations.
+  const categoriesBySourceId = sourceMaps.categoryById
+  const faviconBySourceId = sourceMaps.faviconById
+  // ``sourcesByName`` was a Map<name, Source> before; the
+  // consolidated sourceMaps.byName is the same thing.
+  const sourcesByName = sourceMaps.byName
 
   // Build a Set for O(1) hidden-entry lookup. We recompute on
   // every render where ``hiddenEntries`` changes (the underlying
@@ -692,15 +706,14 @@ export function App() {
   const byCategory = useMemo(() => {
     const grouped = new Map<string, Entry[]>()
     for (const e of visibleEntries) {
-      const sourceName = sourcesById.get(e.source_id)
-      const src = sourceName != null ? sourcesByName.get(sourceName) : undefined
+      const src = sourceMaps.byId.get(e.source_id)
       const cat = src?.category ?? 'other'
       const arr = grouped.get(cat) ?? []
       arr.push(e)
       grouped.set(cat, arr)
     }
     return grouped
-  }, [visibleEntries, sourcesByName, sourcesById])
+  }, [visibleEntries, sourceMaps])
 
   const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
   const visibleForYou = useMemo(
@@ -1036,6 +1049,12 @@ export function App() {
         for (const id of newSeen) merged.add(id)
         seenEntryIdsRef.current = merged
       }
+      // The ref alone wouldn't trigger a re-render — ``newCountByColumn``
+      // reads ``seenEntryIdsRef.current`` (line 918) but the useMemo's
+      // deps don't include the ref, so the "+N new" chip would stay
+      // stale until the next state change elsewhere. Bump the same
+      // timeTick the 30s poller bumps to force the re-render.
+      setTimeTick((n) => n + 1)
       hiddenAtRef.current = null
       setEntries(e)
       setSources(s)
@@ -1423,6 +1442,7 @@ export function App() {
         const merged = new Set(seenEntryIdsRef.current)
         for (const id of ids) merged.delete(id)
         seenEntryIdsRef.current = merged
+        setTimeTick((n) => n + 1)
       }
     },
     [setReadEntries, clearLastViewed],
@@ -1863,6 +1883,7 @@ export function App() {
         const merged = new Set(seenEntryIdsRef.current)
         for (const e of col.entries) merged.add(e.id)
         seenEntryIdsRef.current = merged
+        setTimeTick((n) => n + 1)
       }
     }
     // Surface the action as an Undo-able toast.
