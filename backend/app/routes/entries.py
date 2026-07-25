@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import html
 import re
 from typing import Optional
@@ -459,8 +460,23 @@ async def entry_summary_endpoint(
       - ``cached_summary == ""``     → asked before, no usable text
                                        (feed shipped nothing AND the
                                        article couldn't be fetched).
-                                       Return empty without retrying.
-      - ``cached_summary == "..."``  → asked before, return verbatim.
+                                       Return empty without retrying,
+                                       UNLESS the entry has been
+                                       re-ingested since the cache
+                                       write (see ``cached_summary_fetched_at``).
+      - ``cached_summary == "..."``  → asked before, return verbatim,
+                                       subject to the same staleness
+                                       check as the empty case.
+
+    Cache invalidation: a summary attempt older than
+    ``entry.fetched_at`` is considered stale. The entry has been
+    re-ingested (the source plugin fetched new data) since we
+    last tried to summarise it, so the old "asked but nothing
+    useful" or "got this text" answer is no longer trustworthy.
+    Re-run the summary path. ``cached_summary_fetched_at`` is
+    backfilled to ``fetched_at`` for already-cached rows in
+    migration 0021, so the staleness check is correct from the
+    moment the migration runs.
 
     Summary path (first that produces text wins):
       1. LLM summary of the article's own full text — fetch the
@@ -490,8 +506,18 @@ async def entry_summary_endpoint(
         # Cache hit. ``""`` means we already determined the source
         # shipped nothing usable — return that as ``summary=""`` so
         # the frontend can distinguish "no summary" from "summary
-        # loaded".
-        return EntrySummaryOut(summary=row.cached_summary, cached=True)
+        # loaded". BUT if the entry has been re-ingested since the
+        # cache write, the cached answer is stale (the source
+        # might now ship a summary it didn't before, or the URL
+        # might have changed). Treat as a miss in that case.
+        cache_is_fresh = (
+            row.cached_summary_fetched_at is None
+            or row.fetched_at is None
+            or row.cached_summary_fetched_at >= row.fetched_at
+        )
+        if cache_is_fresh:
+            return EntrySummaryOut(summary=row.cached_summary, cached=True)
+        # Otherwise fall through to re-run the summary path.
 
     final = ""
     if llm_router.providers_for("brief"):
@@ -508,6 +534,7 @@ async def entry_summary_endpoint(
     # next time. Without the persist, every chevron tap would
     # re-run the fetch / extract / LLM chain.
     row.cached_summary = final
+    row.cached_summary_fetched_at = dt.datetime.now(dt.timezone.utc)
     await session.commit()
 
     return EntrySummaryOut(summary=final, cached=False)

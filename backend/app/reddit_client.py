@@ -105,6 +105,26 @@ _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _DIRECT_RPS = 1.0 / 75.0    # 1 call per 75 seconds, just over Reddit's 60s reset
 _DIRECT_BURST = 1.0
 
+# MULTI-WORKER WARNING: the token bucket above is a per-process
+# module-level singleton. Running with ``uvicorn --workers N``
+# gives N independent buckets, so the effective rate is N calls
+# per 75 s = 1 call per 75/N s. For N=4, that's 1 call per ~19s,
+# which exceeds Reddit's 60s reset and gets the IP banned.
+#
+# Three options, in order of preference:
+#  1. Single worker (the safe default — popping is a personal
+#     dashboard and doesn't need fan-out).
+#  2. Move the bucket to Redis (``app.redis``) so all workers
+#     share one counter. Bigger change; the proxied mode
+#     (``REDDIT_HYDRA_URL`` set) avoids this entirely.
+#  3. Set ``REDDIT_DIRECT_DISABLED=true`` and use the Hydra
+#     proxy (which has its own rate limit story on the proxy
+#     side).
+#
+# The log below fires at startup if the bucket is loaded and
+# ``workers > 1`` is detected. Best-effort: a developer running
+# ``uvicorn app.main:app --reload`` (single worker) won't see it.
+
 # Cross-reference cache: how long a fetched subreddit listing stays
 # in memory. The cross-ref sweep scans this cache to answer
 # "is there a thread about URL X" without doing a per-URL fetch.
@@ -251,6 +271,30 @@ def init_client() -> None:
         # Invalidate the cross-ref cache so a process restart
         # re-fetches instead of using stale entries.
         _crossref_cache.clear()
+        # Multi-worker warning. ``WEB_CONCURRENCY`` is the env
+        # var Gunicorn / Uvicorn's ``--workers`` flag sets; check
+        # both for completeness. A direct-mode deploy with
+        # workers > 1 will silently exceed Reddit's per-IP
+        # rate limit and get the IP banned — see the long
+        # comment above ``_DIRECT_RPS``.
+        worker_count_env = (
+            os.environ.get("WEB_CONCURRENCY")
+            or os.environ.get("UVICORN_WORKERS")
+            or "1"
+        )
+        try:
+            workers = int(worker_count_env)
+        except ValueError:
+            workers = 1
+        if workers > 1:
+            logger.warning(
+                "reddit_client: direct Atom mode running with %d workers — "
+                "the token bucket is per-process, so the effective rate is "
+                "%dx the configured %d/%.0fs. Reddit's 60s reset will be "
+                "exceeded and the IP may be banned. Set REDDIT_HYDRA_URL, "
+                "set REDDIT_DIRECT_DISABLED=true, or run with --workers 1.",
+                workers, workers, 1.0 / _DIRECT_RPS, _DIRECT_BURST,
+            )
         logger.info(
             "reddit_client: direct Atom mode (no proxy; "
             "throttled to 1/%.0fs, burst %.0f; "

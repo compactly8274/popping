@@ -159,13 +159,25 @@ app = FastAPI(
 # correct with ``credentials=False`` but failed every time the same-origin
 # assumption broke in practice. The fallback to ``["*"]`` is preserved
 # for the dev case where no public_url is set (e.g. a fresh local clone).
+#
+# ``settings.extra_cors_origins`` adds additional origins on top of
+# ``public_url`` — typically used for LAN access on a different
+# host/port. Comma-separated, treated as literal origins (no
+# wildcards). Empty by default.
 _public_cors_origins: list[str] = []
 if settings.public_url:
-    _public_cors_origins = [settings.public_url.rstrip("/")]
-    # Also allow the http(s)://host:port variant — some operators serve
-    # the API on a different port for direct LAN access. Strip the
-    # default port if it's still in the URL.
-else:
+    _public_cors_origins.append(settings.public_url.rstrip("/"))
+if settings.extra_cors_origins:
+    for origin in settings.extra_cors_origins.split(","):
+        origin = origin.strip()
+        if origin and origin not in _public_cors_origins:
+            _public_cors_origins.append(origin)
+if not _public_cors_origins:
+    # No public_url AND no extra_cors_origins — fall back to the
+    # dev wildcard so a fresh local clone (no env config at all)
+    # still works. A misconfiguration here is "CORS errors on the
+    # user's browser with no clear cause"; the env vars are documented
+    # in the README so this is the safe default.
     _public_cors_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,

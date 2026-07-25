@@ -150,6 +150,7 @@ async def get_preference(
     (e.g. a future "did the user dismiss this onboarding hint?"
     check that loads one specific preference on demand).
     """
+    _validate_key(key)
     user_id = resolve_user_id(user)
     row = await session.scalar(
         select(UserPreference).where(

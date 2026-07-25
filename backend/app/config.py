@@ -158,6 +158,14 @@ class Settings(BaseSettings):
     oidc_client_id: str = ""
     oidc_scopes: str = "openid email profile"
     public_url: str = ""             # e.g. https://popping.example.com
+    # Additional CORS origins beyond ``public_url``. Use for LAN
+    # access on a different host/port (e.g. http://192.168.1.x:8000
+    # while public_url is the HTTPS reverse-proxy URL). Comma-separated.
+    # Empty by default — every CORS request must match ``public_url``
+    # (or fall through to the dev wildcard if public_url is also
+    # empty). Each entry is treated as a literal origin; wildcards
+    # aren't supported.
+    extra_cors_origins: str = ""
     session_secret: str = ""         # required when oidc_enabled (openssl rand -hex 32)
     session_ttl_seconds: int = 28800  # 8 h
     session_cookie_name: str = "popping_session"
