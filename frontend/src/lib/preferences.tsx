@@ -90,17 +90,7 @@ export type LastViewedValue = string
  * circular import (App imports this module, this module would
  * have to import App's ColumnPrefs otherwise).
  */
-export type ColumnPrefsValue = {
-  sort: 'top' | 'newest' | 'oldest'
-  minScore: number
-  maxAgeHours: number | null
-}
-
-/** One column's Fresh/History section collapse state. */
-export type ColumnSectionsValue = {
-  newCollapsed: boolean
-  historyCollapsed: boolean
-}
+export type { ColumnPrefsValue, ColumnSectionsValue } from './types'
 
 /** The History tab's group-by mode. */
 export type HistoryGroupByValue = 'entry' | 'none'

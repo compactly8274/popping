@@ -119,13 +119,14 @@ function loadMobileCol(): number {
 const MAX_PER_COLUMN = 200
 
 
-// Per-column Fresh/History section collapse state. The
-// shape is forgiving on read: a missing column name, a
-// missing field, or a non-boolean value silently falls back to
-// "expanded" so a future shape change can't strand the user with
+// Per-column Fresh/History section collapse state. Imported
+// from ``lib/types`` (canonical location — see the docstring
+// there for the dedup rationale). The shape is forgiving on
+// read: a missing column name, a missing field, or a
+// non-boolean value silently falls back to "expanded" so a
+// future shape change can't strand the user with
 // permanently-collapsed sections.
-type SectionCollapse = { newCollapsed: boolean; historyCollapsed: boolean }
-type ColumnSections = Record<string, SectionCollapse>
+import type { ColumnSectionsValue } from './lib/types'
 
 // User-saved filter preset. Captures a complete dashboard
 // view: which sources are filtered, and the per-column
@@ -507,6 +508,10 @@ export function App() {
   const readEntries = prefs.state.readEntries
   const lastViewed = prefs.state.lastViewed
   const columnPrefs = prefs.state.columnPrefs as Record<string, ColumnPrefs>
+  // ``ColumnSections`` here is the per-column map (Record), not
+  // the per-column value (ColumnSectionsValue, the imported
+  // single-column shape). The Record wraps the per-column value.
+  type ColumnSections = Record<string, ColumnSectionsValue>
   const columnSections = prefs.state.columnSections as ColumnSections
   const hiddenEntries = prefs.state.hiddenEntries
   const starredEntries = prefs.state.starredEntries
@@ -1976,7 +1981,7 @@ export function App() {
   const setColumnSection = (columnName: string, key: 'new' | 'history') => {
     const cur = columnSectionsRef.current[columnName] ?? { newCollapsed: false, historyCollapsed: false }
     const flag = key === 'new' ? 'newCollapsed' : 'historyCollapsed'
-    const next: SectionCollapse = { ...cur, [flag]: !cur[flag] }
+    const next: ColumnSectionsValue = { ...cur, [flag]: !cur[flag] }
     if (!next.newCollapsed && !next.historyCollapsed) {
       // Both bits are back to false. Persist an empty
       // object so the loader treats the column as
