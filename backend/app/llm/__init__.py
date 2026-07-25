@@ -222,10 +222,17 @@ class Router:
             provider = self._construct(backend, model)
             if provider is not None:
                 out.append(provider)
-        # Local Ollama is the unconditional fallback — no API key needed.
-        model = self._model_for(task, "ollama")
-        if model:
-            out.append(OllamaProvider(model))
+        # Local Ollama is the unconditional fallback — no API
+        # key needed. ``settings.ollama_disable_local_fallback``
+        # opts out of this for environments where the default
+        # ``host.docker.internal:11434`` doesn't resolve (the
+        # per-call transport error is more noise than
+        # insurance). See the comment in ``app.config`` for the
+        # full rationale.
+        if not settings.ollama_disable_local_fallback:
+            model = self._model_for(task, "ollama")
+            if model:
+                out.append(OllamaProvider(model))
         return out
 
 
