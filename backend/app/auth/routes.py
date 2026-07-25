@@ -44,8 +44,44 @@ _OIDC_CLAIM_MAX = 255
 # LOCAL_AUTH_ENABLED=true, so it's safe to mount unconditionally here.
 router.include_router(local_auth.router)
 
-# State cookie name (separate from session cookie).
+# State cookie name. The callback is a top-level redirect, not a
+# cross-site fetch, so the state cookie can safely be Strict-mode
+# (unlike the session cookie, which has to be Lax so the post-callback
+# navigation carries it). On HTTPS we also use the ``__Host-`` prefix,
+# which forces Secure + path=/auth (must match the callback's URL path)
+# + no Domain attribute — three browser-enforced invariants that
+# catch a misconfigured ``set-cookie`` in CI rather than in prod. Over
+# plain http we fall back to a non-``__Host-`` name with a startup
+# warning (the Secure flag would be a no-op there anyway, and ``__Host-``
+# requires Secure so the browser would reject the cookie silently).
 _STATE_COOKIE = "popping_oidc_state"
+_STATE_COOKIE_HOST_PREFIX = "__Host-popping_oidc_state"
+
+
+def _state_cookie_name(cfg: OIDCConfig) -> str:
+    return _STATE_COOKIE_HOST_PREFIX if _is_https(cfg) else _STATE_COOKIE
+
+
+def _state_cookie_attrs(cfg: OIDCConfig) -> dict[str, Any]:
+    """Cookie attributes for the OIDC state cookie.
+
+    Path is ``/auth`` (not ``/``) so the cookie is scoped to the
+    callback URL and never visible to JS on the dashboard — even
+    though the value is opaque + httponly, narrowing the scope
+    closes a class of ``fetch('/api/...', {credentials:'include'})``
+    accidents. ``__Host-`` requires path=/auth, no Domain, and
+    Secure; we satisfy all three when on HTTPS. Over plain http
+    (local dev) we drop the ``__Host-`` prefix and use ``samesite=strict``
+    without Secure so the cookie is actually delivered.
+    """
+    attrs: dict[str, Any] = {
+        "httponly": True,
+        "samesite": "strict",
+        "path": "/auth",
+    }
+    if _is_https(cfg):
+        attrs["secure"] = True
+    return attrs
 
 
 def _is_https(cfg: OIDCConfig) -> bool:
@@ -118,10 +154,10 @@ async def login(return_to: str = "/") -> Response:
 
     resp = RedirectResponse(authorize_url, status_code=status.HTTP_302_FOUND)
     resp.set_cookie(
-        _STATE_COOKIE,
+        _state_cookie_name(cfg),
         state_cookie_value,
         max_age=600,            # 10 min
-        **_cookie_attrs(cfg),
+        **_state_cookie_attrs(cfg),
     )
     return resp
 
@@ -141,7 +177,7 @@ async def callback(
     """Exchange the code, mint a session row, set the cookie, redirect."""
     cfg = oidc_config()
 
-    state_cookie = request.cookies.get(_STATE_COOKIE)
+    state_cookie = request.cookies.get(_state_cookie_name(cfg))
     if not state_cookie:
         raise HTTPException(status_code=400, detail="login state cookie missing")
 
@@ -209,7 +245,12 @@ async def callback(
         max_age=cfg.session_ttl_seconds,
         **_cookie_attrs(cfg),
     )
-    resp.delete_cookie(_STATE_COOKIE, path="/")
+    resp.delete_cookie(
+        _state_cookie_name(cfg),
+        path="/auth",
+        samesite="strict",
+        secure=_is_https(cfg),
+    )
     logger.info("OIDC login ok sub=%s", sub)
     return resp
 
