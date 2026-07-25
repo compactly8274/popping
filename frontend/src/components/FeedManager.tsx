@@ -5,9 +5,9 @@
 //     toggle active, edit metadata, edit refresh interval, delete
 //     (works for both dynamic and built-in rows). Plugin-backed
 //     rows have url/name fields locked (the plugin owns them) but
-//     can still be deleted — the row goes away and the scheduler
-//     job is removed; the plugin re-registers itself on the next
-//     backend restart.
+//     can still be deleted — permanently: the backend records the
+//     deletion so the plugin doesn't recreate the row on its next
+//     scheduled tick or after a backend restart.
 //
 //   • Recommended — curated list from GET /api/feed-recommendations,
 //     minus anything the user already has. Tap "Add" to fire
@@ -100,14 +100,10 @@ const CATEGORY_OPTIONS = [
 ]
 
 // Names of the registered plugin sources (BBC, HN, GitHub Releases,
-// NVD, CISA, Wikipedia OTD). These rows are managed by the scheduler
-// at import time and are not user-deletable — the UI hides the
-// delete affordance and the backend rejects DELETE with a 400.
-//
-// We derive this list client-side by hitting /api/sources on mount
-// and looking up each row against `registeredPluginNames`. The
-// backend is the source of truth via the 400 response on DELETE, so
-// a stale client can't accidentally delete a built-in.
+// NVD, CISA, Wikipedia OTD). These rows ARE user-deletable — the
+// "delete" button isn't gated by this set. It only drives the
+// "built-in" badge (url/name locked, managed by the plugin's own
+// schedule) and the row/url-field lock in the edit form below.
 const KNOWN_BUILT_INS = new Set([
   'bbc_news',
   'hn_top',
@@ -410,8 +406,8 @@ function SourceRow({
   const onDelete = async () => {
     // Inline two-tap — the first tap set ``confirmingDelete`` to
     // true (button became "confirm delete"). This is the second tap.
-    // Backend protects built-ins with a 400; we also hide the
-    // button for built-ins so this path is dynamic-only.
+    // Works the same for built-in and dynamic rows — see
+    // ``KNOWN_BUILT_INS`` above.
     setBusy(true)
     try {
       await api.deleteSource(source.id)
@@ -905,7 +901,7 @@ function SourceRow({
         {builtIn && !confirmingDelete && (
           <span
             className="text-ios-caption text-label-tertiary"
-            title="built-in source — managed by the scheduler at startup. Will re-appear after a backend restart unless the plugin is also removed."
+            title="built-in source — url/name are locked to the plugin. Deleting it is permanent."
           >
             built-in
           </span>

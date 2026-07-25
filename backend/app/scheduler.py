@@ -53,7 +53,7 @@ from app.brief import BriefGenerator
 from app.config import settings
 from app.db import SessionLocal
 from app.embeddings import embedder
-from app.models import Brief, Entry, Interaction, NotificationDedup, Source, UserProfile
+from app.models import AppSetting, Brief, Entry, Interaction, NotificationDedup, Source, UserProfile
 from app.notify import Notifier
 from app.scoring import composite as composite_scorer
 from app.scoring import convergence as convergence_helper
@@ -81,13 +81,45 @@ _UNSET: Any = object()
 _brief_generator: Optional[BriefGenerator] = None
 
 
-async def _upsert_source(session: AsyncSession, plugin_cls: Any) -> Source:
-    """Make sure the sources table has a row for this plugin. Idempotent."""
+# Key prefix for the ``app_settings`` marker that records a
+# deliberately-deleted built-in (class-driven) source — see
+# ``_upsert_source`` and ``delete_source``. Built-in plugins register
+# one permanent APScheduler job per class at every ``start_scheduler()``
+# call (unlike dynamic rss/reddit/podcast/youtube rows, whose jobs are
+# added/removed per DB row), so deleting the row alone doesn't stop
+# the next tick — or the immediate startup tick on the next backend
+# restart — from calling ``_upsert_source`` and silently recreating
+# it. This marker is the durable "no, stay deleted" record that
+# survives both.
+_DELETED_BUILTIN_SOURCE_KEY_PREFIX = "deleted_builtin_source:"
+
+
+async def _is_builtin_source_deleted(session: AsyncSession, name: str) -> bool:
+    row = await session.get(AppSetting, f"{_DELETED_BUILTIN_SOURCE_KEY_PREFIX}{name}")
+    return row is not None
+
+
+async def _mark_builtin_source_deleted(session: AsyncSession, name: str) -> None:
+    key = f"{_DELETED_BUILTIN_SOURCE_KEY_PREFIX}{name}"
+    if await session.get(AppSetting, key) is not None:
+        return
+    session.add(AppSetting(key=key, value=dt.datetime.now(dt.timezone.utc).isoformat()))
+
+
+async def _upsert_source(session: AsyncSession, plugin_cls: Any) -> Source | None:
+    """Make sure the sources table has a row for this plugin. Idempotent.
+
+    Returns None if the user has deliberately deleted this built-in
+    source (see ``delete_source``) — the caller must treat that as
+    "skip this ingest tick entirely," not "create it anyway."
+    """
     existing = await session.scalar(
         select(Source).where(Source.name == plugin_cls.name)
     )
     if existing is not None:
         return existing
+    if await _is_builtin_source_deleted(session, plugin_cls.name):
+        return None
     row = Source(
         name=plugin_cls.name,
         type=plugin_cls.type,
@@ -281,6 +313,12 @@ async def _ingest(plugin_cls: Any) -> dict:
         needs_favicon = False
         async with SessionLocal() as session:
             source = await _upsert_source(session, plugin_cls)
+            if source is None:
+                # User deliberately deleted this built-in source — see
+                # ``_upsert_source`` / ``delete_source``. Skip the tick
+                # entirely rather than recreating the row.
+                logger.debug("ingest: %s was deleted by the user — skipping", plugin_cls.name)
+                return summary
             source_id = source.id
             source_url = source.url
             needs_favicon = (
@@ -2022,15 +2060,15 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
     # commits, and it's been deleted besides, so touching row.name
     # afterward would try to re-SELECT a row that's no longer there.
     source_name = row.name
-    # Built-in sources (BBC, HN, etc.) ARE deletable now. The
-    # row goes away, the scheduler job is removed, the
-    # dashboard stops showing the source. The plugin class
-    # stays registered in memory until the next backend
-    # restart — at which point it re-registers itself as a
-    # fresh row. The proper "permanent soft-delete across
-    # restarts" fix is a ``deleted_at`` column on Source;
-    # for now this matches the user's stated intent with
-    # the simplest possible code change.
+    # Built-in sources (BBC, HN, Wikipedia On This Day, etc.) ARE
+    # deletable. The row goes away, the scheduler job is removed, and
+    # (unlike before) the deletion is recorded in ``app_settings`` via
+    # ``_mark_builtin_source_deleted`` — the plugin class stays
+    # registered in memory for the rest of the process's life (that
+    # part can't be undone at runtime), but ``_upsert_source`` checks
+    # this marker before recreating the row, so neither the next
+    # scheduled tick nor a backend restart resurrects it.
+    is_builtin = source_name in list_sources()
     # Delete child rows first. ``Entry.interactions`` also has an
     # ON DELETE CASCADE FK, so dropping entries drops their
     # interactions transparently — no need to fan out further.
@@ -2038,11 +2076,19 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
         delete(Entry).where(Entry.source_id == source_id)
     )
     await session.delete(row)
+    if is_builtin:
+        await _mark_builtin_source_deleted(session, source_name)
     await session.commit()
     if _scheduler is not None:
+        # Built-ins and dynamic rows are registered under different
+        # job id schemes (see ``_ingest_job_id``) — ``_dynamic_job_id``
+        # alone silently no-ops for a built-in, which is what let the
+        # scheduler job keep firing (and recreating the row) after a
+        # "successful" delete.
+        job_id = f"ingest:{source_name}" if is_builtin else _dynamic_job_id(source_id)
         try:
-            _scheduler.remove_job(_dynamic_job_id(source_id))
-            logger.info("scheduler: removed dynamic job for %s (id=%d)", source_name, source_id)
+            _scheduler.remove_job(job_id)
+            logger.info("scheduler: removed job %s for %s (id=%d)", job_id, source_name, source_id)
         except Exception:
             pass
     return True
