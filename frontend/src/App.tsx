@@ -21,7 +21,6 @@ import { api, type Brief, type CurrentUser, type Entry, type Health, type Source
 import { BriefCard } from './components/BriefCard'
 import { ColumnGrid, type ColumnGridHandlers } from './components/ColumnGrid'
 import { DEFAULT_PREFS, type ColumnPrefs } from './components/Column'
-import { Drawer } from './components/Drawer'
 import { ForYouSection, type ForYouHandlers } from './components/ForYouSection'
 import { FramingWatch } from './components/FramingWatch'
 import { Hamburger } from './components/Hamburger'
@@ -32,7 +31,21 @@ import { ToastHost, toast } from './components/Toast'
 import { UserBadge } from './components/UserBadge'
 import { Wallpaper } from './components/Wallpaper'
 import { SkeletonGrid } from './components/Skeleton'
-import { Settings, type SettingsTab } from './components/Settings'
+
+// Lazy-loaded modals. These are the two biggest components in
+// the app (Settings is 1600+ lines, Drawer is 600+) but the
+// user only opens them on explicit action — keeping them out
+// of the initial bundle cuts the first-paint JS payload. The
+// fallback is null (the modals render nothing when closed, so
+// Suspense shows nothing while the chunk loads on first open).
+//
+// NOT lazy: BriefCard (always visible on desktop) and
+// FramingWatch (rendered in 'all' view). Lazy-loading them
+// would mean a chunk fetch + Suspense fallback on every
+// initial page load — strictly worse than the savings.
+const Settings = React.lazy(() => import('./components/Settings'))
+const Drawer = React.lazy(() => import('./components/Drawer'))
+type SettingsTab = import('./components/Settings').SettingsTab
 import { recordImmediate } from './lib/interactions'
 // Per-user server-backed preferences. Replaces the 8 localStorage
 // keys the dashboard used to write (readEntries, lastViewed,
@@ -2734,6 +2747,7 @@ export function App() {
         </>
       )}
 
+      <Suspense fallback={null}>
       <Drawer
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
@@ -2820,6 +2834,7 @@ export function App() {
           )
         }}
       />
+      </Suspense>
 
       <ShortcutsSheet
         open={shortcutsOpen}
