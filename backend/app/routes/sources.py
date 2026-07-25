@@ -723,15 +723,17 @@ async def delete_source_endpoint(
 ) -> None:
     """Drop a source row and its scheduler job.
 
-    Works for both dynamic and built-in rows. For built-ins (BBC,
-    HN, etc.) the plugin class stays registered in memory until
-    the backend restarts — at which point the plugin
-    re-registers itself as a fresh row. The 400-on-built-in
+    Works for both dynamic and built-in rows. The 400-on-built-in
     guard that used to live here was removed so the user can
     actually silence a built-in they don't want (the old
     workaround was to set ``active=false``, which kept the
     scheduler job and the row but stopped fetches — a poor
-    substitute for actual removal).
+    substitute for actual removal). For built-ins (BBC, HN, etc.)
+    the plugin class stays registered in memory for the rest of
+    this process's life, but ``scheduler.delete_source`` records
+    the deletion in ``app_settings`` and removes the scheduler
+    job, so neither the next scheduled tick nor a backend restart
+    resurrects the row — see ``scheduler._upsert_source``.
     """
     row = await session.get(Source, source_id)
     if row is None:
