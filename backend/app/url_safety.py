@@ -107,6 +107,14 @@ _DENIED_NETWORKS: list[ipaddress._BaseNetwork] = [
         "224.0.0.0/4",
         "240.0.0.0/4",
         "::1/128",
+        "::/128",  # IPv6 unspecified — equivalent to 0.0.0.0/8 for v4.
+                  # Without this, an attacker can bypass the check
+                  # with http://[::]/admin — the parser parses it
+                  # as host "::", check_host_safe returns ok, and
+                  # httpx happily connects to the default
+                  # interface. The IPv4 equivalent (0.0.0.0/8) is
+                  # already in the list above; this is the v6
+                  # symmetric entry.
         "fc00::/7",
         "fe80::/10",
         "::ffff:0:0/96",
