@@ -101,13 +101,52 @@ def score(entry: Entry, source: Source | None, profile: UserProfile | None) -> f
     from their SELECT (the For You slim projection does, to keep
     ~3KB of vector data off every candidate row) still get the
     documented "NULL embedding → neutral 50" behaviour instead of
-    an ``AttributeError`` that 500s the whole endpoint."""
+    an ``AttributeError`` that 500s the whole endpoint.
+
+    Delegates to ``score_partial``; kept for callers that have a
+    real ``Entry`` + ``Source`` + ``UserProfile`` (the rescore loop
+    at read-time). The ingest path uses ``score_partial`` directly
+    because at ingest time there IS no Entry yet — only the
+    embedding vector (from the embedder) and the source / profile
+    (already loaded)."""
     embedding = getattr(entry, "embedding", None)
-    vec = vector_score(embedding, profile.preference_vector if profile else None)
+    return score_partial(
+        embedding=embedding,
+        source_category=source.category if source else None,
+        preference_vector=profile.preference_vector if profile else None,
+        followed_categories=profile.followed_categories if profile else None,
+        muted_categories=profile.muted_categories if profile else None,
+    )
+
+
+def score_partial(
+    *,
+    embedding: Optional[list[float]],
+    source_category: Optional[str],
+    preference_vector: Optional[list[float]],
+    followed_categories: Optional[list],
+    muted_categories: Optional[list],
+) -> float:
+    """Personal score from individual fields (no Entry / Source /
+    UserProfile required).
+
+    Same semantics as ``score()``: NULL embedding or NULL
+    preference_vector return a neutral 50 before the category
+    adjustment, the result is clamped to [0, 120] and rounded to
+    1 decimal.
+
+    Keyword-only signature so the 5 args are unambiguous at every
+    call site; the ingest path reads better as
+    ``composite.score_partial(embedding=..., source_category=..., ...)``
+    than as a positional bag of values where argument 4 might be
+    ``followed_categories`` or ``muted_categories`` depending on
+    caller whim.
+    """
+    vec = vector_score(embedding, preference_vector)
     cat_mult = _category_multiplier(
-        source.category if source else None,
-        profile.followed_categories if profile else None,
-        profile.muted_categories if profile else None,
+        source_category,
+        followed_categories,
+        muted_categories,
     )
     out = vec * cat_mult
     # Clamp — a heavy mute can drag below 0, but downstream expects

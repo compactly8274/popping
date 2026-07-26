@@ -38,15 +38,69 @@ def score(
     profile: UserProfile | None,
     now: dt.datetime | None = None,
 ) -> float:
-    """Compute composite_score for one entry."""
-    r = recency.score(entry.published_at, source.category if source else None, now=now)
-    p = personal.score(entry, source, profile)
+    """Compute composite_score for one entry.
+
+    Delegates to ``score_partial``; kept for callers that have a
+    real ``Entry`` + ``Source`` + ``UserProfile`` (the rescore loop
+    at read-time, the ``/api/foryou`` ranking path). The ingest
+    path uses ``score_partial`` directly because at ingest time
+    there IS no Entry yet — the fields it needs (published_at,
+    raw_score, embedding, meta) are all available in the
+    normalized dict the plugin returned.
+    """
+    return score_partial(
+        published_at=getattr(entry, "published_at", None),
+        raw_score=getattr(entry, "raw_score", None),
+        embedding=getattr(entry, "embedding", None),
+        entry_meta=getattr(entry, "meta", None),
+        source=source,
+        profile=profile,
+        now=now,
+    )
+
+
+def score_partial(
+    *,
+    published_at: dt.datetime | None,
+    raw_score: float | None,
+    embedding: list[float] | None,
+    entry_meta: dict | None,
+    source: Source | None,
+    profile: UserProfile | None,
+    now: dt.datetime | None = None,
+) -> float:
+    """Composite score from individual fields (no Entry required).
+
+    Same semantics as ``score()``: returns the weighted blend
+    ``w_r * recency + w_p * personal + w_s * (raw * source_weight)
+    + w_e * engagement`` rounded to 2dp, with all the same NULL
+    handling (NULL embedding → personal returns neutral 50, NULL
+    engagement signals → engagement returns 0, etc.).
+
+    The source and profile kwargs are still required (the
+    composite formula needs source category + source weight, and
+    personal needs preference_vector + followed/muted categories).
+    What this function frees the caller from is having to
+    build a real ``Entry`` row just to hold a few fields. At
+    ingest time we have all the raw inputs but no DB row yet;
+    at read time we have a real row. Both call this same function
+    with the same field set.
+    """
+    source_category = source.category if source else None
+    r = recency.score(published_at, source_category, now=now)
+    p = personal.score_partial(
+        embedding=embedding,
+        source_category=source_category,
+        preference_vector=profile.preference_vector if profile else None,
+        followed_categories=profile.followed_categories if profile else None,
+        muted_categories=profile.muted_categories if profile else None,
+    )
     sw = source_helper.weight(source)
     # raw_score is the recency-at-ingest stored value; source_weight tilts
     # entire sources up or down. Both default to neutral.
-    raw = float(entry.raw_score or 0.0)
+    raw = float(raw_score or 0.0)
     s = raw * sw
-    e = engagement.score(entry, source)
+    e = engagement.score_partial(entry_meta)
     total = (
         settings.scoring_weight_recency * r
         + settings.scoring_weight_personal * p

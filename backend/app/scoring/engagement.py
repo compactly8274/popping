@@ -156,7 +156,12 @@ def _read_meta(meta: Any, *keys: str) -> Optional[float]:
 
 
 def score(entry: Entry, source: Any = None) -> float:
-    """Engagement score for an entry in [0, 100].
+    """Engagement score for an entry in [0, 100]. Delegates to
+    ``score_partial``; kept for callers that have a real Entry
+    (the rescore loop, ``/api/foryou`` slim projection path). The
+    ingest path uses ``score_partial`` directly because at ingest
+    time there IS no Entry yet — the meta dict is the only
+    thing in hand.
 
     Reads canonical meta keys first, then falls back to a wide
     per-source-name list (see ``ENGAGEMENT_VOTE_KEYS`` and
@@ -177,8 +182,26 @@ def score(entry: Entry, source: Any = None) -> float:
     is read-side; engagement has already been folded into
     ``composite_score`` at ingest, which is what the dashboard
     actually ranks on)."""
-    meta = getattr(entry, "meta", None) or {}
+    return score_partial(getattr(entry, "meta", None))
 
+
+def score_partial(entry_meta: Any) -> float:
+    """Engagement score from a meta dict (no Entry required).
+
+    The ingest path passes the ``meta`` dict it just built;
+    the read path passes ``entry.meta`` (via ``score()``'s
+    getattr above). Returns a float in [0, 100] with the same
+    semantics as ``score()`` — 0 when no engagement signals are
+    present, otherwise ``round(100 * tanh(log10(1+votes)*0.6 +
+    log10(1+comments)*0.9), 1)``.
+
+    ``entry_meta`` is typed ``Any`` rather than ``dict | None``
+    so a caller that hands us a SQLAlchemy ``JSONB`` column
+    object (which behaves like a dict) works without an explicit
+    cast; ``_read_meta`` already does the right thing with
+    non-dicts.
+    """
+    meta = entry_meta or {}
     votes = _read_meta(meta, *ENGAGEMENT_VOTE_KEYS)
     comments = _read_meta(meta, *ENGAGEMENT_COMMENT_KEYS)
 
