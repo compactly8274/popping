@@ -1333,9 +1333,22 @@ async def _crossref_sweep() -> None:
     # after 100ms of polite sleep — a 5s/tick of pure wait, every
     # hour, for no work. Bail before the candidate scan so a quiet
     # week doesn't burn 80 scheduler seconds.
-    if not getattr(reddit_client, "_crossref_cache", None):
+    #
+    # Direct attribute access (not ``getattr(..., None)``): the
+    # cache is defined in ``app.reddit_client`` as a module-level
+    # dict; a missing attribute means the module was edited and we
+    # want the AttributeError to surface so the operator notices,
+    # not a silent "no work" return that masks the real bug.
+    if not reddit_client._crossref_cache:
         return
 
+    # Phase 1: open a short-lived session to gather the candidate
+    # set, then close it. The sweep's network work is slow (50
+    # entries × ~100ms = ~5s) and we don't want the session
+    # pinned for the duration — that would block other concurrent
+    # requests on the connection pool. The same pattern as the
+    # thumbnail and og:image passes below.
+    to_check: list[tuple[int, str]] = []
     try:
         async with SessionLocal() as session:
             # Pull all candidate entries. We do an in-Python filter for
@@ -1362,7 +1375,6 @@ async def _crossref_sweep() -> None:
                 )
             ).all())
 
-            to_check: list[tuple[int, str]] = []
             for row in candidates:
                 if row.source_id in reddit_source_ids:
                     continue
@@ -1371,62 +1383,90 @@ async def _crossref_sweep() -> None:
                 if not row.url:
                     continue
                 to_check.append((row.id, row.url))
+    except Exception:
+        logger.exception("crossref candidate scan failed")
+        return
 
-            if not to_check:
-                return
-            logger.info("crossref sweep: %d entries to check", len(to_check))
+    if not to_check:
+        return
+    logger.info("crossref sweep: %d entries to check", len(to_check))
 
-            stamped = 0
-            # ``to_check`` is already truncated to ``_CROSSREF_BATCH``
-            # (the slice below). We sleep per-entry rather than
-            # per-batch because the in-batch cost is dominated by
-            # the per-entry ``search_thread_by_url`` roundtrip —
-            # 100ms between *batches* would bunch all 50 requests
-            # into a single 0.5s wall, while 100ms *per entry*
-            # spreads the same 5 seconds across the tick and gives
-            # Hydra's per-connection throughput a breather.
-            for entry_id, entry_url in to_check[:_CROSSREF_BATCH]:
-                match = await reddit_client.search_thread_by_url(entry_url)
-                if match is None:
-                    # Still pause so a Hydra outage doesn't let us
-                    # spin through 50 entries in 0ms on the
-                    # failure path — same wall-clock cap as a
-                    # healthy tick.
-                    await asyncio.sleep(_CROSSREF_BATCH_SLEEP)
-                    continue
-                thread_url = f"https://www.reddit.com{match['permalink']}"
-                # jsonb || jsonb merge — preserves any other meta
-                # keys the entry already has. The patch goes through
-                # raw SQL because SQLAlchemy's JSONB column type
-                # doesn't auto-merge on update.
-                await session.execute(
-                    text(
-                        "UPDATE entries "
-                        "SET meta = COALESCE(meta, '{}'::jsonb) || :patch::jsonb "
-                        "WHERE id = :id"
-                    ),
+    # Phase 2: outside the session, do the network work. Per-entry
+    # 100ms sleep (NOT per-batch) because the in-batch cost is
+    # dominated by the per-entry ``search_thread_by_url`` roundtrip
+    # — 100ms between *batches* would bunch all 50 requests into a
+    # single 0.5s wall, while 100ms *per entry* spreads the same
+    # 5 seconds across the tick and gives Hydra's per-connection
+    # throughput a breather.
+    #
+    # We collect (id, thread_url, num_comments) tuples instead of
+    # updating the DB inline. The DB session was the long-held
+    # resource in the old code; moving the network loop outside
+    # the session shrinks the held window from ~5s to a few ms.
+    patches: list[tuple[int, str, int]] = []
+    for entry_id, entry_url in to_check[:_CROSSREF_BATCH]:
+        try:
+            match = await reddit_client.search_thread_by_url(entry_url)
+        except Exception:
+            # Defensive: search_thread_by_url already swallows
+            # ProviderError internally, but anything else (e.g. a
+            # malformed cache entry) shouldn't take the whole sweep
+            # down. The outer try/except would catch this anyway,
+            # but logging here gives per-entry visibility.
+            logger.debug("crossref search failed for entry %d", entry_id, exc_info=True)
+            await asyncio.sleep(_CROSSREF_BATCH_SLEEP)
+            continue
+        if match is None:
+            # Still pause so a Hydra outage doesn't let us spin
+            # through 50 entries in 0ms on the failure path — same
+            # wall-clock cap as a healthy tick.
+            await asyncio.sleep(_CROSSREF_BATCH_SLEEP)
+            continue
+        thread_url = f"https://www.reddit.com{match['permalink']}"
+        num_comments = int(match["num_comments"])
+        patches.append((entry_id, thread_url, num_comments))
+        await asyncio.sleep(_CROSSREF_BATCH_SLEEP)
+
+    if not patches:
+        return
+
+    # Phase 3: short-lived session, bulk UPDATE. One round-trip
+    # for the whole batch instead of N. ``jsonb || jsonb`` merge
+    # preserves any other meta keys the entry already has; the
+    # raw SQL is needed because SQLAlchemy's JSONB column type
+    # doesn't auto-merge on update. The same pattern as the
+    # thumbnail/og:image bulk UPDATEs above.
+    try:
+        async with SessionLocal() as session:
+            await session.execute(
+                text(
+                    "UPDATE entries "
+                    "SET meta = COALESCE(meta, '{}'::jsonb) || :patch::jsonb "
+                    "WHERE id = :id"
+                ),
+                [
                     {
                         "patch": json.dumps({
                             "reddit_thread_url": thread_url,
-                            "reddit_comment_count": int(match["num_comments"]),
+                            "reddit_comment_count": num_comments,
                         }),
                         "id": entry_id,
-                    },
-                )
-                stamped += 1
-                await asyncio.sleep(_CROSSREF_BATCH_SLEEP)
-            if stamped:
-                await session.commit()
-                logger.info(
-                    "crossref sweep: stamped %d entries (of %d candidates)",
-                    stamped, len(to_check),
-                )
-            # If we had more candidates than we processed in this
-            # batch, the next hourly tick picks them up. Keeping the
-            # per-tick cap bounded so the sweep can't monopolise the
-            # scheduler's single thread.
+                    }
+                    for entry_id, thread_url, num_comments in patches
+                ],
+            )
+            await session.commit()
+            logger.info(
+                "crossref sweep: stamped %d entries (of %d candidates)",
+                len(patches), len(to_check),
+            )
     except Exception:
-        logger.exception("reddit crossref sweep failed")
+        logger.exception("crossref bulk update failed")
+
+    # If we had more candidates than we processed in this batch,
+    # the next hourly tick picks them up. Keeping the per-tick cap
+    # bounded so the sweep can't monopolise the scheduler's
+    # single thread.
 
 
 async def _already_notified_urls(session: AsyncSession) -> set[str]:
