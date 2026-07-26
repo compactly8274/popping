@@ -24,6 +24,7 @@ import time — hence this file does it at the very top, ahead of the
 from __future__ import annotations
 
 import os
+import asyncio
 import tempfile
 
 os.environ.setdefault("POSTGRES_HOST", "localhost")
@@ -87,11 +88,62 @@ async def _clean_tables():
     connection than whatever a nested-transaction fixture would hand
     the test, so it wouldn't see uncommitted test data anyway. Truncate
     real, committed rows after the fact instead.
+
+    Retry on ``DeadlockDetectedError``
+    ---------------------------------
+
+    A handful of flakes (slice-2 PR #45, slice-5 PR #48, and earlier
+    cycles) showed the truncate occasionally deadlocking with a
+    leaked background task that's still holding ``AccessShareLock``
+    on ``sources`` or ``entries`` from an in-flight ``SELECT`` that
+    outran the test's ``await``. The deadlock detector picks one
+    transaction as victim and aborts it; our ``TRUNCATE`` is that
+    victim because it requested ``AccessExclusiveLock`` last.
+
+    The leaked task usually finishes within a few ms — it's an
+    ``asyncio.create_task(...)`` from the previous test that wasn't
+    awaited. A short exponential-backoff retry (max 5 attempts,
+    capped at 800 ms) lets the lock drain without failing the test.
+    This is the same pattern PostgreSQL recommends for any
+    application-side bulk-DDL that can race with background work
+    on the same connection pool.
     """
     yield
-    async with engine.begin() as conn:
-        tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
-        await conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
+
+    tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
+    stmt = text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")
+
+    async def _truncate_with_retry():
+        last_exc = None
+        # Exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms.
+        # Total worst-case wait: 1.55 s, which is shorter than the
+        # cost of one CI rebuild (~30s) — a few-flake-percent
+        # retry pays for itself.
+        delays = [0.05, 0.1, 0.2, 0.4, 0.8]
+        for delay_s in delays:
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(stmt)
+                return  # success
+            except Exception as exc:
+                # asyncpg wraps the deadlock as DBAPIError with
+                # ``pgcode == "40P01"`` (deadlock_detected). Match on
+                # the SQLSTATE code rather than the exception type
+                # so we catch both the asyncpg native and the
+                # SQLAlchemy-wrapped forms (and any future driver
+                # wrapper that preserves the pgcode attribute).
+                pgcode = getattr(getattr(exc, "orig", None), "sqlstate", None)
+                if pgcode != "40P01":
+                    raise
+                last_exc = exc
+                await asyncio.sleep(delay_s)
+        # Exhausted retries — surface the original error so the test
+        # fails loudly with the actual deadlock detail (which query
+        # was the victim, which other tx was the blocker) rather
+        # than a generic "fixture failed" traceback.
+        raise last_exc
+
+    await _truncate_with_retry()
 
 
 @pytest_asyncio.fixture
