@@ -47,19 +47,27 @@ router.include_router(local_auth.router)
 # State cookie name. The callback is a top-level redirect, not a
 # cross-site fetch, so the state cookie can safely be Strict-mode
 # (unlike the session cookie, which has to be Lax so the post-callback
-# navigation carries it). On HTTPS we also use the ``__Host-`` prefix,
-# which forces Secure + path=/auth (must match the callback's URL path)
-# + no Domain attribute — three browser-enforced invariants that
-# catch a misconfigured ``set-cookie`` in CI rather than in prod. Over
-# plain http we fall back to a non-``__Host-`` name with a startup
-# warning (the Secure flag would be a no-op there anyway, and ``__Host-``
-# requires Secure so the browser would reject the cookie silently).
+# navigation carries it). On HTTPS we also use the ``__Secure-`` prefix,
+# a browser-enforced invariant that the cookie was set with the Secure
+# flag — catches a misconfigured ``set-cookie`` in CI rather than in
+# prod. Over plain http we fall back to a non-prefixed name with a
+# startup warning (the Secure flag would be a no-op there anyway, and
+# a prefixed cookie without Secure is rejected by the browser).
+#
+# NOT ``__Host-``: that prefix additionally requires ``Path=/`` (root)
+# and forbids a Domain attribute. This cookie is deliberately scoped
+# to ``Path=/auth`` (so it's never sent on ``/api/...`` requests) —
+# combining ``__Host-`` with a non-root path produces an invalid
+# Set-Cookie that every compliant browser silently drops, which
+# breaks login outright (the browser never stores the cookie, so the
+# callback always 400s with "login state cookie missing"). ``__Secure-``
+# has no such Path constraint, so it's the correct prefix here.
 _STATE_COOKIE = "popping_oidc_state"
-_STATE_COOKIE_HOST_PREFIX = "__Host-popping_oidc_state"
+_STATE_COOKIE_SECURE_PREFIX = "__Secure-popping_oidc_state"
 
 
 def _state_cookie_name(cfg: OIDCConfig) -> str:
-    return _STATE_COOKIE_HOST_PREFIX if _is_https(cfg) else _STATE_COOKIE
+    return _STATE_COOKIE_SECURE_PREFIX if _is_https(cfg) else _STATE_COOKIE
 
 
 def _state_cookie_attrs(cfg: OIDCConfig) -> dict[str, Any]:
@@ -69,10 +77,11 @@ def _state_cookie_attrs(cfg: OIDCConfig) -> dict[str, Any]:
     callback URL and never visible to JS on the dashboard — even
     though the value is opaque + httponly, narrowing the scope
     closes a class of ``fetch('/api/...', {credentials:'include'})``
-    accidents. ``__Host-`` requires path=/auth, no Domain, and
-    Secure; we satisfy all three when on HTTPS. Over plain http
-    (local dev) we drop the ``__Host-`` prefix and use ``samesite=strict``
-    without Secure so the cookie is actually delivered.
+    accidents. ``__Secure-`` only requires the Secure flag (unlike
+    ``__Host-``, it has no Path or Domain constraint), so path=/auth
+    is compatible with it. Over plain http (local dev) we drop the
+    prefix and use ``samesite=strict`` without Secure so the cookie
+    is actually delivered.
     """
     attrs: dict[str, Any] = {
         "httponly": True,

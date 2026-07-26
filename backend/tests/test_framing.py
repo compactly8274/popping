@@ -11,14 +11,17 @@ matching, and the tone response parser/prompt builder.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 
 import pytest
 
+from app import framing
 from app.framing import (
     _extract_first_json_array,
     _parse_tone_response,
+    _tag_untagged_clusters,
     cluster_recent_entries,
     detect_wire_source,
 )
@@ -318,3 +321,52 @@ async def test_framing_clusters_route_returns_grouped_articles(app_client, db_se
     assert len(match["articles"]) == 2
     titles = {a["title"] for a in match["articles"]}
     assert titles == {"Storm makes landfall", "Hurricane strikes region"}
+
+
+# --- _tag_untagged_clusters (concurrency regression) -------------------------
+
+
+async def test_tag_untagged_clusters_handles_multiple_clusters_concurrently(db_session, monkeypatch):
+    """Regression test: ``_tag_untagged_clusters`` fans out per-cluster
+    LLM calls via ``asyncio.gather`` under a ``Semaphore(3)``, and
+    each cluster's DB write used to happen *inside* that concurrent
+    section, sharing the single ``AsyncSession`` across coroutines —
+    which SQLAlchemy's async session does not support (concurrent
+    ``execute()`` calls raise ``InvalidRequestError: This session is
+    provisioning a new connection; concurrent operations are not
+    permitted``). 5 clusters (more than the semaphore's concurrency
+    cap of 3) reliably reproduced it. The fix moves every DB write to
+    a serial loop after the gather; this test drives that exact
+    shape and asserts every cluster actually gets tagged, with no
+    exception swallowed by the per-cluster ``return_exceptions=True``
+    handling."""
+    async def fake_classify_tones(titles):
+        await asyncio.sleep(0.02)
+        return ["neutral"] * len(titles)
+
+    monkeypatch.setattr(framing, "_classify_tones", fake_classify_tones)
+
+    source = await make_source(db_session, "outlet_concurrent", category="news")
+    cluster_ids = []
+    for i in range(5):
+        cluster = StoryCluster(first_seen_at=_now())
+        db_session.add(cluster)
+        await db_session.flush()
+        cluster_ids.append(cluster.id)
+        for j in range(2):
+            entry = await make_entry(
+                db_session, source, f"story {i} v{j}", published_at=_now(),
+            )
+            entry.story_cluster_id = cluster.id
+    await db_session.commit()
+
+    calls = await _tag_untagged_clusters(db_session)
+
+    assert calls == 5
+    tags = (
+        await db_session.execute(
+            Entry.__table__.select().where(Entry.story_cluster_id.in_(cluster_ids))
+        )
+    ).all()
+    assert len(tags) == 10
+    assert all(row.framing_tone == "neutral" for row in tags)

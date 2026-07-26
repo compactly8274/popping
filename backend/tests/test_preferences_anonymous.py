@@ -53,6 +53,45 @@ async def test_anonymous_round_trip_put_get_list_delete(app_client):
 
 
 @pytest.mark.asyncio
+async def test_column_id_with_uppercase_and_space_is_accepted(app_client):
+    """Regression test: the preference-key allowlist added for the
+    "arbitrary key pollution" fix originally used a lowercase-only
+    ``[a-z0-9_-]+`` suffix charset. App.tsx passes a column's literal
+    display name as the columnId — including the built-in "Saved" /
+    "For You" columns and the multi-source filter column (which is
+    derived from raw source names, e.g. a Reddit source's "r/technology").
+    A lowercase-only charset silently 400'd every one of those, so
+    read-state / last-viewed / column-prefs never persisted for them.
+    """
+    # NOTE: a columnId containing a literal ``/`` (e.g. a Reddit
+    # source's display name "r/technology" as the multi-source-filter
+    # column id) is NOT covered here — that 404s at the route-matching
+    # layer (``/api/preferences/{key}`` uses Starlette's default
+    # ``str`` converter, which doesn't match ``/`` even when percent-
+    # encoded) rather than the allowlist. That's a separate, pre-
+    # existing routing limitation, not something this regex fixes.
+    for key in (
+        "last_viewed:Saved",
+        "read_entries:For You",
+        "column_prefs:Filtering",
+    ):
+        resp = await app_client.put(f"/api/preferences/{key}", json={"value": "x"})
+        assert resp.status_code == 200, f"{key} -> {resp.status_code} {resp.text}"
+
+        resp = await app_client.get(f"/api/preferences/{key}")
+        assert resp.status_code == 200
+        assert resp.json()["value"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_unknown_key_is_still_rejected(app_client):
+    """The allowlist's security boundary is the PREFIX, not the
+    suffix charset — an unrelated key must still 400."""
+    resp = await app_client.put("/api/preferences/admin_override", json={"value": "x"})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_anonymous_put_is_idempotent_upsert(app_client):
     first = await app_client.put(
         "/api/preferences/column_prefs:tech",

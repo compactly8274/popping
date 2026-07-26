@@ -408,6 +408,18 @@ async def _tag_untagged_clusters(session: AsyncSession) -> int:
     blow past a typical per-minute rate budget. Writes are
     coalesced to one bulk UPDATE per cluster (one DB round-trip
     per cluster instead of N).
+
+    The LLM calls run concurrently, but the DB writes do NOT —
+    ``session`` is a single ``AsyncSession`` shared by every
+    ``_tag_one`` call, and SQLAlchemy's async session/connection is
+    not safe for concurrent use across coroutines (two ``execute()``
+    calls in flight at once raise ``InvalidRequestError: This
+    session is provisioning a new connection; concurrent operations
+    are not permitted``, reproduced directly against this project's
+    session stack). So ``_tag_one`` only does the LLM call under the
+    semaphore and returns the per-cluster update payload; all the
+    ``session.execute()`` calls happen afterward, serially, in the
+    plain loop below.
     """
     rows = (
         await session.execute(
@@ -431,46 +443,48 @@ async def _tag_untagged_clusters(session: AsyncSession) -> int:
     _tone_concurrency = 3
     sem = asyncio.Semaphore(_tone_concurrency)
 
-    async def _tag_one(cluster_id: int) -> int:
+    async def _classify_one(cluster_id: int) -> list[dict] | None:
+        """LLM call only — no DB access. Returns the bulk-update
+        payload for this cluster, or None if classification was
+        skipped/unavailable."""
         async with sem:
             members = by_cluster[cluster_id]
             titles = [m.title for m in members]
             labels = await _classify_tones(titles)
             if labels is None:
-                return 0
-            # Bulk UPDATE-by-primary-key: one round-trip per
-            # cluster instead of ``len(members)`` round-trips.
-            # The values list is bound as parameters so the
-            # statement emits one ``UPDATE ... WHERE id IN ...``
-            # with bound params, not N statements.
-            payload = [
+                return None
+            return [
                 {"_id": m.id, "framing_tone": label}
                 for m, label in zip(members, labels)
             ]
-            stmt = (
-                Entry.__table__.update()
-                .where(Entry.id == bindparam("_id"))
-                .values(framing_tone=bindparam("framing_tone"))
-            )
-            await session.execute(stmt, payload)
-            return 1
 
-    # Fire all cluster-classification calls in parallel. A failure
-    # in one cluster's LLM call must not abort the others — we use
-    # ``return_exceptions=True`` and the per-cluster
+    # Fire all cluster-classification LLM calls in parallel. A
+    # failure in one cluster's LLM call must not abort the others —
+    # we use ``return_exceptions=True`` and the per-cluster
     # ``_classify_tones`` already swallows ProviderError internally
     # (it walks the fallback chain). Any exception that does escape
     # is logged here rather than aborting the gather.
     results = await asyncio.gather(
-        *[_tag_one(cid) for cid in cluster_ids],
+        *[_classify_one(cid) for cid in cluster_ids],
         return_exceptions=True,
+    )
+    stmt = (
+        Entry.__table__.update()
+        .where(Entry.id == bindparam("_id"))
+        .values(framing_tone=bindparam("framing_tone"))
     )
     calls = 0
     for cid, r in zip(cluster_ids, results):
         if isinstance(r, Exception):
             logger.exception("framing: cluster %d tone-tagging failed", cid)
             continue
-        calls += int(r)
+        if r is None:
+            continue
+        # Bulk UPDATE-by-primary-key: one round-trip per cluster
+        # instead of ``len(members)`` round-trips. Run one at a
+        # time here (not concurrently) — see the docstring above.
+        await session.execute(stmt, r)
+        calls += 1
     if calls:
         await session.commit()
     return calls
