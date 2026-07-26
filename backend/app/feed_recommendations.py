@@ -56,7 +56,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, func, select
+from sqlalchemy import bindparam, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.embeddings import embedder
@@ -260,17 +260,33 @@ async def _ensure_candidate_embeddings(
         for name in missing_names
     ]
     vectors = await embedder().embed_many(texts)
-    for name, vec in zip(missing_names, vectors):
-        if vec is None:
-            continue
-        result[name] = vec
-        await session.execute(
+    # Bulk UPDATE-by-primary-key instead of one UPDATE per missing
+    # name. ``embed_many`` returns a list parallel to ``texts``;
+    # we filter to the (name, vec) pairs where vec is not None
+    # (the embedder skips a name when its content is empty) and
+    # build a single bound-param payload that SQLAlchemy emits
+    # as one ``UPDATE ... WHERE id IN (?, ?, ...)`` with the right
+    # binding per row. Same final state as the per-row loop; one
+    # round-trip instead of N.
+    payload = [
+        {"_name": name, "embedding": vec}
+        for name, vec in zip(missing_names, vectors)
+        if vec is not None
+    ]
+    if payload:
+        stmt = (
             FeedRecommendationCandidate.__table__.update()
-            .where(FeedRecommendationCandidate.name == name)
-            .values(embedding=vec)
+            .where(FeedRecommendationCandidate.name == bindparam("_name"))
+            .values(embedding=bindparam("embedding"))
         )
-    if any(v is not None for v in vectors):
+        await session.execute(stmt, payload)
+        # Persist so a fresh backend process doesn't re-embed the
+        # same set on the next call. The per-row loop did this
+        # implicitly via the per-row session.execute() writes; the
+        # bulk form needs an explicit commit.
         await session.commit()
+        for row in payload:
+            result[row["_name"]] = row["embedding"]
     return result
 
 
