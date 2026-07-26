@@ -94,6 +94,22 @@ _JOBS_MAX = 200
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
+# Cap CONCURRENT in-flight brief generations, not just the ledger
+# size. ``_JOBS_MAX = 200`` bounds the total entries; this semaphore
+# bounds how many run AT THE SAME TIME. Without it a fast-clicking
+# user (or an attacker who can spam the auth-gated endpoint) can
+# fire 200 simultaneous LLM calls in seconds, saturating the
+# upstream model and the local event loop. 2 is enough to overlap
+# the LLM roundtrip with the next card render while keeping the
+# model budget predictable. The ``acquire`` happens in the request
+# handler (not the background task) so a 429-style "too many in
+# flight" response goes to the caller immediately — the job is
+# never created, the ledger never sees it, and a retry has fresh
+# capacity.
+_GENERATION_CONCURRENCY = 2
+_GENERATION_SEMAPHORE = asyncio.Semaphore(_GENERATION_CONCURRENCY)
+
+
 async def _record_job(job: _Job) -> None:
     async with _JOBS_LOCK:
         _JOBS[job.id] = job
@@ -159,6 +175,12 @@ async def _run_job(job_id: str, tone: str) -> None:
         task = asyncio.current_task()
         if task is not None:
             _RUNNING_TASKS.discard(task)
+        # Release the concurrency slot whether the job succeeded,
+        # failed, or threw. Without this a single crashed job
+        # would permanently pin a slot and the 2-slot budget
+        # would drain to 0 over time. ``release`` is sync + safe
+        # to call from a finally block.
+        _GENERATION_SEMAPHORE.release()
 
 
 class BriefJobOut(BaseModel):
@@ -224,6 +246,29 @@ async def brief_generate(
     when it lands. Browser-initiated double-clicks just spawn two
     jobs — both are bounded by the ledger cap.
     """
+    # Concurrency gate. Holding the semaphore in the request
+    # handler (not the background task) means a saturated queue
+    # returns immediately with a 429 instead of accepting the
+    # job and queueing 200 of them in the background. ``acquire``
+    # without a context manager so we can return a clean
+    # HTTPException on timeout (rather than letting the request
+    # hang for the full 30s).
+    try:
+        await asyncio.wait_for(
+            _GENERATION_SEMAPHORE.acquire(),
+            timeout=10.0,  # 10s is generous — 2 concurrent jobs
+                          # each take 3-10s, so a freshly-acquired
+                          # slot opens within a few seconds.
+        )
+    except asyncio.TimeoutError:
+        # Another in-flight job is using the last slot. The
+        # ledger already has 200 jobs from prior activity; a
+        # 429 lets the client retry with backoff instead of
+        # burning server CPU on a queued pile.
+        raise HTTPException(
+            status_code=429,
+            detail=f"too many concurrent brief generations (max {_GENERATION_CONCURRENCY})",
+        )
     job = _Job(
         id=str(uuid.uuid4()),
         tone=tone,
@@ -235,7 +280,10 @@ async def brief_generate(
     # Task — without a strong reference a long-running generation can
     # be garbage-collected mid-flight. The ``_RUNNING_TASKS`` set
     # pins the task; the finally branch in ``_run_job`` removes the
-    # entry on completion, so the set stays bounded.
+    # entry on completion, so the set stays bounded. The
+    # semaphore is released in the finally branch so a failed
+    # generation returns its slot to the pool before the 429
+    # # budget drains.
     task = asyncio.create_task(_run_job(job.id, tone))
     _RUNNING_TASKS.add(task)
     return BriefGenerateAck(job_id=job.id, tone=tone)
