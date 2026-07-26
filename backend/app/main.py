@@ -25,6 +25,7 @@ from app.config import settings
 from app.embeddings import close_embedder, embedder
 from app.notify import build_notifier
 from app import reddit_client
+from app.request_id import bind_request_id, clear_request_id, current_request_id
 from app.request_state import set_notifier
 from app import runtime_settings
 from app.routes import brief as brief_routes
@@ -44,8 +45,32 @@ from app.scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s[%(request_id)s]: %(message)s",
 )
+
+
+class _RequestIdFilter(logging.Filter):
+    """Inject the current request id into every log record.
+
+    Pulls from the ``ContextVar`` set by the request middleware
+    (see ``app.request_id.bind_request_id``). When no request is
+    in flight — startup, shutdown, scheduler ticks, background
+    tasks launched outside any request — the value is ``None``
+    and the formatter renders it as ``-`` so the segment is
+    present-but-empty rather than missing, which keeps log
+    parsing tools happy.
+
+    A ``LogRecord`` gains a ``request_id`` attribute (str) —
+    FastAPI/starlette's logging chain doesn't touch this name,
+    so adding it is safe.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = current_request_id() or "-"
+        return True
+
+
+logging.getLogger().addFilter(_RequestIdFilter())
 logger = logging.getLogger("popping")
 
 
@@ -246,4 +271,47 @@ async def _assets_security_headers(request, call_next):
     response = await call_next(request)
     if request.url.path.startswith("/assets/"):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
+
+
+@app.middleware("http")
+async def _request_id(request, call_next):
+    """Bind a request id for the duration of the request, surface
+    it on the response, and (via ``_RequestIdFilter`` above) on
+    every log line emitted while the request is in flight.
+
+    Honors ``X-Request-Id`` from the client if present (so a
+    browser-side correlate can pre-generate the id and trace a
+    single user action from click to log line). Otherwise
+    generates a 12-char hex token. The bound value is also
+    set on the response as ``X-Request-Id`` so the client can
+    read it back — the operator (who is also the user in this
+    single-user dashboard) can copy/paste that id when
+    reporting an issue.
+
+    Static-file requests (under ``/assets/``) get the same
+    treatment: they can fail (asset dir missing, file
+    disappeared) and the operator needs the same trace
+    correlation the API surface gets.
+
+    The contextvar is reset on the way out so a follow-up
+    request on the same asyncio task (rare under uvicorn,
+    possible under some test fixtures) doesn't inherit the
+    previous request's id.
+    """
+    incoming = request.headers.get("X-Request-Id")
+    rid = bind_request_id(incoming)
+    try:
+        response = await call_next(request)
+    finally:
+        # Reset on the way out so a leaked task (e.g. one
+        # scheduled by a BackgroundTasks dependency) starts
+        # with a clean slate rather than inheriting a
+        # request-id that no longer matches any in-flight
+        # request. NOTE: this lives in a ``finally`` so the
+        # reset happens even when ``call_next`` raises; the
+        # exception still propagates to FastAPI's normal
+        # 500 handler.
+        clear_request_id()
+    response.headers["X-Request-Id"] = rid
     return response
