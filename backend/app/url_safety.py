@@ -232,4 +232,52 @@ __all__ = [
     "check_url_safe",
     "check_host_safe",
     "resolve_addresses",
+    "ssrf_event_hook",
 ]
+
+
+def ssrf_event_hook(request):
+    """httpx ``event_hooks=request`` callback.
+
+    Fires before EVERY request httpx sends, including the redirects
+    that ``follow_redirects=True`` walks. The shared post-response
+    ``check_url_safe(final_url)`` check in ``app.assets`` and
+    ``app.article_extract`` is the safety net for the LAST hop; this
+    hook is the per-hop guard — it rejects a redirect to a denied
+    address BEFORE the request is sent, so a ``public.example.com
+    → 127.0.0.1/admin`` chain gets cut at the first hop and never
+    even opens a TCP connection to the loopback.
+
+    Opt-in: callers register it via
+    ``httpx.AsyncClient(event_hooks={"request": [ssrf_event_hook]})``
+    on whichever clients fetch user-controlled URLs. The shared
+    ``app.assets._client`` and ``app.article_extract.fetch_html`` are
+    the two currently-affected call sites; future callers should
+    follow the same pattern.
+
+    The hook raises ``httpx.RequestError`` (a subclass of
+    ``HTTPError``) so existing ``except httpx.HTTPError`` blocks in
+    the call sites catch the abort with no code change — the
+    request was never sent, the response is never observed, and
+    callers fall through to their existing failure path (DEBUG log
+    + return None / 4xx to the route layer).
+
+    The lazy ``import httpx`` keeps this module importable without
+    pulling in the network stack during config load. The hook is a
+    no-op on the rare path that runs without httpx installed.
+    """
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a hard dep
+        return
+    url = str(request.url)
+    safe, _reason = check_url_safe(url)
+    if not safe:
+        # ``RequestError(message, request=request)`` is the
+        # documented constructor in httpx 0.27+. The ``request``
+        # kwarg is what the error needs to bubble up to the
+        # caller's ``except httpx.HTTPError`` handler cleanly.
+        raise httpx.RequestError(
+            f"SSRF guard aborted request to {url!r} (denied host)",
+            request=request,
+        )
