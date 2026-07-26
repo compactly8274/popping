@@ -376,10 +376,21 @@ async def _ingest(plugin_cls: Any) -> dict:
                 # as "how fresh was this when it arrived".
                 raw_score = recency.score(norm["published_at"], source.category)
                 embedding = await _embed_text(norm)
-                composite = composite_scorer.score(
-                    _stub_entry(norm, raw_score, embedding),
-                    source,
-                    profile,
+                # Composite without an Entry. The fields it needs
+                # (published_at, raw_score, embedding, meta) are all
+                # in hand from the plugin output and the embedder;
+                # there's no Entry row yet (the INSERT below creates
+                # it). The old code built a transient ``_stub_entry``
+                # here as a workaround for ``composite.score``'s
+                # Entry-shaped signature; the new ``score_partial``
+                # takes the fields directly and the stub is gone.
+                composite = composite_scorer.score_partial(
+                    published_at=norm["published_at"],
+                    raw_score=raw_score,
+                    embedding=embedding,
+                    entry_meta=meta or None,
+                    source=source,
+                    profile=profile,
                 )
                 stmt = (
                     pg_insert(Entry)
@@ -600,22 +611,6 @@ async def _ingest(plugin_cls: Any) -> dict:
         await _maybe_notify_cves(newly_inserted)
 
     return summary
-
-
-def _stub_entry(norm: dict, raw_score: float, embedding: list[float] | None) -> Entry:
-    """Build a transient Entry with only the fields composite_score touches.
-
-    Saves us round-tripping to the DB between insert and composite.
-    composite_score is later overwritten anyway.
-    """
-    e = Entry()
-    e.title = norm.get("title") or ""
-    e.url = norm.get("url") or ""
-    e.published_at = norm.get("published_at")
-    e.raw_score = raw_score
-    e.personal_score = 0.0
-    e.embedding = embedding
-    return e
 
 
 async def _backfill_embeddings(batch_size: int | None = None) -> None:
