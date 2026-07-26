@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import reddit_client
 from app.article_extract import fetch_article_text
 from app.article_summary import summarize_article
+from app.auth.deps import require_user
+from app.config import settings
 from app.db import get_session
 from app.llm import router as llm_router
 from app.models import Entry, Source, StoryCluster
@@ -30,6 +32,20 @@ from app.schemas import (
 )
 
 router = APIRouter(tags=["entries"])
+
+
+# Same auth-gating pattern as ``app.routes.sources._write_deps`` and
+# ``app.routes.brief._route_deps``: require auth when OIDC is on, allow
+# unauthenticated when OIDC is off (the single-user LAN case). The
+# three summary endpoints below are POSTs that fetch a URL and may
+# run an LLM call (and write to the DB), so an attacker who can reach
+# the API could otherwise DoS the LLM budget, pollute the
+# cached_summary column with attacker-controlled text, or just
+# cause a lot of outbound network traffic. The OIDC-on case must
+# require auth; the OIDC-off case keeps the existing single-user
+# behavior (the dashboard itself has no auth, the local network
+# is the only access boundary).
+_write_deps = [Depends(require_user)] if settings.oidc_enabled else []
 
 
 # When ``q`` is set we cap results tighter than the default 50 — the
@@ -403,6 +419,7 @@ def _extract_fallback_summary(row: Entry) -> str:
 @router.post(
     "/entries/{entry_id}/summary",
     response_model=EntrySummaryOut,
+    dependencies=_write_deps,
 )
 async def entry_summary_endpoint(
     entry_id: int,
@@ -478,6 +495,7 @@ async def entry_summary_endpoint(
 @router.post(
     "/entries/{entry_id}/podcast_summary",
     response_model=EntryPodcastSummaryOut,
+    dependencies=_write_deps,
 )
 async def entry_podcast_summary_endpoint(
     entry_id: int,
@@ -551,6 +569,7 @@ async def entry_podcast_summary_endpoint(
 @router.post(
     "/entries/{entry_id}/reddit_comment_summary",
     response_model=EntryRedditCommentSummaryOut,
+    dependencies=_write_deps,
 )
 async def entry_reddit_comment_summary_endpoint(
     entry_id: int,
