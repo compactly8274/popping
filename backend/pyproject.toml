@@ -63,3 +63,13 @@ asyncio_mode = "auto"
 # fixtures and tests keep the engine and every test on the same loop.
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
+# Custom marker used by ``tests/conftest.py`` to opt tests out of
+# the DB-backed autouse fixtures (``_schema`` session setup,
+# ``_clean_tables`` truncate-after-each-test). Tests marked
+# ``no_db`` (or ``unit``) run with no Postgres connection.
+# Add new marker names here so pytest stops warning about
+# "Unknown pytest.mark.<name>".
+markers = [
+    "no_db: pure unit test; does not require a Postgres connection",
+    "unit: alias for no_db; pure unit test",
+]

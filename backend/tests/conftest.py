@@ -59,9 +59,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import SessionLocal, engine
 from app.models import Base
 
+# Markers that opt a test out of the DB-backed fixtures. A test
+# with ANY of these markers skips the schema setup and the
+# truncate-with-retry teardown; it's a pure unit test as far as
+# the test infrastructure is concerned.
+_NO_DB_MARKERS = frozenset({"no_db", "unit"})
+
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
-async def _schema():
+async def _schema(request):
     """Create every table once for the whole test session, drop at the end.
 
     ``Base.metadata.create_all`` (not Alembic) — same models the
@@ -69,7 +75,26 @@ async def _schema():
     run. Assumes the ``vector`` extension already exists in the target
     database (a one-time ``CREATE EXTENSION vector``, not something
     that needs to happen per test run).
+
+    Skipped when *every* collected test in the session is marked
+    ``@pytest.mark.no_db`` (or any of its aliases — see
+    ``_NO_DB_MARKERS``). The check is at session setup time, so
+    a mixed run still provisions the schema. Pure unit tests
+    that don't touch the DB get the speed win.
     """
+    # If any collected item in this session needs the schema, do
+    # the work. If NONE of them do (a pure unit-test session),
+    # skip the connection entirely — no DB host required.
+    items = request.session.items if hasattr(request, "session") else []
+    needs_db = any(
+        not any(mark.name in _NO_DB_MARKERS for mark in item.iter_markers())
+        for item in items
+    )
+    if not needs_db:
+        # Yield nothing — but the fixture is async, so we still
+        # have to yield once. Tests run without schema setup.
+        yield
+        return
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
@@ -79,7 +104,7 @@ async def _schema():
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _clean_tables():
+async def _clean_tables(request):
     """Truncate every table after each test.
 
     Deliberately not a rolled-back transaction: several functions under
@@ -107,8 +132,21 @@ async def _clean_tables():
     This is the same pattern PostgreSQL recommends for any
     application-side bulk-DDL that can race with background work
     on the same connection pool.
+
+    Skipped entirely when the test is marked ``@pytest.mark.no_db``
+    (or any of its aliases — see ``_NO_DB_MARKERS``). Pure unit
+    tests that don't touch the DB run with no DB round-trip in
+    the teardown, which keeps them fast and lets them run on
+    hosts without a Postgres reachable.
     """
     yield
+
+    # Opt-out: a pure unit test (marked ``no_db``/``unit``)
+    # doesn't need the truncate, and trying to run it would
+    # force a DB connection. Skip the teardown entirely.
+    test_marks = {m.name for m in request.node.iter_markers()}
+    if test_marks & _NO_DB_MARKERS:
+        return
 
     tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
     stmt = text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")
