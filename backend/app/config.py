@@ -158,6 +158,17 @@ class Settings(BaseSettings):
     oidc_client_id: str = ""
     oidc_scopes: str = "openid email profile"
     public_url: str = ""             # e.g. https://popping.example.com
+    # Extra CORS origins, comma-separated. Useful when the frontend
+    # is served from a different host than ``public_url`` (LAN IP,
+    # staging alias, the docker-host IP that the proxy runs on).
+    # Each entry is a full origin like ``http://192.168.1.10:8080``.
+    # The default ``""`` (empty) means "only ``public_url`` is
+    # allowed". The CORS middleware in ``app/main.py`` builds the
+    # final allowlist from these two settings; if both are empty the
+    # middleware falls back to ``["*"]`` for backward compatibility
+    # with the dev-only docker-compose flow where ``public_url``
+    # isn't set.
+    extra_cors_origins: str = ""
     session_secret: str = ""         # required when oidc_enabled (openssl rand -hex 32)
     session_ttl_seconds: int = 28800  # 8 h
     session_cookie_name: str = "popping_session"

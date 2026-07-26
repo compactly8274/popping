@@ -151,9 +151,51 @@ app = FastAPI(
 # via Vite's dev proxy). The dev proxy makes /api/* same-origin so cookies
 # flow naturally; with `credentials` set on the fetch wrapper, the
 # session cookie rides on every API call.
+#
+# The allowlist is built from ``settings.public_url`` (the production
+# origin the dashboard is served from) plus ``settings.extra_cors_origins``
+# (a comma-separated list of additional origins — e.g. a LAN IP
+# when accessing the dashboard from a phone, a staging alias).
+# ``allow_credentials=False`` keeps this safe even with a misconfigured
+# allowlist — the browser will refuse to send the session cookie
+# cross-origin, so the worst case is "JS on origin A can read
+# public data on the API" (which is what ``public_url`` says is OK).
+#
+# If BOTH settings are empty (the default docker-compose dev
+# setup where ``PUBLIC_URL`` is unset), we fall back to ``["*"]`` for
+# backward compatibility — dev-mode access from any origin still
+# works. In production the operator MUST set PUBLIC_URL (or
+# ``public_url`` + ``extra_cors_origins`` if the frontend is on a
+# different host).
+_allow_origin_set = set()
+if settings.public_url:
+    # ``public_url`` is the canonical "where the dashboard is served
+    # from" — strip any trailing slash so ``https://x.example.com``
+    # and ``https://x.example.com/`` don't end up as two distinct
+    # allowlist entries (CORS matches the request's ``Origin``
+    # header, which never has a trailing slash for a bare host).
+    _allow_origin_set.add(settings.public_url.rstrip("/"))
+if settings.extra_cors_origins:
+    # Comma-separated list. Each entry is a full origin
+    # (``http://192.168.1.10:8080``); trim whitespace and drop
+    # empties so a trailing comma in the env doesn't leave an
+    # empty string in the allowlist.
+    for entry in settings.extra_cors_origins.split(","):
+        stripped = entry.strip().rstrip("/")
+        if stripped:
+            _allow_origin_set.add(stripped)
+_cors_origins = (
+    sorted(_allow_origin_set) if _allow_origin_set else ["*"]
+)
+logger.info(
+    "cors: %d origin(s) allowed (public_url=%r, extra=%r)",
+    len(_cors_origins),
+    settings.public_url,
+    settings.extra_cors_origins,
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
