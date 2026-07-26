@@ -53,10 +53,21 @@ class OIDCError(Exception):
 # ``_check_convergence`` (per-tick) doesn't accidentally hammer the
 # IdP's discovery endpoint.
 #
-# The cache key is the issuer URL so a single process supporting
-# multiple IdPs (not currently used but cheap to support) gets a
-# separate entry per issuer.
+# Size cap: 8 issuers. The cache key is the issuer URL so a single
+# process supporting multiple IdPs (not currently used but cheap to
+# support) gets a separate entry per issuer. We cap at 8 to bound
+# memory: at ~5KB per entry, 8 is ~40KB total — negligible. The
+# purpose isn't really a memory cap (8 entries won't OOM anyone) but
+# a hygiene cap: a long-lived process with an IdP config that gets
+# changed periodically (rotated test IdPs during development, a
+# staging/prod swap on the same backend) would otherwise accumulate
+# one entry per issuer forever. Stale entries past the TTL are
+# evicted on read (opportunistic), and the size cap is a hard
+# backstop if the TTL eviction is somehow missed (e.g. an issuer
+# that stops being used but never goes stale because the entry is
+# re-touched on every check).
 _METADATA_TTL_SECONDS = 3600
+_METADATA_CACHE_MAX = 8
 _metadata_cache: dict[str, tuple[float, dict]] = {}
 
 
@@ -66,9 +77,54 @@ def _metadata_fresh(entry: tuple[float, dict]) -> bool:
     ``time.monotonic`` rather than wall-clock — a wall-clock jump
     (NTP step, daylight-savings, manual clock set) shouldn't
     invalidate a fresh cache nor keep a stale one alive.
+
+    Opportunistic eviction: when the entry is stale, the caller
+    (or this helper, in ``_metadata_get_or_evict``) pops it from
+    the cache. Otherwise a long-lived process with periodic
+    IdP rotations would accumulate one stale entry per issuer
+    forever; the dict would never grow past a few entries in
+    practice but the cycle is a leak. The size cap below is
+    the hard backstop.
     """
     cached_at, _ = entry
     return (time.monotonic() - cached_at) < _METADATA_TTL_SECONDS
+
+
+def _metadata_get_or_evict(issuer: str) -> tuple[float, dict] | None:
+    """Return the cached entry if fresh, else evict it and return None.
+
+    Combines the cache lookup + TTL check + eviction so the
+    caller can do ``meta = _metadata_get_or_evict(issuer)`` in
+    one line and trust the dict to be self-pruning.
+    """
+    entry = _metadata_cache.get(issuer)
+    if entry is None:
+        return None
+    if not _metadata_fresh(entry):
+        _metadata_cache.pop(issuer, None)
+        return None
+    return entry
+
+
+def _metadata_enforce_size_cap() -> None:
+    """Drop the oldest entries if the cache exceeds the size cap.
+
+    Called from ``_discovery`` after a successful fetch, so the
+    cap is checked once per cache miss, not on every read.
+    Pops the entry with the smallest ``cached_at`` (the
+    oldest) until the cache is at or below the cap.
+
+    In practice this branch is almost never hit — the cap is 8,
+    the cache sees 1-2 issuers in real deployments, and the
+    opportunistic eviction in ``_metadata_get_or_evict`` keeps
+    the dict clean. The cap exists for the "rotated test IdPs
+    during development" / "staging-prod swap on the same
+    backend" cases where the dict would otherwise grow without
+    bound.
+    """
+    while len(_metadata_cache) > _METADATA_CACHE_MAX:
+        oldest_key = min(_metadata_cache, key=lambda k: _metadata_cache[k][0])
+        _metadata_cache.pop(oldest_key, None)
 
 
 def _fetch_discovery_sync(cfg: OIDCConfig) -> dict:
@@ -96,6 +152,22 @@ def _fetch_discovery_sync(cfg: OIDCConfig) -> dict:
 # stampede) don't fire two discovery requests. Held briefly — the
 # lock is only around the cache check + ``to_thread`` dispatch, not
 # the network roundtrip itself.
+#
+# Size cap: same 8 as the metadata cache. The cap is mostly
+# hygiene: a long-lived process that rotates IdP issuers
+# (development: a test IdP being swapped; ops: a staging-prod
+# swap on the same backend) would otherwise accumulate one lock
+# per issuer forever. Locks are tiny (an asyncio.Lock is just
+# a few hundred bytes), so the cap is about not leaking the
+# references, not about memory. When the cap is hit, we
+# refuse the new lock and use the metadata-cache entry's
+# lock-or-eviction machinery instead — the caller will
+# still get a cache miss, fetch the discovery, and write the
+# entry; we just don't keep the per-issuer lock around. The
+# only downside is a brief cold-start stampede is possible
+# for the 9th+ issuer, which is the desired trade-off (we'd
+# rather re-fetch than leak).
+_DISCOVERY_LOCKS_MAX = 8
 _discovery_locks: dict[str, asyncio.Lock] = {}
 _discovery_locks_guard = asyncio.Lock()
 
@@ -103,9 +175,32 @@ _discovery_locks_guard = asyncio.Lock()
 async def _get_discovery_lock(issuer: str) -> asyncio.Lock:
     async with _discovery_locks_guard:
         lock = _discovery_locks.get(issuer)
-        if lock is None:
-            lock = asyncio.Lock()
-            _discovery_locks[issuer] = lock
+        if lock is not None:
+            return lock
+        # Cap the dict. We don't evict (locks are non-serializable,
+        # so we can't LRU them) — we just refuse to add a new
+        # entry. The caller proceeds without a per-issuer lock,
+        # which means a cold-start stampede is possible for the
+        # 9th+ issuer. The cap is essentially a leak guard for
+        # long-lived processes that rotate IdPs; in normal
+        # operation the dict has 1-2 entries.
+        if len(_discovery_locks) >= _DISCOVERY_LOCKS_MAX:
+            logger.warning(
+                "OIDC discovery lock dict is at the size cap (%d); "
+                "serving %s without per-issuer lock (a cold-start "
+                "stampede is possible if the cache misses)",
+                _DISCOVERY_LOCKS_MAX, issuer,
+            )
+            # Return a fresh, untracked lock so this call still
+            # serializes locally (it just doesn't share with
+            # concurrent calls of the same issuer). The next
+            # call for the same issuer will also get its own
+            # throwaway lock. The trade-off (mild cold-start
+            # stampede for >8 issuers) is strictly better than
+            # leaking a lock per request.
+            return asyncio.Lock()
+        lock = asyncio.Lock()
+        _discovery_locks[issuer] = lock
         return lock
 
 
@@ -115,16 +210,16 @@ async def _discovery(cfg: OIDCConfig) -> dict:
 
     Async so the underlying httpx.Client doesn't block the event
     loop. The cache itself is a plain dict (single-writer per
-    issuer thanks to the lock above)."""
-    entry = _metadata_cache.get(cfg.issuer)
-    if entry is not None and _metadata_fresh(entry):
+    issuer thanks to the lock below)."""
+    entry = _metadata_get_or_evict(cfg.issuer)
+    if entry is not None:
         return entry[1]
     lock = await _get_discovery_lock(cfg.issuer)
     async with lock:
         # Re-check after acquiring the lock — another coroutine
         # may have just filled the cache.
-        entry = _metadata_cache.get(cfg.issuer)
-        if entry is not None and _metadata_fresh(entry):
+        entry = _metadata_get_or_evict(cfg.issuer)
+        if entry is not None:
             return entry[1]
         meta = await asyncio.to_thread(_fetch_discovery_sync, cfg)
         for required in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
@@ -133,6 +228,11 @@ async def _discovery(cfg: OIDCConfig) -> dict:
                     f"OIDC discovery at {cfg.issuer} is missing {required!r}"
                 )
         _metadata_cache[cfg.issuer] = (time.monotonic(), meta)
+        # Bound the cache after every successful write. Cheap
+        # (a single min() over a tiny dict) and keeps the
+        # long-lived process leak bounded. See the helper's
+        # docstring for why this is mostly belt-and-suspenders.
+        _metadata_enforce_size_cap()
         logger.info("OIDC discovery loaded from %s", cfg.issuer)
         return meta
 
