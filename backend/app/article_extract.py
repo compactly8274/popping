@@ -22,7 +22,7 @@ import logging
 import httpx
 import trafilatura
 
-from app.url_safety import check_url_safe
+from app.url_safety import check_url_safe, ssrf_event_hook
 
 logger = logging.getLogger("popping.article_extract")
 
@@ -63,7 +63,20 @@ async def fetch_html(url: str) -> str | None:
         logger.info("article_extract: %s rejected by URL safety check (%s)", url, reason)
         return None
     try:
-        async with httpx.AsyncClient(timeout=_FETCH_TIMEOUT, follow_redirects=True, max_redirects=5) as client:
+        async with httpx.AsyncClient(
+            timeout=_FETCH_TIMEOUT,
+            follow_redirects=True,
+            max_redirects=5,
+            # Per-hop SSRF guard: fires before every request
+            # httpx sends, including the redirects
+            # ``follow_redirects=True`` walks. Catches a
+            # ``public.example.com → 127.0.0.1/admin`` chain at
+            # the first hop. See ``app.url_safety.ssrf_event_hook``
+            # for the policy. The post-response final-URL
+            # check below is the safety net for the LAST hop;
+            # the hook is the per-hop guard.
+            event_hooks={"request": [ssrf_event_hook]},
+        ) as client:
             async with client.stream("GET", url, headers={"User-Agent": "Popping/0.2"}) as resp:
                 if resp.status_code >= 400:
                     logger.info("article_extract: %s -> HTTP %s", url, resp.status_code)

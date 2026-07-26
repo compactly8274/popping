@@ -52,6 +52,7 @@ and was already fixed this way.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -67,6 +68,75 @@ from app.schemas import UserPreferenceIn, UserPreferenceListOut, UserPreferenceO
 logger = logging.getLogger("popping.routes.preferences")
 
 router = APIRouter(tags=["preferences"])
+
+
+# Allowlist of the 9 known preference key namespaces the frontend
+# actually uses (see ``PREFERENCE_KEYS`` in
+# ``frontend/src/lib/preferences.tsx``). Five of them take a
+# ``:<columnId>`` suffix (``read_entries``, ``last_viewed``,
+# ``column_prefs``, ``column_sections``) — the column id is a
+# slug the user can name freely (e.g. ``tech``, ``worldnews``,
+# ``cisa_kev``), so the suffix is a free-form ``[a-z0-9_-]+``
+# rather than a hard-coded list. Four of them are global
+# (no suffix: ``hidden_entries``, ``starred_entries``,
+# ``voted_entries``, ``filter_presets``, ``history_group_by``).
+# The ``hidden_entries`` etc. keys are also valid WITHOUT a
+# suffix because the legacy localStorage keys were the bare
+# names; the frontend migrates them on first load.
+#
+# Why an allowlist: the URL is the source of truth for which
+# row gets written. Allowing any string here lets a caller with
+# a session pollute the namespace with arbitrary keys
+# (``admin_override``, ``__internal_xyz``, etc.) that future
+# code might trust as a known shape. Returns 400 with a clear
+# message so a typo in the frontend surfaces immediately
+# instead of silently writing a row no one reads.
+_PREFERENCE_KEY_RE = re.compile(
+    r"^(?:" + "|".join(
+        # Suffixed names: ``<key>:<columnId>``
+        f"(?:{re.escape(name)}:[a-z0-9_-]+)"
+        for name in (
+            "read_entries",
+            "last_viewed",
+            "column_prefs",
+            "column_sections",
+        )
+    ) + "|" + "|".join(
+        # Global names: bare key, no suffix.
+        re.escape(name)
+        for name in (
+            "hidden_entries",
+            "starred_entries",
+            "voted_entries",
+            "filter_presets",
+            "history_group_by",
+        )
+    ) + r")$"
+)
+
+
+def _validate_key(key: str) -> None:
+    """Raise HTTP 400 if ``key`` isn't on the preference allowlist.
+
+    Applied to all 3 single-key endpoints (GET, PUT, DELETE) so a
+    caller can read / write / delete exactly the rows the frontend
+    writes, and no others. The bulk ``GET /api/preferences`` is
+    intentionally not gated — the caller can only read their own
+    rows, so pollution on the read side is bounded by what they
+    already wrote (which is gated by PUT).
+    """
+    if not isinstance(key, str) or not _PREFERENCE_KEY_RE.match(key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"preference key {key!r} is not on the allowlist; "
+                f"expected one of the 9 known namespaces "
+                f"(read_entries:<id>, last_viewed:<id>, "
+                f"column_prefs:<id>, column_sections:<id>, "
+                f"hidden_entries, starred_entries, voted_entries, "
+                f"filter_presets, history_group_by)"
+            ),
+        )
 
 
 @router.get("/preferences", response_model=UserPreferenceListOut)
@@ -113,6 +183,7 @@ async def get_preference(
     (e.g. a future "did the user dismiss this onboarding hint?"
     check that loads one specific preference on demand).
     """
+    _validate_key(key)
     user_id = resolve_user_id(user)
     row = await session.scalar(
         select(UserPreference).where(
@@ -145,7 +216,7 @@ async def put_preference(
     "the URL key matches what the caller is writing" if we ever
     need to (we don't today -- the URL is the source of truth).
 
-    The ``value`` field is opaque; the route passes it through to
+    rounds. The ``value`` field is opaque; the route passes it through to
     the JSONB column without coercion. The frontend's TS types
     are the source of truth for what shape each key holds.
 
@@ -157,6 +228,7 @@ async def put_preference(
     one card read on every visible-card-scroll would otherwise
     burn 2x the round-trips.
     """
+    _validate_key(key)
     user_id = resolve_user_id(user)
     stmt = (
         pg_insert(UserPreference)
@@ -195,6 +267,7 @@ async def delete_preference(
     so a future "reset all preferences" button or per-key clear
     action has a server-side target.
     """
+    _validate_key(key)
     user_id = resolve_user_id(user)
     await session.execute(
         delete(UserPreference).where(

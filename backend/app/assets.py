@@ -36,7 +36,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from app.config import settings
-from app.url_safety import check_url_safe
+from app.url_safety import check_url_safe, ssrf_event_hook
 
 logger = logging.getLogger("popping.assets")
 
@@ -61,11 +61,16 @@ def init_client() -> None:
         return
     # Per-call headers/timeout go through ``client.stream(..., headers=...)``
     # so the shared client only needs the defaults that are common to
-    # every call (follow_redirects, base timeout).
+    # every call (follow_redirects, base timeout). The
+    # ``event_hooks=request`` callback is the per-hop SSRF guard
+    # — fires before every request httpx sends, including the
+    # redirects ``follow_redirects=True`` walks. See
+    # ``app.url_safety.ssrf_event_hook`` for the policy.
     _client = httpx.AsyncClient(
         timeout=_TIMEOUT,
         follow_redirects=True,
         headers={"User-Agent": _APP_UA},
+        event_hooks={"request": [ssrf_event_hook]},
     )
 
 
@@ -82,11 +87,14 @@ def _get_client() -> httpx.AsyncClient:
     if _client is None:
         # Defensive — if a route fires before lifespan startup (e.g.
         # during tests), build a one-off. The shared pool is the
-        # common case.
+        # common case. Same ``event_hooks`` as the shared client so
+        # the SSRF guard fires regardless of which path built the
+        # client.
         return httpx.AsyncClient(
             timeout=_TIMEOUT,
             follow_redirects=True,
             headers={"User-Agent": _APP_UA},
+            event_hooks={"request": [ssrf_event_hook]},
         )
     return _client
 
