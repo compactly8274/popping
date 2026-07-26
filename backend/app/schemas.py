@@ -6,7 +6,7 @@ import datetime as dt
 import enum
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class SourceOut(BaseModel):
@@ -49,8 +49,7 @@ class SourceOut(BaseModel):
     # directly without a null check.
     net_vote_score: int = 0
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SourceCreate(BaseModel):
@@ -334,7 +333,14 @@ class EntryOut(BaseModel):
     composite_score: float
     personal_score: float
     raw_score: float
-    meta: Optional[dict]
+    # ``= None`` is required for the v2 model_validate path: in v1
+    # ``Optional[dict]`` without a default was implicitly ``None``,
+    # but v2 requires the explicit default. The /api/entries list
+    # endpoint SELECTs ``meta`` (it's a JSONB blob) so the field is
+    # usually populated; the default is the safety net for any
+    # future code path that constructs an EntryOut from a partial
+    # row.
+    meta: Optional[dict] = None
     # Remote URL of the entry's thumbnail (parsed from the feed).
     image_url: Optional[str] = None
     # Local path under /assets, e.g. "thumbnails/1234.jpg".
@@ -350,8 +356,7 @@ class EntryOut(BaseModel):
     # common 200-row list poll.
     source_name: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class EntryListOut(BaseModel):
@@ -421,8 +426,7 @@ class EntryListOut(BaseModel):
     # GET /entries/{id}/related, not shipped in the list payload.
     story_cluster_id: Optional[int] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class IngestResult(BaseModel):
@@ -441,8 +445,7 @@ class BriefOut(BaseModel):
     delivered_at: Optional[dt.datetime] = None
     meta: Optional[dict] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class NotificationStatus(BaseModel):
@@ -597,8 +600,7 @@ class InteractionOut(BaseModel):
     source_id: int
     source_name: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class InteractionListOut(BaseModel):
