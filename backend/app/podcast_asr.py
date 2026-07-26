@@ -26,7 +26,7 @@ import logging
 import httpx
 
 from app import runtime_settings
-from app.url_safety import check_url_safe
+from app.url_safety import check_url_safe, ssrf_event_hook
 
 logger = logging.getLogger("popping.podcast_asr")
 
@@ -73,7 +73,19 @@ async def _download_audio(url: str) -> tuple[bytes, str] | None:
         logger.warning("podcast_asr: %s rejected by URL safety check (%s)", url, reason)
         return None
     try:
-        async with httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT, follow_redirects=True, max_redirects=5) as client:
+        async with httpx.AsyncClient(
+            timeout=_DOWNLOAD_TIMEOUT,
+            follow_redirects=True,
+            max_redirects=5,
+            # Per-hop SSRF guard: same as app.assets + app.article_extract.
+            # Fires before every request httpx sends, including the
+            # redirects follow_redirects=True walks. Catches a
+            # public.example.com -> 127.0.0.1/admin chain at the
+            # first hop. The post-response final-URL check below
+            # stays as the safety net for the LAST hop; the hook
+            # is the per-hop guard.
+            event_hooks={"request": [ssrf_event_hook]},
+        ) as client:
             async with client.stream("GET", url) as resp:
                 if resp.status_code >= 400:
                     logger.warning("podcast_asr: %s -> HTTP %s", url, resp.status_code)
