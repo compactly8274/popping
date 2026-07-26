@@ -236,8 +236,17 @@ __all__ = [
 ]
 
 
-def ssrf_event_hook(request):
+async def ssrf_event_hook(request):
     """httpx ``event_hooks=request`` callback.
+
+    Must be ``async def`` — ``httpx.AsyncClient`` awaits every hook
+    registered under ``event_hooks["request"]``. A plain (sync) ``def``
+    here still runs synchronously (Python doesn't care that a plain
+    function was placed where a coroutine function was expected), but
+    calling it returns ``None``, and httpx's ``await hook(request)``
+    then raises ``TypeError: object NoneType can't be used in 'await'
+    expression`` on every single request through any client that
+    registers this hook — i.e. every article/podcast summary fetch.
 
     Fires before EVERY request httpx sends, including the redirects
     that ``follow_redirects=True`` walks. The shared post-response

@@ -70,7 +70,25 @@ class _RequestIdFilter(logging.Filter):
         return True
 
 
-logging.getLogger().addFilter(_RequestIdFilter())
+# Attached to the root logger's HANDLER, not the root Logger object.
+# A filter added via ``Logger.addFilter()`` only runs for records
+# that originate on that exact logger (``Logger.handle()`` calls
+# ``self.filter(record)`` on itself, once, before ``callHandlers``
+# walks the chain) — it does NOT run for records from child loggers
+# like ``logging.getLogger("popping.scheduler")`` propagating up,
+# which is how virtually every log call in this app is made. Adding
+# the filter to root would leave ``record.request_id`` unset for
+# those, and the format string's ``%(request_id)s`` would then raise
+# ``KeyError`` inside the formatter on every single one of them —
+# reproduced directly: every "popping.*" log call failed with
+# "Logging error" / "Formatting field not found in record:
+# 'request_id'", drowning out real log output (including the actual
+# tracebacks needed to debug requests) without crashing the process.
+# A filter added to the HANDLER runs for every record that reaches
+# it regardless of which logger originated it, which is what we want
+# here.
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_RequestIdFilter())
 logger = logging.getLogger("popping")
 
 

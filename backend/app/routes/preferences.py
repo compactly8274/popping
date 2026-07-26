@@ -74,17 +74,31 @@ router = APIRouter(tags=["preferences"])
 # actually uses (see ``PREFERENCE_KEYS`` in
 # ``frontend/src/lib/preferences.tsx``). Five of them take a
 # ``:<columnId>`` suffix (``read_entries``, ``last_viewed``,
-# ``column_prefs``, ``column_sections``) — the column id is a
-# slug the user can name freely (e.g. ``tech``, ``worldnews``,
-# ``cisa_kev``), so the suffix is a free-form ``[a-z0-9_-]+``
-# rather than a hard-coded list. Four of them are global
+# ``column_prefs``, ``column_sections``). Four of them are global
 # (no suffix: ``hidden_entries``, ``starred_entries``,
 # ``voted_entries``, ``filter_presets``, ``history_group_by``).
 # The ``hidden_entries`` etc. keys are also valid WITHOUT a
 # suffix because the legacy localStorage keys were the bare
 # names; the frontend migrates them on first load.
 #
-# Why an allowlist: the URL is the source of truth for which
+# The columnId suffix is NOT a slug — App.tsx passes the column's
+# literal display name (``col.name``) as the columnId, and that
+# name is frequently NOT ``[a-z0-9_-]+``: the built-in "Saved" /
+# "For You" columns are capitalized, the multi-source filter
+# column is literally derived from source names (``multisubColumnName``
+# returns things like ``names[0]`` or ``"${names[0]} + 1"`` — a raw
+# source display name, which for a Reddit source can contain a
+# slash, e.g. ``r/technology``, and for a custom RSS feed can be
+# almost any string the user typed when adding it). A charset-
+# restricted suffix pattern silently 400s real, common column
+# names — this previously shipped as ``[a-z0-9_-]+`` and broke
+# persistence for the Saved/For You/multi-source-filter columns.
+# So the suffix here is deliberately "anything non-empty"; the
+# actual security boundary is the PREFIX allowlist below (a caller
+# still can't write to an unrelated key like ``admin_override`` —
+# it just won't match any of these 9 prefixes).
+#
+# Why an allowlist at all: the URL is the source of truth for which
 # row gets written. Allowing any string here lets a caller with
 # a session pollute the namespace with arbitrary keys
 # (``admin_override``, ``__internal_xyz``, etc.) that future
@@ -93,8 +107,8 @@ router = APIRouter(tags=["preferences"])
 # instead of silently writing a row no one reads.
 _PREFERENCE_KEY_RE = re.compile(
     r"^(?:" + "|".join(
-        # Suffixed names: ``<key>:<columnId>``
-        f"(?:{re.escape(name)}:[a-z0-9_-]+)"
+        # Suffixed names: ``<key>:<anything non-empty>``
+        f"(?:{re.escape(name)}:.+)"
         for name in (
             "read_entries",
             "last_viewed",
@@ -216,7 +230,7 @@ async def put_preference(
     "the URL key matches what the caller is writing" if we ever
     need to (we don't today -- the URL is the source of truth).
 
-    rounds. The ``value`` field is opaque; the route passes it through to
+    The ``value`` field is opaque; the route passes it through to
     the JSONB column without coercion. The frontend's TS types
     are the source of truth for what shape each key holds.
 
