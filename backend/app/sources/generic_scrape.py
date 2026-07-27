@@ -21,6 +21,7 @@ dedicated DB table.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from typing import Optional
 
@@ -81,10 +82,84 @@ async def _extract_one(url: str) -> dict | None:
     return {
         "title": title,
         "url": url,
-        "published_at": data.get("date"),
+        # Trafilatura returns ``data.get("date")`` as a string
+        # in one of several shapes — ISO-8601 with offset
+        # (``"2026-07-27T08:59:10-07:00"``), bare ISO date
+        # (``"2026-07-27"``), or with a trailing ``Z`` (the
+        # Z-suffix form). The downstream ``recency.score`` calls
+        # ``.tzinfo`` on the value, so a raw string crashes the
+        # whole ingest. Normalize via ``_parse_published_str``
+        # which handles all three shapes and returns ``None`` on
+        # anything it can't parse (a missing or unparseable date
+        # yields zero recency contribution — the entry still
+        # lands in the DB, just without the convergence boost).
+        "published_at": _parse_published_str(data.get("date")),
         "summary": summary,
         "image_url": data.get("image"),
     }
+
+
+def _parse_published_str(raw: object) -> Optional[dt.datetime]:
+    """Normalize a trafilatura ``date`` value to a UTC datetime.
+
+    Trafilatura's ``bare_extraction`` returns ``data["date"]`` in
+    several shapes — depends on what metadata the page exposed:
+
+    - ``"2026-07-27T08:59:10-07:00"`` (ISO-8601 with offset)
+    - ``"2026-07-27"`` (date only — no time component)
+    - ``"2026-07-27T08:59:10Z"`` (Z-suffix; some HTML metadata)
+    - ``"Mon, 27 Jul 2026 15:59:10 +0000"`` (RFC-822, rare)
+    - ``None`` (page didn't expose any date metadata)
+
+    Returns a timezone-aware ``datetime`` in UTC for the parseable
+    cases, or ``None`` for ``None`` / unparseable strings. Plain
+    dates get their time component set to midnight UTC (the
+    earliest moment of that day) so the recency score is at least
+    representative — a publication-day accuracy is fine for a
+    "freshness" signal, a "publication second" wouldn't add value
+    the RSS path doesn't already have.
+
+    Mirrors the spirit of ``app.sources.rss._parse_published``
+    (which handles ``feedparser`` entries) but operates on a raw
+    string instead, since trafilatura doesn't expose a struct_time
+    the way feedparser does.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    # Shape 1: ISO-8601 with offset, possibly Z-suffix.
+    # Python 3.11+ ``fromisoformat`` accepts the Z suffix; on
+    # 3.10 and earlier we'd have to substitute. We're on
+    # 3.12 (matches the deploy image), so this is safe; if
+    # 3.10 ever comes back, replace ``Z`` with ``+00:00``
+    # first as a belt-and-braces measure.
+    try:
+        # Belt-and-braces: handle Z on every Python version
+        # by substituting before fromisoformat. fromisoformat
+        # rejects the literal 'Z' on 3.10.
+        normalized = s.replace("Z", "+00:00") if s.endswith("Z") else s
+        parsed = dt.datetime.fromisoformat(normalized)
+        # Naive datetime (date-only or no offset) → assume UTC.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
+    except ValueError:
+        pass
+    # Shape 2: RFC-822 (rare, e.g. ``"Mon, 27 Jul 2026 15:59:10 +0000"``)
+    # ``email.utils.parsedate_to_datetime`` is the canonical
+    # stdlib helper for this; it raises ``TypeError`` on bad
+    # input rather than returning a sentinel.
+    try:
+        from email.utils import parsedate_to_datetime
+
+        parsed = parsedate_to_datetime(s)
+        if parsed is not None and parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
+    except (TypeError, ValueError):
+        return None
 
 
 async def probe(url: str, limit: int = 3) -> list[dict]:
