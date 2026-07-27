@@ -1133,7 +1133,50 @@ function AutoFeedBlock({
 }) {
   const [autoUrl, setAutoUrl] = useState('')
   const [autoSubmitting, setAutoSubmitting] = useState(false)
+  // Track-anyway path. ``trackSubmitting`` is true while the
+  // generic_scrape POST is in flight. Surfaced as a button next
+  // to the "couldn't find a feed" error so the user has a path
+  // forward when auto-discovery gives up.
+  const [trackSubmitting, setTrackSubmitting] = useState(false)
   const [autoMessage, setAutoMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+
+  const trackAnyway = async () => {
+    const trimmed = autoUrl.trim()
+    if (!trimmed) return
+    setTrackSubmitting(true)
+    try {
+      // Mirror the backend's ``_slugify_hostname`` so the
+      // auto-derived name matches what the manual form's
+      // ``Auto Feed`` path would have produced for the same
+      // URL. The backend's ``_free_source_name`` de-duplicates
+      // against existing rows and built-in plugin names —
+      // relying on it here means a user clicking "Track anyway"
+      // on the same URL twice gets the existing row, not a
+      // duplicate.
+      const host = (() => {
+        try {
+          return new URL(trimmed).hostname || 'site'
+        } catch {
+          return 'site'
+        }
+      })().toLowerCase().replace(/^www\./, '')
+      const name = (host.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'site').slice(0, 100)
+      await api.createSource({
+        name,
+        type: 'generic_scrape',
+        category: 'news',
+        url: trimmed,
+      })
+      toast(`Tracking: ${name} — scraping for new articles`, 'info')
+      setAutoUrl('')
+      setAutoMessage(null)
+      await onAdded()
+    } catch (err) {
+      onError(parseApiError(err, 'failed to add scrape source'))
+    } finally {
+      setTrackSubmitting(false)
+    }
+  }
 
   const autoAdd = async () => {
     const trimmed = autoUrl.trim()
@@ -1200,9 +1243,28 @@ function AutoFeedBlock({
         </button>
       </div>
       {autoMessage && (
-        <p className={`text-ios-caption ${autoMessage.kind === 'err' ? 'text-red-400' : 'text-label-secondary'}`}>
-          {autoMessage.text}
-        </p>
+        <div className="space-y-2">
+          <p className={`text-ios-caption ${autoMessage.kind === 'err' ? 'text-red-400' : 'text-label-secondary'}`}>
+            {autoMessage.text}
+          </p>
+          {autoMessage.kind === 'err' &&
+            autoMessage.text.includes("couldn't find a feed") && (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void trackAnyway()}
+                  disabled={trackSubmitting || !autoUrl.trim()}
+                  className="shrink-0 min-h-[32px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-caption font-medium text-label-primary active:opacity-70 disabled:opacity-40"
+                  title="Add this URL as a generic_scrape source: the dashboard will periodically fetch it and extract new articles via its sitemap, even though no RSS feed exists."
+                >
+                  {trackSubmitting ? 'Tracking…' : 'Track this URL anyway'}
+                </button>
+                <span className="text-ios-caption text-label-tertiary">
+                  adds a scrape source instead
+                </span>
+              </div>
+            )}
+        </div>
       )}
     </div>
   )
@@ -1235,7 +1297,9 @@ function AddCustomTab({
   // backend applies the same dispatch in
   // ``routes/sources.create_source_endpoint`` so the field reaches
   // ``POST /api/sources`` as ``type``.
-  const [sourceType, setSourceType] = useState<'rss' | 'reddit' | 'podcast' | 'youtube_channel'>('rss')
+  const [sourceType, setSourceType] = useState<
+    'rss' | 'reddit' | 'podcast' | 'youtube_channel' | 'generic_scrape'
+  >('rss')
   const [submitting, setSubmitting] = useState(false)
   // Test step. ``testing`` is true while the request is in flight;
   // ``testResult`` holds the last result so the user can see
@@ -1276,7 +1340,12 @@ function AddCustomTab({
       return 'name must be lowercase letters, digits, or underscore (1-120 chars)'
     }
     if (!trimmedUrl) return 'url is required'
-    if (sourceType === 'rss' || sourceType === 'podcast' || sourceType === 'youtube_channel') {
+    if (
+      sourceType === 'rss' ||
+      sourceType === 'podcast' ||
+      sourceType === 'youtube_channel' ||
+      sourceType === 'generic_scrape'
+    ) {
       try {
         new URL(trimmedUrl)
       } catch {
@@ -1299,7 +1368,12 @@ function AddCustomTab({
     const trimmedUrl = url.trim()
     if (!trimmedUrl) {
       setUrlError('url is required')
-    } else if (sourceType === 'rss' || sourceType === 'podcast' || sourceType === 'youtube_channel') {
+    } else if (
+      sourceType === 'rss' ||
+      sourceType === 'podcast' ||
+      sourceType === 'youtube_channel' ||
+      sourceType === 'generic_scrape'
+    ) {
       try {
         new URL(trimmedUrl)
         setUrlError(null)
@@ -1485,6 +1559,30 @@ function AddCustomTab({
           />
           YouTube
         </label>
+        <label
+          className="flex items-center gap-1 text-ios-caption text-label-primary"
+          title="For sites without an RSS feed: the dashboard periodically scrapes the URL for new articles via its sitemap."
+        >
+          <input
+            type="radio"
+            name="fm-type"
+            value="generic_scrape"
+            checked={sourceType === 'generic_scrape'}
+            onChange={() => {
+              setSourceType('generic_scrape')
+              // 2h is the backend default for generic_scrape
+              // (_GENERIC_SCRAPE_DEFAULT_REFRESH). Single polls
+              // can mean multiple real page fetches per tick, so
+              // hourly is too aggressive for a scrape that wasn't
+              // opted into via a real feed.
+              if (refresh === 3600 || refresh === PODCAST_DEFAULT_REFRESH) {
+                setRefresh(7200)
+              }
+            }}
+            className="accent-accent"
+          />
+          Track page (no RSS)
+        </label>
       </fieldset>
       <div>
         <label
@@ -1497,7 +1595,9 @@ function AddCustomTab({
               ? 'Podcast RSS URL'
               : sourceType === 'youtube_channel'
                 ? 'YouTube channel URL'
-                : 'RSS / Atom URL'}
+                : sourceType === 'generic_scrape'
+                  ? 'Page URL (no RSS — will be scraped)'
+                  : 'RSS / Atom URL'}
         </label>
         <input
           id="fm-url"
@@ -1511,7 +1611,9 @@ function AddCustomTab({
                 ? 'https://example.com/podcast/feed.xml'
                 : sourceType === 'youtube_channel'
                   ? 'https://www.youtube.com/@handle'
-                  : 'https://example.com/feed.xml'
+                  : sourceType === 'generic_scrape'
+                    ? 'https://example.com'
+                    : 'https://example.com/feed.xml'
           }
           className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
         />
