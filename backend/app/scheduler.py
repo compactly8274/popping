@@ -42,7 +42,7 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import bindparam, delete, select, text
+from sqlalchemy import bindparam, delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1476,8 +1476,22 @@ async def _already_notified_urls(session: AsyncSession) -> set[str]:
     ``Brief.meta.notified_urls`` — the old layout wrote to one Brief
     row and read across all rows, which silently dropped entries past
     the 500-row bucket cap.
+
+    Windowed to the ``notification_dedup_retention_days`` window so
+    the read cost stays bounded as the ledger grows over months. The
+    prune job (``_prune_notification_dedup``) removes rows older
+    than the same window on a daily cadence — so a row that the
+    prune has already removed wouldn't be in the set anyway, and
+    a row the prune hasn't reached yet (within the window) is
+    exactly the set we want to dedup against. When
+    ``retention_days=0`` (operator chose to keep the full history),
+    the read stays unbounded to match.
     """
     stmt = select(NotificationDedup.key).where(NotificationDedup.kind == "cve_url")
+    retention_days = getattr(settings, "notification_dedup_retention_days", 30)
+    if retention_days > 0:
+        cutoff = func.now() - func.make_interval(0, 0, 0, retention_days)
+        stmt = stmt.where(NotificationDedup.last_notified_at >= cutoff)
     return {row[0] for row in (await session.execute(stmt)).all()}
 
 
@@ -1485,9 +1499,16 @@ async def _already_alerted_slugs(session: AsyncSession) -> set[str]:
     """Slugs already in the convergence alert dedup ledger.
 
     Same ledger table, different ``kind`` discriminator. Was a union
-    across Brief rows; now a direct PK lookup.
+    across Brief rows; now a direct PK lookup. Same windowing
+    rationale as ``_already_notified_urls`` — bounded to the
+    retention window so the read cost doesn't grow with months of
+    accumulated slugs.
     """
     stmt = select(NotificationDedup.key).where(NotificationDedup.kind == "convergence_slug")
+    retention_days = getattr(settings, "notification_dedup_retention_days", 30)
+    if retention_days > 0:
+        cutoff = func.now() - func.make_interval(0, 0, 0, retention_days)
+        stmt = stmt.where(NotificationDedup.last_notified_at >= cutoff)
     return {row[0] for row in (await session.execute(stmt)).all()}
 
 
