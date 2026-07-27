@@ -21,6 +21,8 @@ import pytest
 
 from app.url_safety import ssrf_event_hook
 
+pytestmark = pytest.mark.no_db
+
 
 def _handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, text="ok")
