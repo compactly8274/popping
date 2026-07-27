@@ -22,6 +22,7 @@ dedicated DB table.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from app.article_extract import fetch_html
 from app.feed_autodiscovery import discover_sitemap_urls
@@ -120,6 +121,16 @@ class GenericScrapePlugin(SourcePlugin):
         self.url = source_row.url
         self.refresh_interval_seconds = source_row.refresh_interval_seconds
         self.source_id = source_row.id
+        # Optional direct sitemap URL. When set, the plugin skips
+        # trafilatura's homepage-based sitemap discovery (which
+        # doesn't work on every site — e.g. theprogress.com's
+        # sitemap_index has 1100+ cross-domain entries that all
+        # 404) and instead parses the user-specified URL directly
+        # with ``trafilatura.sitemaps.sitemap_search``. Same code
+        # path, same SSRF guard, same dedup; just a more specific
+        # entry point. None falls back to the original behavior
+        # so old rows aren't affected by the migration.
+        self.sitemap_url: Optional[str] = getattr(source_row, "sitemap_url", None)
         # In-process cache of URLs we've already attempted extraction
         # for — see the module docstring for why this instance
         # persists across polls. Resets on backend restart, which
@@ -131,7 +142,17 @@ class GenericScrapePlugin(SourcePlugin):
         self._extracted_urls: set[str] = set()
 
     async def fetch(self) -> list[dict]:
-        candidates = await discover_sitemap_urls(self.url, limit=_MAX_SITEMAP_CANDIDATES)
+        # If the row carries an explicit sitemap_url, use it
+        # directly — ``trafilatura.sitemaps.sitemap_search`` will
+        # parse it as a sitemap (returning the article URLs) when
+        # given a direct sitemap URL, but it tries to *find* the
+        # sitemap first when given a homepage URL, which is
+        # fragile (e.g. theprogress.com's sitemap_index is
+        # 1.1MB of cross-domain entries that all 404). Letting
+        # the user point at a known-good sitemap URL side-steps
+        # the discovery heuristic entirely.
+        sitemap_input = self.sitemap_url or self.url
+        candidates = await discover_sitemap_urls(sitemap_input, limit=_MAX_SITEMAP_CANDIDATES)
         items: list[dict] = []
         attempted = 0
         for url in candidates:

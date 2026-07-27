@@ -664,6 +664,17 @@ async def update_source_endpoint(
             body.url = _validate_reddit_url(body.url)
         else:
             _validate_url(body.url)
+    # ``sitemap_url`` is an optional override for generic_scrape
+    # sources only. ``None`` means "clear back to homepage-based
+    # discovery"; any string is validated as an http(s) URL. The
+    # plugin only reads this on ``generic_scrape`` rows; setting it
+    # on other types is silently stored-but-ignored — same pattern
+    # as ``custom_headers`` (which is also stored-but-ignored for
+    # generic_scrape since that plugin doesn't make HTTP requests
+    # with headers).
+    sitemap_url_value = None
+    if "sitemap_url" in body.model_fields_set and body.sitemap_url is not None:
+        sitemap_url_value = _validate_url(body.sitemap_url)
     if body.refresh_interval_seconds is not None:
         body.refresh_interval_seconds = _validate_refresh(body.refresh_interval_seconds)
     if body.category is not None:
@@ -695,6 +706,7 @@ async def update_source_endpoint(
             category=body.category,
             name=body.name,
             url=body.url,
+            sitemap_url=sitemap_url_value,
             custom_headers=headers,
         )
     except IntegrityError:

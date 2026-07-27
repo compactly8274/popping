@@ -45,6 +45,15 @@ class Source(Base):
     type: Mapped[str] = mapped_column(String(20), nullable=False)  # rss / api / scrape
     category: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     url: Mapped[str] = mapped_column(Text, nullable=False)
+    # Optional direct sitemap URL. When set, the generic_scrape
+    # plugin parses it with ``trafilatura.sitemaps.sitemap_search``
+    # directly instead of asking trafilatura to discover the
+    # sitemap from the page URL. Solves the case where the
+    # homepage's sitemap_index is broken (e.g. 1100+ cross-domain
+    # 404s on WordPress VIP installs like theprogress.com) but a
+    # specific section sitemap is healthy. NULL = fall back to
+    # the original homepage-discovery heuristic.
+    sitemap_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     refresh_interval_seconds: Mapped[int] = mapped_column(Integer, default=3600)
     last_fetch_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

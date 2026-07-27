@@ -2043,6 +2043,7 @@ async def update_source(
     category: str | None = None,
     name: str | None = None,
     url: str | None = None,
+    sitemap_url: str | None = _UNSET,
     custom_headers: dict | None = _UNSET,
 ) -> Source | None:
     """Apply a partial update to a Source row and reschedule if needed.
@@ -2055,16 +2056,25 @@ async def update_source(
     rows); this function assumes the inputs have already passed
     validation.
 
+    ``sitemap_url`` participates in the same change-detection /
+    reschedule dance as ``url``: a change to the sitemap URL means
+    the next ingest should re-fetch the sitemap entirely, so the
+    dynamic job gets replaced with one that knows about the new
+    URL. Sentinel value (``_UNSET``) carries the "field missing
+    from the request body, don't touch" semantic; ``None`` means
+    "explicitly clear it back to discovery-by-homepage".
+
     Scheduler effects:
       - ``active`` False → remove the dynamic job. A class-driven
         source (``name in list_sources()``) is left alone; the
         class-driven job continues independently of the row.
-      - ``active`` True, ``refresh`` change, ``name`` change, or
-        ``url`` change → re-add the dynamic job with the new trigger
-        (``replace_existing=True`` handles idempotency). ``replace_existing=True``
-        rebinds the job's args — for dynamic rows this means the
-        next tick uses a freshly-constructed ``DynamicRssPlugin``
-        instance built from the renamed row.
+      - ``active`` True, ``refresh`` change, ``name`` change,
+        ``url`` change, or ``sitemap_url`` change → re-add the
+        dynamic job with the new trigger (``replace_existing=True``
+        handles idempotency). ``replace_existing=True`` rebinds the
+        job's args — for dynamic rows this means the next tick uses
+        a freshly-constructed ``DynamicRssPlugin`` / ``GenericScrapePlugin``
+        instance built from the updated row.
 
     URL changes clear the cached favicon: ``favicon_url`` and
     ``favicon_path`` are NULLed on the row, and the on-disk file
@@ -2091,10 +2101,15 @@ async def update_source(
     headers_changed = (
         custom_headers is not _UNSET and custom_headers != row.custom_headers
     )
-    # ALL six fields participate in the early-return guard. The
-    # original three-field version silently dropped name/url-only
-    # PATCHes because the commit lives below the guard; the new
-    # fields would have suffered the same bug.
+    # ``sitemap_url`` uses the sentinel pattern: missing from the
+    # body = no-op; ``None`` (explicit null) = clear; any string =
+    # set. Comparing against the row's current value avoids a
+    # pointless scheduler rebuild on an idempotent PATCH.
+    sitemap_url_changed = (
+        sitemap_url is not _UNSET
+        and sitemap_url != row.sitemap_url
+    )
+    # All seven fields participate in the early-return guard.
     if not (
         refresh_changed
         or active_changed
@@ -2102,6 +2117,7 @@ async def update_source(
         or name_changed
         or url_changed
         or headers_changed
+        or sitemap_url_changed
     ):
         return row
     if refresh is not None:
@@ -2143,6 +2159,12 @@ async def update_source(
         # Route layer has already normalized this (None → NULL,
         # empty dict → NULL). Storing ``{}`` would be wasteful.
         row.custom_headers = custom_headers
+    if sitemap_url is not _UNSET:
+        # ``None`` = explicit clear back to homepage discovery.
+        # Any string = set the direct sitemap URL the plugin
+        # should parse with ``trafilatura.sitemaps.sitemap_search``
+        # next poll.
+        row.sitemap_url = sitemap_url
     await session.commit()
     if url_changed and old_favicon_path:
         # Post-commit filesystem cleanup. Only reached on a

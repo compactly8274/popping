@@ -20,6 +20,12 @@ class SourceOut(BaseModel):
     last_error: Optional[str]
     error_count: int
     active: bool
+    # Optional direct sitemap URL — see Source.sitemap_url's
+    # docstring. Surfaces in the GET response so the frontend
+    # can show "Sitemap: <url>" in the source list and a PATCH
+    # form to edit it. NULL = the plugin is using the original
+    # homepage-discovery heuristic.
+    sitemap_url: Optional[str] = None
     # Remote URL of the source's favicon. NULL until first ingest
     # downloads it (typically origin's /favicon.ico).
     favicon_url: Optional[str] = None
@@ -129,6 +135,15 @@ class SourceUpdate(BaseModel):
     category: Optional[str] = None
     name: Optional[str] = None
     url: Optional[str] = None
+    # Optional direct sitemap URL for ``type='generic_scrape'``
+    # sources. Set to ``None`` (default) for the original
+    # homepage-discovery behavior; set to a working direct
+    # sitemap URL when the homepage's sitemap_index is broken
+    # but a specific section's sitemap is healthy. The plugin
+    # uses this URL with ``trafilatura.sitemaps.sitemap_search``
+    # directly instead of going through the broken discovery
+    # heuristic.
+    sitemap_url: Optional[str] = None
     # Set to ``{}`` (or empty dict) to clear an existing override.
     # ``None`` leaves the column untouched (the PATCH endpoint
     # treats missing fields as no-ops).
