@@ -19,6 +19,8 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+import numpy as np
+
 from app.models import Entry, Source, UserProfile
 
 NEUTRAL = 50.0
@@ -33,27 +35,34 @@ def _cosine(a, b) -> Optional[float]:
     ``a`` / ``b`` may arrive as a Python list (``embedding`` column
     when set in-process), a ``numpy.ndarray`` (when read back from
     the Postgres ``vector`` column via the pgvector dialect), or
-    ``None``. Coerce to a list up front so the body can treat them
-    uniformly and ``not a`` doesn't trip numpy's "ambiguous truth
-    value" rule.
+    ``None``. Coerce to ``np.asarray(..., dtype=float)`` up front so
+    the body uses a single vectorized path — slice 16 added numpy to
+    the rescore path's aggregate step but missed this per-call site.
+
+    Returns ``None`` (not a raise, not 0.0) for the documented edge
+    cases — missing input, mismatched lengths, or zero-norm — so
+    callers can map ``None`` → the neutral midpoint (``vector_score``
+    below). The previous Python for-loop kept this contract; the
+    numpy rewrite preserves it.
     """
     if a is None or b is None:
         return None
-    if hasattr(a, "tolist"):
-        a = a.tolist()
-    if hasattr(b, "tolist"):
-        b = b.tolist()
-    if not a or not b or len(a) != len(b):
+    # ``np.asarray`` is a no-op for already-ndarray inputs (returns
+    # the same object) and a cheap copy for list inputs. ``dtype=float``
+    # avoids integer-array behaviour on a pgvector ``bigint``-encoded
+    # read-back (rare, but defensive — the prior Python loop did this
+    # implicitly via ``x * y``).
+    a_arr = np.asarray(a, dtype=float)
+    b_arr = np.asarray(b, dtype=float)
+    if a_arr.size == 0 or b_arr.size == 0 or a_arr.shape != b_arr.shape:
         return None
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
+    dot = float(np.dot(a_arr, b_arr))
+    na = float(np.dot(a_arr, a_arr))
+    nb = float(np.dot(b_arr, b_arr))
     if na == 0.0 or nb == 0.0:
         return None
+    # ``math.sqrt`` is fine on a Python float — wrapping np.sqrt would
+    # add overhead for a single-element reduction.
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
