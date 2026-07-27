@@ -103,16 +103,39 @@ export function Drawer({
   // closing the Drawer mid-fetch leaves the promise in flight;
   // the later .then calls hit an unmounted component and React
   // logs a "state update on an unmounted component" warning.
+  // Slice 22 fix: the aliveRef effect previously had NO deps array,
+  // so it ran on every render. Sequence on each commit was:
+  //   1. aliveRef.current = true
+  //   2. cleanup runs → aliveRef.current = false
+  //   3. effect runs again → aliveRef.current = true
+  // The ref flickered false between renders, so an async ``.then``
+  // callback that landed during step 2 read stale ``false`` and
+  // silently dropped its ``setState``. The drawer would stay empty
+  // (sources list stale) until the next user action triggered a
+  // re-fetch.
+  //
+  // Drawer is mounted unconditionally by App (visibility is gated by
+  // the ``open`` prop, not by mount/unmount — see App.tsx:2723), so
+  // the original "alive = true on every (re)open" intent was never
+  // what the code did. Adding ``[]`` deps so the effect runs once on
+  // mount is the right fix:
+  //   - Mount → aliveRef.current = true (and stays true)
+  //   - Unmount (which only happens when App itself unmounts, i.e.
+  //     page navigation away) → cleanup sets it to false
+  //   - ``.then`` callbacks check this flag and skip setState only
+  //     when the component is actually gone, which is the correct
+  //     guard
+  //
+  // The Esc/swipe/focus-trap effects below already use ``[open, ...]``
+  // deps correctly — they were the model for what should have been
+  // written here.
   const aliveRef = useRef(true)
   useEffect(() => {
-    // Mark every (re)open as a fresh "alive" generation. The
-    // ref is updated synchronously on every render so the .then
-    // closures see the current value.
     aliveRef.current = true
     return () => {
       aliveRef.current = false
     }
-  })
+  }, [])
   const refetchSources = (): Promise<void> => {
     setSourcesError(null)
     return api.sources().then((rows) => {
