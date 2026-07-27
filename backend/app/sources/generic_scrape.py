@@ -181,6 +181,87 @@ async def probe(url: str, limit: int = 3) -> list[dict]:
     return items
 
 
+def _extract_links_from_html(html: str, page_url: str, pattern: str) -> list[str]:
+    """Pull every ``<a href="...">`` from ``html`` whose URL matches
+    ``pattern`` (a leading-slash path prefix like ``/library/``),
+    resolved to an absolute URL via ``page_url``'s origin.
+
+    Strict same-origin only — links to other hosts are discarded.
+    That keeps the SSRF guard (``app.article_extract.fetch_html``)
+    effective: every URL we subsequently fetch is from the same
+    origin as the source row's ``url``, which is the only host
+    the operator has approved.
+
+    Deduplicates while preserving order (first-occurrence) so the
+    plugin's ``_extracted_urls`` dedup and the poll cap work as
+    expected.
+
+    Trafilatura can return ``html`` already partially cleaned
+    (a "main text" view) when called via the higher-level
+    ``extract()`` API, but here we work on the raw ``html`` from
+    ``fetch_html`` so we can pick up the actual ``href``
+    attributes. ``re.findall`` on the raw string is fast enough
+    for the page sizes we care about (typically <200 KB) and
+    avoids pulling BeautifulSoup as a dependency.
+    """
+    import re
+    from urllib.parse import urljoin, urlparse
+
+    parsed = urlparse(page_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    seen: set[str] = set()
+    out: list[str] = []
+    # Anchor with any attributes in between, then ``href="..."``
+    # or ``href='...'``. Order matters: capture the URL value,
+    # not the surrounding HTML.
+    for match in re.finditer(
+        r'<a\s[^>]*href=([\"\'])([^\"\']*)\1[^>]*>',
+        html,
+        re.IGNORECASE,
+    ):
+        href = match.group(2).strip()
+        if not href or href.startswith("#") or href.startswith("javascript:") or href.startswith("mailto:"):
+            continue
+        # Resolve relative URLs against the page.
+        absolute = urljoin(origin, href)
+        # Strict same-origin.
+        abs_parsed = urlparse(absolute)
+        if abs_parsed.scheme not in ("http", "https"):
+            continue
+        if f"{abs_parsed.scheme}://{abs_parsed.netloc}" != origin:
+            continue
+        # Match the path prefix.
+        if not abs_parsed.path.startswith(pattern):
+            continue
+        # Skip the page itself and any URL with a different query
+        # string than the page (avoids "newest" vs "top" sorting
+        # variants being treated as separate candidates).
+        if abs_parsed.path == parsed.path:
+            continue
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        out.append(absolute)
+    return out
+
+
+async def _discover_page_links(
+    page_url: str, pattern: str, limit: int = _MAX_SITEMAP_CANDIDATES
+) -> list[str]:
+    """Fetch ``page_url``, extract matching ``<a href>`` URLs from
+    its HTML, return up to ``limit`` of them.
+
+    ``fetch_html`` enforces the URL safety check (denied hosts,
+    private network ranges), so this layer inherits the SSRF
+    guard for free — every link returned here is reachable +
+    not on a private network.
+    """
+    html = await fetch_html(page_url)
+    if html is None:
+        return []
+    return _extract_links_from_html(html, page_url, pattern)[:limit]
+
+
 class GenericScrapePlugin(SourcePlugin):
     """SourcePlugin bound to a single ``type="generic_scrape"`` Source row.
 
@@ -206,6 +287,16 @@ class GenericScrapePlugin(SourcePlugin):
         # entry point. None falls back to the original behavior
         # so old rows aren't affected by the migration.
         self.sitemap_url: Optional[str] = getattr(source_row, "sitemap_url", None)
+        # Optional path-prefix for the page_links strategy. When
+        # set, the plugin tries sitemap discovery first, and if
+        # that returns zero candidates, falls through to
+        # fetching ``self.url`` and extracting ``<a href>`` URLs
+        # matching this prefix. Designed for sites that don't
+        # publish a sitemap at all (e.g. ollama.com) but DO
+        # expose a "list of recent items" page with stable URL
+        # shapes (``/library/<model>``, ``/blog/<slug>``, etc).
+        # gettattr with a default preserves pre-migration rows.
+        self.link_pattern: Optional[str] = getattr(source_row, "link_pattern", None)
         # In-process cache of URLs we've already attempted extraction
         # for — see the module docstring for why this instance
         # persists across polls. Resets on backend restart, which
@@ -228,6 +319,18 @@ class GenericScrapePlugin(SourcePlugin):
         # the discovery heuristic entirely.
         sitemap_input = self.sitemap_url or self.url
         candidates = await discover_sitemap_urls(sitemap_input, limit=_MAX_SITEMAP_CANDIDATES)
+        # Fall back to the page_links strategy when:
+        #   1. sitemap discovery returned nothing
+        #   2. AND the user supplied a link_pattern on the row
+        # The plugin doesn't page_links-only by design — sitemap
+        # discovery is still the primary path because it's
+        # robust (trafilatura's sitemap_search handles sitemap
+        # indexes, news sitemaps, gzip, etc.). page_links is
+        # the "no sitemap at all" escape hatch.
+        if not candidates and self.link_pattern:
+            candidates = await _discover_page_links(
+                self.url, self.link_pattern, limit=_MAX_SITEMAP_CANDIDATES
+            )
         items: list[dict] = []
         attempted = 0
         for url in candidates:

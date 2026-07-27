@@ -54,6 +54,19 @@ class Source(Base):
     # specific section sitemap is healthy. NULL = fall back to
     # the original homepage-discovery heuristic.
     sitemap_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Optional path-prefix to match ``<a href>`` links against
+    # when ``sitemap_url`` discovery returns nothing. Designed
+    # for sites that don't publish a sitemap at all but DO
+    # expose a "list of recent items" page with a stable URL
+    # shape (e.g. ollama.com/search?o=newest returns ~20
+    # ``/library/<model>`` links). Plugin fetches the page,
+    # extracts every ``<a href="...">`` matching this prefix
+    # (relative to the page origin), then runs the standard
+    # per-URL extraction chain. NULL = don't try page_links.
+    # Must be a leading-slash path prefix (e.g. ``/library/``),
+    # never a full URL — full URLs would bypass the same-origin
+    # safety check.
+    link_pattern: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     refresh_interval_seconds: Mapped[int] = mapped_column(Integer, default=3600)
     last_fetch_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

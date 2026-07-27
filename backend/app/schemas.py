@@ -26,6 +26,12 @@ class SourceOut(BaseModel):
     # form to edit it. NULL = the plugin is using the original
     # homepage-discovery heuristic.
     sitemap_url: Optional[str] = None
+    # Optional path-prefix filter for the page_links strategy —
+    # see Source.link_pattern's docstring. Surfaces in the GET
+    # response so the frontend can show "Link pattern: /library/"
+    # and a PATCH form to edit it. NULL = the plugin doesn't
+    # try page_links (sitemap strategies only).
+    link_pattern: Optional[str] = None
     # Remote URL of the source's favicon. NULL until first ingest
     # downloads it (typically origin's /favicon.ico).
     favicon_url: Optional[str] = None
@@ -144,6 +150,17 @@ class SourceUpdate(BaseModel):
     # directly instead of going through the broken discovery
     # heuristic.
     sitemap_url: Optional[str] = None
+    # Optional path-prefix filter for the page_links strategy.
+    # E.g. ``"/library/"`` for ollama.com's library pages, or
+    # ``"/blog/"`` for blog index links. Plugin fetches
+    # ``self.url`` and extracts every ``<a href>`` matching
+    # this prefix (resolved to absolute URLs via the page's
+    # origin), then runs each through the standard
+    # ``_extract_one`` chain. NULL = don't try page_links.
+    # Must be a leading-slash path prefix, NOT a full URL —
+    # route layer enforces this so the same-origin safety
+    # check isn't bypassed.
+    link_pattern: Optional[str] = None
     # Set to ``{}`` (or empty dict) to clear an existing override.
     # ``None`` leaves the column untouched (the PATCH endpoint
     # treats missing fields as no-ops).
