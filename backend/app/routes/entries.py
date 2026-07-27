@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import html
 import re
 from typing import Optional
@@ -84,7 +85,55 @@ _LIKE_ESCAPE_RE = re.compile(r"([\\%_])")
 def _escape_like(term: str) -> str:
     """Escape LIKE wildcards. Called once per request to build the
     search pattern. Cheap (linear scan, single regex)."""
-    return _LIKE_ESCAPE_RE.sub(r"\\\1", term)
+    return _LIKE_ESCAPE_RE.sub(r"\\\\\\1", term)
+
+
+def _should_retry_empty_cache(
+    fetched_at: Optional[dt.datetime],
+    retry_hours: float,
+    now: Optional[dt.datetime] = None,
+) -> bool:
+    """Decide whether an empty-string ``cached_summary`` is still
+    fresh enough to skip a retry.
+
+    Returns True when the cache is "old enough to retry"; the
+    endpoint uses this in a negated form (``not
+    _should_retry_empty_cache(...)``) so a True return means
+    "fall through to the fetch / extract / LLM chain".
+
+    Rules:
+      - ``fetched_at is None`` (pre-migration rows that pre-date
+        the column) → True. The first chevron tap after deploy
+        refetches and re-caches every empty-string hit. One-time
+        burst cost; subsequent calls land in the normal
+        cache-or-retry decision via the real timestamp.
+      - ``fetched_at`` is older than ``retry_hours`` ago → True.
+        The cache has been empty long enough that a transient
+        failure (the source's article URL was temporarily 404,
+        the LLM provider was momentarily over-quota) is unlikely
+        to still be in effect; retrying is worthwhile.
+      - ``fetched_at`` is within ``retry_hours`` of ``now`` → False.
+        Recent empty cache: trust it, don't burn the LLM budget
+        on a constant retry loop.
+
+    Pure function (no DB), so unit-testable without a real
+    backend. ``now`` is injectable for deterministic testing.
+    """
+    if fetched_at is None:
+        # Pre-migration row. Treat as "old enough to retry" so
+        # the deploy's first tap after upgrade refreshes stale
+        # empty-string caches.
+        return True
+    if now is None:
+        now = dt.datetime.now(dt.timezone.utc)
+    # fetched_at is a tz-aware UTC timestamp from the model; guard
+    # against a naive value just in case the DB driver ever drops
+    # tz info (some MySQL drivers do — Postgres's asyncpg preserves
+    # it, but a future driver swap shouldn't silently break the
+    # retry window).
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=dt.timezone.utc)
+    return (now - fetched_at).total_seconds() >= retry_hours * 3600
 
 
 def _clean_summary(raw: str | None) -> str:
@@ -469,8 +518,29 @@ async def entry_summary_endpoint(
         # Cache hit. ``""`` means we already determined the source
         # shipped nothing usable — return that as ``summary=""`` so
         # the frontend can distinguish "no summary" from "summary
-        # loaded".
-        return EntrySummaryOut(summary=row.cached_summary, cached=True)
+        # loaded", BUT only if the empty cache is still inside the
+        # retry window. After ``cached_summary_retry_hours`` has
+        # passed we re-run the fetch / extract / LLM chain (and
+        # the fallback) — a transient failure at ingest time (the
+        # source's article URL was temporarily 404, the LLM
+        # provider was momentarily over-quota) used to permanently
+        # poison the cache; the retry window is the operator's
+        # lever to recover without re-ingesting the source. A
+        # non-empty cached_summary is never retried: re-summarizing
+        # the same article would just churn the LLM budget.
+        #
+        # Pre-migration rows have ``cached_summary_fetched_at is
+        # None``; the helper treats that as "old enough to retry",
+        # so the first chevron tap after deploy refetches and
+        # re-caches every entry that's currently an empty-string
+        # hit. That's a one-time burst cost — every subsequent
+        # call gets a real timestamp and lands in the normal
+        # cache-or-retry decision.
+        if row.cached_summary != "" or not _should_retry_empty_cache(
+            row.cached_summary_fetched_at,
+            retry_hours=settings.cached_summary_retry_hours,
+        ):
+            return EntrySummaryOut(summary=row.cached_summary, cached=True)
 
     final = ""
     if llm_router.providers_for("brief"):
@@ -485,8 +555,12 @@ async def entry_summary_endpoint(
 
     # Persist even when empty — that's the cache-hit signal for
     # next time. Without the persist, every chevron tap would
-    # re-run the fetch / extract / LLM chain.
+    # re-run the fetch / extract / LLM chain. ``fetched_at`` is
+    # set on every write (including the empty-string write) so
+    # the next chevron tap's retry-window check has a real
+    # timestamp to compare against.
     row.cached_summary = final
+    row.cached_summary_fetched_at = dt.datetime.now(dt.timezone.utc)
     await session.commit()
 
     return EntrySummaryOut(summary=final, cached=False)

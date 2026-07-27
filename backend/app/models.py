@@ -138,6 +138,18 @@ class Entry(Base):
     # so a future LLM-summary path can populate the same column
     # under a different source without another migration.
     cached_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # When ``cached_summary`` was last written (NULL for the empty
+    # string never-had-anything case *and* for any pre-migration rows
+    # that pre-date the column's existence). The ``entry_summary_endpoint``
+    # route uses this to retry an empty-string cache after a window
+    # (``settings.cached_summary_retry_hours``, default 24) so a
+    # transient failure doesn't permanently poison the cache; see
+    # migration 0022 for the full rationale. Set on every cache-write
+    # including the empty-string write, so the "should I retry?" check
+    # has a real timestamp to compare against.
+    cached_summary_fetched_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # LLM-generated summary of a podcast episode's transcript.
     # Populated by POST /api/entries/{id}/podcast_summary the first
     # time it's requested — same NULL-vs-empty-string cache contract
