@@ -2044,6 +2044,7 @@ async def update_source(
     name: str | None = None,
     url: str | None = None,
     sitemap_url: str | None = _UNSET,
+    link_pattern: str | None = _UNSET,
     custom_headers: dict | None = _UNSET,
 ) -> Source | None:
     """Apply a partial update to a Source row and reschedule if needed.
@@ -2109,7 +2110,17 @@ async def update_source(
         sitemap_url is not _UNSET
         and sitemap_url != row.sitemap_url
     )
-    # All seven fields participate in the early-return guard.
+    # ``link_pattern`` participates in the same sentinel dance as
+    # ``sitemap_url``: missing = no-op, explicit ``None`` = clear
+    # (turn off the page_links fallback), string = set. Note the
+    # plugin treats both ``link_pattern=None`` and ``link_pattern=""
+    # as "don't try page_links" via falsy-check on the field, so
+    # an empty string in the body also clears.
+    link_pattern_changed = (
+        link_pattern is not _UNSET
+        and link_pattern != row.link_pattern
+    )
+    # All eight fields participate in the early-return guard.
     if not (
         refresh_changed
         or active_changed
@@ -2118,6 +2129,7 @@ async def update_source(
         or url_changed
         or headers_changed
         or sitemap_url_changed
+        or link_pattern_changed
     ):
         return row
     if refresh is not None:
@@ -2165,6 +2177,13 @@ async def update_source(
         # should parse with ``trafilatura.sitemaps.sitemap_search``
         # next poll.
         row.sitemap_url = sitemap_url
+    if link_pattern is not _UNSET:
+        # Same semantics as ``sitemap_url``: ``None`` clears the
+        # page_links fallback, any string sets it. The plugin
+        # treats both ``None`` and ``""`` as "don't try
+        # page_links" so an empty-string body also counts as a
+        # clear here.
+        row.link_pattern = link_pattern
     await session.commit()
     if url_changed and old_favicon_path:
         # Post-commit filesystem cleanup. Only reached on a

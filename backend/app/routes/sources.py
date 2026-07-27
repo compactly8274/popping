@@ -675,6 +675,25 @@ async def update_source_endpoint(
     sitemap_url_value = None
     if "sitemap_url" in body.model_fields_set and body.sitemap_url is not None:
         sitemap_url_value = _validate_url(body.sitemap_url)
+    # ``link_pattern`` is a path-prefix filter for the page_links
+    # fallback. Strict validation: must be a leading-slash path
+    # prefix (e.g. ``/library/``), NEVER a full URL — accepting a
+    # full URL would let the user bypass the same-origin safety
+    # check that ``_extract_links_from_html`` enforces.
+    link_pattern_value = None
+    if "link_pattern" in body.model_fields_set and body.link_pattern is not None:
+        candidate = body.link_pattern
+        if not candidate.startswith("/"):
+            raise HTTPException(
+                status_code=422,
+                detail="link_pattern must start with '/' (path prefix, not a full URL)",
+            )
+        if "://" in candidate:
+            raise HTTPException(
+                status_code=422,
+                detail="link_pattern must be a path prefix, not a full URL",
+            )
+        link_pattern_value = candidate
     if body.refresh_interval_seconds is not None:
         body.refresh_interval_seconds = _validate_refresh(body.refresh_interval_seconds)
     if body.category is not None:
@@ -707,6 +726,7 @@ async def update_source_endpoint(
             name=body.name,
             url=body.url,
             sitemap_url=sitemap_url_value,
+            link_pattern=link_pattern_value,
             custom_headers=headers,
         )
     except IntegrityError:
