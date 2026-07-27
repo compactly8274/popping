@@ -52,6 +52,62 @@ async def test_discover_feed_url_unreachable_host_returns_none():
     assert await discover_feed_url("http://127.0.0.1:1/nope") is None
 
 
+# --- app.feed_autodiscovery: trafilatura's per-request download timeout ----
+#
+# Follow-up regression: even after the find_feed_urls -> determine_feed
+# fix above, Auto Feed still failed on real multi-sitemap sites.
+# trafilatura's OWN per-request download timeout defaults to 30s —
+# the exact same value as our outer _TRAFILATURA_BUDGET. sitemap_search
+# doesn't make just one request; it crawls robots.txt, several guessed
+# paths, and any nested sitemap-index references, fetching each in
+# turn. So a single slow/hanging host among those candidates could
+# consume the ENTIRE outer 30s budget by itself, starving every other
+# candidate in the same crawl of a chance to run — observed directly
+# via a real site's sitemap discovery going silent for ~28s before our
+# wait_for cut it off. _tighten_trafilatura_download_timeout() mutates
+# the shared ConfigParser trafilatura's fetch_url binds as its default
+# so every internal request this module triggers is capped tightly
+# instead of up to 30s.
+
+
+def test_tighten_trafilatura_download_timeout_mutates_the_shared_default():
+    import inspect
+
+    from trafilatura.downloads import fetch_url
+
+    def _current_timeout() -> int:
+        return inspect.signature(fetch_url).parameters["config"].default.getint(
+            "DEFAULT", "DOWNLOAD_TIMEOUT",
+        )
+
+    original = _current_timeout()
+    try:
+        feed_autodiscovery_mod._tighten_trafilatura_download_timeout()
+        assert _current_timeout() == feed_autodiscovery_mod._TRAFILATURA_DOWNLOAD_TIMEOUT_S
+    finally:
+        # Restore — this module-level ConfigParser is shared process-
+        # wide, so a leaked mutation would affect unrelated trafilatura
+        # callers (e.g. app.article_extract) for the rest of the test run.
+        inspect.signature(fetch_url).parameters["config"].default.set(
+            "DEFAULT", "DOWNLOAD_TIMEOUT", str(original),
+        )
+
+
+def test_sitemap_search_internal_fetch_uses_the_same_shared_config():
+    """Pins the mechanism the fix relies on: SitemapObject.fetch calls
+    fetch_url with no explicit config, so it resolves to the same
+    bound default our tighten function mutates. If a trafilatura
+    upgrade ever changes this call to pass its own config, the timeout
+    fix silently stops applying to sitemap crawls — this test would
+    catch that."""
+    import inspect
+
+    from trafilatura.sitemaps import SitemapObject
+
+    src = inspect.getsource(SitemapObject.fetch)
+    assert "fetch_url(self.current_url)" in src
+
+
 # --- app.feed_autodiscovery: real trafilatura discovery, no monkeypatch ----
 #
 # Everything above (and the rest of this file) either rejects a URL

@@ -42,14 +42,56 @@ logger = logging.getLogger("popping.feed_autodiscovery")
 _MAX_FEED_CANDIDATES = 5
 _MAX_SITEMAP_URLS = 50
 
+# trafilatura's own per-request download timeout — NOT unbounded, as
+# the ``_TRAFILATURA_BUDGET`` comment below used to claim. It defaults
+# to 30s (``trafilatura.settings`` DEFAULT.DOWNLOAD_TIMEOUT), which is
+# a problem for us specifically: ``sitemap_search`` doesn't crawl a
+# site with just one request — it tries robots.txt, several guessed
+# common paths, and any nested sitemap-index references it finds,
+# fetching each one in turn (see ``trafilatura.sitemaps.SitemapObject
+# .fetch``, which calls ``fetch_url`` with no override). Our own
+# ``_TRAFILATURA_BUDGET`` (30s) wraps that WHOLE multi-request crawl,
+# so if trafilatura's internal per-request timeout is ALSO 30s, a
+# single slow/hanging host among several candidates can consume the
+# entire outer budget by itself — the rest of the crawl (which might
+# have found something) never even gets a chance to run. Observed
+# directly: a real site's sitemap crawl went completely silent for
+# ~28s (one slow request eating nearly the whole 30s budget) before
+# our outer wait_for cut it off.
+#
+# ``fetch_url`` resolves to a shared, mutable ConfigParser object when
+# called without an explicit ``config=`` (which is how both
+# ``sitemap_search`` and ``determine_feed``'s own fetch call it) — we
+# tighten THAT shared object in place so every internal trafilatura
+# request this module triggers is bounded to a few seconds instead of
+# up to 30, leaving room in our outer budget for the multi-request
+# crawl a real site's sitemap discovery actually needs.
+_TRAFILATURA_DOWNLOAD_TIMEOUT_S = 8
+
+
+def _tighten_trafilatura_download_timeout() -> None:
+    import inspect
+
+    from trafilatura.downloads import fetch_url as _trafilatura_fetch_url
+
+    # ``config`` is a positional-or-keyword parameter, so its default
+    # lives in ``__defaults__`` — but which slot depends on how many
+    # other defaulted params precede it, which is exactly the kind of
+    # detail a trafilatura version bump could silently shift. Using
+    # ``inspect.signature`` instead of indexing ``__defaults__``
+    # directly is robust to that: it resolves the actual bound
+    # default object regardless of position.
+    default_config = inspect.signature(_trafilatura_fetch_url).parameters["config"].default
+    default_config.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(_TRAFILATURA_DOWNLOAD_TIMEOUT_S))
+
+
 # Per-stage timeouts for the autodiscovery flow.
 #
 # The /api/sources/auto endpoint is synchronous from the user's
 # perspective ("click Add Custom, wait for a toast"). The discovery
 # chain — initial fetch_rss + trafilatura.find_feed_urls + a per-
 # candidate fetch_rss loop — runs WITHOUT an outer endpoint
-# timeout, so the worst case is unbounded (trafilatura doesn't
-# expose its own timeouts, and ``fetch_rss`` uses
+# timeout, so the worst case is unbounded (``fetch_rss`` uses
 # ``_READ_TIMEOUT=60.0`` × 2 attempts = 120s per candidate).
 # Observed: a slow CDN makes the endpoint hang 5-10 minutes, which
 # the user reads as "the autofeed button is broken".
@@ -64,9 +106,12 @@ _MAX_SITEMAP_URLS = 50
 #                              (fast probe; if the URL itself isn't a
 #                              feed we move on quickly)
 #   _TRAFILATURA_BUDGET      30s  one-shot internal HTTP for find_feed_urls
-#                              / sitemap_search; trafilatura's own
-#                              internal timeouts are widely-unknown
-#                              and silently unbounded on bad hosts
+#                              / sitemap_search — a multi-request crawl
+#                              (robots.txt, guessed paths, nested
+#                              sitemap indexes), each request now
+#                              capped at ``_TRAFILATURA_DOWNLOAD_TIMEOUT_S``
+#                              (see above) so this budget covers
+#                              several of them instead of one
 #   _CANDIDATE_PROBE_BUDGET  20s  per-candidate fetch_rss; shorter than
 #                              60s because we have many candidates and
 #                              the diminishing-return on slow feeds is
@@ -136,6 +181,8 @@ async def discover_feed_url(page_url: str) -> str | None:
         from trafilatura.downloads import fetch_url
         from trafilatura.feeds import FeedParameters, determine_feed, get_hostinfo
 
+        _tighten_trafilatura_download_timeout()
+
         # NOT trafilatura.feeds.find_feed_urls — despite the name, that
         # function does NOT return feed URLs found on the page. It
         # fetches the page, and if the page itself doesn't parse as a
@@ -166,12 +213,33 @@ async def discover_feed_url(page_url: str) -> str | None:
         def _sync_determine_feed() -> list[str]:
             domain, baseurl = get_hostinfo(page_url)
             if domain is None:
+                logger.info(
+                    "feed_autodiscovery: get_hostinfo could not extract a "
+                    "domain from %s — giving up before fetching",
+                    page_url,
+                )
                 return []
             downloaded = fetch_url(page_url)
             if downloaded is None:
+                # trafilatura's fetch_url swallows the underlying reason
+                # (bot-blocked, TLS error, DNS failure, non-2xx status,
+                # etc.) and just returns None — this is as much detail
+                # as we get without reimplementing its fetch layer.
+                logger.info(
+                    "feed_autodiscovery: trafilatura could not fetch %s "
+                    "(blocked, non-2xx, or a network error) — no page "
+                    "content to scan for a <link rel=alternate> tag",
+                    page_url,
+                )
                 return []
             params = FeedParameters(baseurl, domain, page_url, False, None)
-            return determine_feed(downloaded, params)
+            found = determine_feed(downloaded, params)
+            logger.info(
+                "feed_autodiscovery: determine_feed found %d candidate(s) "
+                "for %s: %s",
+                len(found), page_url, found[:_MAX_FEED_CANDIDATES],
+            )
+            return found
 
         return await asyncio.to_thread(_sync_determine_feed)
 
@@ -198,6 +266,11 @@ async def discover_feed_url(page_url: str) -> str | None:
             result = await asyncio.wait_for(_probe_candidate(candidate), _CANDIDATE_PROBE_BUDGET)
             if result:
                 return result
+            logger.info(
+                "feed_autodiscovery: candidate %s for %s fetched but "
+                "didn't parse as a feed with any items; trying next candidate",
+                candidate, page_url,
+            )
         except asyncio.TimeoutError:
             # Log and try the next candidate. A single slow candidate
             # shouldn't take down the whole loop.
@@ -206,7 +279,12 @@ async def discover_feed_url(page_url: str) -> str | None:
                 "trying next candidate",
                 candidate, page_url, _CANDIDATE_PROBE_BUDGET,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "feed_autodiscovery: candidate %s for %s raised %s; "
+                "trying next candidate",
+                candidate, page_url, exc,
+            )
             continue
     return None
 
@@ -231,8 +309,15 @@ async def discover_sitemap_urls(page_url: str, limit: int = _MAX_SITEMAP_URLS) -
         # Lazy import — see ``_trafilatura_find`` above.
         from trafilatura import sitemaps as trafilatura_sitemaps
 
+        _tighten_trafilatura_download_timeout()
+
         # Same to_thread reasoning as find_feed_urls above —
         # sitemap_search is synchronous and does its own network I/O.
+        # It crawls MULTIPLE URLs internally (robots.txt, guessed
+        # common paths, nested sitemap indexes) — see the
+        # _TRAFILATURA_DOWNLOAD_TIMEOUT_S comment up top for why each
+        # of those needs its own tight cap, not just the one this
+        # wait_for applies to the whole crawl.
         return await asyncio.to_thread(trafilatura_sitemaps.sitemap_search, page_url)
     try:
         urls = await asyncio.wait_for(_trafilatura_sitemap(), _TRAFILATURA_BUDGET)
