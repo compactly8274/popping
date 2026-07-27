@@ -1827,7 +1827,14 @@ export function App() {
     if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
   }, [selectedCardId])
 
-  const markColumnRead = (columnName: string) => {
+  // Slice 21: wrapped in ``useCallback`` so the JSX-passed closures
+  // (``onMarkRead={() => markColumnRead(col.name)}``) can become
+  // stable across renders once we lift them out of inline arrows.
+  // Without this wrap, the inline closures re-allocate every render
+  // and defeat the ``Column.memo`` comparator (slice 21, same
+  // commit). The deps below are the minimum that captures every
+  // state the body reads.
+  const markColumnRead = useCallback((columnName: string) => {
     // Three updates in one render cycle:
     //   1. lastViewed[columnName] = now  (chips to 0)
     //   2. readEntries[columnName] += all current entry ids
@@ -1883,22 +1890,22 @@ export function App() {
         },
       })
     }
-  }
+  }, [columns, readEntriesRef, seenEntryIdsRef, setLastViewed, setReadEntries, unmarkColumnRead, toast])
 
-  const toggleSource = (name: string) => {
+  const toggleSource = useCallback((name: string) => {
     setActiveSources((prev) => {
       const next = new Set(prev)
       if (next.has(name)) next.delete(name)
       else next.add(name)
       return next
     })
-  }
+  }, [setActiveSources])
   // When a user renames a source via the FeedManager inline editor,
   // remap any active filter chip in the same render cycle so the
   // chip bar doesn't briefly lose the source between PATCH and the
   // next ``refresh()`` resolving. A no-op if the renamed source
   // wasn't in the active set.
-  const onSourceRenamed = (oldName: string, newName: string) => {
+  const onSourceRenamed = useCallback((oldName: string, newName: string) => {
     if (oldName === newName) return
     setActiveSources((prev) => {
       if (!prev.has(oldName)) return prev
@@ -1907,7 +1914,7 @@ export function App() {
       next.add(newName)
       return next
     })
-  }
+  }, [setActiveSources])
   // Same as ``toggleSource`` but also closes the drawer the first time
   // the user adds a source to an empty filter. The "empty → first tap"
   // transition is the confusing one — the user picked a source, the
@@ -1917,16 +1924,16 @@ export function App() {
   // the drawer ping-ponging shut when the user wants to pick two or
   // three sources in a row). The "sizeBefore === 0" check runs on the
   // current state, captured before ``toggleSource`` queues its update.
-  const toggleSourceAndMaybeClose = (name: string) => {
+  const toggleSourceAndMaybeClose = useCallback((name: string) => {
     const wasEmpty = activeSources.size === 0
     toggleSource(name)
     if (wasEmpty) setDrawerOpen(false)
-  }
-  const clearSourceFilters = () => {
+  }, [activeSources, toggleSource, setDrawerOpen])
+  const clearSourceFilters = useCallback(() => {
     setActiveSources(new Set())
-  }
+  }, [setActiveSources])
 
-  const jumpToCategory = (category: string) => {
+  const jumpToCategory = useCallback((category: string) => {
     const idx = columns.findIndex((c) => c.name === category)
     if (idx >= 0) {
       setSelectedColumnIndex(idx)
@@ -1934,11 +1941,11 @@ export function App() {
       const el = columnRefs.current.get(category)
       if (el) el.scrollIntoView({ block: 'start', behavior: 'smooth' })
     }
-  }
+  }, [columns, setSelectedColumnIndex, setSelectedCardId, columnRefs])
 
-  const setPrefsFor = (columnName: string, prefs: ColumnPrefs) => {
+  const setPrefsFor = useCallback((columnName: string, prefs: ColumnPrefs) => {
     setColumnPrefs(columnName, prefs as ColumnPrefsValue)
-  }
+  }, [setColumnPrefs])
 
   // Toggle a single section's collapsed bit for a column. Lazily
   // creates the column's entry on first toggle so the persisted
@@ -1952,7 +1959,7 @@ export function App() {
   // ``setColumnSections`` replaces the per-column value, so
   // we just compute the next value (or the empty marker) and
   // hand it off.
-  const setColumnSection = (columnName: string, key: 'new' | 'history') => {
+  const setColumnSection = useCallback((columnName: string, key: 'new' | 'history') => {
     const cur = columnSectionsRef.current[columnName] ?? { newCollapsed: false, historyCollapsed: false }
     const flag = key === 'new' ? 'newCollapsed' : 'historyCollapsed'
     const next: SectionCollapse = { ...cur, [flag]: !cur[flag] }
@@ -1965,18 +1972,32 @@ export function App() {
     } else {
       setColumnSections(columnName, next as ColumnSectionsValue)
     }
-  }
+  }, [columnSectionsRef, setColumnSections])
 
-  // Defaulting lookup for the per-column collapse state. Missing
-  // column names (or missing fields) silently fall through to
-  // "both expanded" — matches the loader's contract.
-  const sectionsCollapsedFor = (columnName: string): { new: boolean; history: boolean } => {
-    const cur = columnSections[columnName]
-    return {
-      new: cur?.newCollapsed ?? false,
-      history: cur?.historyCollapsed ?? false,
+  // Slice 21: memoize the per-column collapse-state lookup so
+  // ``Column.memo`` can skip on reference equality. Without this,
+  // the inline ``sectionsCollapsedFor(col.name)`` call returns a
+  // fresh ``{ new, history }`` object every render and the
+  // comparator's ``===`` check always fails for this prop. Keyed
+  // on the column name + the underlying bits so a real flip
+  // produces a new object identity and the memo correctly
+  // re-renders.
+  const sectionsCollapsedCache = useMemo(() => {
+    const cache: Record<string, { new: boolean; history: boolean }> = {}
+    for (const colName of Object.keys(columnSections)) {
+      const cur = columnSections[colName]
+      cache[colName] = {
+        new: cur?.newCollapsed ?? false,
+        history: cur?.historyCollapsed ?? false,
+      }
     }
-  }
+    return cache
+  }, [columnSections])
+  const sectionsCollapsedFor = useCallback((columnName: string): { new: boolean; history: boolean } => {
+    return (
+      sectionsCollapsedCache[columnName] ?? { new: false, history: false }
+    )
+  }, [sectionsCollapsedCache])
 
   // The outer div lets us register a per-column ref on a wrapper
   // without breaking the grid layout — the wrapper uses

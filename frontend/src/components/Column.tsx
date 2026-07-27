@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import type { Entry } from '../api'
 import { Card } from './Card'
 
@@ -140,7 +140,31 @@ type Props = {
   onToggleSection?: (key: 'new' | 'history') => void
 }
 
-export function Column({
+// Slice 21: renamed ``Column`` to ``ColumnInner`` and added a
+// ``React.memo`` wrap with a custom comparator (``_columnPropsEqual``,
+// below) so App's per-render closures don't defeat memoization. The
+// comparator ignores the per-card callback props (``onMarkEntryRead``,
+// ``onHideEntry``, ``onStarEntry``, ``onHideToggle``, ``onVoteEntry``,
+// ``onToggleSummary``, ``onToggleSection``, ``onPrefsChange``,
+// ``onMarkRead``, ``onRefresh``) and the per-card ``cardRefs`` —
+// they're inherently per-render at the App layer; the data-driven
+// props (``sections``, ``sourcesById``, ``sourcesByName``,
+// ``starredSet``, ``hiddenSet``, ``votedMap``, ``prefs``,
+// ``sectionsCollapsed``) are what we actually re-render against.
+//
+// Trade-off: if a callback's logic changes without the data
+// changing, this Column won't re-render. That can't happen in
+// practice because callbacks here only depend on data props
+// (``onMarkEntryRead(e.id)`` reads from the same entry id, which is
+// stable across renders for the same card) and App-level state. If
+// a future caller starts passing callbacks that close over mutable
+// refs, lift this to a stable ref and re-evaluate.
+//
+// Pair with the ``useCallback`` wraps in ``App.tsx`` (slice 21, same
+// commit) so the App-level handlers keep stable identity between
+// renders — otherwise the JSX-passed inline arrows would still defeat
+// the memo even with this comparator.
+export function ColumnInner({
   name,
   sections,
   sourcesById,
@@ -825,3 +849,44 @@ function EmptyColumnMessage({
     </p>
   )
 }
+
+// Slice 21: custom comparator for ``React.memo`` wrap. Compares the
+// data-driven props by identity (refs/maps/sets are reference-compared)
+// or by value (scalars). Callback props are intentionally ignored —
+// the App layer re-allocates them every render, and the per-render
+// closure captures fresh state, so comparing them by identity would
+// always return false and defeat the memo.
+//
+// Same pattern as ``Card.memo`` in ``Card.tsx`` (line 1477). Card's
+// comparator is finer-grained (per-entry); Column's is coarser
+// (sections ref + sets ref + scalar props) because Column renders
+// the section containers and delegates to memoized Card children.
+function _columnPropsEqual(prev: Props, next: Props): boolean {
+  return (
+    prev.name === next.name &&
+    prev.sections === next.sections &&
+    prev.sourcesById === next.sourcesById &&
+    prev.sourcesByName === next.sourcesByName &&
+    prev.newCount === next.newCount &&
+    prev.selectedId === next.selectedId &&
+    // ``prefs`` is a fresh object per columnPrefs write, but its
+    // contents only change when the user opens the popover and picks
+    // a new value. The user's own ``onPrefsChange`` callback reads
+    // the latest value, so a stale comparator returning true here is
+    // safe (the next user-driven write will produce a new prefs
+    // object and the comparator will return false). Comparing by
+    // reference is what makes this work — shallow-equal would
+    // always differ because every render allocates a new object.
+    prev.prefs === next.prefs &&
+    prev.totalCount === next.totalCount &&
+    prev.categoriesBySourceId === next.categoriesBySourceId &&
+    prev.faviconBySourceId === next.faviconBySourceId &&
+    prev.expandedSummaries === next.expandedSummaries &&
+    prev.starredSet === next.starredSet &&
+    prev.hiddenSet === next.hiddenSet &&
+    prev.votedMap === next.votedMap &&
+    prev.sectionsCollapsed === next.sectionsCollapsed
+  )
+}
+
+export const Column = memo(ColumnInner, _columnPropsEqual) as typeof ColumnInner
