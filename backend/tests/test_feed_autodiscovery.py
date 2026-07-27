@@ -11,11 +11,16 @@ and its two "nothing found" / "no provider" style outcomes.
 
 from __future__ import annotations
 
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import pytest
 
+from app import feed_autodiscovery as feed_autodiscovery_mod
 from app.feed_autodiscovery import discover_feed_url, discover_sitemap_urls
 from app.routes import sources as sources_route
 from app.routes.sources import _free_source_name, _slugify_hostname
+from app.sources import rss as rss_mod
 from factories import make_source
 
 
@@ -45,6 +50,126 @@ async def test_discover_feed_url_unreachable_host_returns_none():
     # access, the same way test_article_summary.py's loopback tests
     # force a deterministic failure.
     assert await discover_feed_url("http://127.0.0.1:1/nope") is None
+
+
+# --- app.feed_autodiscovery: real trafilatura discovery, no monkeypatch ----
+#
+# Everything above (and the rest of this file) either rejects a URL
+# before trafilatura is ever called, or monkeypatches discovery
+# entirely — by design (see the module docstring: "the real happy
+# path needs real network access"). But that meant NOTHING exercised
+# trafilatura's actual return contract, and it turned out our
+# assumption about it was wrong: trafilatura.feeds.find_feed_urls()
+# does not return feed URLs found on a page — it fetches whatever
+# feed it finds and returns the ARTICLE links extracted from inside
+# it. Every real "paste a homepage URL" Auto Feed attempt failed
+# because of this (verified against theprogress.com and other real
+# sites reported by the user) even though the underlying site had a
+# perfectly normal <link rel=alternate> tag. Guard against this
+# regressing (or a future trafilatura upgrade changing behavior
+# again) with a real HTTP round-trip over loopback — deterministic,
+# no external network, and the only way this class of bug is
+# actually observable.
+
+
+class _MockNewsSiteHandler(BaseHTTPRequestHandler):
+    """Serves a homepage with a <link rel=alternate> feed tag, and the
+    feed itself, on two paths. Deliberately minimal — just enough
+    markup for trafilatura's real parser to find and validate."""
+
+    def log_message(self, *args):  # noqa: D401 - silence test output
+        pass
+
+    def do_GET(self):
+        if self.path == "/feed.xml":
+            body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>Mock News</title>
+<link>http://{self.headers.get('Host')}/</link>
+<item><title>Test article one</title>
+<link>http://{self.headers.get('Host')}/article-1</link>
+<pubDate>Mon, 27 Jul 2026 10:00:00 GMT</pubDate></item>
+<item><title>Test article two</title>
+<link>http://{self.headers.get('Host')}/article-2</link>
+<pubDate>Sun, 26 Jul 2026 10:00:00 GMT</pubDate></item>
+</channel></rss>""".encode()
+            content_type = "application/rss+xml"
+        else:
+            host = self.headers.get("Host")
+            body = f"""<!doctype html><html><head><title>Mock News</title>
+<link rel="alternate" type="application/rss+xml" title="Mock News Feed"
+      href="http://{host}/feed.xml"></head>
+<body><h1>Mock News</h1><article><a href="/article-1">A headline</a></article>
+</body></html>""".encode()
+            content_type = "text/html"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def mock_news_site(monkeypatch):
+    """Starts a real local HTTP server serving realistic homepage +
+    feed markup, and bypasses the SSRF guard for the duration of the
+    test (a loopback test server is, by design, exactly what that
+    guard exists to block on a real request — it's not something to
+    weaken outside a test). Yields the site's base URL."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _MockNewsSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    # Both modules import check_url_safe directly into their own
+    # namespace (``from app.url_safety import check_url_safe``), so
+    # each needs its own patch target — patching the source module
+    # (app.url_safety.check_url_safe) wouldn't affect either binding.
+    safe = lambda url: (True, None)  # noqa: E731
+    monkeypatch.setattr(feed_autodiscovery_mod, "check_url_safe", safe)
+    monkeypatch.setattr(rss_mod, "check_url_safe", safe)
+    # courlan's get_hostinfo (which trafilatura.feeds.determine_feed's
+    # caller relies on) treats a bare "127.0.0.1:PORT" as having no
+    # extractable domain (it wants a real TLD) and bails before ever
+    # reaching determine_feed's actual <link rel=alternate> parsing —
+    # a courlan quirk unrelated to the bug under test. Substitute a
+    # synthetic domain only when the real extractor comes back empty,
+    # so determine_feed's real parsing/validation logic still runs
+    # against our real HTTP responses.
+    import trafilatura.feeds as trafilatura_feeds_mod
+    real_get_hostinfo = trafilatura_feeds_mod.get_hostinfo
+
+    def _patched_get_hostinfo(url: str):
+        domain, base = real_get_hostinfo(url)
+        return (domain or "mock-news-site.test"), base
+
+    monkeypatch.setattr(trafilatura_feeds_mod, "get_hostinfo", _patched_get_hostinfo)
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_trafilatura_find_feed_urls_does_not_return_the_feed_url(mock_news_site):
+    """Documents the exact surprising behavior that caused the bug:
+    find_feed_urls() dereferences the feed it finds and returns the
+    article links from inside it, not the feed URL. If this ever
+    changes upstream, discover_feed_url should be revisited — but it
+    must NOT go back to calling find_feed_urls() directly under the
+    assumption that its output is a list of candidate feed URLs."""
+    from trafilatura.feeds import find_feed_urls
+
+    result = find_feed_urls(mock_news_site)
+    assert f"{mock_news_site}feed.xml" not in result
+
+
+@pytest.mark.asyncio
+async def test_discover_feed_url_finds_feed_linked_from_homepage(mock_news_site):
+    """The actual regression: pasting a homepage URL (not the feed URL
+    directly) must resolve to the real feed, via the <link
+    rel=alternate> tag — this is the entire point of Auto Feed."""
+    result = await discover_feed_url(mock_news_site)
+    assert result == f"{mock_news_site}feed.xml"
 
 
 # --- app.routes.sources._slugify_hostname ----------------------------------

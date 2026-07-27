@@ -133,31 +133,59 @@ async def discover_feed_url(page_url: str) -> str | None:
         # Lazy import — ``trafilatura`` is a heavy dep that loads lxml at
         # import time, so deferring to here keeps the module-load cost
         # off the request hot path when no one is using autofeed.
-        from trafilatura import feeds as trafilatura_feeds
+        from trafilatura.downloads import fetch_url
+        from trafilatura.feeds import FeedParameters, determine_feed, get_hostinfo
 
-        # find_feed_urls is synchronous AND does its own network I/O
-        # internally (fetching the page, following redirects, probing
-        # candidate feed URLs) — calling it directly here would block
-        # the entire event loop for however long that takes (measured
-        # 15-30s against an unreachable host), freezing every other
-        # request the backend is handling concurrently. to_thread runs
-        # it on a worker thread instead. ``wait_for`` then bounds the
-        # total wait — trafilatura has no internal timeout, so without
-        # this a black-hole host would hang us until the worker's own
-        # socket defaults bail (which on some systems is minutes).
-        return await asyncio.to_thread(trafilatura_feeds.find_feed_urls, page_url)
+        # NOT trafilatura.feeds.find_feed_urls — despite the name, that
+        # function does NOT return feed URLs found on the page. It
+        # fetches the page, and if the page itself doesn't parse as a
+        # feed, it locates a candidate feed (via determine_feed, same
+        # as below), fetches THAT too, and returns the individual
+        # ARTICLE links extracted from inside the feed — it's a "give
+        # me article URLs, using feed discovery as the mechanism"
+        # helper, not a "find the feed URL" helper. Feeding its output
+        # to fetch_rss() (which is what happens below) means every
+        # "candidate" is an individual article page, which never
+        # parses as RSS/Atom — so this returned real candidates from
+        # trafilatura but discover_feed_url still reported "not
+        # found" for effectively every site whose homepage isn't
+        # itself the feed (i.e. nearly every real site). Verified via
+        # a local mock: find_feed_urls returned the mock feed's two
+        # <item> links, not the feed.xml URL itself.
+        #
+        # determine_feed(html, params) is the actual "<link
+        # rel=alternate>-and-common-paths" scanner find_feed_urls
+        # calls internally before it goes and dereferences the
+        # result — replicate exactly that first half (fetch the page,
+        # build the same FeedParameters, call determine_feed) and
+        # return ITS output, which is real feed URLs. Same to_thread
+        # reasoning as before: fetch_url is synchronous and does its
+        # own network I/O, so it runs on a worker thread; wait_for
+        # (below) still bounds the total wait since trafilatura has
+        # no internal timeout of its own.
+        def _sync_determine_feed() -> list[str]:
+            domain, baseurl = get_hostinfo(page_url)
+            if domain is None:
+                return []
+            downloaded = fetch_url(page_url)
+            if downloaded is None:
+                return []
+            params = FeedParameters(baseurl, domain, page_url, False, None)
+            return determine_feed(downloaded, params)
+
+        return await asyncio.to_thread(_sync_determine_feed)
 
     try:
         candidates = await asyncio.wait_for(_trafilatura_find(), _TRAFILATURA_BUDGET)
     except asyncio.TimeoutError:
         logger.info(
-            "feed_autodiscovery: trafilatura.find_feed_urls for %s hit the "
+            "feed_autodiscovery: determine_feed for %s hit the "
             "%ss budget; giving up",
             page_url, _TRAFILATURA_BUDGET,
         )
         return None
     except Exception as exc:  # noqa: BLE001 - third-party discovery, never let it fail the request
-        logger.info("feed_autodiscovery: find_feed_urls failed for %s: %s", page_url, exc)
+        logger.info("feed_autodiscovery: determine_feed failed for %s: %s", page_url, exc)
         return None
 
     async def _probe_candidate(candidate: str) -> str | None:
