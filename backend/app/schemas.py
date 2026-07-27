@@ -66,8 +66,11 @@ class SourceOut(BaseModel):
 
 class SourceCreate(BaseModel):
     """Body for ``POST /api/sources``. All fields required except
-    ``refresh_interval_seconds`` (defaults to 1h) and
-    ``custom_headers`` (defaults to None — use the source-plugin defaults).
+    ``refresh_interval_seconds`` (defaults to 1h),
+    ``custom_headers`` (defaults to None — use the source-plugin defaults),
+    ``sitemap_url`` (defaults to None — use the homepage-based
+    discovery heuristic), and ``link_pattern`` (defaults to None —
+    don't try the page_links strategy).
 
     The route layer validates ``name`` against ``^[a-z0-9_]{1,120}$``
     and ``url`` against an http/https URL parse — clients get a 422
@@ -76,12 +79,31 @@ class SourceCreate(BaseModel):
     or is shaped like a non-object — see ``_validate_custom_headers``
     in ``routes.sources``. This is the escape hatch for CDNs that
     block our default ``Popping/0.2`` User-Agent (CBC, etc.).
+
+    ``sitemap_url`` and ``link_pattern`` are slice-17/slice-18
+    additions for ``type='generic_scrape'`` sources. Letting the
+    user set them at creation time means they don't have to PATCH
+    the row after creating it to activate the discovery
+    strategies. Both are optional at the schema layer; the route
+    layer enforces type-specific validation (sitemap_url must be
+    a valid URL; link_pattern must be a leading-slash path
+    prefix, never a full URL).
     """
     name: str
     type: str = "rss"
     category: str
     url: str
     refresh_interval_seconds: int = 3600
+    # Optional direct sitemap URL for ``type='generic_scrape'``
+    # sources. NULL = homepage-based discovery heuristic (the
+    # default). Validated as an http(s) URL at the route layer.
+    sitemap_url: Optional[str] = None
+    # Optional path-prefix filter for the page_links strategy
+    # (e.g. ``/library/``). NULL = don't try page_links.
+    # Validated as a leading-slash path prefix (no protocol) at
+    # the route layer. See ``Source.link_pattern``'s docstring
+    # for the full design rationale.
+    link_pattern: Optional[str] = None
     # Per-source HTTP header overrides merged on top of the defaults
     # at fetch time. NULL = use defaults. Most-common use is
     # ``{"User-Agent": "<browser UA>"}`` for CDNs that block our

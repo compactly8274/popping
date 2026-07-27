@@ -1300,6 +1300,16 @@ function AddCustomTab({
   const [sourceType, setSourceType] = useState<
     'rss' | 'reddit' | 'podcast' | 'youtube_channel' | 'generic_scrape'
   >('rss')
+  // Slice 20: optional discovery hints for generic_scrape sources.
+  // ``sitemapUrl`` is a direct sitemap URL (parsed by the plugin
+  // instead of asking trafilatura to discover the sitemap from
+  // the page). ``linkPattern`` is a path-prefix filter for the
+  // page_links fallback (the plugin fetches self.url and extracts
+  // <a href> URLs matching this prefix when sitemap discovery
+  // returns nothing). Both empty by default; only meaningful when
+  // sourceType='generic_scrape' is selected.
+  const [sitemapUrl, setSitemapUrl] = useState('')
+  const [linkPattern, setLinkPattern] = useState('')
   const [submitting, setSubmitting] = useState(false)
   // Test step. ``testing`` is true while the request is in flight;
   // ``testResult`` holds the last result so the user can see
@@ -1401,12 +1411,27 @@ function AddCustomTab({
     try {
       const trimmedName = name.trim().toLowerCase()
       const trimmedUrl = url.trim()
+      // Slice 20: only send the discovery hints when type='generic_scrape'
+      // (other types ignore them server-side). Empty-string values are
+      // coerced to undefined so the backend sees a missing field and
+      // leaves the column NULL — the legacy ``Source.sitemap_url`` /
+      // ``Source.link_pattern`` columns default to NULL for non-scrapes
+      // and that's the right semantics for a "use the default discovery"
+      // intent.
+      const trimmedSitemapUrl = sitemapUrl.trim()
+      const trimmedLinkPattern = linkPattern.trim()
       await api.createSource({
         name: trimmedName,
         type: sourceType,
         category,
         url: trimmedUrl,
         refresh_interval_seconds: refresh,
+        ...(sourceType === 'generic_scrape' && trimmedSitemapUrl
+          ? { sitemap_url: trimmedSitemapUrl }
+          : {}),
+        ...(sourceType === 'generic_scrape' && trimmedLinkPattern
+          ? { link_pattern: trimmedLinkPattern }
+          : {}),
       })
       // Success — celebrate with a toast. The toast stays for the
       // standard 1.5s but the user can keep typing / closing the
@@ -1414,6 +1439,11 @@ function AddCustomTab({
       toast(`Feed Added: ${trimmedName}`, 'info')
       setName('')
       setUrl('')
+      // Slice 20: also clear the discovery hints so the next Add
+      // starts with empty inputs (the user can re-use them if
+      // they want — copying from the previous row is one click).
+      setSitemapUrl('')
+      setLinkPattern('')
       setTestResult(null)
       await onAdded()
     } catch (err) {
@@ -1618,6 +1648,52 @@ function AddCustomTab({
           className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
         />
       </div>
+      {/* Slice 20: discovery hints for ``type='generic_scrape'`` sources.
+          Two optional inputs that let the user bypass the homepage-based
+          sitemap discovery (sitemapUrl) or fall through to page_links
+          (linkPattern) without having to PATCH the row after creating.
+          Both are conditional — only render when type=generic_scrape;
+          for other types the fields are silently ignored server-side.
+          Empty values are coerced to undefined in submit() so the
+          backend leaves the columns NULL (= default behavior). */}
+      {sourceType === 'generic_scrape' && (
+        <div className="space-y-3">
+          <div>
+            <label
+              className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1"
+              htmlFor="fm-sitemap-url"
+              title="Direct sitemap URL. Bypasses the homepage-based discovery heuristic — useful when the homepage's sitemap_index is broken or absent."
+            >
+              Sitemap URL (optional)
+            </label>
+            <input
+              id="fm-sitemap-url"
+              type="url"
+              value={sitemapUrl}
+              onChange={(e) => setSitemapUrl(e.target.value)}
+              placeholder="https://example.com/sitemap-news.xml"
+              className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
+            />
+          </div>
+          <div>
+            <label
+              className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1"
+              htmlFor="fm-link-pattern"
+              title="Path prefix for the page_links fallback. Plugin fetches the page above and extracts every <a href> matching this prefix when sitemap discovery returns nothing."
+            >
+              Link pattern (optional)
+            </label>
+            <input
+              id="fm-link-pattern"
+              type="text"
+              value={linkPattern}
+              onChange={(e) => setLinkPattern(e.target.value)}
+              placeholder="/library/"
+              className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
+            />
+          </div>
+        </div>
+      )}
       <div className="flex gap-2">
         <div className="flex-1">
           <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-category">Category</label>
