@@ -66,7 +66,18 @@ import logging
 import os
 import re
 import time
-import xml.etree.ElementTree as ET
+# Slice 23 (security): use ``defusedxml`` instead of the stdlib
+# ``xml.etree.ElementTree`` for parsing third-party-controlled XML
+# (Reddit Atom feeds in this module). The stdlib parser doesn't
+# expand external entities by default (so classic XXE file-disclosure
+# is blocked), but a ``DOCTYPE`` with nested entity expansion still
+# triggers quadratic / exponential entity expansion = CPU DoS.
+# ``defusedxml.ElementTree`` disables DTD processing entirely so the
+# parser bails before reading a single entity.
+#
+# Aliased as ``ET`` so the existing call sites (``ET.fromstring(...)``,
+# ``root.findall(...)``) don't change — only the import does.
+from defusedxml import ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlparse

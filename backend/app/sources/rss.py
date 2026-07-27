@@ -18,7 +18,11 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import re
-import xml.etree.ElementTree as ET
+# Slice 23 (security): use ``defusedxml`` for parsing third-party
+# podcast feed XML. See app/reddit_client.py for the rationale (DTD
+# billion-laughs DoS). Aliased as ``ET`` so the existing call sites
+# (``ET.fromstring(...)``) don't change.
+from defusedxml import ElementTree as ET
 from typing import Any
 from urllib.parse import urljoin
 
