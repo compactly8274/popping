@@ -1812,11 +1812,42 @@ async def stop_scheduler() -> None:
 
 
 async def trigger_now(plugin_name: str) -> dict:
-    """Run a single plugin once on demand. Used by the /ingest endpoint."""
+    """Run a single plugin once on demand. Used by the /ingest endpoint.
+
+    Accepts both registry-registered plugin class names
+    (``bbc_news``, ``hn_top``, etc.) and dynamic ``Source`` row names
+    (anything the user has added via Add custom or Track anyway).
+    The class-driven path is the fast one — it goes through the
+    in-memory registry. The dynamic path opens a DB session and
+    dispatches via ``_plugin_for(row)`` so the same code path the
+    scheduled tick uses also runs for the manual fetch.
+
+    Returns a small summary dict; ``error`` is set on the
+    unknown-source case.
+    """
     plugins = list_sources()
-    if plugin_name not in plugins:
+    if plugin_name in plugins:
+        return await _ingest(plugins[plugin_name])
+    # Not in the registry — check the DB for a dynamic row.
+    # ``Source`` is a SQLAlchemy ORM model; import lazily to keep
+    # the module-load graph the same as before (the registry-only
+    # path is the hot one and shouldn't pay for the dynamic
+    # import on every startup).
+    from app.db import SessionLocal
+    from app.models import Source
+
+    async with SessionLocal() as session:
+        row = await session.scalar(select(Source).where(Source.name == plugin_name))
+    if row is None:
         return {"source": plugin_name, "error": "unknown source", "fetched": 0, "inserted": 0, "duplicates": 0}
-    return await _ingest(plugins[plugin_name])
+    plugin = _plugin_for(row)
+    if plugin is None:
+        # The row exists but its ``type`` doesn't map to a dynamic
+        # plugin class — should not happen since ``add_source``
+        # only allows the five types ``_plugin_for`` handles, but
+        # guard against drift.
+        return {"source": plugin_name, "error": f"unsupported source type: {row.type!r}", "fetched": 0, "inserted": 0, "duplicates": 0}
+    return await _ingest(plugin)
 
 
 async def backfill_now() -> dict:
