@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import html
 import re
@@ -88,6 +89,81 @@ def _escape_like(term: str) -> str:
     return _LIKE_ESCAPE_RE.sub(r"\\\\\\1", term)
 
 
+# ---------------------------------------------------------------------------
+# Per-entry in-flight lock for the three summary endpoints
+# ---------------------------------------------------------------------------
+#
+# All three summary endpoints (``/api/entries/{id}/summary``,
+# ``/podcast_summary``, ``/reddit_comment_summary``) share the same
+# race: two concurrent requests for the same entry both see
+# "cache empty", both run the (expensive) fetch + LLM chain, and
+# both write back the same answer. The user pays for two LLM
+# calls and the slower of the two wins the write. The behavior
+# was previously correct-but-wasteful.
+#
+# Fix: a per-entry lock guards the entire "check cache →
+# fetch → LLM → write" body. A second request that arrives
+# while the first is in flight blocks on the lock; once it
+# acquires the lock, the cache has been populated by request
+# 1, so the second-check inside the critical section sees a
+# populated cache and returns immediately. This is the
+# double-checked locking pattern: cheap fast-path (no lock)
+# for the common case of a populated cache, expensive slow-
+# path (lock + re-check) for the cache-miss case.
+#
+# The cap is a leak guard, not a memory bound. ``asyncio.Lock``
+# is a few hundred bytes; 256 entries × ~500 B is ~125 KB,
+# which is fine. The cap prevents a pathological workload
+# (an attacker hammering 10k distinct entry ids) from
+# accumulating one lock per id forever. When the cap is hit
+# we return a throwaway lock — the lock still serializes
+# locally for the requesting task (so two concurrent
+# requests for the SAME id beyond the cap still serialize),
+# but two requests for DIFFERENT ids beyond the cap each get
+# their own lock and can race. The trade-off (mild stampede
+# for the 257+ distinct id) is strictly better than leaking
+# locks per request.
+#
+# This mirrors ``app.auth.oidc._get_discovery_lock`` — same
+# dict-of-locks + guard + cap pattern, kept identical for
+# readability.
+_SUMMARY_LOCKS_MAX = 256
+_summary_locks: dict[int, asyncio.Lock] = {}
+_summary_locks_guard = asyncio.Lock()
+
+
+async def _get_summary_lock(entry_id: int) -> asyncio.Lock:
+    """Return a process-wide ``asyncio.Lock`` for ``entry_id``.
+
+    First call for a given id allocates a lock and stores it.
+    Subsequent calls return the same lock. When the cap is
+    hit, returns a throwaway untracked lock (a fresh
+    ``asyncio.Lock()`` per call) — see the module-level
+    comment for the trade-off.
+    """
+    # Fast path: the common case is a single concurrent request
+    # per entry. Reading the dict under no lock is safe because
+    # dict.__getitem__ is atomic in CPython, and a missing-key
+    # race just falls through to the slow path.
+    lock = _summary_locks.get(entry_id)
+    if lock is not None:
+        return lock
+    async with _summary_locks_guard:
+        lock = _summary_locks.get(entry_id)
+        if lock is not None:
+            return lock
+        if len(_summary_locks) >= _SUMMARY_LOCKS_MAX:
+            # Return a fresh, untracked lock. The caller still
+            # serializes locally for THIS call, but doesn't
+            # share the lock with any other in-flight request.
+            # Mild cold-start stampede is possible for ids
+            # beyond the cap; preferred over leaking locks.
+            return asyncio.Lock()
+        lock = asyncio.Lock()
+        _summary_locks[entry_id] = lock
+        return lock
+
+
 def _should_retry_empty_cache(
     fetched_at: Optional[dt.datetime],
     retry_hours: float,
@@ -134,6 +210,39 @@ def _should_retry_empty_cache(
     if fetched_at.tzinfo is None:
         fetched_at = fetched_at.replace(tzinfo=dt.timezone.utc)
     return (now - fetched_at).total_seconds() >= retry_hours * 3600
+
+
+def _summary_cache_response(row) -> Optional[EntrySummaryOut]:
+    """Decide whether ``row`` is already cached, and if so build
+    the response for the fast-path return.
+
+    Returns ``None`` when the cache is empty OR when the empty
+    cache is "old enough to retry" (the caller falls through to
+    the fetch / extract / LLM chain). Otherwise returns a
+    pre-built ``EntrySummaryOut(summary=row.cached_summary,
+    cached=True)``.
+
+    Pure function: no DB, no LLM. The double-checked locking
+    pattern in ``entry_summary_endpoint`` calls this TWICE —
+    once before acquiring the per-entry lock (fast path) and
+    once after acquiring the lock with a freshly-refreshed row
+    (the second half of the double check). Keeping the rule
+    in a single function means a future change to the cache
+    semantics only needs to update one place.
+    """
+    if row.cached_summary is None:
+        return None
+    if row.cached_summary == "" and _should_retry_empty_cache(
+        row.cached_summary_fetched_at,
+        retry_hours=settings.cached_summary_retry_hours,
+    ):
+        # Empty cache + still inside the retry window → return
+        # the empty string as "we already determined no summary
+        # is available". Outside the window (the
+        # _should_retry_empty_cache returned False) → fall
+        # through and re-run the chain.
+        return None
+    return EntrySummaryOut(summary=row.cached_summary, cached=True)
 
 
 def _clean_summary(raw: str | None) -> str:
@@ -514,56 +623,54 @@ async def entry_summary_endpoint(
         # clickable so a retry is one tap away.
         raise HTTPException(status_code=404, detail="entry not found")
 
-    if row.cached_summary is not None:
-        # Cache hit. ``""`` means we already determined the source
-        # shipped nothing usable — return that as ``summary=""`` so
-        # the frontend can distinguish "no summary" from "summary
-        # loaded", BUT only if the empty cache is still inside the
-        # retry window. After ``cached_summary_retry_hours`` has
-        # passed we re-run the fetch / extract / LLM chain (and
-        # the fallback) — a transient failure at ingest time (the
-        # source's article URL was temporarily 404, the LLM
-        # provider was momentarily over-quota) used to permanently
-        # poison the cache; the retry window is the operator's
-        # lever to recover without re-ingesting the source. A
-        # non-empty cached_summary is never retried: re-summarizing
-        # the same article would just churn the LLM budget.
-        #
-        # Pre-migration rows have ``cached_summary_fetched_at is
-        # None``; the helper treats that as "old enough to retry",
-        # so the first chevron tap after deploy refetches and
-        # re-caches every entry that's currently an empty-string
-        # hit. That's a one-time burst cost — every subsequent
-        # call gets a real timestamp and lands in the normal
-        # cache-or-retry decision.
-        if row.cached_summary != "" or not _should_retry_empty_cache(
-            row.cached_summary_fetched_at,
-            retry_hours=settings.cached_summary_retry_hours,
-        ):
-            return EntrySummaryOut(summary=row.cached_summary, cached=True)
+    # Fast path: cache hit. ``_summary_cache_response`` is the
+    # single source of truth for the "is this cached, and if so
+    # is the empty-string retry window still in effect" decision
+    # — see its docstring for the rules.
+    cached = _summary_cache_response(row)
+    if cached is not None:
+        return cached
 
-    final = ""
-    if llm_router.providers_for("brief"):
-        article_text = await fetch_article_text(row.url)
-        if article_text:
-            llm_summary = await summarize_article(row.title, article_text)
-            if llm_summary:
-                final = _truncate_summary(llm_summary.strip())
+    # Slow path: cache miss. Acquire the per-entry lock so two
+    # concurrent requests for the same entry can't both run the
+    # fetch + LLM chain. ``session.get`` is on a session-scoped
+    # connection, so the row handle ``row`` may be stale by the
+    # time we acquire the lock (another request holding the lock
+    # for a few seconds could have written the cache in the
+    # meantime). Re-read the row inside the critical section —
+    # that's the second half of the double-checked locking
+    # pattern: the first half was the fast-path check above, the
+    # second is this re-read. If the re-read sees a populated
+    # cache, return it; otherwise we're the request that owns
+    # the work, run the chain, and write.
+    async with await _get_summary_lock(entry_id):
+        await session.refresh(row)
+        cached = _summary_cache_response(row)
+        if cached is not None:
+            return cached
 
-    if not final:
-        final = _extract_fallback_summary(row)
+        final = ""
+        if llm_router.providers_for("brief"):
+            article_text = await fetch_article_text(row.url)
+            if article_text:
+                llm_summary = await summarize_article(row.title, article_text)
+                if llm_summary:
+                    final = _truncate_summary(llm_summary.strip())
 
-    # Persist even when empty — that's the cache-hit signal for
-    # next time. Without the persist, every chevron tap would
-    # re-run the fetch / extract / LLM chain. ``fetched_at`` is
-    # set on every write (including the empty-string write) so
-    # the next chevron tap's retry-window check has a real
-    # timestamp to compare against.
-    row.cached_summary = final
-    row.cached_summary_fetched_at = dt.datetime.now(dt.timezone.utc)
-    await session.commit()
+        if not final:
+            final = _extract_fallback_summary(row)
 
-    return EntrySummaryOut(summary=final, cached=False)
+        # Persist even when empty — that's the cache-hit signal for
+        # next time. Without the persist, every chevron tap would
+        # re-run the fetch / extract / LLM chain. ``fetched_at`` is
+        # set on every write (including the empty-string write) so
+        # the next chevron tap's retry-window check has a real
+        # timestamp to compare against.
+        row.cached_summary = final
+        row.cached_summary_fetched_at = dt.datetime.now(dt.timezone.utc)
+        await session.commit()
+
+        return EntrySummaryOut(summary=final, cached=False)
 
 
 @router.post(
@@ -603,6 +710,10 @@ async def entry_podcast_summary_endpoint(
     if row is None:
         raise HTTPException(status_code=404, detail="entry not found")
 
+    # Fast path: cache hit. ``podcast_transcript_summary is not
+    # None`` means we already attempted (success or empty); the
+    # per-row column is the source of truth and a populated
+    # entry never re-runs the fetch + transcribe + LLM chain.
     if row.podcast_transcript_summary is not None:
         return EntryPodcastSummaryOut(
             summary=row.podcast_transcript_summary, cached=True, available=True,
@@ -613,31 +724,53 @@ async def entry_podcast_summary_endpoint(
     transcript_type = meta.get("transcript_type") or ""
     audio_url = meta.get("audio_url")
 
-    transcript_text = None
-    if isinstance(transcript_url, str) and transcript_url:
-        transcript_text = await fetch_transcript_text(transcript_url, transcript_type)
-    elif isinstance(audio_url, str) and audio_url and asr_available():
-        transcript_text = await transcribe_audio(audio_url)
-    else:
-        # Neither a published transcript nor (audio_url + a
-        # configured ASR key) — nothing to cache (a future re-ingest
-        # or a later GROQ_API_KEY setup could make this available,
-        # so we don't want to permanently record "unavailable" on
-        # the row).
+    # Pre-lock bail-out: the entry has no transcript AND no
+    # ASR-capable audio AND no configured Groq key. There's
+    # nothing for the lock to protect — the result is the same
+    # no matter how many requests arrive. Bail before the
+    # lock so a feed-wide "no transcripts, no audio" sweep
+    # doesn't pin 256+ per-entry locks.
+    if not (
+        (isinstance(transcript_url, str) and transcript_url)
+        or (isinstance(audio_url, str) and audio_url and asr_available())
+    ):
         return EntryPodcastSummaryOut(summary=None, cached=False, available=False)
 
-    summary = None
-    if transcript_text:
-        summary = await summarize_transcript(row.title, transcript_text)
+    # Slow path: cache miss AND we have something to fetch.
+    # Per-entry lock so two concurrent requests for the same
+    # episode don't both run the (expensive) transcript fetch
+    # + ASR + LLM chain. Re-read inside the lock — a
+    # concurrent request that held the lock for the few
+    # seconds of the chain will have populated the cache by
+    # the time we get here.
+    async with await _get_summary_lock(entry_id):
+        await session.refresh(row)
+        if row.podcast_transcript_summary is not None:
+            return EntryPodcastSummaryOut(
+                summary=row.podcast_transcript_summary, cached=True, available=True,
+            )
 
-    # Persist even on failure (empty string) — same rationale as
-    # cached_summary: without this, a broken transcript URL or an
-    # unconfigured LLM provider would re-attempt the fetch + (would-be)
-    # LLM call on every single tap.
-    row.podcast_transcript_summary = summary or ""
-    await session.commit()
+        transcript_text = None
+        if isinstance(transcript_url, str) and transcript_url:
+            transcript_text = await fetch_transcript_text(transcript_url, transcript_type)
+        elif isinstance(audio_url, str) and audio_url and asr_available():
+            transcript_text = await transcribe_audio(audio_url)
+        # The pre-lock check above already short-circuited the
+        # "neither transcript nor audio + ASR" case, so we don't
+        # need the `else` here.
 
-    return EntryPodcastSummaryOut(summary=summary, cached=False, available=True)
+        summary = None
+        if transcript_text:
+            summary = await summarize_transcript(row.title, transcript_text)
+
+        # Persist even on failure (empty string) — same rationale as
+        # cached_summary: without this, a broken transcript URL or an
+        # unconfigured LLM provider would re-attempt the fetch + (would-be)
+        # LLM call on every single tap.
+        row.podcast_transcript_summary = summary or ""
+        await session.commit()
+
+        return EntryPodcastSummaryOut(summary=summary, cached=False, available=True)
 
 
 @router.post(
@@ -671,11 +804,16 @@ async def entry_reddit_comment_summary_endpoint(
     if row is None:
         raise HTTPException(status_code=404, detail="entry not found")
 
+    # Fast path: cache hit.
     if row.reddit_comment_summary is not None:
         return EntryRedditCommentSummaryOut(
             summary=row.reddit_comment_summary, cached=True, available=True,
         )
 
+    # Pre-lock bail-out: no thread URL stamped on this entry.
+    # The cross-reference sweep is what populates
+    # ``reddit_thread_url``; an entry without one has no
+    # comments to summarize, and a lock doesn't change that.
     meta = row.meta or {}
     thread_url = meta.get("reddit_thread_url")
     if not isinstance(thread_url, str) or not thread_url:
@@ -683,25 +821,49 @@ async def entry_reddit_comment_summary_endpoint(
         # could still stamp this entry with a thread URL later.
         return EntryRedditCommentSummaryOut(summary=None, cached=False, available=False)
 
-    try:
-        comments = await reddit_client.fetch_thread_comments(thread_url)
-    except reddit_client.RedditRateLimited:
-        return EntryRedditCommentSummaryOut(
-            summary=None, cached=False, available=True, rate_limited=True,
-        )
+    # Slow path: cache miss, thread URL present. Per-entry
+    # lock so two concurrent requests for the same entry
+    # don't both pay for the Reddit fetch + LLM. Re-read
+    # inside the lock — a concurrent request that held the
+    # lock for the few seconds of the chain will have
+    # populated the cache by the time we get here.
+    #
+    # Note: the rate-limited short-circuit is INSIDE the
+    # lock. We don't cache rate-limited responses (a retry
+    # shortly after could succeed), so the lock's only
+    # purpose is to deduplicate the work that follows; a
+    # rate-limited response from one request doesn't help
+    # any other request (they'd all hit the same rate
+    # limit). The 2nd-3rd-... requests will queue on the
+    # lock and each return their own rate-limited response,
+    # which is correct — they all "didn't do the work"
+    # for the same reason.
+    async with await _get_summary_lock(entry_id):
+        await session.refresh(row)
+        if row.reddit_comment_summary is not None:
+            return EntryRedditCommentSummaryOut(
+                summary=row.reddit_comment_summary, cached=True, available=True,
+            )
 
-    summary = None
-    if comments:
-        summary = await summarize_comments(row.title, comments)
+        try:
+            comments = await reddit_client.fetch_thread_comments(thread_url)
+        except reddit_client.RedditRateLimited:
+            return EntryRedditCommentSummaryOut(
+                summary=None, cached=False, available=True, rate_limited=True,
+            )
 
-    # Persist even on failure (empty string) — same rationale as the
-    # other summary caches. The rate-limited case above already
-    # returned before reaching here, so this only covers genuine
-    # failures (no thread found, malformed feed, no LLM configured).
-    row.reddit_comment_summary = summary or ""
-    await session.commit()
+        summary = None
+        if comments:
+            summary = await summarize_comments(row.title, comments)
 
-    return EntryRedditCommentSummaryOut(summary=summary, cached=False, available=True)
+        # Persist even on failure (empty string) — same rationale as the
+        # other summary caches. The rate-limited case above already
+        # returned before reaching here, so this only covers genuine
+        # failures (no thread found, malformed feed, no LLM configured).
+        row.reddit_comment_summary = summary or ""
+        await session.commit()
+
+        return EntryRedditCommentSummaryOut(summary=summary, cached=False, available=True)
 
 
 @router.get(
