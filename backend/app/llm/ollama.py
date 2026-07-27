@@ -32,6 +32,7 @@ class OllamaProvider(Provider):
         *,
         max_tokens: int = 512,
         stop: list[str] | None = None,
+        think: bool = True,
     ) -> str:
         url = f"{self._base}/api/generate"
         payload: dict[str, Any] = {
@@ -44,6 +45,13 @@ class OllamaProvider(Provider):
             # Ollama's native ``stop`` field. Halts generation the
             # moment any of these strings appear in the output.
             payload["stop"] = stop
+        if not think and self._model in _THINKING_MODELS:
+            # See the matching comment in ``ollama_cloud.py`` — only
+            # set the key when disabling AND the model actually
+            # supports the toggle, so the default (True) case's wire
+            # payload is unchanged and a non-thinking model never sees
+            # an unrecognized field.
+            payload["think"] = False
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
                 resp = await client.post(url, json=payload)

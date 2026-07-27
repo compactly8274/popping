@@ -43,6 +43,7 @@ class OllamaCloudProvider(Provider):
         *,
         max_tokens: int = 512,
         stop: list[str] | None = None,
+        think: bool = True,
     ) -> str:
         url = f"{self._base}/api/generate"
         payload: dict[str, Any] = {
@@ -53,6 +54,19 @@ class OllamaCloudProvider(Provider):
         }
         if stop:
             payload["stop"] = stop
+        if not think and self._model in _THINKING_MODELS:
+            # Only set the key when disabling AND the model is one we
+            # know supports the toggle — omitting it otherwise keeps
+            # the wire payload byte-for-byte identical to before this
+            # parameter existed (so the Brief generator, which always
+            # wants the default, is unaffected) and avoids sending an
+            # unrecognized field to a model that has no concept of
+            # "thinking" at all. For a thinking model (glm-5.2:cloud,
+            # deepseek-r1, gpt-oss — see ``_THINKING_MODELS``), this
+            # skips the CoT preamble and puts the answer directly in
+            # ``response``, which is what a short, tightly-token-capped
+            # summarization call needs.
+            payload["think"] = False
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",

@@ -64,7 +64,11 @@ async def summarize_comments(title: str, comments: list[dict]) -> str | None:
     for candidate in providers:
         try:
             content = await asyncio.wait_for(
-                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS),
+                # think=False — see app.article_summary's matching
+                # comment / Provider.complete's docstring: a thinking
+                # model can burn the whole token budget on CoT and
+                # never reach the actual summary.
+                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS, think=False),
                 timeout=_LLM_CALL_TIMEOUT_S,
             )
         except ProviderError as exc:

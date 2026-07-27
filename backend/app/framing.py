@@ -382,7 +382,14 @@ async def _classify_tones(titles: list[str]) -> Optional[list[str]]:
     prompt = _build_tone_prompt(titles)
     for candidate in providers:
         try:
-            content = await candidate.complete(prompt, max_tokens=_TONE_MAX_TOKENS)
+            # think=False: a short, structured-output prompt (a JSON
+            # array of tone labels) — same reasoning as
+            # app.article_summary's matching comment. This call
+            # already tolerates CoT-wrapped output via
+            # _extract_first_json_array below as a second line of
+            # defense, but disabling thinking avoids relying on that
+            # fallback in the first place.
+            content = await candidate.complete(prompt, max_tokens=_TONE_MAX_TOKENS, think=False)
         except ProviderError as exc:
             logger.warning("framing: tone call failed on %s: %s — trying next provider", candidate.name, exc)
             continue

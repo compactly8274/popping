@@ -30,7 +30,11 @@ class GroqProvider(Provider):
         *,
         max_tokens: int = 512,
         stop: list[str] | None = None,
+        think: bool = True,
     ) -> str:
+        # ``think`` is an Ollama-specific knob (see Provider.complete's
+        # docstring) — accepted for call-site uniformity across the
+        # provider chain, unused here.
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
             "authorization": f"Bearer {self._api_key}",
