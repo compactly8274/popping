@@ -261,6 +261,14 @@ class Settings(BaseSettings):
     convergence_window_hours: int = 24
     convergence_boost_2: float = 1.10
     convergence_boost_3plus: float = 1.20
+    # Max number of recent rows ``convergence.counts()`` will scan in
+    # the window. The convergence boost is a "hot right now" signal;
+    # capping to the most recent N keeps the SQL bounded when a deploy
+    # backlog or a news-heavy weekend pushes the in-window row count
+    # into the tens of thousands. The TTL cache makes the cost
+    # amortized, but a 30s window with 100k rows in it is still a
+    # ~3s scan the first time. Set to 0 to disable the cap.
+    convergence_scan_cap: int = 5000
 
     # --- Framing Watch: same-story / different-headline clustering --------
     # Distinct from convergence above: convergence matches on normalized

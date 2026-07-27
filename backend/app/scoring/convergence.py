@@ -30,6 +30,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Entry, Source
 from app.scoring import composite as composite_scorer
 
@@ -40,15 +41,18 @@ _TTL_SECONDS = 30.0
 # support today) hit the cache 100% of the time after the first call.
 # A multi-worker deploy would have N caches; that's fine because the
 # underlying scan is read-only and identical.
-_cache: dict[tuple[int, float], dict[str, int]] = {}
+_cache: dict[tuple[int, float, int], dict[str, int]] = {}
 _cache_lock = asyncio.Lock()
 
 
-def _cache_key(window_hours: int) -> tuple[int, float]:
+def _cache_key(window_hours: int) -> tuple[int, float, int]:
     """Quantize the TTL so two callers inside the same 30s window
     share a cache entry. Without the floor, every call would have a
-    fresh key and never hit."""
-    return (window_hours, time.monotonic() // _TTL_SECONDS)
+    fresh key and never hit. The ``scan_cap`` is part of the key
+    so a runtime config change doesn't serve stale data from the
+    old shape of the scan.
+    """
+    return (window_hours, time.monotonic() // _TTL_SECONDS, settings.convergence_scan_cap)
 
 
 async def counts(
@@ -66,11 +70,35 @@ async def counts(
         return cached
 
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
-    stmt = (
-        select(Entry.title, Source.name)
-        .join(Source, Entry.source_id == Source.id)
-        .where(Entry.published_at >= since)
-    )
+    # Cap the row count to the most recent ``convergence_scan_cap``
+    # entries in the window. Without this, a 24h window that catches
+    # 100k entries (a backlog after a deploy, a news-heavy weekend)
+    # pulls every row just to find the last 5k that the convergence
+    # boost actually cares about. The boost is a "hot right now"
+    # signal; old rows don't move the needle regardless of how
+    # many sources cover them, and a per-row ``title_slug`` call in
+    # Python (below) is the second cost we're saving. ``scan_cap=0``
+    # disables the cap as an escape hatch (a debugging session, a
+    # regression that needs the full historical view).
+    scan_cap = settings.convergence_scan_cap
+    if scan_cap > 0:
+        recent = (
+            select(Entry.id, Entry.title, Entry.source_id)
+            .where(Entry.published_at >= since)
+            .order_by(Entry.published_at.desc().nullslast(), Entry.id.desc())
+            .limit(scan_cap)
+            .subquery()
+        )
+        stmt = (
+            select(recent.c.title, Source.name)
+            .join(Source, Source.id == recent.c.source_id)
+        )
+    else:
+        stmt = (
+            select(Entry.title, Source.name)
+            .join(Source, Entry.source_id == Source.id)
+            .where(Entry.published_at >= since)
+        )
     rows = (await session.execute(stmt)).all()
     bucket: dict[str, set[str]] = defaultdict(set)
     for title, source_name in rows:
