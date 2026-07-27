@@ -472,6 +472,29 @@ async def create_source_endpoint(
     else:
         refresh = _validate_refresh(body.refresh_interval_seconds)
     headers = _validate_custom_headers(body.custom_headers)
+    # Slice 20: validate ``sitemap_url`` and ``link_pattern`` at
+    # creation time. These are optional and only meaningful for
+    # ``type='generic_scrape'`` rows — other types ignore them
+    # silently. ``sitemap_url`` is parsed as an http(s) URL (same
+    # validator the PATCH route uses); ``link_pattern`` must be a
+    # leading-slash path prefix, never a full URL (same rule).
+    sitemap_url_value = None
+    if body.sitemap_url is not None:
+        sitemap_url_value = _validate_url(body.sitemap_url)
+    link_pattern_value = None
+    if body.link_pattern is not None:
+        candidate = body.link_pattern
+        if not candidate.startswith("/"):
+            raise HTTPException(
+                status_code=422,
+                detail="link_pattern must start with '/' (path prefix, not a full URL)",
+            )
+        if "://" in candidate:
+            raise HTTPException(
+                status_code=422,
+                detail="link_pattern must be a path prefix, not a full URL",
+            )
+        link_pattern_value = candidate
     row = await scheduler.add_source(
         session,
         name=body.name,
@@ -479,6 +502,8 @@ async def create_source_endpoint(
         category=body.category,
         url=url,
         refresh=refresh,
+        sitemap_url=sitemap_url_value,
+        link_pattern=link_pattern_value,
         custom_headers=headers,
     )
     # Auto-expand the Recommended pool from what the user just added.

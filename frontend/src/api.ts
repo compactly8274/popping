@@ -312,6 +312,13 @@ export const api = {
     category: string
     url: string
     refresh_interval_seconds?: number
+    // Slice 20: optional discovery hints for ``type='generic_scrape'``
+    // sources. Set at creation time so the user doesn't have to
+    // PATCH the row afterward. Both are optional; backend route
+    // validates ``sitemap_url`` as an http(s) URL and ``link_pattern``
+    // as a leading-slash path prefix (no protocol).
+    sitemap_url?: string
+    link_pattern?: string
     custom_headers?: Record<string, string> | null
   }) =>
     jsonFetch<Source>('/api/sources', {

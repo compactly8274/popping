@@ -1978,6 +1978,13 @@ async def add_source(
     category: str,
     url: str,
     refresh: int,
+    # Slice 20: optional discovery hints for ``type='generic_scrape'``
+    # sources. Both default to None (use the plugin's default
+    # behavior). The route layer validates them before this is
+    # called (sitemap_url parsed as an http(s) URL; link_pattern
+    # must start with '/' and not contain a protocol).
+    sitemap_url: str | None = None,
+    link_pattern: str | None = None,
     custom_headers: dict | None = None,
 ) -> Source:
     """Create a Source row and register its scheduler job.
@@ -2010,6 +2017,11 @@ async def add_source(
         url=url,
         refresh_interval_seconds=refresh,
         active=True,
+        # Slice 20: discovery hints propagated to the row.
+        # None means "use plugin defaults" — exactly the same
+        # behavior as a pre-slice row that never had these fields.
+        sitemap_url=sitemap_url,
+        link_pattern=link_pattern,
         custom_headers=custom_headers,
     )
     session.add(row)
