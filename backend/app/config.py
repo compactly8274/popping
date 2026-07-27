@@ -322,6 +322,17 @@ class Settings(BaseSettings):
     # POPPING_LLM_TAGS_CACHE_TTL_SECONDS if you need tighter refresh.
     llm_tags_cache_ttl_seconds: int = 3600
 
+    # How long to keep an empty-string cached_summary before retrying
+    # the fetch / extract / LLM chain. The empty-string branch used
+    # to be permanent; see migration 0022 for the rationale. 24h
+    # is a sensible default — long enough that a single transient
+    # failure (e.g. an article URL that's temporarily 404) doesn't
+    # burn the LLM budget on a constant retry loop, short enough
+    # that a permanent source fix or LLM-provider reconfiguration
+    # becomes visible within a day. Override with
+    # POPPING_CACHED_SUMMARY_RETRY_HOURS.
+    cached_summary_retry_hours: float = 24.0
+
     # --- Asset cache (favicons + thumbnails) ------------------------------
     # Where the ingest pipeline writes downloaded images. Must be
     # readable by the StaticFiles mount at /assets and writable by the
