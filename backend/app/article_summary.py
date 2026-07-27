@@ -60,7 +60,12 @@ async def summarize_article(title: str, article_text: str) -> str | None:
     for candidate in providers:
         try:
             content = await asyncio.wait_for(
-                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS),
+                # think=False: a short, tightly-token-capped direct-
+                # answer prompt. A thinking model given the default
+                # (True) can burn the whole _SUMMARY_MAX_TOKENS budget
+                # on its CoT preamble and never reach the actual
+                # summary — see Provider.complete's docstring.
+                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS, think=False),
                 timeout=_LLM_CALL_TIMEOUT_S,
             )
         except ProviderError as exc:

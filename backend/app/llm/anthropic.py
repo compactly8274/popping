@@ -36,7 +36,13 @@ class AnthropicProvider(Provider):
         *,
         max_tokens: int = 512,
         stop: list[str] | None = None,
+        think: bool = True,
     ) -> str:
+        # ``think`` is an Ollama-specific knob (see Provider.complete's
+        # docstring) — Anthropic has its own opt-in extended-thinking
+        # feature but it's off by default and unrelated to this
+        # parameter, so it's accepted (for call-site uniformity across
+        # the provider chain) and otherwise unused here.
         url = "https://api.anthropic.com/v1/messages"
         headers = {
             "x-api-key": self._api_key,
