@@ -35,6 +35,14 @@ type Props = {
     history: Entry[]
   }
   sourcesById: Map<number, string>
+  // Source objects keyed by name, so the empty-state JSX can show
+  // the source's last_fetch_at / error_count / last_error and
+  // tell the user why the column is empty ("last fetch errored",
+  // "auto-disabled after 5 errors", etc.) instead of just
+  // "no entries yet". Optional — meta columns (Saved, For You,
+  // Multisub) pass ``undefined`` and the empty-state falls back
+  // to the original generic message. Added in slice 19.
+  sourcesByName?: Map<string, import('../api').Source>
   // Number of entries in this column that are "new since the user's
   // last visit to this column". Rendered as a chip in the header so
   // the user knows to come look. ``undefined`` means we haven't
@@ -136,6 +144,10 @@ export function Column({
   name,
   sections,
   sourcesById,
+  // Slice 19: optional sourcesByName map for context-aware empty-state.
+  // Meta columns (Saved / For You / Multisub) pass undefined; the
+  // empty-state falls back to the original generic message in that case.
+  sourcesByName,
   newCount,
   selectedId,
   cardRefs,
@@ -444,7 +456,14 @@ export function Column({
       </header>
       <div className="flex-1 overflow-y-auto space-y-2 pr-1">
         {entryCount === 0 ? (
-          <p className="text-ios-body text-label-secondary italic px-1">no entries in this column yet \u2014 the scheduler will fetch the first batch shortly</p>
+          // Slice 19: context-aware empty state. The source's
+          // ``last_fetch_at`` / ``last_error`` / ``error_count``
+          // tell the user WHY the column is empty — has the
+          // scheduler tried yet? did the last fetch error? was
+          // the source auto-disabled? Meta columns (Saved /
+          // For You / Multisub) don't have a backing source so
+          // we fall back to the original generic message.
+          <EmptyColumnMessage name={name} sourcesByName={sourcesByName} />
         ) : (
           <>
             {/* Fresh section. Rendered first (the only section
@@ -735,3 +754,74 @@ function ChevronIcon({ className, collapsed }: { className?: string; collapsed?:
 
 
 
+
+
+// ---------------------------------------------------------------------------
+// Slice 19: context-aware empty-state
+// ---------------------------------------------------------------------------
+
+// Auto-disable threshold for the source.error_count check below.
+// Mirrors ``app.scheduler._AUTO_DISABLE_THRESHOLD`` — the backend
+// flips active=False when error_count hits this. Surfacing it in
+// the empty-state lets the user distinguish "transient error"
+// (error_count < 5) from "auto-disabled" (>= 5).
+const AUTO_DISABLE_THRESHOLD = 5
+
+function EmptyColumnMessage({
+  name,
+  sourcesByName,
+}: {
+  name: string
+  sourcesByName?: Map<string, import('../api').Source>
+}) {
+  const source = sourcesByName?.get(name)
+  // Meta column (Saved / For You / Multisub) or sourcesByName not
+  // provided — fall back to the original generic message.
+  if (!source) {
+    return (
+      <p className="text-ios-body text-label-secondary italic px-1">
+        no entries in this column yet — the scheduler will fetch the first batch shortly
+      </p>
+    )
+  }
+  // Source-backed column. Pick the most specific message:
+  //   1. auto-disabled (error_count >= threshold and not active)
+  //   2. transient error (last_error set, error_count < threshold)
+  //   3. fetched but found nothing (last_fetch_at set, no error)
+  //   4. never fetched yet (last_fetch_at null)
+  if (source.error_count >= AUTO_DISABLE_THRESHOLD && !source.active) {
+    return (
+      <p className="text-ios-body text-label-secondary italic px-1">
+        auto-disabled after {source.error_count} consecutive errors — re-enable from Feed Manager
+      </p>
+    )
+  }
+  if (source.last_error) {
+    // Truncate to keep the message terse — the full traceback lives
+    // in the Feed Manager. 80 chars is enough to identify the kind
+    // of error without scrolling.
+    const snippet = source.last_error.slice(0, 80)
+    return (
+      <p className="text-ios-body text-label-secondary italic px-1">
+        last fetch failed: {snippet}{source.last_error.length > 80 ? '\u2026' : ''}
+      </p>
+    )
+  }
+  if (source.last_fetch_at) {
+    // Format the timestamp as "Xh ago" without pulling in a date
+    // library. Sufficient granularity for "is the scheduler still
+    // running?" — minutes/seconds aren't actionable.
+    const fetchedMs = new Date(source.last_fetch_at).getTime()
+    const ageHours = Math.max(0, Math.round((Date.now() - fetchedMs) / (1000 * 60 * 60)))
+    return (
+      <p className="text-ios-body text-label-secondary italic px-1">
+        last fetched {ageHours}h ago — no entries match the current filters
+      </p>
+    )
+  }
+  return (
+    <p className="text-ios-body text-label-secondary italic px-1">
+      source added, waiting for first fetch
+    </p>
+  )
+}
