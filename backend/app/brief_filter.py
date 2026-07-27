@@ -56,14 +56,33 @@ _EXCESSIVE_PUNCT_RE = re.compile(r"[!?]{3,}")
 
 # Listicles / how-to / "you won't believe" templates. Case-insensitive.
 # Each pattern is a substring match — cheap, no tokenization.
-_LISTICLE_PATTERNS: tuple[str, ...] = (
-    r"\b\d+\s+(things|ways|reasons|tips|hacks|tricks|secrets|signs)\b",
-    r"\byou (won't|wont|will never|should never)\s+(believe|guess|imagine|expect)\b",
-    r"\bthis (one )?(weird|crazy|simple|genius)\s+(trick|secret|hack|method)\b",
-    r"\bwhat (happened|they did) next\b",
-    r"\bthe truth about\b",
-    r"\bdoctors (hate|don't want|won't tell)\b",
+#
+# Pre-compiled at module load. The previous shape was a tuple of
+# ``str`` patterns; ``re.search(pat, ...)`` re-compiled the pattern
+# on every call, and ``is_clickbait`` runs once per entry the brief
+# pipeline considers (up to 500 in the over-fetch path). The
+# pre-compiled tuple means ``pat.search(tl)`` skips the compile
+# step at every call site. The wall-clock impact is modest
+# (the function is dominated by the tokenize + emoji-ratio
+# work, not the regex compile), but the pre-compile is
+# unambiguously cleaner and removes a per-call allocation.
+_LISTICLE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b\d+\s+(things|ways|reasons|tips|hacks|tricks|secrets|signs)\b",
+        r"\byou (won't|wont|will never|should never)\s+(believe|guess|imagine|expect)\b",
+        r"\bthis (one )?(weird|crazy|simple|genius)\s+(trick|secret|hack|method)\b",
+        r"\bwhat (happened|they did) next\b",
+        r"\bthe truth about\b",
+        r"\bdoctors (hate|don't want|won't tell)\b",
+    )
 )
+
+
+# Token extractor for the sensational-words check. Same pre-compile
+# rationale as ``_LISTICLE_PATTERNS`` — the regex is built once
+# at module load, not on every ``is_clickbait`` call.
+_TOKEN_RE: re.Pattern[str] = re.compile(r"[a-zA-Z][a-zA-Z\-']*")
 
 
 # Sensational adjectives in caps or title case. Matched as whole
@@ -113,11 +132,13 @@ def _emoji_ratio(title: str) -> float:
 def is_clickbait(title: Optional[str]) -> bool:
     """True if ``title`` matches any clickbait surface pattern.
 
-    The listicle patterns are pre-compiled at module load; everything
-    else is per-call but cheap (linear scan). A title that's empty,
-    None, or just whitespace isn't clickbait — it's a bad row, but
-    that's a separate problem (the normalizer already rejects empty
-    titles so this branch is just defensive).
+    The listicle patterns and the token-extractor are pre-compiled
+    at module load (see ``_LISTICLE_PATTERNS`` / ``_TOKEN_RE``);
+    everything else is per-call but cheap (linear scan). A title
+    that's empty, None, or just whitespace isn't clickbait — it's
+    a bad row, but that's a separate problem (the normalizer
+    already rejects empty titles so this branch is just
+    defensive).
 
     This is intentionally a SHALLOW filter. We don't try to detect
     "subtle" clickbait ("You won't guess what happened next…") —
@@ -140,13 +161,13 @@ def is_clickbait(title: Optional[str]) -> bool:
 
     tl = t.lower()
     for pat in _LISTICLE_PATTERNS:
-        if re.search(pat, tl):
+        if pat.search(tl):
             return True
 
     # Sensational words — match as whole words so "unbelievable" trips
     # but "unbelievably" doesn't (we're being conservative on the
     # latter; the prompt handles "epic launch" naturally).
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z\-']*", tl)
+    tokens = _TOKEN_RE.findall(tl)
     if any(tok in _SENSATIONAL_WORDS for tok in tokens):
         return True
 
