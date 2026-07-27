@@ -212,8 +212,16 @@ class Entry(Base):
     framing_tone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ``index=True`` added in slice 25 — this column is the WHERE-clause
+    # gate on four hot query paths (brief selector, rescore tick,
+    # convergence-alert slug filter, pref-vector recompute). Without the
+    # index each was a full table scan + in-memory sort. The
+    # ``CREATE INDEX`` itself is the alembic migration
+    # ``0025_entries_fetched_at_index.py``; the ``index=True`` here keeps
+    # ``Base.metadata.create_all()``-based dev setups consistent with the
+    # migration-managed production schema.
     fetched_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
 
     source: Mapped[Source] = relationship(back_populates="entries")
