@@ -22,6 +22,7 @@ from app.llm import router as llm_router
 from app.models import Entry, Source, StoryCluster
 from app.podcast_asr import asr_available, transcribe_audio
 from app.podcast_transcript import fetch_transcript_text, summarize_transcript
+from app.reddit_client import fetch_thread_comments
 from app.reddit_comment_summary import summarize_comments
 from app.schemas import (
     EntryListOut,
@@ -574,6 +575,55 @@ def _extract_fallback_summary(row: Entry) -> str:
     return _truncate_summary(_clean_summary(raw))
 
 
+def _is_reddit_url(url: str | None) -> bool:
+    """True if ``url`` is a Reddit thread permalink or comment permalink.
+
+    Matches both ``reddit.com`` and ``www.reddit.com`` hostnames. Does
+    NOT match ``old.reddit.com`` or any other host — the helper is
+    specifically for routing Reddit URLs into the Reddit-specific
+    article-fetch path (which fetches the thread's ``.rss`` and uses
+    the post body as the article text). Non-Reddit URLs are handled
+    by ``fetch_article_text`` (HTML fetch + trafilatura).
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        host = url.split("/", 3)[2] if "://" in url else ""
+    except IndexError:
+        return False
+    return host in ("reddit.com", "www.reddit.com")
+
+
+async def _fetch_reddit_post_body(url: str) -> str:
+    """Fetch a Reddit thread's post body via its ``.rss`` feed.
+
+    Reddit's main site is a client-rendered SPA — ``fetch_article_text``
+    (which uses trafilatura to extract from raw HTML) returns empty
+    for any ``reddit.com`` URL because the actual post body never
+    lands in the initial HTML payload. Reddit's ``.rss`` feed
+    sidesteps this: the first ``<entry>`` in the thread's RSS IS
+    the post itself (the OP's body text), rendered as a
+    ``<content type="html">`` element that the standard XML parser
+    reads directly.
+
+    Returns the cleaned text of the first entry, or empty string on
+    any failure (Reddit down, rate-limited, malformed feed, empty
+    body). The same comments-fetch path is used elsewhere, so the
+    rate-limit semantics align with the existing direct-mode
+    bucket: a rate-limited call here doesn't block the
+    cross-reference sweep or the scheduled ingest jobs.
+    """
+    try:
+        comments = await fetch_thread_comments(url)
+    except Exception:
+        return ""
+    if not comments:
+        return ""
+    # The thread's RSS includes the post as the first entry, then
+    # the comments in tree order. The first entry is the OP.
+    return _clean_summary(comments[0].get("text", ""))
+
+
 @router.post(
     "/entries/{entry_id}/summary",
     response_model=EntrySummaryOut,
@@ -650,7 +700,36 @@ async def entry_summary_endpoint(
             return cached
 
         final = ""
-        if llm_router.providers_for("brief"):
+        if _is_reddit_url(row.url):
+            # Reddit's main site is a client-rendered SPA — the
+            # standard ``fetch_article_text`` (HTML fetch +
+            # trafilatura) returns empty for every ``reddit.com``
+            # URL because the post body never lands in the initial
+            # HTML payload. Use the thread's ``.rss`` instead: the
+            # first entry is the post itself, with full body text
+            # in ``<content>``. The cleaned post text becomes the
+            # article body for the LLM call. If no LLM is
+            # configured, we fall through to the post text
+            # directly — the ``_truncate_summary`` step at the end
+            # caps it to ``_SUMMARY_MAX_CHARS`` so we never dump
+            # thousands of words into a card.
+            post_body = await _fetch_reddit_post_body(row.url)
+            if post_body:
+                if llm_router.providers_for("brief"):
+                    llm_summary = await summarize_article(
+                        row.title, post_body
+                    )
+                    if llm_summary:
+                        final = _truncate_summary(llm_summary.strip())
+                if not final:
+                    # No LLM or LLM call failed. The post body
+                    # itself is a usable summary — at least it
+                    # gives the user the OP's question / context,
+                    # which is the whole point of expanding the
+                    # card. Truncated to ``_SUMMARY_MAX_CHARS``
+                    # below.
+                    final = post_body
+        elif llm_router.providers_for("brief"):
             article_text = await fetch_article_text(row.url)
             if article_text:
                 llm_summary = await summarize_article(row.title, article_text)
@@ -811,11 +890,20 @@ async def entry_reddit_comment_summary_endpoint(
         )
 
     # Pre-lock bail-out: no thread URL stamped on this entry.
-    # The cross-reference sweep is what populates
-    # ``reddit_thread_url``; an entry without one has no
-    # comments to summarize, and a lock doesn't change that.
+    # The cross-reference sweep populates ``reddit_thread_url``
+    # for non-Reddit sources that are cross-referenced to a
+    # thread, and (since slice 31) the dynamic_reddit source
+    # populates it for Reddit-source entries on every ingest. So
+    # a missing field only happens for entries ingested BEFORE
+    # slice 31 — those rows are still in the DB, and we want the
+    # comment-summary path to work for them too. Fall back to
+    # ``row.url`` when the entry itself IS a Reddit thread (the
+    # thread URL and the entry URL are the same for Reddit-source
+    # entries) — same effect, no DB migration needed.
     meta = row.meta or {}
     thread_url = meta.get("reddit_thread_url")
+    if (not isinstance(thread_url, str) or not thread_url) and _is_reddit_url(row.url):
+        thread_url = row.url
     if not isinstance(thread_url, str) or not thread_url:
         # Nothing to cache — a future cross-reference sweep tick
         # could still stamp this entry with a thread URL later.

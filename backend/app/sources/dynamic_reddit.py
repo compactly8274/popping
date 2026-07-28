@@ -198,6 +198,26 @@ class DynamicRedditPlugin(SourcePlugin):
                     # ``composite.score`` reads.
                     "engagement_score": listing.get("score"),
                     "engagement_comments": listing.get("num_comments"),
+                    # Slice 31: also stamp ``reddit_thread_url`` so
+                    # downstream consumers (the comment-summary
+                    # endpoint, the "Discussed on Reddit" card link)
+                    # have a consistent field to read. For
+                    # Reddit-source entries, the thread URL IS the
+                    # entry's URL — same value. The cross-reference
+                    # sweep never stamps Reddit-source entries
+                    # (their URL is already the thread), so without
+                    # this line the data model is "thread_url is
+                    # present iff a non-Reddit source was
+                    # cross-referenced", which leaves every
+                    # Reddit-source entry with ``meta.reddit_thread_url
+                    # == None`` and breaks the comment-summary path.
+                    # Setting it here makes the data uniform across
+                    # source types.
+                    "reddit_thread_url": (
+                        outbound_url if outbound_url.startswith("http")
+                        else f"https://www.reddit.com{permalink}" if permalink
+                        else ""
+                    ),
                 },
             })
         return out
