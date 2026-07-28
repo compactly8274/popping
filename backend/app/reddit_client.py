@@ -788,6 +788,19 @@ def _parse_comment_entries(atom_xml: str) -> list[dict]:
     return out
 
 
+# Sentinel exception used internally to break out of the ``async with
+# client.stream(...)`` block on a 404 (the ``async with`` doesn't
+# have an inline ``else`` we could check, and we want to fall through
+# to the direct-Reddit retry path which is the same code shape that
+# ``_get_atom`` uses elsewhere in this module). Using a private
+# exception type means a real 404 from the proxy is a normal control
+# flow, not a bug. Defined here, before ``fetch_thread_comments``,
+# so the function below can raise it without an ImportError-style
+# ``NameError`` at module-load time.
+class _ThreadProxy404(Exception):
+    pass
+
+
 async def fetch_thread_comments(thread_url: str) -> Optional[list[dict]]:
     """Fetch and parse a Reddit thread's comments via its ``.rss``
     feed. Returns a list of ``{"author", "text"}`` dicts, or ``None``
@@ -815,6 +828,21 @@ async def fetch_thread_comments(thread_url: str) -> Optional[list[dict]]:
     client = _get_client()
     try:
         async with client.stream("GET", path) as resp:
+            # If the proxy returns 404 for a thread URL (it currently
+            # only relays listing + search endpoints, not thread
+            # .rss), fall through to the direct-Reddit fetch below
+            # so the user-facing summary still works. The proxy
+            # doesn't 404 on a malformed URL — only on a URL shape
+            # it doesn't know about (i.e. thread permalinks).
+            if resp.status_code == 404 and _proxy_client is not None:
+                logger.debug(
+                    "reddit_client: thread URL %s returned 404 from proxy; "
+                    "retrying direct from Reddit",
+                    thread_url,
+                )
+                # Fall through to the direct-from-Reddit path below
+                # by raising and catching outside the with block.
+                raise _ThreadProxy404
             resp.raise_for_status()
             cl = resp.headers.get("content-length")
             if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
@@ -825,6 +853,12 @@ async def fetch_thread_comments(thread_url: str) -> Optional[list[dict]]:
                 if len(buf) > _MAX_RESPONSE_BYTES:
                     return None
         body = bytes(buf).decode("utf-8", errors="replace")
+    except _ThreadProxy404:
+        # Proxy 404'd on a thread URL. Bypass the proxy and hit
+        # Reddit directly. The polite rate-limit bucket still
+        # applies (token consumed in _get_atom via the direct client
+        # branch), so a runaway tap won't burn Reddit's trust.
+        return await _fetch_thread_comments_direct(thread_url)
     except httpx.HTTPError as exc:
         logger.debug("reddit_client: fetch_thread_comments %s failed: %s", thread_url, exc)
         return None
@@ -832,5 +866,72 @@ async def fetch_thread_comments(thread_url: str) -> Optional[list[dict]]:
         comments = _parse_comment_entries(body)
     except ValueError as exc:
         logger.debug("reddit_client: fetch_thread_comments %s parse failed: %s", thread_url, exc)
+        return None
+    return comments or None
+
+
+async def _fetch_thread_comments_direct(thread_url: str) -> Optional[list[dict]]:
+    """Bypass the proxy and hit Reddit directly for thread .rss.
+
+    The proxy (``popping-proxy``) currently only relays listing +
+    search endpoints, not thread permalinks. Without this fallback,
+    the comment-summary endpoint on Reddit-source entries would
+    always 404 and return ``available: false``.
+
+    The path here mirrors ``_get_atom`` for the direct-mode case
+    (token-bucket gated) but uses a one-off client scoped to
+    ``https://www.reddit.com`` so we don't need to touch the
+    lifespan-managed shared client. The polite rate-limit still
+    applies (a runaway tap burns tokens, not Reddit trust); if the
+    token bucket is empty, the comment summary endpoint's caller
+    surfaces ``rate_limited: true`` to the frontend (existing
+    contract; this fallback doesn't change it).
+    """
+    if not thread_url:
+        return None
+    # Take a token before opening the socket. Same gate as
+    # ``_get_atom`` for direct mode.
+    if not await _try_take_token():
+        raise RedditRateLimited(
+            f"reddit_client: no rate-limit token available for {thread_url}"
+        )
+    path = thread_url.rstrip("/") + "/.rss"
+    if path.startswith("https://www.reddit.com"):
+        path = path[len("https://www.reddit.com"):]
+    headers = {
+        "User-Agent": _user_agent(),
+        "Accept": "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+    try:
+        async with httpx.AsyncClient(
+            base_url="https://www.reddit.com",
+            timeout=_TIMEOUT,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            async with client.stream("GET", path) as resp:
+                resp.raise_for_status()
+                cl = resp.headers.get("content-length")
+                if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
+                    return None
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) > _MAX_RESPONSE_BYTES:
+                        return None
+            body = bytes(buf).decode("utf-8", errors="replace")
+    except httpx.HTTPError as exc:
+        logger.debug(
+            "reddit_client: fetch_thread_comments_direct %s failed: %s",
+            thread_url, exc,
+        )
+        return None
+    try:
+        comments = _parse_comment_entries(body)
+    except ValueError as exc:
+        logger.debug(
+            "reddit_client: fetch_thread_comments_direct %s parse failed: %s",
+            thread_url, exc,
+        )
         return None
     return comments or None
