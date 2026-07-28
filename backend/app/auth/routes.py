@@ -216,6 +216,29 @@ async def callback(
     sub = claims.get("sub")
     if not sub:
         raise HTTPException(status_code=502, detail="OIDC claims missing 'sub'")
+    # Slice 28 (security): reject when the IdP mints tokens with
+    # unverified emails. Some legacy / permissive IdPs allow this,
+    # which means an attacker can claim any email address as their
+    # own and the ``sub`` would still be unique per attacker. The
+    # ``email_verified`` claim is the standard OIDC way to assert
+    # the IdP actually checked ownership. Reject the whole login
+    # if the email is present but unverified — without this, the
+    # email gets used as a session display name even though the
+    # attacker never owned it.
+    #
+    # Absent (key missing entirely) is treated the same as ``False``
+    # for safety — we'd rather force the user to re-auth on a
+    # well-configured IdP than silently accept an unverified email.
+    if email := claims.get("email"):
+        if not claims.get("email_verified", False):
+            logger.warning(
+                "OIDC login rejected: email %r is not email_verified=True",
+                email,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="OIDC email is not verified; please use a provider that verifies emails",
+            )
     # Truncate user-controlled claims at the schema boundary so a
     # hostile / buggy IdP can't take down login with a 500 on a 1MB
     # email field. ``sub`` is the primary key for sessions and must

@@ -292,6 +292,41 @@ async def _assets_security_headers(request, call_next):
     return response
 
 
+# Slice 28 (security): defense-in-depth headers on every response.
+# The clickjacking concern on /auth/login + /auth/callback is real
+# (those are the only redirect-shaped endpoints that take user
+# input via URL params). CSP ``frame-ancestors 'none'`` is the
+# modern way to forbid framing; ``X-Frame-Options DENY`` is the
+# legacy header for browsers that don't honor CSP frame-ancestors.
+# HSTS only fires when the public_url is https — sending it over
+# http would be a no-op for the user (browsers ignore HSTS over
+# http) but a fingerprintable header.
+#
+# ``Referrer-Policy: no-referrer`` — the dashboard never needs to
+# send a referer to third-party resources; same-origin already
+# knows what page you're on. Reduces accidental referer leakage
+# from any ``window.open`` we might add later.
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    response = await call_next(request)
+    # ``frame-ancestors 'none'`` is the modern CSP directive; X-Frame-Options
+    # is the legacy fallback. Browsers ignore the legacy one if the modern
+    # one is present, but old browsers (and some non-browser embedders)
+    # still need it.
+    response.headers.setdefault(
+        "Content-Security-Policy", "frame-ancestors 'none'"
+    )
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if settings.public_url and settings.public_url.startswith("https://"):
+        # 1-year HSTS — long enough to be a real commitment, short
+        # enough that a config mistake can recover in a year.
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000"
+        )
+    return response
+
+
 @app.middleware("http")
 async def _request_id(request, call_next):
     """Bind a request id for the duration of the request, surface
