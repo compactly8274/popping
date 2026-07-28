@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from collections import OrderedDict
 from typing import Optional
 
 from app.article_extract import fetch_html
@@ -51,6 +52,14 @@ _MAX_SITEMAP_CANDIDATES = 200
 # way that endpoint would truncate a long one anyway. Keeps a huge
 # extracted article from bloating the entries table.
 _SUMMARY_MAX_CHARS = 2000
+
+# Slice 27: cap on the per-plugin ``_extracted_urls`` set. The DB
+# UNIQUE constraint on entries.url is the real correctness backstop
+# (re-attempts are silently no-op'd by ``on_conflict_do_nothing``);
+# this cap bounds the in-memory footprint only. 5000 is enough to
+# cover a news site's full sitemap over a multi-day window without
+# forcing the FIFO eviction to re-attempt URLs the DB already has.
+_MAX_EXTRACTED_URLS = 5000
 
 
 async def _extract_one(url: str) -> dict | None:
@@ -305,7 +314,29 @@ class GenericScrapePlugin(SourcePlugin):
         # backstop regardless — on_conflict_do_nothing in the
         # scheduler's insert path silently no-ops a re-attempt),
         # not a correctness issue.
-        self._extracted_urls: set[str] = set()
+        #
+        # Slice 27: bounded via ``OrderedDict`` with FIFO eviction at
+        # ``_MAX_EXTRACTED_URLS``. Without the bound, a source with a
+        # growing sitemap (e.g. a news site with daily new articles)
+        # accumulates URLs for the lifetime of the backend process —
+        # tens of thousands of entries over weeks. The DB dedup
+        # constraint is the real correctness backstop, but the in-
+        # memory set still paid linear-cost scans + memory. The
+        # FIFO cap gives a worst-case fixed footprint; eviction
+        # just means a previously-seen URL gets re-attempted, which
+        # the entries-table UNIQUE constraint silently no-ops.
+        self._extracted_urls: "OrderedDict[str, None]" = OrderedDict()
+
+    def _mark_extracted(self, url: str) -> None:
+        """Add ``url`` to the seen-set, evicting the oldest entry if
+        the cap is exceeded. ``OrderedDict.popitem(last=False)`` is
+        O(1) and returns FIFO order.
+        """
+        # ``setdefault`` would also work but ``__setitem__`` is faster
+        # and we don't need the existing-value semantics.
+        self._extracted_urls[url] = None
+        while len(self._extracted_urls) > _MAX_EXTRACTED_URLS:
+            self._extracted_urls.popitem(last=False)
 
     async def fetch(self) -> list[dict]:
         # If the row carries an explicit sitemap_url, use it
@@ -344,7 +375,10 @@ class GenericScrapePlugin(SourcePlugin):
                 break
             attempted += 1
             item = await _extract_one(url)
-            self._extracted_urls.add(url)
+            # Use the bounded helper (FIFO eviction at
+            # ``_MAX_EXTRACTED_URLS``) instead of ``.add()`` to keep
+            # the in-memory set's footprint fixed.
+            self._mark_extracted(url)
             if item is not None:
                 items.append(item)
         return items

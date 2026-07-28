@@ -527,9 +527,37 @@ async def _ingest(plugin_cls: Any) -> dict:
     # and lets us run them concurrently via ``asyncio.gather`` since
     # they're independent of each other. The bulk UPDATE at the end
     # persists all results in one round-trip.
+    #
+    # Slice 27: bound concurrency with an asyncio.Semaphore. A source
+    # with ~100 entries was firing 100 concurrent HTTP requests with
+    # no throttle — same anti-pattern as the old framing-LLM path
+    # (slice 16/26 era). 10 concurrent is enough to overlap the ~3s
+    # per-fetch latency on a small ingest while keeping a big
+    # ingest's open-connection count bounded.
+    _FETCH_CONCURRENCY = 10
+
+    sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+    async def _bounded_fetch(fn, *args):
+        """Wrap an asset-fetcher call in the semaphore so the gather
+        below can't fire more than ``_FETCH_CONCURRENCY`` at once.
+        ``assets.fetch_thumbnail`` and ``fetch_og_image_fallback``
+        both return ``Optional[str]`` / ``Optional[tuple[str, str]]``;
+        we forward whatever they return so the surrounding bulk
+        UPDATE loop sees the same shape.
+        """
+        async with sem:
+            return await fn(*args)
+
+    def _thumbnail_fetch(eid, url):
+        return _bounded_fetch(assets.fetch_thumbnail, url, eid)
+
+    def _og_image_fetch(eid, url):
+        return _bounded_fetch(assets.fetch_og_image_fallback, url, eid)
+
     if thumbnail_jobs:
         results = await asyncio.gather(
-            *(assets.fetch_thumbnail(url, eid) for eid, url in thumbnail_jobs),
+            *(_thumbnail_fetch(eid, url) for eid, url in thumbnail_jobs),
             return_exceptions=True,
         )
         path_by_id: dict[int, str] = {}
@@ -572,7 +600,7 @@ async def _ingest(plugin_cls: Any) -> dict:
     # image_url going in.
     if og_image_jobs:
         results = await asyncio.gather(
-            *(assets.fetch_og_image_fallback(url, eid) for eid, url in og_image_jobs),
+            *(_og_image_fetch(eid, url) for eid, url in og_image_jobs),
             return_exceptions=True,
         )
         og_result_by_id: dict[int, tuple[str, str]] = {}
