@@ -87,7 +87,11 @@ async def test_probe_stops_at_limit(monkeypatch):
 async def test_plugin_fetch_skips_already_extracted_urls(db_session, monkeypatch):
     source = await make_source(db_session, "scraped_site", type="generic_scrape")
     plugin = GenericScrapePlugin(source)
-    plugin._extracted_urls.add("https://example.com/already-seen")
+    # Slice 27: ``_extracted_urls`` is now an ``OrderedDict`` with FIFO
+    # eviction. Use ``_mark_extracted`` (the bounded helper) to seed
+    # the seen-set, and compare against the dict's keys for the
+    # membership check below.
+    plugin._mark_extracted("https://example.com/already-seen")
 
     async def fake_discover_sitemap_urls(url, limit=200):
         return ["https://example.com/already-seen", "https://example.com/new-one"]
@@ -108,8 +112,9 @@ async def test_plugin_fetch_skips_already_extracted_urls(db_session, monkeypatch
     assert items[0]["url"] == "https://example.com/new-one"
     # Both the pre-seeded and the newly-extracted URL are now marked
     # extracted, so a second fetch() with the same candidates finds
-    # nothing new to do.
-    assert plugin._extracted_urls == {
+    # nothing new to do. Compare against the dict's keys — the
+    # OrderedDict is bounded but membership is by URL.
+    assert set(plugin._extracted_urls.keys()) == {
         "https://example.com/already-seen",
         "https://example.com/new-one",
     }
