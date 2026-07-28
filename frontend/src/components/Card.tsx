@@ -21,7 +21,7 @@
 //     backup for anyone who doesn't want to use the gesture.
 
 import { memo, useEffect, useRef, useState, type MouseEvent, type TouchEvent } from 'react'
-import { api, type Entry, type FramingCluster } from '../api'
+import { api, type Entry, type FramingCluster, safeExternalUrl } from '../api'
 import { recordBatched, recordImmediate } from '../lib/interactions'
 import { SourceIcon, stableHue } from './SourceIcon'
 import { toast } from './Toast'
@@ -813,7 +813,10 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
     actions.push({
       label: 'Open in new tab',
       onClick: () => {
-        window.open(entry.url, '_blank', 'noopener,noreferrer')
+        // ``safeExternalUrl`` rewrites reddit.com -> old.reddit.com
+        // so the popped-out tab doesn't show the "Get the App"
+        // overlay (see api.ts for the full rationale).
+        window.open(safeExternalUrl(entry.url), '_blank', 'noopener,noreferrer')
       },
     })
     showContextMenu(e.clientX, e.clientY, actions)
@@ -1005,7 +1008,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       {entry.reddit_thread_url && (
         <div className="mt-1.5 flex items-center gap-3">
           <a
-            href={entry.reddit_thread_url}
+            href={safeExternalUrl(entry.reddit_thread_url)}
             target="_blank"
             rel="noopener noreferrer"
             data-card-interactive
@@ -1013,7 +1016,13 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
               e.preventDefault()
               e.stopPropagation()
               recordImmediate({ entry_id: entry.id, type: 'click' })
-              window.open(entry.reddit_thread_url!, '_blank', 'noopener,noreferrer')
+              // ``safeExternalUrl`` rewrites reddit.com -> old.reddit.com
+              // so the popped-out tab doesn't show the "Get the App"
+              // overlay (see api.ts). The href above is also rewritten
+              // for middle-click / cmd-click / context-menu "Open in
+              // new tab" so every path out of this card uses the
+              // app-prompt-free variant.
+              window.open(safeExternalUrl(entry.reddit_thread_url!), '_blank', 'noopener,noreferrer')
             }}
             className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
           >
@@ -1176,7 +1185,9 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
                 onClick={(e) => {
                   e.preventDefault()
                   e.stopPropagation()
-                  window.open(a.url, '_blank', 'noopener,noreferrer')
+                  // ``safeExternalUrl`` rewrites reddit.com -> old.reddit.com so
+                  // the popped-out tab doesn't show the "Get the App" overlay.
+                  window.open(safeExternalUrl(a.url), '_blank', 'noopener,noreferrer')
                 }}
                 className="flex items-start gap-2 group"
               >
@@ -1758,7 +1769,9 @@ function Thumbnail({ path, title, url, entryId }: { path: string; title: string;
     // so the headline's onClick won't fire. Record the click event
     // here so the recommendation ranker sees both kinds of opens.
     recordImmediate({ entry_id: entryId, type: 'click' })
-    window.open(url, '_blank', 'noopener,noreferrer')
+    // ``safeExternalUrl`` rewrites reddit.com -> old.reddit.com so
+    // the popped-out tab doesn't show the "Get the App" overlay.
+    window.open(safeExternalUrl(url), '_blank', 'noopener,noreferrer')
   }
   const onClick = (e: MouseEvent<HTMLDivElement>) => {
     // Don't bubble up — the article-level handlers (long-press,

@@ -7,6 +7,48 @@
 // cookie; endpoints that gate on it (POST /api/ingest, /api/interactions
 // in phase 2) require it to be present.
 
+/**
+ * Rewrite an external URL to a variant that doesn't trigger the
+ * platform's "Get the App" overlay on Reddit threads opened from
+ * iOS Safari (and the iOS PWA popout window, where the modal is
+ * particularly painful because the back button doesn't return to
+ * the parent PWA).
+ *
+ * Background: Reddit's main site (``reddit.com``, ``www.reddit.com``)
+ * shows a full-screen "Get the App" modal the first time a thread
+ * is opened from a mobile browser. The modal hijacks navigation
+ * (universal-link style) and there's no close button — force-reload
+ * or force-quit the browser/PWA is the only escape.
+ *
+ * ``old.reddit.com`` is Reddit's legacy desktop site, which:
+ *   - never shows the "Get the App" modal
+ *   - still loads the same thread content
+ *   - works on every Reddit subdomain (``.rss`` redirects,
+ *     comments, etc.) — the path is preserved 1:1
+ *   - uses a slightly older UI (functional, not pretty)
+ *
+ * We rewrite at the click-handler boundary so the backend still
+ * stores the canonical ``reddit.com`` URL — old.reddit.com is just
+ * a browser-handoff convenience. The DB schema, Reddit source
+ * fetcher, cross-reference sweep, and the in-app
+ * ``Discussed on Reddit`` text all keep using the canonical URL.
+ *
+ * Non-Reddit URLs pass through unchanged.
+ */
+export function safeExternalUrl(url: string): string {
+  if (typeof url !== 'string' || !url) return url
+  try {
+    const u = new URL(url)
+    if (u.hostname === 'reddit.com' || u.hostname === 'www.reddit.com') {
+      u.hostname = 'old.reddit.com'
+      return u.toString()
+    }
+  } catch {
+    // Not a valid absolute URL (e.g. a relative path); pass through.
+  }
+  return url
+}
+
 export interface Entry {
   id: number
   source_id: number
