@@ -1211,11 +1211,21 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
           the user is just trying to read the summary text. The
           click target is the card itself; selecting text inside
           works because the inner ``e.stopPropagation`` only fires
-          on a true click, not on text-selection dragstart. */}
+          on a true click, not on text-selection dragstart.
+
+          No ``line-clamp`` here — the user explicitly expanded the
+          summary to read it, and long LLM summaries getting
+          truncated to 3 lines made them visually concatenated (the
+          browser would overflow the text horizontally inside the
+          narrow clamp, producing the "stuck together" appearance).
+          Removing the clamp lets the card grow to fit whatever the
+          summary is. The user collapses via the chevron to hide it
+          again. The podcast + reddit summary blocks below already
+          work this way (no clamp). */}
       {expanded && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap line-clamp-3"
+          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap"
         >
           {summaryError
             ? <span className="italic">couldn't load summary</span>
