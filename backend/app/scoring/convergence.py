@@ -64,55 +64,66 @@ async def counts(
     with source_count == 1 won't get a boost anyway).
     """
     key = _cache_key(window_hours)
+    # Slice 26 (singleflight): the previous code released the lock
+    # between the cache read and the SQL scan, so two concurrent
+    # callers both saw a cache miss and both ran the scan. With a
+    # high-concurrency endpoint like ``/api/foryou`` firing while a
+    # brief is being generated, that's a thundering-herd that doubles
+    # the convergence-scan DB load on every miss.
+    #
+    # Hold the lock around the full miss path (read → scan → write)
+    # so the first caller does the scan + populates the cache, and
+    # concurrent callers see the populated cache and return without
+    # scanning. Cost: a brief serialization on the very first miss in
+    # a 30s TTL window. Win: every concurrent caller after that hits
+    # the cache without touching the DB.
     async with _cache_lock:
         cached = _cache.get(key)
-    if cached is not None:
-        return cached
+        if cached is not None:
+            return cached
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
+        # Cap the row count to the most recent ``convergence_scan_cap``
+        # entries in the window. Without this, a 24h window that catches
+        # 100k entries (a backlog after a deploy, a news-heavy weekend)
+        # pulls every row just to find the last 5k that the convergence
+        # boost actually cares about. The boost is a "hot right now"
+        # signal; old rows don't move the needle regardless of how
+        # many sources cover them, and a per-row ``title_slug`` call in
+        # Python (below) is the second cost we're saving. ``scan_cap=0``
+        # disables the cap as an escape hatch (a debugging session, a
+        # regression that needs the full historical view).
+        scan_cap = settings.convergence_scan_cap
+        if scan_cap > 0:
+            recent = (
+                select(Entry.id, Entry.title, Entry.source_id)
+                .where(Entry.published_at >= since)
+                .order_by(Entry.published_at.desc().nullslast(), Entry.id.desc())
+                .limit(scan_cap)
+                .subquery()
+            )
+            stmt = (
+                select(recent.c.title, Source.name)
+                .join(Source, Source.id == recent.c.source_id)
+            )
+        else:
+            stmt = (
+                select(Entry.title, Source.name)
+                .join(Source, Entry.source_id == Source.id)
+                .where(Entry.published_at >= since)
+            )
+        rows = (await session.execute(stmt)).all()
+        bucket: dict[str, set[str]] = defaultdict(set)
+        for title, source_name in rows:
+            slug = composite_scorer.title_slug(title)
+            if not slug:
+                continue
+            bucket[slug].add(source_name)
+        result = {slug: len(srcs) for slug, srcs in bucket.items() if len(srcs) > 1}
 
-    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
-    # Cap the row count to the most recent ``convergence_scan_cap``
-    # entries in the window. Without this, a 24h window that catches
-    # 100k entries (a backlog after a deploy, a news-heavy weekend)
-    # pulls every row just to find the last 5k that the convergence
-    # boost actually cares about. The boost is a "hot right now"
-    # signal; old rows don't move the needle regardless of how
-    # many sources cover them, and a per-row ``title_slug`` call in
-    # Python (below) is the second cost we're saving. ``scan_cap=0``
-    # disables the cap as an escape hatch (a debugging session, a
-    # regression that needs the full historical view).
-    scan_cap = settings.convergence_scan_cap
-    if scan_cap > 0:
-        recent = (
-            select(Entry.id, Entry.title, Entry.source_id)
-            .where(Entry.published_at >= since)
-            .order_by(Entry.published_at.desc().nullslast(), Entry.id.desc())
-            .limit(scan_cap)
-            .subquery()
-        )
-        stmt = (
-            select(recent.c.title, Source.name)
-            .join(Source, Source.id == recent.c.source_id)
-        )
-    else:
-        stmt = (
-            select(Entry.title, Source.name)
-            .join(Source, Entry.source_id == Source.id)
-            .where(Entry.published_at >= since)
-        )
-    rows = (await session.execute(stmt)).all()
-    bucket: dict[str, set[str]] = defaultdict(set)
-    for title, source_name in rows:
-        slug = composite_scorer.title_slug(title)
-        if not slug:
-            continue
-        bucket[slug].add(source_name)
-    result = {slug: len(srcs) for slug, srcs in bucket.items() if len(srcs) > 1}
-
-    async with _cache_lock:
+        # Write the cache and evict older entries on each insert. The
+        # TTL quantizes keys so there are at most ``1 + a tiny jitter``
+        # keys live at any moment, but pruning is cheap insurance.
         _cache[key] = result
-        # Evict older entries on each insert. The TTL quantizes keys
-        # so there are at most ``1 + a tiny jitter`` keys live at any
-        # moment, but pruning is cheap insurance.
         for old in list(_cache.keys()):
             if old[1] < key[1] - 2:  # older than ~60s — drop
                 _cache.pop(old, None)
