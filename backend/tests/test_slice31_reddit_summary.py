@@ -136,14 +136,30 @@ def test_fetch_reddit_post_body_helper_exists():
 
 
 @pytest.mark.no_db
-def test_fetch_reddit_post_body_uses_thread_comments():
+def test_fetch_reddit_post_body_uses_thread_comments_or_direct_atom():
+    """The helper must read the thread's .rss in some way (via
+    fetch_thread_comments OR a direct _get_atom call). The thread's
+    .rss first entry is the post body; the rest are comments.
+    Reusing the existing Reddit .rss fetch path (or, in slice 32,
+    calling _get_atom directly) means a single HTTP call serves
+    both the comment-summary endpoint AND the article-summary
+    endpoint on the same thread. This is true either way --
+    direct _get_atom still hits the same .rss URL, just doesn't
+    share the parsed comments cache.
+    """
     body = _function_body(ENTRY_ROUTES.read_text(), "_fetch_reddit_post_body")
     assert body, "Couldn't extract _fetch_reddit_post_body body"
-    assert "fetch_thread_comments" in body, (
-        "_fetch_reddit_post_body must use fetch_thread_comments to "
-        "reuse the existing Reddit .rss fetch path — a separate "
-        "call would double the request count and the rate-limit "
-        "token burn for every Reddit summary tap."
+    # Either path is correct -- slice 31 used fetch_thread_comments,
+    # slice 32 switched to direct _get_atom so link-post extraction
+    # has access to the <a href> in the OP <content>. Both share
+    # the same Reddit .rss underlying call.
+    assert "fetch_thread_comments" in body or "_get_atom" in body, (
+        "_fetch_reddit_post_body must read the Reddit thread's "
+        ".rss feed -- either via fetch_thread_comments (slice 31) "
+        "or a direct _get_atom call (slice 32). The Reddit .rss "
+        "feed is the only reliable source of the OP body, since "
+        "reddit.com main site is a client-rendered SPA. "
+        "fetch_article_text returns empty for every reddit.com URL."
     )
 
 
