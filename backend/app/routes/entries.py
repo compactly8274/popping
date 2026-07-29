@@ -597,31 +597,109 @@ def _is_reddit_url(url: str | None) -> bool:
 async def _fetch_reddit_post_body(url: str) -> str:
     """Fetch a Reddit thread's post body via its ``.rss`` feed.
 
-    Reddit's main site is a client-rendered SPA — ``fetch_article_text``
+    Reddit's main site is a client-rendered SPA -- ``fetch_article_text``
     (which uses trafilatura to extract from raw HTML) returns empty
     for any ``reddit.com`` URL because the actual post body never
     lands in the initial HTML payload. Reddit's ``.rss`` feed
-    sidesteps this: the first ``<entry>`` in the thread's RSS IS
-    the post itself (the OP's body text), rendered as a
+    sidesteps this: the first ``<entry>`` in the thread's RSS is the
+    post itself (the OP's body text), rendered as a
     ``<content type="html">`` element that the standard XML parser
     reads directly.
 
-    Returns the cleaned text of the first entry, or empty string on
-    any failure (Reddit down, rate-limited, malformed feed, empty
-    body). The same comments-fetch path is used elsewhere, so the
-    rate-limit semantics align with the existing direct-mode
-    bucket: a rate-limited call here doesn't block the
-    cross-reference sweep or the scheduled ingest jobs.
+    Reddit serves TWO kinds of post in its threads:
+
+      - Self-posts: the OP includes a body of markdown text, which
+        Reddit serialises into ``<content type="html">``. The first
+        ``<entry>``'s content IS the article body. This is the easy
+        case -- return that cleaned content.
+
+      - Link posts: the OP links out to an external article and
+        Reddit's first ``<entry>`` is just a tiny ``submitted by /u/X
+        [link] [comments]`` template card (the actual article body
+        is at the linked external URL). The template text shows up
+        in the first ``<entry>``'s ``<content type="html">`` --
+        fetching and returning it as the summary is useless (it
+        would say ``submitted by X [link] [comments]`` with no
+        actual article body). For link posts, detect the template
+        shape, pull the external URL from the same first entry's
+        content, and fall back to ``fetch_article_text`` on that URL
+        (trafilatura extraction).
+
+    Returns the cleaned body text of the first entry (self-post) OR
+    the linked external article's text (link post), or empty
+    string on any failure (Reddit down, rate-limited, malformed
+    feed, no linked URL for a link post, external fetch failed).
+
+    Detection heuristic for the link-post template: the first
+    entry's cleaned content must contain both ``submitted by`` AND
+    ``[link]`` (the two markers in the Reddit template). False
+    positives are extremely unlikely -- a self-post would have to
+    be about literally submitting links and contain both phrases,
+    which isn't a normal Reddit post shape. The detection is
+    intentionally narrow on purpose: a tighter check is worse than
+    no check (the worst miss is ``we show the template card as a
+    1-line summary``, which is what the user reported before this
+    slice).
+
+    One network call to Reddit (the thread's .rss feed) for both
+    self-post and link-post detection. The link-post path adds a
+    second HTTP call to the linked external URL only when the
+    Reddit RSS shape tells us it's a link post. Self-posts skip
+    the second call entirely. The proxy keeps responses in its
+    rate-limit bucket; bursts are still capped at 2 req/s +
+    4 burst.
     """
+    import re
+    from app import reddit_client  # local import to avoid a top-level cycle
+    from defusedxml import ElementTree as ET
+
+    # Build the same path the reddit_client uses for the thread.
+    path = url.rstrip("/") + "/.rss"
+    if path.startswith("https://www.reddit.com"):
+        path = path[len("https://www.reddit.com"):]
     try:
-        comments = await fetch_thread_comments(url)
+        body = await reddit_client._get_atom(path)
     except Exception:
         return ""
-    if not comments:
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
         return ""
-    # The thread's RSS includes the post as the first entry, then
-    # the comments in tree order. The first entry is the OP.
-    return _clean_summary(comments[0].get("text", ""))
+    entries = root.findall("atom:entry", reddit_client._NS)
+    if not entries:
+        return ""
+    first = entries[0]
+    op_html = first.findtext("atom:content", default="", namespaces=reddit_client._NS)
+    op_text = _clean_summary(op_html)
+
+    # Link-post detection. If the OP text is just Reddit's
+    # ``submitted by ... [link] [comments]`` template card, fall
+    # back to fetching the external article (the real body lives
+    # at the linked URL, not in the thread).
+    if (
+        op_text
+        and "submitted by" in op_text.lower()
+        and "[link]" in op_text.lower()
+    ):
+        # Link post. Pull the external URL from the OP HTML's first
+        # non-reddit.com anchor. Reddit's submission card embeds
+        # the outbound link as ``<a href="EXTERNAL_URL">[link]</a>``.
+        for m in re.finditer(r'<a\s+href="([^"]+)"', op_html):
+            external_url = m.group(1)
+            # Skip reddit.com internal anchors (the user's profile,
+            # the comment permalink, the subreddit). We want the
+            # outbound link, which is the article body.
+            if "reddit.com" in external_url:
+                continue
+            external_text = await fetch_article_text(external_url)
+            if external_text:
+                return _clean_summary(external_text)
+            # External fetch failed; fall through and return
+            # op_text rather than empty (which would cache an empty
+            # summary for 24h).
+            break
+    # Self-post: the OP text IS the body.
+    return op_text
 
 
 @router.post(
