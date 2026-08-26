@@ -175,6 +175,18 @@ class DynamicRedditPlugin(SourcePlugin):
                 if created_ts
                 else None
             )
+            # Build the Reddit thread URL from the permalink — this is
+            # always the Reddit discussion page, NOT the external
+            # article URL. For link posts the outbound_url is the
+            # external article (e.g. https://bbc.com/...), but
+            # ``reddit_thread_url`` is consumed by the comment-summary
+            # endpoint and the "Discussed on Reddit" card link, both
+            # of which need the Reddit thread, not the article.
+            # Self-posts already have outbound_url == the thread URL,
+            # so this is a no-op for them.
+            reddit_thread_url = (
+                f"https://www.reddit.com{permalink}" if permalink else ""
+            )
             out.append({
                 "title": listing.get("title") or "",
                 "url": outbound_url,
@@ -213,19 +225,23 @@ class DynamicRedditPlugin(SourcePlugin):
                     # == None`` and breaks the comment-summary path.
                     # Setting it here makes the data uniform across
                     # source types.
-                    "reddit_thread_url": (
-                        outbound_url if outbound_url.startswith("http")
-                        else f"https://www.reddit.com{permalink}" if permalink
-                        else ""
-                    ),
+                    #
+                    # B3 fix: always use the Reddit permalink, NOT the
+                    # outbound article URL. For link posts the
+                    # outbound_url is the external article (e.g.
+                    # https://bbc.com/...); stamping that as
+                    # reddit_thread_url broke the comment-summary
+                    # endpoint and the "Discussed on Reddit" card
+                    # link, which both need the Reddit thread URL.
+                    "reddit_thread_url": reddit_thread_url,
                 },
             })
         return out
 
     # ``normalize`` falls through to ``SourcePlugin.normalize`` →
     # ``validate_required`` (in ``base.py``). Our ``fetch`` already
-    # emits contract-correct shapes (title + url are always set),
-    # so no per-source override is needed. Keeping the default makes
+    # emits contract-correct shapes (title + url are always set), so
+    # no per-source override is needed. Keeping the default makes
     # the contract self-evident: anything custom would go here.
 
     @property
