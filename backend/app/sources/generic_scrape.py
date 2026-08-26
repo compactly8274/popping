@@ -62,14 +62,21 @@ _SUMMARY_MAX_CHARS = 2000
 _MAX_EXTRACTED_URLS = 5000
 
 
-async def _extract_one(url: str) -> dict | None:
+async def _extract_one(url: str, custom_headers: dict | None = None) -> dict | None:
     """Fetch + extract a single candidate URL into a plugin-item
     dict, or None if the fetch or extraction didn't produce anything
     usable. Module-level (not a method) so both ``GenericScrapePlugin.
     fetch`` and the "Test" endpoint's ``probe`` below share the exact
     same extraction logic without one needing a full Source row to
-    exercise the other's code path."""
-    html = await fetch_html(url)
+    exercise the other's code path.
+
+    ``custom_headers`` (B4 fix): forwarded to ``fetch_html`` so the
+    plugin can pass user-supplied ``Source.custom_headers`` (e.g.
+    a custom User-Agent for sites that block default UAs, or an
+    Authorization header for paywalled content) through to the
+    actual HTTP request. ``None`` uses only the default headers.
+    """
+    html = await fetch_html(url, custom_headers=custom_headers)
     if html is None:
         return None
     try:
@@ -224,7 +231,7 @@ def _extract_links_from_html(html: str, page_url: str, pattern: str) -> list[str
     # or ``href='...'``. Order matters: capture the URL value,
     # not the surrounding HTML.
     for match in re.finditer(
-        r'<a\s[^>]*href=([\"\'])([^\"\']*)\1[^>]*>',
+        r'<a\s[^>]*href=(["\'])([^"\']*)\1[^>]*>',
         html,
         re.IGNORECASE,
     ):
@@ -306,6 +313,14 @@ class GenericScrapePlugin(SourcePlugin):
         # shapes (``/library/<model>``, ``/blog/<slug>``, etc).
         # gettattr with a default preserves pre-migration rows.
         self.link_pattern: Optional[str] = getattr(source_row, "link_pattern", None)
+        # B4 fix: user-supplied custom HTTP headers (e.g. a custom
+        # User-Agent for sites that block default UAs, or an
+        # Authorization header for paywalled content). Stored on
+        # the Source row via ``add_source`` / ``update_source``;
+        # forwarded to ``fetch_html`` on every candidate URL
+        # extraction. ``None`` (or empty dict) means "use default
+        # headers only" — the pre-B4 behavior.
+        self.custom_headers: dict | None = getattr(source_row, "custom_headers", None)
         # In-process cache of URLs we've already attempted extraction
         # for — see the module docstring for why this instance
         # persists across polls. Resets on backend restart, which
@@ -374,7 +389,12 @@ class GenericScrapePlugin(SourcePlugin):
                 # instead of being skipped forever.
                 break
             attempted += 1
-            item = await _extract_one(url)
+            # B4 fix: pass custom_headers through to _extract_one
+            # so user-supplied headers (e.g. a custom User-Agent
+            # or Authorization) are actually used by the HTTP
+            # fetch. Previously the headers were stored on the
+            # Source row but never passed to fetch_html.
+            item = await _extract_one(url, custom_headers=self.custom_headers)
             # Use the bounded helper (FIFO eviction at
             # ``_MAX_EXTRACTED_URLS``) instead of ``.add()`` to keep
             # the in-memory set's footprint fixed.
