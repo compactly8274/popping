@@ -24,6 +24,7 @@ import httpx
 
 from app.sources import register_source
 from app.sources.base import SourcePlugin
+from app.url_safety import ssrf_event_hook
 
 logger = logging.getLogger("popping.sources.cisa_kev")
 
@@ -62,6 +63,12 @@ class CisaKev(SourcePlugin):
             async with httpx.AsyncClient(
                 timeout=_TIMEOUT, headers=_DEFAULT_HEADERS,
                 follow_redirects=True, max_redirects=5,
+                # B7: per-hop SSRF guard — fires before every request
+                # httpx sends, including redirect hops. CISA's URL is
+                # hardcoded and safe, but a compromised CDN redirect
+                # chain could point at a private IP; the hook catches
+                # that before the TCP connection opens.
+                event_hooks={"request": [ssrf_event_hook]},
             ) as client:
                 # Stream so we can enforce the byte cap on the actual
                 # body, not just the advisory Content-Length header
