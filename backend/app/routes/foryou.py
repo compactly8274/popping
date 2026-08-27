@@ -7,6 +7,23 @@ story clusters get a multiplicative bump as soon as they form.
 The convergence SQL is one GROUP BY over the last
 ``convergence_window_hours``, cached at the process level for 30s —
 see ``app.scoring.convergence`` for the helper.
+
+Scoring strategy
+----------------
+
+The endpoint reads the stored ``composite_score`` column (which already
+blends recency, personal, source weight, and engagement — refreshed
+every 10 min by the scheduler's rescore tick) and applies only the
+convergence multiplier at query time.  The previous implementation
+pulled ``Entry.embedding`` (Vector(384)) for 500 candidate rows
+(~1.5MB of wire data per request) to recompute ``personal_score`` in
+Python via cosine similarity, but the stored value is already current
+within a 10-minute window — the live recompute was pure overhead.
+
+The convergence multiplier is the only signal that can change between
+rescore ticks (a story can enter a multi-source cluster at any
+moment), so applying it at query time is the correct and sufficient
+live adjustment.  The brief generator uses the same pattern.
 """
 
 from __future__ import annotations
@@ -16,7 +33,6 @@ import datetime as dt
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.auth.deps import current_user
 from app.config import settings
@@ -42,42 +58,27 @@ async def foryou(
       1. Pull a wide candidate set ordered by composite_score DESC.
          We over-fetch (capped at 500) so convergence-boosted entries
          still have room to climb into the result.
-      2. Recompute composite_score with the convergence multiplier
-         applied (per-row source_count for the entry's title slug).
+      2. Apply the convergence multiplier to the stored composite_score.
       3. Re-sort and trim to ``limit``.
     """
     profile = await session.scalar(select(UserProfile).where(UserProfile.id == 1))
 
     over_fetch = min(max(limit * 4, 200), 500)
-    # ``selectinload(Entry.source)`` eagerly fetches the related
-    # ``Source`` rows in a single follow-up SELECT and populates them
-    # on each entry before we leave the async session. Without it,
-    # ``composite_scorer.score(entry, entry.source, ...)`` below
-    # triggers a lazy load on the SyncSession-bridged async session,
-    # which raises ``MissingGreenlet: greenlet_spawn has not been
-    # called`` — the symptom was a 500 on every /api/foryou call
-    # once a recent /api/entries?source=… call had primed enough
-    # rows. ``selectinload`` issues one IN(…) query regardless of
-    # candidate count, so the cost is bounded.
+    # Slim SELECT: we project only the columns the frontend renders plus
+    # the source fields needed for the convergence slug lookup.
+    # ``Entry.embedding`` (Vector(384)) is deliberately excluded — it
+    # was ~3KB serialized per row (~1.5MB for 500 candidates), and the
+    # stored ``composite_score`` already incorporates the personal
+    # component (refreshed every 10 min by the scheduler rescore tick).
+    # The only live adjustment is the convergence multiplier, which
+    # uses the entry title (already in the projection) and the cached
+    # convergence counts (one GROUP BY, 30s TTL).
     #
-    # Slim SELECT: we only need the columns the frontend renders plus
-    # the source join. ``meta`` JSONB is ~500B and unused here (the
-    # per-card summary endpoint pulls it on demand).
-    #
-    # B1 fix: ``Entry.embedding`` (Vector(384)) is now included in the
-    # slim projection. It was previously excluded (~3KB serialized per
-    # row, or ~1.5MB for 500 candidates), which caused the personal
-    # scorer's cosine similarity to fall back to the neutral 50 for
-    # every entry — the /foryou feed was effectively unpersonalized
-    # (recency + source weight + engagement only). The embedding is
-    # needed by ``composite_scorer.score()`` which calls
-    # ``personal.score_partial()`` which calls ``_cosine(entry_emb,
-    # pref_vec)``; a None embedding returns the neutral midpoint.
-    # Including it here costs ~1.5MB of wire data over the docker-compose
-    # network (local, sub-ms latency), which is an acceptable trade-off
-    # for actually personalizing the feed. The DB is on the same host;
-    # pgvector's binary wire format is more compact than the 3KB text
-    # serialization, so the real overhead is lower.
+    # JOIN Source in the same query (instead of a follow-up IN query)
+    # so we can read source.category for the category filter and avoid
+    # a second DB round-trip.  Projecting source fields the scorer might
+    # need keeps the door open for future re-weighting without re-
+    # introducing the N+1 pattern.
     stmt = (
         select(
             Entry.id,
@@ -92,13 +93,17 @@ async def foryou(
             Entry.image_url,
             Entry.image_path,
             Entry.cached_summary,
-            Entry.embedding,
             # Reddit cross-reference footer. Same projection as
             # ``/api/entries`` — ``->>`` returns unescaped text;
             # NULL when the key is absent. Coerced to int in the
             # _Row builder below (see comment there).
             Entry.meta.op("->>")("reddit_thread_url").label("reddit_thread_url"),
             Entry.meta.op("->>")("reddit_comment_count").label("reddit_comment_count_text"),
+            # Source fields needed for category filter and potential
+            # future re-weighting.  Joining here eliminates the second
+            # round-trip the previous code did to hydrate Source rows.
+            Source.category.label("source_category"),
+            Source.source_weight.label("source_weight"),
         )
         .join(Source, Entry.source_id == Source.id)
         .order_by(Entry.composite_score.desc(), Entry.published_at.desc().nullslast())
@@ -109,17 +114,6 @@ async def foryou(
     rows = (await session.execute(stmt)).all()
     if not rows:
         return []
-    # Hydrate into ORM-ish objects the score loop can read. We can't
-    # use scalars() + .all() here because we project specific columns
-    # (no Entry row); re-attach the source via a follow-up IN query
-    # so composite_scorer.score() can read entry.source.
-    source_ids = list({r.source_id for r in rows})
-    sources_by_id = {
-        s.id: s
-        for s in (
-            await session.scalars(select(Source).where(Source.id.in_(source_ids)))
-        ).all()
-    }
 
     conv = await convergence.counts(session, settings.convergence_window_hours)
 
@@ -127,10 +121,10 @@ async def foryou(
         __slots__ = (
             "id", "source_id", "title", "url", "published_at", "fetched_at",
             "composite_score", "personal_score", "raw_score",
-            "image_url", "image_path", "cached_summary", "source",
-            "reddit_thread_url", "reddit_comment_count", "embedding",
+            "image_url", "image_path", "cached_summary",
+            "reddit_thread_url", "reddit_comment_count",
         )
-        def __init__(self, raw, source):
+        def __init__(self, raw):
             self.id = raw.id
             self.source_id = raw.source_id
             self.title = raw.title
@@ -143,7 +137,6 @@ async def foryou(
             self.image_url = raw.image_url
             self.image_path = raw.image_path
             self.cached_summary = raw.cached_summary
-            self.source = source
             self.reddit_thread_url = raw.reddit_thread_url
             # ``reddit_comment_count`` projects as text from JSONB
             # (``->>`` is always text). Coerce to int so the
@@ -155,17 +148,18 @@ async def foryou(
                 self.reddit_comment_count = int(raw_count) if raw_count is not None else None
             except (TypeError, ValueError):
                 self.reddit_comment_count = None
-            # B1 fix: populate embedding from the query. The personal
-            # scorer's ``_cosine()`` accepts a list, ndarray, or None;
-            # pgvector returns a list of floats (or None if the column
-            # is NULL for this entry).
-            self.embedding = raw.embedding
 
-    candidates = [_Row(r, sources_by_id.get(r.source_id)) for r in rows]
+    candidates = [_Row(r) for r in rows]
 
+    # Apply the convergence multiplier to the stored composite_score.
+    # The stored composite_score already blends recency, personal,
+    # source weight, and engagement (refreshed every 10 min by the
+    # scheduler's rescore tick).  The convergence multiplier is the
+    # only signal that can change between ticks, so applying it here
+    # is sufficient.  The brief generator uses the same pattern.
     boosted: list[tuple[float, _Row]] = []
     for entry in candidates:
-        base = composite_scorer.score(entry, entry.source, profile)
+        base = entry.composite_score or 0.0
         slug = composite_scorer.title_slug(entry.title)
         mult = composite_scorer.convergence_multiplier(conv.get(slug, 1))
         boosted.append((base * mult, entry))
