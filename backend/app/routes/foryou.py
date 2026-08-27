@@ -42,7 +42,7 @@ from app.schemas import EntryListOut
 from app.scoring import composite as composite_scorer
 from app.scoring import convergence
 
-router = APIRouter(tags=["\"foryou\""])
+router = APIRouter(tags=["foryou"])
 
 
 @router.get("/foryou", response_model=list[EntryListOut])
