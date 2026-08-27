@@ -70,7 +70,7 @@ async def test_probe_stops_at_limit(monkeypatch):
     async def fake_discover_sitemap_urls(url, limit=50):
         return [f"https://example.com/{i}" for i in range(5)]
 
-    async def fake_extract_one(url):
+    async def fake_extract_one(url, custom_headers=None):
         return {"title": f"Article at {url}", "url": url}
 
     monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
@@ -98,7 +98,7 @@ async def test_plugin_fetch_skips_already_extracted_urls(db_session, monkeypatch
 
     calls: list[str] = []
 
-    async def fake_extract_one(url):
+    async def fake_extract_one(url, custom_headers=None):
         calls.append(url)
         return {"title": "New Article", "url": url}
 
@@ -128,7 +128,7 @@ async def test_plugin_fetch_respects_per_poll_cap(db_session, monkeypatch):
     async def fake_discover_sitemap_urls(url, limit=200):
         return [f"https://example.com/{i}" for i in range(generic_scrape._MAX_NEW_PER_POLL + 5)]
 
-    async def fake_extract_one(url):
+    async def fake_extract_one(url, custom_headers=None):
         return {"title": f"Article {url}", "url": url}
 
     monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)

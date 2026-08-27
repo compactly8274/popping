@@ -124,7 +124,7 @@ async def test_plugin_page_links_runs_when_sitemap_empty_and_pattern_set():
         "https://ollama.com/library/bar",
     ]
 
-    async def fake_extract(url: str):
+    async def fake_extract(url: str, custom_headers=None):
         return {"title": url.rsplit("/", 1)[-1], "url": url, "text": "x", "published_at": None, "summary": "x", "image_url": None}
 
     with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=[])), \
@@ -157,7 +157,7 @@ async def test_plugin_sitemap_wins_over_page_links():
 
     sitemap_candidates = ["https://example.com/post-1", "https://example.com/post-2"]
 
-    async def fake_extract(url: str):
+    async def fake_extract(url: str, custom_headers=None):
         return {"title": url.rsplit("/", 1)[-1], "url": url, "text": "x", "published_at": None, "summary": "x", "image_url": None}
 
     with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=sitemap_candidates)), \
