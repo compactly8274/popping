@@ -25,6 +25,7 @@ import httpx
 from app.config import settings
 from app.sources import register_source
 from app.sources.base import SourcePlugin
+from app.url_safety import ssrf_event_hook
 
 logger = logging.getLogger("popping.sources.github_releases")
 
@@ -162,6 +163,11 @@ class GithubReleases(SourcePlugin):
         async with httpx.AsyncClient(
             timeout=_TIMEOUT,
             follow_redirects=True, max_redirects=5,
+            # B7: per-hop SSRF guard — fires before every request
+            # httpx sends, including redirect hops. GitHub's URL is
+            # hardcoded and safe, but a compromised CDN redirect
+            # chain could point at a private IP.
+            event_hooks={"request": [ssrf_event_hook]},
         ) as client:
             # Concurrent across repos — keeps total wall time at one
             # round-trip. 5 in flight is fine for our default list.

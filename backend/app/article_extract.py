@@ -50,18 +50,44 @@ _ARTICLE_CHAR_BUDGET = 12_000
 # extraction's leftovers.
 _MIN_USABLE_CHARS = 200
 
+# Default User-Agent for all fetches. Callers can override via the
+# ``custom_headers`` parameter to ``fetch_html`` (B4 fix).
+_DEFAULT_HEADERS = {"User-Agent": "Popping/0.2"}
 
-async def fetch_html(url: str) -> str | None:
+
+async def fetch_html(url: str, custom_headers: dict | None = None) -> str | None:
     """SSRF-guarded HTML fetch, public so other callers that need raw
     HTML (rather than just extracted article text) can reuse the same
     guarded fetch instead of duplicating it — see
     ``app.sources.generic_scrape``, which needs the title trafilatura's
     metadata extraction gives it, not just the body text
-    ``extract_text`` below returns."""
+    ``extract_text`` below returns.
+
+    Parameters
+    ----------
+    url
+        The URL to fetch.
+    custom_headers
+        Optional dict of HTTP headers to merge with (or override)
+        the default headers. ``User-Agent`` and other keys supplied
+        here take precedence over the defaults. ``None`` (the
+        default) uses only the default headers. This is the path
+        that ``GenericScrapePlugin`` uses to pass user-supplied
+        ``Source.custom_headers`` through to the fetch (B4 fix).
+    """
     safe, reason = check_url_safe(url)
     if not safe:
         logger.info("article_extract: %s rejected by URL safety check (%s)", url, reason)
         return None
+    # Merge default headers with custom headers. Custom headers take
+    # precedence (e.g. a user-supplied User-Agent override for sites
+    # that block default UAs). ``None`` values in custom_headers are
+    # skipped so a caller can't accidentally null out a required header.
+    headers = dict(_DEFAULT_HEADERS)
+    if custom_headers:
+        for k, v in custom_headers.items():
+            if v is not None:
+                headers[k] = v
     try:
         async with httpx.AsyncClient(
             timeout=_FETCH_TIMEOUT,
@@ -77,7 +103,7 @@ async def fetch_html(url: str) -> str | None:
             # the hook is the per-hop guard.
             event_hooks={"request": [ssrf_event_hook]},
         ) as client:
-            async with client.stream("GET", url, headers={"User-Agent": "Popping/0.2"}) as resp:
+            async with client.stream("GET", url, headers=headers) as resp:
                 if resp.status_code >= 400:
                     logger.info("article_extract: %s -> HTTP %s", url, resp.status_code)
                     return None
@@ -126,12 +152,12 @@ def extract_text(html: str) -> str | None:
     return text[:_ARTICLE_CHAR_BUDGET]
 
 
-async def fetch_article_text(url: str) -> str | None:
+async def fetch_article_text(url: str, custom_headers: dict | None = None) -> str | None:
     """Fetch ``url`` and return its extracted article text, or None on
     any failure (network, SSRF rejection, empty body, extraction
     found nothing usable). Never raises — callers treat None as "fall
     back to the feed's own summary"."""
-    html = await fetch_html(url)
+    html = await fetch_html(url, custom_headers=custom_headers)
     if html is None:
         return None
     return extract_text(html)

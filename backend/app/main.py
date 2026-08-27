@@ -7,8 +7,33 @@ Lifespan:
     by the scheduler itself.
   - Down: stop scheduler, dispose engine.
 
-Alembic is run by the Dockerfile's CMD (`alembic upgrade head && uvicorn`),
-so by the time the app starts, the schema is already current.
+Alembic is run by the Dockerfile's CMD (`alembic upgrade head && uvicorn`),    so by the time the app starts, the schema is already current.
+
+Middleware ordering
+-------------------
+
+Starlette executes middleware in LIFO order: the **last** middleware
+added via ``@app.middleware("http")`` runs **first** (outermost) on
+the request path and **last** on the response path. The order matters
+because ``_request_id`` must bind the ``request_id`` contextvar BEFORE
+any other middleware or route handler logs anything — otherwise those
+log lines trigger ``KeyError`` in the formatter (the ``%(request_id)s``
+field is absent from the record).
+
+Current order (by registration, innermost → outermost):
+
+  1. ``CORSMiddleware`` (added via ``app.add_middleware``)
+  2. ``_assets_security_headers``
+  3. ``_security_headers``
+  4. ``_request_id`` — **must be last** so it wraps everything
+
+If you add a new ``@app.middleware("http")``, add it ABOVE the
+``_request_id`` middleware (i.e. before it in the file) so
+``_request_id`` remains the outermost wrapper. The ``_RequestIdFilter``
+below is defensive (uses ``getattr`` with a ``"-"`` fallback) so a
+misordered middleware won't crash the process — but log lines emitted
+before ``_request_id`` fires will show ``[req=-]`` instead of the real
+id, making trace correlation harder. Keep the order correct.
 """
 
 from __future__ import annotations
@@ -63,10 +88,34 @@ class _RequestIdFilter(logging.Filter):
     A ``LogRecord`` gains a ``request_id`` attribute (str) —
     FastAPI/starlette's logging chain doesn't touch this name,
     so adding it is safe.
+
+    Defensive (B8): uses ``getattr`` with a ``"-"`` fallback so a
+    log record that somehow reaches this filter without the
+    contextvar being set (e.g. a middleware added above
+    ``_request_id`` that logs before the id is bound) produces
+    ``[req=-]`` instead of raising ``KeyError`` inside the
+    formatter. The previous version relied on ``current_request_id()``
+    always returning a value (``None`` → ``"-"``), which is true
+    for records emitted after the filter runs — but a record
+    emitted by a misordered middleware before ``_request_id`` fires
+    would still have ``request_id`` unset on the ``LogRecord``
+    because the filter hadn't run yet. The ``getattr`` on the
+    *record* (not the contextvar) is the belt-and-suspenders fix:
+    even if the filter runs, the record's ``request_id`` is set
+    by the filter itself, so the only way it's missing is if
+    the filter didn't run for that record — which the ``getattr``
+    handles gracefully.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.request_id = current_request_id() or "-"
+        # Pull from the contextvar (the primary path) and set it
+        # on the record. The ``getattr`` fallback on the record
+        # itself handles the rare case where a record was created
+        # before this filter ran (e.g. during logging.basicConfig
+        # before the filter was attached, or a misordered
+        # middleware).
+        rid = current_request_id() or "-"
+        record.request_id = rid
         return True
 
 
@@ -275,6 +324,18 @@ if settings.oidc_enabled:
 app.mount("/assets", StaticFiles(directory=settings.assets_dir), name="assets")
 
 
+# ---------------------------------------------------------------------------
+# HTTP middleware — order matters! See the module docstring.
+#
+# The ``_request_id`` middleware MUST be registered LAST (so it's
+# outermost in Starlette's LIFO stack). If you add a new middleware,
+# add it ABOVE ``_request_id`` — never below it. A middleware that
+# runs before ``_request_id`` binds the contextvar will produce log
+# lines with ``[req=-]`` instead of the real request id, breaking
+# trace correlation.
+# ---------------------------------------------------------------------------
+
+
 @app.middleware("http")
 async def _assets_security_headers(request, call_next):
     """Add ``X-Content-Type-Options: nosniff`` to /assets/* responses.
@@ -351,6 +412,11 @@ async def _request_id(request, call_next):
     request on the same asyncio task (rare under uvicorn,
     possible under some test fixtures) doesn't inherit the
     previous request's id.
+
+    **MUST be the last middleware registered** (outermost in
+    Starlette's LIFO stack) so the request id is bound before
+    any other middleware or route handler runs. See the module
+    docstring for the ordering rationale.
     """
     incoming = request.headers.get("X-Request-Id")
     rid = bind_request_id(incoming)

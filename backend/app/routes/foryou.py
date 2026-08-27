@@ -61,9 +61,23 @@ async def foryou(
     # candidate count, so the cost is bounded.
     #
     # Slim SELECT: we only need the columns the frontend renders plus
-    # the source join. ``embedding`` (Vector(384)) is ~3KB serialized
-    # and unused at this layer, ``meta`` JSONB is ~500B and unused
-    # here (the per-card summary endpoint pulls it on demand).
+    # the source join. ``meta`` JSONB is ~500B and unused here (the
+    # per-card summary endpoint pulls it on demand).
+    #
+    # B1 fix: ``Entry.embedding`` (Vector(384)) is now included in the
+    # slim projection. It was previously excluded (~3KB serialized per
+    # row, or ~1.5MB for 500 candidates), which caused the personal
+    # scorer's cosine similarity to fall back to the neutral 50 for
+    # every entry — the /foryou feed was effectively unpersonalized
+    # (recency + source weight + engagement only). The embedding is
+    # needed by ``composite_scorer.score()`` which calls
+    # ``personal.score_partial()`` which calls ``_cosine(entry_emb,
+    # pref_vec)``; a None embedding returns the neutral midpoint.
+    # Including it here costs ~1.5MB of wire data over the docker-compose
+    # network (local, sub-ms latency), which is an acceptable trade-off
+    # for actually personalizing the feed. The DB is on the same host;
+    # pgvector's binary wire format is more compact than the 3KB text
+    # serialization, so the real overhead is lower.
     stmt = (
         select(
             Entry.id,
@@ -78,6 +92,7 @@ async def foryou(
             Entry.image_url,
             Entry.image_path,
             Entry.cached_summary,
+            Entry.embedding,
             # Reddit cross-reference footer. Same projection as
             # ``/api/entries`` — ``->>`` returns unescaped text;
             # NULL when the key is absent. Coerced to int in the
@@ -113,7 +128,7 @@ async def foryou(
             "id", "source_id", "title", "url", "published_at", "fetched_at",
             "composite_score", "personal_score", "raw_score",
             "image_url", "image_path", "cached_summary", "source",
-            "reddit_thread_url", "reddit_comment_count",
+            "reddit_thread_url", "reddit_comment_count", "embedding",
         )
         def __init__(self, raw, source):
             self.id = raw.id
@@ -140,6 +155,11 @@ async def foryou(
                 self.reddit_comment_count = int(raw_count) if raw_count is not None else None
             except (TypeError, ValueError):
                 self.reddit_comment_count = None
+            # B1 fix: populate embedding from the query. The personal
+            # scorer's ``_cosine()`` accepts a list, ndarray, or None;
+            # pgvector returns a list of floats (or None if the column
+            # is NULL for this entry).
+            self.embedding = raw.embedding
 
     candidates = [_Row(r, sources_by_id.get(r.source_id)) for r in rows]
 

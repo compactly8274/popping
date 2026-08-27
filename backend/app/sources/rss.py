@@ -31,7 +31,7 @@ import httpx
 
 from app.sources import register_source
 from app.sources.base import SourcePlugin
-from app.url_safety import check_url_safe
+from app.url_safety import check_url_safe, ssrf_event_hook
 
 logger = logging.getLogger("popping.sources.rss")
 
@@ -379,6 +379,15 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
             async with httpx.AsyncClient(
                 timeout=_RSS_TIMEOUT,
                 follow_redirects=True, max_redirects=5,
+                # B7: per-hop SSRF guard — fires before every request
+                # httpx sends, including redirect hops. RSS feed URLs
+                # can be user-controlled (DynamicRssPlugin), so the
+                # guard is critical here — without it a feed owner
+                # could redirect the backend to 127.0.0.1 or
+                # 169.254.169.254. The post-response final-URL check
+                # below is the safety net for the LAST hop; this hook
+                # is the per-hop guard that cuts the chain early.
+                event_hooks={"request": [ssrf_event_hook]},
             ) as client:
                 resp = await client.get(url, headers=merged_headers)
                 resp.raise_for_status()
