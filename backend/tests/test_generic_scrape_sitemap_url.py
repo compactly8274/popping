@@ -189,7 +189,9 @@ async def test_plugin_dedup_works_with_sitemap_url_override():
     ]
 
     # Mock _extract_one to return a dummy item for any URL.
-    async def fake_extract(url: str):
+    # B4 followup: accept custom_headers kwarg to match the real
+    # _extract_one signature (fetch() passes custom_headers=self.custom_headers).
+    async def fake_extract(url: str, custom_headers=None):
         return {"title": url.split("/")[-1], "url": url, "text": "x", "published_at": None, "summary": "x", "image_url": None}
 
     with patch(
