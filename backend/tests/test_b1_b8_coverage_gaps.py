@@ -59,6 +59,28 @@ def _read(rel: str) -> str:
     return (REPO / rel).read_text()
 
 
+def _strip_py_comments(src: str) -> str:
+    """Remove ``#``-comments from Python source (line-by-line).
+
+    Structural guards that assert "token X must NOT appear in the
+    body" need the comments gone first — the body's explanatory
+    prose routinely NAMES the very thing being guarded against
+    (e.g. foryou.py's SELECT comment explains that
+    ``Entry.embedding`` is deliberately excluded, which contains
+    the literal token). Naive whole-body assertions trip on that
+    prose; this is the comment-shaped twin of the docstring-strip
+    the ingest-bugfixes suite already does. Only used by guards
+    that make negative (absence) assertions.
+    """
+    out_lines = []
+    for line in src.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        out_lines.append(line)
+    return "".join(out_lines)
+
+
 # ===========================================================================
 # B1 — foryou.py personalization via the stored composite_score
 # ===========================================================================
@@ -105,7 +127,11 @@ def test_b1_foryou_scores_via_stored_composite():
             depth -= 1
         i += 1
     select_body = src[start:i]
-    assert "Entry.embedding" not in select_body, (
+    # Strip comments BEFORE the absence check — the SELECT's own
+    # explanatory comment names ``Entry.embedding`` when describing
+    # what is deliberately excluded, and that prose is not code.
+    select_body_code = _strip_py_comments(select_body)
+    assert "Entry.embedding" not in select_body_code, (
         "foryou.py must NOT project Entry.embedding in the candidate "
         "SELECT — it is ~3 KB serialized per row and the stored "
         "composite_score already blends the personal component "
