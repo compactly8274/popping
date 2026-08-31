@@ -168,10 +168,29 @@ class _MockNewsSiteHandler(BaseHTTPRequestHandler):
 @pytest.fixture
 def mock_news_site(monkeypatch):
     """Starts a real local HTTP server serving realistic homepage +
-    feed markup, and bypasses the SSRF guard for the duration of the
-    test (a loopback test server is, by design, exactly what that
-    guard exists to block on a real request — it's not something to
-    weaken outside a test). Yields the site's base URL."""
+    feed markup, and bypasses the SSRF guards for the duration of the
+    test (a loopback test server is, by design, exactly what those
+    guards exist to block on a real request — it's not something to
+    weaken outside a test). Yields the site's base URL.
+
+    BOTH SSRF layers need neutralizing. The original version of this
+    fixture patched only the two ``check_url_safe`` module bindings
+    (feed_autodiscovery's entry check + rss.py's post-response final-
+    URL check), which was sufficient when it was written. PR #91's
+    B7 fix then added a THIRD layer: ``fetch_rss`` registers
+    ``ssrf_event_hook`` on its httpx client via
+    ``event_hooks={"request": [...]}``, and that hook resolves
+    ``check_url_safe`` from ``app.url_safety``'s OWN namespace — a
+    binding none of the existing patches touch. The hook aborted the
+    candidate probe to the loopback mock server BEFORE the request
+    was ever sent (127.0.0.1 is in the denied set), so the candidate
+    loop's ``except Exception`` swallowed the RequestError,
+    ``discover_feed_url`` returned None, and the regression test
+    failed despite the mock feed being perfectly reachable.
+    Neutralize the ``rss_mod.ssrf_event_hook`` binding too —
+    ``fetch_rss`` reads it from the module namespace when it builds
+    the client per call, so the patch takes effect for every probe.
+    """
     server = ThreadingHTTPServer(("127.0.0.1", 0), _MockNewsSiteHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -182,6 +201,12 @@ def mock_news_site(monkeypatch):
     safe = lambda url: (True, None)  # noqa: E731
     monkeypatch.setattr(feed_autodiscovery_mod, "check_url_safe", safe)
     monkeypatch.setattr(rss_mod, "check_url_safe", safe)
+    # Third layer (see docstring): the per-request event hook B7 wired
+    # into fetch_rss's httpx clients. Same loopback rationale as the
+    # check_url_safe patches above.
+    async def _noop_ssrf_event_hook(request):
+        return None
+    monkeypatch.setattr(rss_mod, "ssrf_event_hook", _noop_ssrf_event_hook)
     # courlan's get_hostinfo (which trafilatura.feeds.determine_feed's
     # caller relies on) treats a bare "127.0.0.1:PORT" as having no
     # extractable domain (it wants a real TLD) and bails before ever
