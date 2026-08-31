@@ -9,9 +9,20 @@ test.
 Coverage gaps addressed (see the audit in the conversation that
 produced this file):
 
-B1 — ``foryou.py`` must include ``Entry.embedding`` in its slim
-     SELECT so the personal scorer gets real vectors instead of
-     falling back to the neutral midpoint.
+B1 — ``foryou.py`` used to exclude ``Entry.embedding`` from its slim
+     SELECT, so the personal scorer fell back to the neutral
+     midpoint and the feed was effectively unpersonalized.  The
+     original fix re-added the embedding column to the projection.
+     PR #94 then replaced the live personal recompute entirely: the
+     endpoint now reads the STORED ``composite_score`` (which already
+     blends recency + personal + source weight + engagement —
+     refreshed every 10 min by the scheduler's rescore tick) and
+     applies only the convergence multiplier at query time.  The
+     B1 intent — personalization present on /foryou — is now
+     guaranteed by the stored column, not by a per-request vector
+     fetch (which cost ~1.5 MB of wire data per request).  These
+     tests were updated to guard the CURRENT architecture instead
+     of the pre-#94 one (the old assertion failed on main).
 
 B3 — ``dynamic_reddit.py`` must build ``reddit_thread_url`` from
      ``permalink`` (the Reddit thread path), NOT from
@@ -49,35 +60,41 @@ def _read(rel: str) -> str:
 
 
 # ===========================================================================
-# B1 — foryou.py includes Entry.embedding in the slim SELECT
+# B1 — foryou.py personalization via the stored composite_score
 # ===========================================================================
 
 
-def test_b1_foryou_includes_entry_embedding_in_select():
-    """The personal scorer's ``_cosine()`` needs the embedding column.
-    Without it every entry gets the neutral midpoint (50) and the
-    /foryou feed is effectively unpersonalized — recency + source
-    weight + engagement only.
+def test_b1_foryou_scores_via_stored_composite():
+    """The /foryou feed must rank on the STORED ``composite_score``.
 
-    The slim SELECT in foryou.py intentionally omits heavy columns
-    (``meta`` JSONB is ~500 B per row and unused here), but
-    ``Entry.embedding`` (Vector(384)) must NOT be omitted.
+    PR #94 replaced the per-request personal recompute (which pulled
+    ``Entry.embedding`` — ~3 KB serialized per row, ~1.5 MB per
+    request for 500 candidates — and recomputed the cosine in Python)
+    with a read of the stored ``composite_score``.  The stored value
+    already blends the personal component (``scoring_weight_personal``
+    in the composite formula) and is refreshed every 10 min by the
+    scheduler's rescore tick, so a live recompute was pure overhead.
+
+    The B1 intent (personalization present on /foryou) is carried by
+    two invariants now, both guarded here:
+
+      1. ``/foryou`` ranks on ``Entry.composite_score`` and does NOT
+         re-project the heavy ``Entry.embedding`` vector (the
+         pre-#94 workaround the original B1 test asserted on).
+      2. The scheduler registers the rescore job that keeps the
+         stored score fresh — without it the stored value goes stale
+         and the personal signal stops updating after ingest.
     """
     src = _read("backend/app/routes/foryou.py")
-    # The select(...) call is a multi-line expression.  We just need
-    # to see ``Entry.embedding`` inside a ``select(`` block that also
-    # includes other Entry columns — i.e. it's in the projection, not
-    # in a random comment elsewhere.
-    assert "Entry.embedding" in src, (
-        "foryou.py must include Entry.embedding in its select() projection. "
-        "Without it the personal scorer falls back to the neutral midpoint "
-        "for every entry and the /foryou feed is effectively unpersonalized."
+    # The projection includes the stored score and orders by it.
+    assert "Entry.composite_score" in src, (
+        "foryou.py must rank on the stored Entry.composite_score. "
+        "Without it the feed has no personal signal at all."
     )
-    # Verify it's in the select(...) call, not just a comment, by
-    # checking it appears inside the statement = ( select( ... ) block.
+    # The heavy embedding vector must NOT be projected. Find the
+    # stmt = ( select( ... ) block and check its body.
     m = re.search(r"stmt\s*=\s*\(\s*select\(", src)
     assert m, "Could not locate the stmt = ( select( ... block in foryou.py"
-    # Find the matching close paren of the select(...) call.
     start = m.end()  # position right after "select("
     depth = 1
     i = start
@@ -88,10 +105,38 @@ def test_b1_foryou_includes_entry_embedding_in_select():
             depth -= 1
         i += 1
     select_body = src[start:i]
-    assert "Entry.embedding" in select_body, (
-        "Entry.embedding must appear inside the select(...) call in "
-        "foryou.py's stmt = ( select( ... ) block, not just elsewhere "
-        "in the file."
+    assert "Entry.embedding" not in select_body, (
+        "foryou.py must NOT project Entry.embedding in the candidate "
+        "SELECT — it is ~3 KB serialized per row and the stored "
+        "composite_score already blends the personal component "
+        "(refreshed by the scheduler's rescore tick). The pre-PR#94 "
+        "shape cost ~1.5 MB of wire data per request for no gain."
+    )
+    # The convergence multiplier (the one signal that can change
+    # between rescore ticks) is applied at query time.
+    assert "convergence_multiplier" in src, (
+        "foryou.py must apply the convergence multiplier at query time — "
+        "it's the only score component that can change between rescore "
+        "ticks, so it's the only live adjustment the endpoint needs."
+    )
+
+
+def test_b1_rescore_job_registered():
+    """The scheduler must register the rescore tick that refreshes the
+    stored composite_score/personal_score — the freshness half of the
+    B1 invariant. Without the job, the stored score is write-once at
+    ingest and the personal component never tracks the user's
+    evolving preference vector."""
+    src = _read("backend/app/scheduler.py")
+    m = re.search(
+        r"_scheduler\.add_job\(\s*_rescore_recent_entries", src,
+    )
+    assert m, (
+        "scheduler.py must register _rescore_recent_entries as a job. "
+        "foryou.py ranks on the STORED composite_score; without the "
+        "rescore tick that value goes stale at ingest time and the "
+        "personal component stops tracking the user's preferences "
+        "(the B1 intent, regressed through a different path)."
     )
 
 
@@ -180,8 +225,8 @@ def test_b4_extract_one_accepts_custom_headers_kwarg():
 def test_b4_plugin_fetch_passes_custom_headers_to_extract_one():
     """``GenericScrapePlugin.fetch()`` must pass
     ``custom_headers=self.custom_headers`` to ``_extract_one`` so
-    user-supplied headers stored on the Source row actually reach the
-    HTTP fetch.  Before the B4 fix the headers were stored on the row
+    user-supplied headers stored on the Source row actually reach
+    the HTTP fetch.  Before the B4 fix the headers were stored on the row
     but never forwarded."""
     src = _read("backend/app/sources/generic_scrape.py")
     func_body = _extract_function_body(src, "fetch")
