@@ -86,8 +86,21 @@ _LIKE_ESCAPE_RE = re.compile(r"([\\%_])")
 
 def _escape_like(term: str) -> str:
     """Escape LIKE wildcards. Called once per request to build the
-    search pattern. Cheap (linear scan, single regex)."""
-    return _LIKE_ESCAPE_RE.sub(r"\\\\\\1", term)
+    search pattern. Cheap (linear scan, single regex).
+
+    The replacement template is ``r"\\\1"`` — in ``re.sub`` template
+    syntax ``\\`` expands to one literal backslash and ``\1`` to the
+    matched character, so each ``%`` / ``_`` / ``\`` in the term
+    becomes ``\%`` / ``\_`` / ``\\\\`` (backslash-escaped for LIKE).
+    The previous template was ``r"\\\\\\1"`` (six backslashes): three
+    escaped-backslash pairs expand to three literal backslashes and
+    the trailing ``1`` loses its group-reference meaning, so
+    ``_escape_like("100%")`` produced ``100\\\\\\1`` instead of
+    ``100\\%`` and every search containing a wildcard character
+    matched nothing (the SQL pattern required the literal text
+    ``100\\1`` in the title).
+    """
+    return _LIKE_ESCAPE_RE.sub(r"\\\1", term)
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +392,7 @@ async def list_entries(
         # works. Postgres needs the cast to be explicit; ``meta``
         # alone is a jsonb value and ILIKE on a jsonb fails.
         # Escape LIKE wildcards so a user query of "%" or "_" doesn't
-        # match every row; ``ESCAPE '\'`` tells PG the backslash is
+        # match every row; ``ESCAPE '\\'`` tells PG the backslash is
         # the escape character (the default is no escape, which would
         # make the backslash literal — see
         # https://www.postgresql.org/docs/current/functions-matching.html).
@@ -476,7 +489,7 @@ async def entries_by_ids(
     state doesn't include hidden entries).
 
     The endpoint is unauth'd — same pattern as
-    ``/api/entries``. In a homelab / single-user
+    `/api/entries`. In a homelab / single-user
     deployment, the bypass covers the common
     case; in an OIDC deployment, the row-level
     data isn't sensitive (no PII, just article
@@ -1112,4 +1125,3 @@ async def entry_related_endpoint(
             for r in rows
         ],
     )
-

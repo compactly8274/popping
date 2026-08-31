@@ -146,9 +146,29 @@ async def _load_profile(session: AsyncSession) -> UserProfile | None:
 
 
 async def _embed_text(norm: dict) -> list[float] | None:
-    """Build the embed text from a normalized item. Empty → zero vector."""
+    """Build the embed text from a normalized item. Empty → zero vector.
+
+    The summary lives in ``norm["meta"]`` — ``validate_required``
+    buckets every non-(title/url/published_at/meta) top-level key into
+    the meta dict, including ``summary``. The previous
+    ``norm.get("summary")`` read a top-level key the normalizer never
+    produced, so the summary half of the designed
+    ``title + " — " + summary`` embed text was always empty and every
+    embedding was title-only — a weaker signal for the personal
+    scorer, the preference vector, and Framing Watch clustering. RSS
+    summaries are near-plain text with occasional HTML wrappers (the
+    same shape ``routes.entries._clean_summary`` handles), so strip
+    tags and collapse whitespace before embedding to keep markup
+    noise out of the vector.
+    """
     title = (norm.get("title") or "").strip()
-    summary = (norm.get("summary") or "").strip()
+    meta = norm.get("meta") or {}
+    summary = ""
+    if isinstance(meta, dict):
+        raw_summary = meta.get("summary")
+        if raw_summary:
+            summary = re.sub(r"<[^>]+>", " ", str(raw_summary))
+            summary = re.sub(r"\s+", " ", summary).strip()
     if not title and not summary:
         return [0.0] * embedder().dim
     text = title
@@ -284,6 +304,15 @@ async def _ingest(plugin_cls: Any) -> dict:
     # the row with a stale ``last_error`` and no entries landing.
     plugin = plugin_cls() if not isinstance(plugin_cls, SourcePlugin) else plugin_cls
     newly_inserted: list[tuple[Entry, Source]] = []
+    # Every entry id inserted this tick. Re-fetched after the commit
+    # for the post-ingest hook (CVE notifications). The previous code
+    # only collected ids that landed in ``thumbnail_jobs`` — i.e.
+    # entries with a feed-supplied image — so the notify hook never
+    # saw NVD/CISA entries (which ship no images) and high-CVSS CVE
+    # alerts never fired. Tracking every insert closes that gap; the
+    # notify path itself filters by CVSS threshold and no-ops cheaply
+    # for entries without cvss meta.
+    inserted_ids: list[int] = []
     # Track entries that need a thumbnail pass. Collected here so we
     # can do the network fetches outside the DB session (each
     # ``fetch_thumbnail`` can take up to 20s with the new retry
@@ -423,6 +452,7 @@ async def _ingest(plugin_cls: Any) -> dict:
                 inserted_id = result.scalar_one_or_none()
                 if inserted_id is not None:
                     summary["inserted"] += 1
+                    inserted_ids.append(inserted_id)
                     if remote_image_url:
                         # Defer the network fetch to a single pass
                         # after the commit (see below).
@@ -450,11 +480,14 @@ async def _ingest(plugin_cls: Any) -> dict:
                 # never failed skips this; nothing to restore.
                 _reschedule_ingest_job(plugin_cls, plugin_cls.refresh_interval_seconds)
             # Re-fetch inserted rows for the post-hook (notification
-            # path) after the commit so they have stable ids.
-            if thumbnail_jobs:
-                ids = [jid for jid, _ in thumbnail_jobs]
+            # path) after the commit so they have stable ids. Covers
+            # EVERY insert this tick (``inserted_ids``), not just the
+            # thumbnail-eligible ones — see the comment on
+            # ``inserted_ids`` above for why the narrower set silently
+            # disabled the CVE notify path.
+            if inserted_ids:
                 rows = (
-                    await session.scalars(select(Entry).where(Entry.id.in_(ids)))
+                    await session.scalars(select(Entry).where(Entry.id.in_(inserted_ids)))
                 ).all()
                 for row in rows:
                     newly_inserted.append((row, source))
@@ -645,8 +678,8 @@ async def _backfill_embeddings(batch_size: int | None = None) -> None:
     """One-shot at startup: embed any existing entries with NULL embedding.
 
     Runs in batches so we don't OOM the embedder. Logs progress; never
-    raises — a failure here is logged and swallowed so the rest of the
-    app can start.
+    raises — a failure here is logged and swallowed so the rest of
+    the app can start.
     """
     if not embedder().loaded:
         logger.info("embedding backfill: skipping (embedder not loaded)")
@@ -948,8 +981,7 @@ async def _recompute_preference_vector() -> None:
                 # next tick (10 min later) re-stabilises.
                 logger.warning(
                     "pref vector: dim mismatch (old=%d, new=%d), discarding old",
-                    len(old_list),
-                    dim,
+                    len(old_list), dim,
                 )
                 old_list = [0.0] * dim
             old = np.asarray(old_list, dtype=np.float32)
@@ -1093,8 +1125,7 @@ async def _rescore_recent_entries() -> None:
                 await session.commit()
                 logger.info(
                     "rescore: updated %d/%d recent entries",
-                    len(updates),
-                    len(rows),
+                    len(updates), len(rows),
                 )
     except Exception:
         logger.exception("rescore: failed (will retry next tick)")
@@ -1891,9 +1922,10 @@ async def backfill_now() -> dict:
 # ``Source`` rows whose ``name`` is not in the registered plugin
 # registry are "dynamic" — they have no class backing them and need a
 # runtime-constructed plugin to be fetched. Covers ``type="rss"``
-# (``DynamicRssPlugin``), ``type="reddit"`` (``DynamicRedditPlugin``),
-# ``type="podcast"`` (``DynamicPodcastPlugin``), and
-# ``type="youtube_channel"`` (``DynamicYouTubePlugin``) — podcast and
+# (``DynamicRssPlugin``), ``type="reddit"``
+# (``DynamicRedditPlugin``), ``type="podcast"``
+# (``DynamicPodcastPlugin``), and ``type="youtube_channel"``
+# (``DynamicYouTubePlugin``) — podcast and
 # YouTube channel feeds are both RSS/Atom-shaped, so both are thin
 # wrappers around the same fetch path.
 #
@@ -2143,9 +2175,9 @@ async def update_source(
         custom_headers is not _UNSET and custom_headers != row.custom_headers
     )
     # ``sitemap_url`` uses the sentinel pattern: missing from the
-    # body = no-op; ``None`` (explicit null) = clear; any string =
-    # set. Comparing against the row's current value avoids a
-    # pointless scheduler rebuild on an idempotent PATCH.
+    # body = no-op; ``None`` (explicit null) = clear; any string = set.
+    # Comparing against the row's current value avoids a pointless
+    # scheduler rebuild on an idempotent PATCH.
     sitemap_url_changed = (
         sitemap_url is not _UNSET
         and sitemap_url != row.sitemap_url
@@ -2153,7 +2185,7 @@ async def update_source(
     # ``link_pattern`` participates in the same sentinel dance as
     # ``sitemap_url``: missing = no-op, explicit ``None`` = clear
     # (turn off the page_links fallback), string = set. Note the
-    # plugin treats both ``link_pattern=None`` and ``link_pattern=""
+    # plugin treats both ``link_pattern=None`` and ``link_pattern=""``
     # as "don't try page_links" via falsy-check on the field, so
     # an empty string in the body also clears.
     link_pattern_changed = (
@@ -2324,4 +2356,3 @@ async def delete_source(session: AsyncSession, source_id: int) -> bool:
         except Exception:
             pass
     return True
-

@@ -182,6 +182,14 @@ def test_extract_one_uses_parser_for_published_at(monkeypatch):
     item's ``published_at`` is a tz-aware datetime, not a
     string. The pre-slice-18 version returned the raw string,
     which crashed ``recency.score()`` downstream.
+
+    The fake_fetch_html stub accepts ``custom_headers`` — the
+    B4 fix (PR #91) added that kwarg to the real ``fetch_html``
+    signature and ``_extract_one`` now always passes it
+    (``custom_headers=None`` on the default path). A stub
+    without the kwarg raises TypeError before the parser is
+    ever exercised; this file's two stubs were missed by the
+    B4-followup test fixes in PR #92 and stayed red on main.
     """
     import trafilatura
 
@@ -196,14 +204,7 @@ def test_extract_one_uses_parser_for_published_at(monkeypatch):
         }
     )
 
-    class FakeHtmlCtx:
-        async def __aenter__(self):
-            return "<html>fake</html>"
-
-        async def __aexit__(self, *args):
-            return None
-
-    async def fake_fetch_html(url):
+    async def fake_fetch_html(url, custom_headers=None):
         return "<html>fake</html>"
 
     monkeypatch.setattr("app.sources.generic_scrape.fetch_html", fake_fetch_html)
@@ -230,7 +231,7 @@ def test_extract_one_unparseable_date_yields_none(monkeypatch):
     should return a result with ``published_at=None`` (so the
     entry still lands in the DB — just without the recency
     boost) rather than raising or returning ``None`` for the
-    whole item.
+    whole item. Same B4 stub-signature fix as above.
     """
     import trafilatura
 
@@ -245,7 +246,7 @@ def test_extract_one_unparseable_date_yields_none(monkeypatch):
         }
     )
 
-    async def fake_fetch_html(url):
+    async def fake_fetch_html(url, custom_headers=None):
         return "<html>fake</html>"
 
     monkeypatch.setattr("app.sources.generic_scrape.fetch_html", fake_fetch_html)

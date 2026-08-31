@@ -26,6 +26,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.settings import OIDCConfig
+from app.config import settings
 from app.models import Session as SessionRow
 
 
@@ -36,6 +37,35 @@ class SessionError(Exception):
 def _new_sid() -> str:
     """32 bytes of randomness, url-safe base64 (no padding)."""
     return secrets.token_urlsafe(32)
+
+
+def _sliding_ttl_seconds() -> int:
+    """The full configured TTL, used as the sliding-window extension.
+
+    The previous implementation extended ``expires_at`` by the row's
+    REMAINING time (``_row_ttl`` returned ``max(expires_at - now, 60)``),
+    so the UPDATE's ``expires_at = now + (expires_at - now)`` was a
+    no-op: the value never moved. An active user was logged out exactly
+    ``session_ttl_seconds`` after login no matter how often they
+    refreshed — the "sliding TTL" the module docstring promises never
+    actually slid.
+
+    A sliding TTL extends by the FULL configured window on every
+    authenticated request, so an in-use session never expires and
+    only a genuinely idle one hits the wall. ``settings.session_
+    ttl_seconds`` is the same source ``OIDCConfig`` copies from, so
+    rows created via ``create()`` (which uses ``cfg.session_ttl_
+    seconds``) and rows extended here stay consistent without
+    threading the config object through ``decode``.
+    """
+    ttl = getattr(settings, "session_ttl_seconds", 28800)
+    try:
+        ttl = int(ttl)
+    except (TypeError, ValueError):
+        return 28800
+    # A non-positive TTL (misconfiguration) falls back to the default
+    # 8h window rather than creating a session that instantly expires.
+    return ttl if ttl > 0 else 28800
 
 
 async def create(
@@ -75,7 +105,9 @@ async def decode(
 ) -> dict:
     """Return the user payload for ``sid``, or raise SessionError.
 
-    Touches ``last_used_at`` to implement the sliding TTL. The update is
+    Touches ``last_used_at`` and extends ``expires_at`` by the full
+    configured TTL to implement the sliding window — an active
+    session never expires while in use. The update is
     fire-and-forget — if it fails the session still works this request.
     """
     now = dt.datetime.now(dt.timezone.utc)
@@ -87,8 +119,9 @@ async def decode(
         await db.delete(row)
         await db.commit()
         raise SessionError("session expired")
-    # Sliding refresh: bump last_used_at and extend expires_at. We
-    # use UPDATE … RETURNING id so the same query that updates also
+    # Sliding refresh: bump last_used_at and extend expires_at by the
+    # FULL configured TTL (see ``_sliding_ttl_seconds``). We use
+    # UPDATE … RETURNING id so the same query that updates also
     # tells us whether the row still exists — without RETURNING, a
     # concurrent purge_expired() (running every session_purge_interval
     # from the scheduler) can DELETE the row between our SELECT and
@@ -103,7 +136,7 @@ async def decode(
         )
         .values(
             last_used_at=now,
-            expires_at=now + dt.timedelta(seconds=_row_ttl(row)),
+            expires_at=now + dt.timedelta(seconds=_sliding_ttl_seconds()),
         )
         .returning(SessionRow.id)
     )
@@ -115,13 +148,6 @@ async def decode(
         "name": row.name or "",
         "auth_method": row.auth_method,
     }
-
-
-def _row_ttl(row: SessionRow) -> int:
-    """How much longer the session has. Falls back to a sane default if
-    the row was written by an older release without a stored ttl."""
-    remaining = (row.expires_at - dt.datetime.now(dt.timezone.utc)).total_seconds()
-    return max(int(remaining), 60)
 
 
 async def destroy(db: AsyncSession, sid: str) -> None:

@@ -70,15 +70,63 @@ def validate_required(name: str, raw: dict) -> dict:
     ``&#8217;`` etc. sitting in the text (e.g. ``"Nomad&#8217;s
     accessories"`` instead of ``"Nomad's accessories"``). A no-op on
     a title that was already clean.
+
+    A plugin's own ``meta`` dict is flattened into the returned meta
+    rather than nested under a ``"meta"`` key. Several plugins (HN,
+    NVD, CISA KEV, GitHub releases, Wikipedia, dynamic Reddit) return
+    items shaped ``{title, url, published_at, summary, meta: {...}}``
+    with their source-specific keys inside ``meta``. The previous
+    "bucket every unknown top-level key" passthrough nested that dict
+    as ``meta["meta"]``, so every consumer reading top-level meta
+    keys — ``scoring.engagement`` (``engagement_score`` /
+    ``engagement_comments``), ``scheduler._cvss_score``
+    (``cvss_score``), the routes layer's ``meta ->> 'reddit_thread_url'``
+    projection, ``brief_filter.extract_summary`` — read nothing and
+    silently no-op'd: HN/Reddit engagement contributed zero to the
+    composite score (25% of its weight), high-CVSS CVE alerts never
+    fired, and the "Discussed on Reddit" card footer never rendered.
+    Flattening restores every one of those paths with no per-plugin
+    change. On a key collision the plugin's ``meta`` value wins —
+    ``dict.update`` semantics — a plugin explicitly setting e.g.
+    ``meta["summary"]`` is a deliberate, source-specific statement
+    and should not be clobbered by the passthrough bucket. A non-dict
+    ``meta`` value (no plugin ships one; defensive) stays in the
+    passthrough under the ``meta`` key rather than being dropped.
+
+    Plugins that do NOT set their own ``meta`` key (BBC via
+    ``fetch_rss``'s top-level shape, RFD via ``_rfd_normalize``,
+    generic_scrape) keep the exact behavior they had before —
+    ``summary`` / ``image_url`` / ``audio_url`` land in meta via the
+    passthrough bucket and the flatten step is a no-op.
     """
     title = raw.get("title")
     url = raw.get("url")
     if not title or not url:
         raise ValueError(f"{name}: item missing title or url: {raw!r}")
     published_at = raw.get("published_at")
+    # Start from the full passthrough (title/url/published_at excluded —
+    # they have their own return slots). When the item carries its own
+    # nested ``meta`` dict, merge that dict's keys on top of the
+    # passthrough (they win on collision) and drop the nested key so it
+    # doesn't survive as a ``meta["meta"]`` blob. A non-dict ``meta``
+    # value (no plugin ships one; defensive) stays in the passthrough
+    # under the ``meta`` key like every other unknown top-level key —
+    # ``get`` here (NOT ``pop``) is what preserves it. The previous
+    # commit used ``pop``, which removes the key unconditionally and
+    # silently dropped the value; the regression suite caught the
+    # discrepancy in the backend-tests CI run.
+    passthrough = {
+        k: v
+        for k, v in raw.items()
+        if k not in ("title", "url", "published_at")
+    }
+    plugin_meta = passthrough.get("meta")
+    if isinstance(plugin_meta, dict):
+        del passthrough["meta"]
+        passthrough.update(plugin_meta)
     return {
         "title": html.unescape(str(title).strip()),
         "url": str(url).strip(),
         "published_at": published_at,
-        "meta": {k: v for k, v in raw.items() if k not in ("title", "url", "published_at")},
+        "meta": passthrough,
     }
