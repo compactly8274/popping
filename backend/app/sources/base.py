@@ -71,53 +71,55 @@ def validate_required(name: str, raw: dict) -> dict:
     accessories"`` instead of ``"Nomad's accessories"``). A no-op on
     a title that was already clean.
 
-    A plugin's own ``meta`` dict is MERGED into the returned meta
+    A plugin's own ``meta`` dict is flattened into the returned meta
     rather than nested under a ``"meta"`` key. Several plugins (HN,
-    NVD, CISA KEV, GitHub releases, Wikipedia, dynamic Reddit)
-    return items shaped ``{title, url, published_at, summary, meta:
-    {...}}`` with their source-specific keys inside ``meta``. The
-    previous "bucket every unknown top-level key" passthrough nested
-    that dict as ``meta["meta"]``, so every consumer reading
-    top-level meta keys — ``scoring.engagement``
-    (``engagement_score`` / ``engagement_comments``),
-    ``scheduler._cvss_score`` (``cvss_score``), the routes layer's
-    ``meta ->> 'reddit_thread_url'`` projection — read nothing and
+    NVD, CISA KEV, GitHub releases, Wikipedia, dynamic Reddit) return
+    items shaped ``{title, url, published_at, summary, meta: {...}}``
+    with their source-specific keys inside ``meta``. The previous
+    "bucket every unknown top-level key" passthrough nested that dict
+    as ``meta["meta"]``, so every consumer reading top-level meta
+    keys — ``scoring.engagement`` (``engagement_score`` /
+    ``engagement_comments``), ``scheduler._cvss_score``
+    (``cvss_score``), the routes layer's ``meta ->> 'reddit_thread_url'``
+    projection, ``brief_filter.extract_summary`` — read nothing and
     silently no-op'd: HN/Reddit engagement contributed zero to the
     composite score (25% of its weight), high-CVSS CVE alerts never
-    fired, and the "Discussed on Reddit" card footer never rendered
-    for Reddit-source entries. Merging instead of nesting restores
-    every one of those paths with no per-plugin change. On a key
-    collision the plugin's ``meta`` value wins — a plugin explicitly
-    setting e.g. ``meta["summary"]`` is a deliberate, source-specific
-    statement and should not be clobbered by the passthrough bucket.
+    fired, and the "Discussed on Reddit" card footer never rendered.
+    Flattening restores every one of those paths with no per-plugin
+    change. On a key collision the plugin's ``meta`` value wins —
+    ``dict.update`` semantics — a plugin explicitly setting e.g.
+    ``meta["summary"]`` is a deliberate, source-specific statement
+    and should not be clobbered by the passthrough bucket. A non-dict
+    ``meta`` value (no plugin ships one; defensive) stays in the
+    passthrough under the ``meta`` key rather than being dropped.
+
+    Plugins that do NOT set their own ``meta`` key (BBC via
+    ``fetch_rss``'s top-level shape, RFD via ``_rfd_normalize``,
+    generic_scrape) keep the exact behavior they had before —
+    ``summary`` / ``image_url`` / ``audio_url`` land in meta via the
+    passthrough bucket and the flatten step is a no-op.
     """
     title = raw.get("title")
     url = raw.get("url")
     if not title or not url:
         raise ValueError(f"{name}: item missing title or url: {raw!r}")
     published_at = raw.get("published_at")
-    # Pass every remaining top-level key through into meta, then flatten
-    # a plugin's own nested ``meta`` dict on top (its keys win on
-    # collision). Plugins that do NOT set their own ``meta`` key (BBC
-    # via ``fetch_rss``'s top-level shape, RFD via ``_rfd_normalize``,
-    # generic_scrape) keep the exact behavior they had before —
-    # ``summary`` / ``image_url`` / ``audio_url`` land in meta via the
-    # passthrough bucket exactly as before, and the flattened merge
-    # is a no-op.
+    # Start from the full passthrough (title/url/published_at excluded —
+    # they have their own return slots), then pull the nested ``meta``
+    # key out and, when it's a dict, merge its keys on top (they win on
+    # collision). ``pop`` with a default keeps a non-dict ``meta`` value
+    # in the passthrough instead of dropping it.
     passthrough = {
         k: v
         for k, v in raw.items()
-        if k not in ("title", "url", "published_at", "meta")
+        if k not in ("title", "url", "published_at")
     }
-    plugin_meta = raw.get("meta")
+    plugin_meta = passthrough.pop("meta", None)
     if isinstance(plugin_meta, dict):
-        flattened = dict(passthrough)
-        flattened.update(plugin_meta)
-    else:
-        flattened = passthrough
+        passthrough.update(plugin_meta)
     return {
         "title": html.unescape(str(title).strip()),
         "url": str(url).strip(),
         "published_at": published_at,
-        "meta": flattened,
+        "meta": passthrough,
     }
