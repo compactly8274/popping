@@ -67,7 +67,30 @@ jobs:
           POSTGRES_USER: popping_test
           POSTGRES_PASSWORD: popping_test
           POSTGRES_DB: popping_test
-        run: pytest -q
+        # -ra shows the short summary of every failed/error test at the
+        # end of the run. `set -o pipefail` keeps the exit code honest
+        # while teeing the output to a file for the annotation pass.
+        # The annotation pass below re-emits every FAILED/ERROR line as
+        # a `::error::` workflow command — GitHub turns those into
+        # check-run annotations, which are readable from the PUBLIC
+        # annotations API even when raw job logs require admin rights.
+        # Without this, a red test run reports only "Process completed
+        # with exit code 1" and the failure can only be diagnosed by an
+        # admin reading the full log — which blocked three debugging
+        # cycles on PR #96.
+        run: |
+          set -o pipefail
+          pytest -ra 2>&1 | tee pytest_output.txt
+
+      - name: Emit failure annotations
+        if: failure()
+        working-directory: backend
+        run: |
+          # Every line that starts with "FAILED" or "ERROR" from pytest's
+          # short summary becomes a workflow-command error annotation.
+          grep -E '^(FAILED|ERROR)' pytest_output.txt | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
 
   build-backend:
     name: backend image
