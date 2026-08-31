@@ -105,17 +105,24 @@ def validate_required(name: str, raw: dict) -> dict:
         raise ValueError(f"{name}: item missing title or url: {raw!r}")
     published_at = raw.get("published_at")
     # Start from the full passthrough (title/url/published_at excluded —
-    # they have their own return slots), then pull the nested ``meta``
-    # key out and, when it's a dict, merge its keys on top (they win on
-    # collision). ``pop`` with a default keeps a non-dict ``meta`` value
-    # in the passthrough instead of dropping it.
+    # they have their own return slots). When the item carries its own
+    # nested ``meta`` dict, merge that dict's keys on top of the
+    # passthrough (they win on collision) and drop the nested key so it
+    # doesn't survive as a ``meta["meta"]`` blob. A non-dict ``meta``
+    # value (no plugin ships one; defensive) stays in the passthrough
+    # under the ``meta`` key like every other unknown top-level key —
+    # ``get`` here (NOT ``pop``) is what preserves it. The previous
+    # commit used ``pop``, which removes the key unconditionally and
+    # silently dropped the value; the regression suite caught the
+    # discrepancy in the backend-tests CI run.
     passthrough = {
         k: v
         for k, v in raw.items()
         if k not in ("title", "url", "published_at")
     }
-    plugin_meta = passthrough.pop("meta", None)
+    plugin_meta = passthrough.get("meta")
     if isinstance(plugin_meta, dict):
+        del passthrough["meta"]
         passthrough.update(plugin_meta)
     return {
         "title": html.unescape(str(title).strip()),
