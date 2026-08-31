@@ -45,7 +45,6 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-SCHEDULER = REPO / "backend/app/scheduler.py"
 
 # --- helpers ---------------------------------------------------------------
 
@@ -285,12 +284,18 @@ async def test_decode_extends_near_expiry_session(db_session):
     payload = await session_mod.decode(db_session, sid)
     assert payload["sub"] == "user-1"
 
+    # The sliding UPDATE runs through Core (session.execute), which
+    # does NOT synchronize the ORM identity map — refresh explicitly
+    # so the attribute read reflects the row the UPDATE touched.
     refreshed = await db_session.get(SessionRow, sid)
+    await db_session.refresh(refreshed)
+
     expected_full = now + dt.timedelta(seconds=settings.session_ttl_seconds)
-    # The expiry must be within a few seconds of now+full_ttl — NOT
-    # still ~100s out (the no-op behavior). 5s of slack covers the
-    # test's own runtime; the old code fails this by hours.
-    assert abs((refreshed.expires_at - expected_full).total_seconds()) < 5, (
+    # The expiry must be within a minute of now+full_ttl — NOT still
+    # ~100s out (the no-op behavior). 60s of slack covers the test's
+    # own runtime between the `now` capture and the decode call; the
+    # old code fails this by ~8 hours.
+    assert abs((refreshed.expires_at - expected_full).total_seconds()) < 60, (
         f"expires_at={refreshed.expires_at} did not slide to now+{settings.session_ttl_seconds}s "
         f"(expected ~{expected_full}); the sliding TTL is still a no-op."
     )
@@ -343,19 +348,28 @@ def test_embed_text_reads_summary_from_meta():
     """``_embed_text`` must read the summary from ``norm["meta"]`` —
     ``validate_required`` buckets every unknown top-level key into
     meta, including ``summary``, so a top-level read always saw an
-    empty string and every embedding was title-only."""
+    empty string and every embedding was title-only.
+
+    The docstring is stripped before the "no top-level read"
+    assertion — the fix's own docstring quotes the old buggy
+    expression, which is exactly the prose a naive whole-body
+    assertion would trip over.
+    """
     src = _read("backend/app/scheduler.py")
     m = re.search(r"async def _embed_text\([\s\S]*?(?=\n# Favicon retry gate)", src)
     assert m, "Could not extract _embed_text body"
     body = m.group(0)
-    assert 'meta.get("summary")' in body, (
+    # Strip the docstring so prose ABOUT the old bug doesn't trip the
+    # "no top-level read" check.
+    body_no_doc = re.sub(r'"""[\s\S]*?"""', "", body, count=1)
+    assert 'meta.get("summary")' in body_no_doc, (
         "_embed_text must read the summary from the meta dict "
-        "(norm['meta']['summary']) — the top-level norm['summary'] key "
-        "was never produced by validate_required, so the summary half "
-        "of the designed 'title — summary' embed text was always empty."
+        "(norm['meta']['summary']) — validate_required buckets the "
+        "plugin's summary there, and the top-level norm['summary'] key "
+        "was never produced."
     )
     # And it must NOT read the dead top-level key.
-    assert 'norm.get("summary")' not in body, (
+    assert 'norm.get("summary")' not in body_no_doc, (
         "_embed_text still reads norm.get('summary') — a top-level key "
         "validate_required never produces. Read the summary from "
         "norm['meta'] instead."
@@ -367,7 +381,6 @@ async def test_embed_text_builds_title_plus_summary():
     """Behavioral: _embed_text with a summary in meta must embed
     'title — summary', and with none, the title alone. Uses a stub
     embedder so no model is needed (tests run with EMBEDDING_ENABLED=false)."""
-    import asyncio
     from unittest.mock import patch
 
     from app import scheduler
@@ -389,6 +402,7 @@ async def test_embed_text_builds_title_plus_summary():
         }
         vec = await scheduler._embed_text(norm)
         assert vec == [0.1] * 8
+        # HTML tags stripped, whitespace collapsed.
         assert calls == ["Headline — Body text"], calls
 
         calls.clear()
