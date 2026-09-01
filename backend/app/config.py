@@ -241,6 +241,10 @@ class Settings(BaseSettings):
 
     # --- Preference vector recompute -------------------------------------
     # The personal scorer reads ``UserProfile.preference_vector``
+    # (a 384-dim embedding). Dwell interactions contribute
+    # VALUE-SCALED weights -- the dwell knob below is the cap for a
+    # fully-read reference article (10s), not a per-event constant
+    # like the other interaction weights.
     # (a 384-dim embedding). It is recomputed from the last
     # ``pref_vector_window_days`` of interactions, weighted by
     # ``_INTERACTION_WEIGHTS`` (see scheduler._recompute_preference_vector).
@@ -254,6 +258,15 @@ class Settings(BaseSettings):
     pref_vector_window_days: int = 30
     pref_vector_blend_new: float = 0.7
     pref_vector_recompute_interval_minutes: int = 10
+    # Weight of a fully-read (10-second reference) dwell interaction
+    # in the preference-vector recompute. Per-row dwell contribution:
+    #     PREF_VECTOR_WEIGHT_DWELL * min(dwell_seconds / 10, 1.0)
+    # (see ``scheduler._interaction_row_weight`` and issue #99).
+    # Deliberately below click-parity: dwell is a passive, volume-
+    # heavy signal that also scales with article length -- the full
+    # rationale is in the sweep2 PR's notes-for-review. Override
+    # with POPPING_PREF_VECTOR_WEIGHT_DWELL.
+    pref_vector_weight_dwell: float = 0.3
 
     # --- Phase 2: convergence boost ----------------------------------------
     # Cross-source story clusters (same normalized title in 24h) get a
