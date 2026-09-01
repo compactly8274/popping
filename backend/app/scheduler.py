@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import math
 import json
 import logging
@@ -1945,6 +1946,23 @@ def _dynamic_job_id(row_id: int) -> str:
     return f"{_DYNAMIC_JOB_PREFIX}{row_id}"
 
 
+def _dynamic_source_offset(name: str, interval_seconds: float) -> float:
+    """Deterministic, stable sub-interval offset for a dynamic source.
+
+    Hashes the source ``name`` into the range ``[0, interval_seconds)``
+    so jobs that share the same interval don't all fire in the same
+    second after a scheduler restart. The offset is reproducible across
+    restarts (same name -> same offset) and bounded so the first run still
+    happens within one interval window.
+    """
+    if interval_seconds <= 0:
+        return 0.0
+    # 32 bits of hash is plenty of spread and avoids big-integer math.
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    bucket = int(digest[:8], 16)
+    return float(bucket % int(interval_seconds))
+
+
 def _plugin_for(row: Source) -> SourcePlugin | None:
     """Dispatch a ``Source`` row to the right plugin instance.
 
@@ -1980,20 +1998,24 @@ def _add_or_replace_dynamic_job(scheduler: Any, row: Source) -> bool:
     plugin = _plugin_for(row)
     if plugin is None:
         return False
+    now = dt.datetime.now(dt.timezone.utc)
+    offset_seconds = _dynamic_source_offset(row.name, row.refresh_interval_seconds)
     scheduler.add_job(
         _ingest,
-        trigger=IntervalTrigger(seconds=row.refresh_interval_seconds),
+        trigger=IntervalTrigger(
+            seconds=row.refresh_interval_seconds,
+            start_date=now + dt.timedelta(seconds=offset_seconds),
+        ),
         args=[plugin],
         id=_dynamic_job_id(row.id),
         name=f"Ingest {row.name} (dynamic)",
         replace_existing=True,
-        next_run_time=dt.datetime.now(dt.timezone.utc),
         max_instances=1,
         coalesce=True,
     )
     logger.info(
-        "scheduler: registered dynamic source id=%d name=%s interval=%ds",
-        row.id, row.name, row.refresh_interval_seconds,
+        "scheduler: registered dynamic source id=%d name=%s interval=%ds offset=%.0fs",
+        row.id, row.name, row.refresh_interval_seconds, offset_seconds,
     )
     return True
 
