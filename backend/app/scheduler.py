@@ -2003,7 +2003,7 @@ async def backfill_now() -> dict:
 # ``ingest:<name>`` used for class-driven sources — different prefix
 # (``dynamic:``) so a ``name`` collision with a registered plugin
 # name can't mask the class-driven job, and so ``reschedule_job`` /
-# ``remove_job`` know they're talking to a row, not a class.
+# ``remove_job`` know they're talking about a row, not a class.
 _DYNAMIC_JOB_PREFIX = "ingest:dynamic:"
 
 
