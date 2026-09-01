@@ -15,7 +15,7 @@ Migration 0025's docstring claims a fourth path,
 the recompute windows on ``Interaction.created_at`` (when the user
 interacted), never on ``Entry.fetched_at``, so no fetched_at index
 serves it. The original fourth guard was false-green -- its lazy
-``(?=^def |\\Z)`` span ran past the end of the ``async def``
+``(?=^def |\Z)`` span ran past the end of the ``async def``
 function (``^def `` doesn't match ``async def``) into
 ``_rescore_recent_entries``, whose own ``fetched_at >= cutoff``
 satisfied the assertion -- so it verified nothing. It is removed
