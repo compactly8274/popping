@@ -58,6 +58,12 @@ from app.sources.reddit import normalize_subreddit
 
 logger = logging.getLogger("popping.sources.dynamic_reddit")
 
+# Per-source one-cycle cooldown state. Set when a scheduled fetch gets
+# 429 / 5xx; consumed and cleared on the next scheduled tick so the job
+# skips one poll and gives Reddit/proxy breathing room. Process-local;
+# the single-worker constraint is documented in ARCHITECTURE.md.
+_throttled_sources: dict[str, bool] = {}
+
 # Track rows we've already complained about so a missing Hydra
 # config doesn't spam the scheduler log once per row per tick (a
 # user with 8 subs would otherwise produce 32 WARNING lines an
@@ -101,6 +107,16 @@ class DynamicRedditPlugin(SourcePlugin):
         self.source_id = source_row.id
 
     async def fetch(self) -> list[dict]:
+        # If this source is in its one-cycle cooldown from a previous
+        # 429/5xx, skip the fetch silently and clear the flag so the
+        # *following* tick retries normally. This avoids hammering
+        # Reddit/proxy immediately after a throttle signal.
+        if _throttled_sources.pop(self.name, False):
+            logger.info(
+                "reddit feed cooldown: source=%s (skipping scheduled poll)",
+                self.name,
+            )
+            return []
         # Parse the user-entered subreddit reference. Malformed inputs
         # (empty, wrong shape, weird chars) log DEBUG and return ``[]``
         # — matches the "never raise" pattern shared by every other
@@ -138,7 +154,15 @@ class DynamicRedditPlugin(SourcePlugin):
                     self.name,
                 )
             return []
-        listings = await reddit_client.fetch_subreddit(sub, listing="hot", limit=50)
+        try:
+            listings = await reddit_client.fetch_subreddit(sub, listing="hot", limit=50)
+        except reddit_client.RedditFetchThrottled as exc:
+            logger.warning(
+                "reddit feed throttled: source=%s status=%s",
+                self.name, exc.status,
+            )
+            _throttled_sources[self.name] = True
+            return []
         if not listings:
             return []
         out: list[dict] = []

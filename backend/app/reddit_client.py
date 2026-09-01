@@ -381,6 +381,12 @@ async def _get_atom(path: str) -> str:
         await _take_token()
     client = _get_client()
     async with client.stream("GET", path) as resp:
+        # Surface 429 / 5xx as a typed exception so the scheduler can
+        # distinguish throttling from an empty feed and back off one
+        # cycle. Check before streaming the body to avoid pulling a
+        # big error page into memory.
+        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+            raise RedditFetchThrottled(resp.status_code)
         resp.raise_for_status()
         cl = resp.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
@@ -786,6 +792,18 @@ def _parse_comment_entries(atom_xml: str) -> list[dict]:
         except Exception:  # noqa: BLE001 - one bad entry shouldn't sink the whole parse
             continue
     return out
+
+
+class RedditFetchThrottled(Exception):
+    """Raised by the shared Reddit fetch path when the upstream proxy
+    or Reddit returns 429 / 5xx. Propagated to the scheduler so it can
+    distinguish "temporarily throttled" from "empty feed" and back off
+    one cycle instead of hammering the endpoint.
+    """
+
+    def __init__(self, status: int, message: str = "") -> None:
+        self.status = status
+        super().__init__(message or f"Reddit fetch throttled: status={status}")
 
 
 # Sentinel exception used internally to break out of the ``async with
