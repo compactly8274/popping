@@ -1,23 +1,32 @@
-"""Slice 25 — ``Entry.fetched_at`` index for hot query paths.
+"""Slice 25 -- ``Entry.fetched_at`` index for hot query paths.
 
-Four hot query paths filter on ``entries.fetched_at``:
+sweep2 REPLACEMENT (0002-c): the false-green fourth guard is removed
+and every remaining path-guard span is bounded to a true function
+boundary.
 
-  1. brief.py:_select_entries — brief generation
-  2. scheduler.py:_rescore_recent_entries — every 5-min rescore
-  3. brief.py:_select_entries_by_slug — convergence alerts
-  4. scheduler.py:_recompute_preference_vector — pref-vector recompute
+Three hot query paths filter on ``entries.fetched_at``:
 
-Before slice 25, none used an index. Each was a full table scan +
-in-memory sort, observed in CI logs as multi-second ``StatementTimeout``
-warnings on the rescore path. The fix is a single B-tree index.
+  1. brief.py:_select_entries -- brief generation
+  2. scheduler.py:_rescore_recent_entries -- the periodic rescore
+  3. brief.py:_select_entries_by_slug -- convergence alerts
 
-This test file guards:
+Migration 0025's docstring claims a fourth path,
+``scheduler.py:_recompute_preference_vector``. That claim is false:
+the recompute windows on ``Interaction.created_at`` (when the user
+interacted), never on ``Entry.fetched_at``, so no fetched_at index
+serves it. The original fourth guard was false-green -- its lazy
+``(?=^def |\Z)`` span ran past the end of the ``async def``
+function (``^def `` doesn't match ``async def``) into
+``_rescore_recent_entries``, whose own ``fetched_at >= cutoff``
+satisfied the assertion -- so it verified nothing. It is removed
+here rather than kept as a lie about the code.
 
-- backend/app/models.py — Entry.fetched_at has ``index=True``
-- alembic/versions/0025_entries_fetched_at_index.py — creates the
-  index, downgrades cleanly, has the correct down_revision
-- The four hot-query paths still issue ``WHERE fetched_at >= :since``
-  (regression guard: a future refactor must not drop the filter)
+Span hardening (the same defect, fixed everywhere it appeared):
+- the scheduler guard now stops at the next module-level ``def`` OR
+  ``async def`` -- the old ``^def``-only lookahead is what let the
+  span leak across three unrelated functions;
+- the brief.py guards stop at the next method boundary inside
+  ``BriefGenerator`` instead of running to end-of-file.
 """
 from __future__ import annotations
 
@@ -34,6 +43,31 @@ BRIEF = REPO / "backend/app/brief.py"
 SCHEDULER = REPO / "backend/app/scheduler.py"
 
 
+def _module_func(src: str, name: str) -> str:
+    """Module-level (``async``) function body, bounded by the next
+    module-level ``def`` / ``async def`` / ``class`` -- never by
+    end-of-file."""
+    m = re.search(
+        rf"^(?:async )?def {re.escape(name)}\(.*?(?=\n^(?:async )?def |\n^class |\Z)",
+        src,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert m, f"Couldn't locate {name}() at module level"
+    return m.group(0)
+
+
+def _method(src: str, name: str) -> str:
+    """Method body inside a class, bounded by the next same-indent
+    method / decorator or the class's end."""
+    m = re.search(
+        rf"^    (?:async )?def {re.escape(name)}\(.*?(?=\n    (?:async )?def |\n    @|\n[^\s]|\Z)",
+        src,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert m, f"Couldn't locate {name}() as a method"
+    return m.group(0)
+
+
 # ---------------------------------------------------------------------------
 # 1. Model has index=True on Entry.fetched_at
 # ---------------------------------------------------------------------------
@@ -46,10 +80,9 @@ def test_entry_fetched_at_column_has_index_true():
     m = re.search(r"^class Entry\(Base\):[\s\S]*?(?=^class )", src, re.MULTILINE)
     assert m, "Couldn't locate Entry class in models.py"
     block = m.group(0)
-    # Find the fetched_at column declaration — match from the
+    # Find the fetched_at column declaration -- match from the
     # ``fetched_at:`` annotation line through the closing paren of
-    # ``mapped_column(...)``. The closing paren is preceded by
-    # ``nullable=False, index=True`` for our slice 25 form.
+    # ``mapped_column(...)``.
     m2 = re.search(
         r"fetched_at:\s*Mapped\[dt\.datetime\]\s*=\s*mapped_column\(",
         block,
@@ -87,7 +120,7 @@ def test_entry_fetched_at_column_has_index_true():
 @pytest.mark.no_db
 def test_migration_0025_exists():
     assert MIGRATION.exists(), (
-        "alembic/versions/0025_entries_fetched_at_index.py must exist — "
+        "alembic/versions/0025_entries_fetched_at_index.py must exist -- "
         "the migration is the canonical way production gets the index."
     )
 
@@ -123,7 +156,7 @@ def test_migration_upgrade_creates_index():
 def test_migration_downgrade_drops_index():
     src = MIGRATION.read_text()
     assert "op.drop_index(" in src, (
-        "downgrade() must call op.drop_index(...) — symmetric with upgrade."
+        "downgrade() must call op.drop_index(...) -- symmetric with upgrade."
     )
     assert "ix_entries_fetched_at_desc" in src, (
         "downgrade must target the same index name as upgrade created."
@@ -131,80 +164,50 @@ def test_migration_downgrade_drops_index():
 
 
 # ---------------------------------------------------------------------------
-# 3. Hot query paths still filter on fetched_at (regression guard)
+# 3. Hot query paths still filter on fetched_at (regression guards,
+#    function-bounded spans)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.no_db
 def test_brief_select_entries_filters_on_fetched_at():
-    """brief.py:_select_entries (or its inlined equivalent) must
-    filter on ``fetched_at >= :since``. Slice 25 adds the index;
-    a future refactor that drops the filter would render the
-    index useless."""
-    src = BRIEF.read_text()
-    # Search the function body for the fetch-at filter
-    m = re.search(
-        r"def _select_entries[\s\S]*?(?=^def |\Z)",
-        src,
-        re.MULTILINE,
-    )
-    assert m, "Couldn't locate _select_entries in brief.py"
-    body = m.group(0)
+    """brief.py:_select_entries must filter on ``fetched_at >= ...``.
+    Bounded to the method -- the original lazy span ran to
+    end-of-file."""
+    body = _method(BRIEF.read_text(), "_select_entries")
     assert re.search(r"fetched_at\s*>=", body), (
-        "_select_entries must filter on ``fetched_at >= ...`` — "
-        "this is the query path the new index serves."
+        "_select_entries must filter on ``fetched_at >= ...`` -- "
+        "this is a query path the 0025 index serves."
     )
 
 
 @pytest.mark.no_db
 def test_scheduler_rescore_filters_on_fetched_at():
     """scheduler.py:_rescore_recent_entries must filter on
-    ``fetched_at >= cutoff``."""
-    src = SCHEDULER.read_text()
-    m = re.search(
-        r"def _rescore_recent_entries[\s\S]*?(?=^def |\Z)",
-        src,
-        re.MULTILINE,
-    )
-    assert m, "Couldn't locate _rescore_recent_entries in scheduler.py"
-    body = m.group(0)
+    ``fetched_at >= cutoff``. Bounded to the function -- the
+    original ``(?=^def |\Z)`` span leaked past the (``async def``)
+    function into three unrelated ones."""
+    body = _module_func(SCHEDULER.read_text(), "_rescore_recent_entries")
     assert re.search(r"fetched_at\s*>=", body), (
         "_rescore_recent_entries must filter on fetched_at >= cutoff."
     )
 
 
 @pytest.mark.no_db
-def test_scheduler_preference_vector_filters_on_fetched_at():
-    """scheduler.py:_recompute_preference_vector (or its inlined
-    equivalent) must filter on ``fetched_at >= :window_start`` —
-    another query path the index serves.
-    """
-    src = SCHEDULER.read_text()
-    m = re.search(
-        r"def _recompute_preference_vector[\s\S]*?(?=^def |\Z)",
-        src,
-        re.MULTILINE,
-    )
-    assert m, "Couldn't locate _recompute_preference_vector in scheduler.py"
-    body = m.group(0)
-    assert re.search(r"fetched_at\s*>=", body), (
-        "_recompute_preference_vector must filter on fetched_at >= ..."
-    )
-
-
-@pytest.mark.no_db
 def test_brief_slug_filter_filters_on_fetched_at():
     """brief.py:_select_entries_by_slug must filter on
-    ``fetched_at >= :since`` — the convergence-alert query path.
-    """
-    src = BRIEF.read_text()
-    m = re.search(
-        r"def _select_entries_by_slug[\s\S]*?(?=^def |\Z)",
-        src,
-        re.MULTILINE,
-    )
-    assert m, "Couldn't locate _select_entries_by_slug in brief.py"
-    body = m.group(0)
+    ``fetched_at >= ...`` -- the convergence-alert query path.
+    Bounded to the method."""
+    body = _method(BRIEF.read_text(), "_select_entries_by_slug")
     assert re.search(r"fetched_at\s*>=", body), (
         "_select_entries_by_slug must filter on fetched_at >= ..."
     )
+
+
+# NOTE: there is deliberately NO guard for
+# scheduler._recompute_preference_vector here. Migration 0025's
+# docstring lists it as a fourth hot path, but the recompute windows
+# on Interaction.created_at, not Entry.fetched_at -- no fetched_at
+# index serves it, and the original guard was false-green (see the
+# module docstring). Adding a fetched_at filter to the recompute
+# would be a behavior change, not something to pin here.

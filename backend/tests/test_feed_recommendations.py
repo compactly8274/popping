@@ -13,9 +13,15 @@ from __future__ import annotations
 
 import datetime as dt
 
+import math
+
 import pytest
 
-from app.feed_recommendations import recommendations_for, recommendations_for_user
+from app.feed_recommendations import (
+    _squeeze,
+    recommendations_for,
+    recommendations_for_user,
+)
 from app.models import FeedRecommendationCandidate, Interaction, UserProfile
 from factories import make_entry, make_source
 
@@ -143,6 +149,45 @@ async def test_recommendations_for_user_ranks_by_embedding_similarity(db_session
 
     names = [r["name"] for r in result]
     assert names.index("aligned_cand") < names.index("opposed_cand")
+
+
+# --- signed squeeze (H1) ----------------------------------------------------
+
+
+async def test_net_negative_category_demotes_below_no_signal(db_session):
+    """A category the user is actively rejecting must rank BELOW a
+    category with no engagement at all -- not tie it and win on pool
+    order. Before the H1 fix ``_squeeze`` clamped the net-negative
+    score to 0.0, so both categories scored identically and this
+    candidate (lower id, earlier pool index) came first; the fix
+    makes the demotion explicit and the assertion flips."""
+    await _make_candidate(db_session, "rejected_cat", category="sports")
+    await _make_candidate(db_session, "neutral_cat", category="news")
+
+    source = await make_source(db_session, "rejected_source", category="sports")
+    entry = await make_entry(db_session, source, "An entry")
+    db_session.add(
+        Interaction(entry_id=entry.id, user_id="anonymous", type="never", value=1.0)
+    )
+    await db_session.commit()
+
+    result = await recommendations_for_user(db_session, [], ("anonymous",))
+
+    names = [r["name"] for r in result]
+    assert names.index("neutral_cat") < names.index("rejected_cat"), (
+        "net-negative category must demote below a no-signal category"
+    )
+
+
+@pytest.mark.no_db
+def test_squeeze_is_odd_symmetric():
+    """H1 pins the map itself: plain ``tanh`` over ``(-1, 1)``,
+    odd-symmetric, no negative clamp."""
+    assert _squeeze(5.0) == pytest.approx(math.tanh(1.0))
+    assert _squeeze(-5.0) == pytest.approx(-math.tanh(1.0))
+    assert _squeeze(-5.0) == pytest.approx(-_squeeze(5.0))
+    assert _squeeze(0.0) == pytest.approx(0.0)
+    assert _squeeze(-5.0) < 0.0
 
 
 # --- route ------------------------------------------------------------------

@@ -26,12 +26,17 @@ signals — see the "Ranking" section below, unchanged by the storage
 migration.
 
 Ranking (``recommendations_for_user``):
-    Blends two independent signals, each rescaled to ``[0, 1]``:
+    Blends two independent signals, each rescaled to a fixed range
+    (category co-occurrence to ``(-1, 1)`` via a signed ``tanh``;
+    vector similarity to ``[0, 1]``):
 
     1. Category co-occurrence — aggregate per-source-category scores
        from the last 30 days of ``Interaction`` rows, negate
        ``thumb_down`` / ``never`` events, and squeeze through
-       ``tanh`` so a single hot category doesn't dominate.
+       ``tanh`` so a single hot category doesn't dominate. The
+       negation survives the squeeze: a net-negative category maps
+       into ``(-1, 0)`` and its candidates are DEMOTED below the
+       neutral baseline in the blend, not merely kept from winning.
     2. Vector similarity — cosine similarity between the user's
        ``UserProfile.preference_vector`` (the same one that ranks
        For You) and a one-time sentence embedding of each
@@ -207,12 +212,15 @@ async def top_category_for_user(session: AsyncSession, user_ids: tuple[str, ...]
 
 
 def _squeeze(raw: float) -> float:
-    """Map raw net-score to ``[0, 1]`` via ``tanh`` so a single hot
-    category can't pull every recommendation toward it. Output is
-    non-negative because all candidates with a net score below 0 are
-    sorted by their (already clamped) value."""
-    if raw <= 0:
-        return 0.0
+    """Map raw net-score to ``(-1, 1)`` via ``tanh`` so a single hot
+    category can't pull every recommendation toward it, and a
+    net-negative category can't hide. The map is odd-symmetric: a
+    category the user is actively rejecting (``thumb_down`` /
+    ``never`` outweighing positives) squeezes into ``(-1, 0)`` and
+    drags its candidates below the neutral vector baseline in
+    ``_combined_score`` -- negative engagement demotes instead of
+    tying with "no data". Demotion magnitude is bounded by the
+    same tanh squash that bounds promotion."""
     return math.tanh(raw / _TANH_DIVISOR)
 
 
@@ -331,7 +339,10 @@ async def recommendations_for_user(
             item.setdefault("_pool_index", idx)
 
         def _combined_score(item: dict) -> float:
-            cat_component = squeezed.get(item["category"], 0.0)  # 0..1, 0 = no signal
+            # -1..1, 0 = no signal. Negative = net-negative user
+            # engagement with this category -- the candidate is
+            # demoted below the neutral baseline (H1).
+            cat_component = squeezed.get(item["category"], 0.0)
             # vector_score is 0..100 with 50 as its own "no signal"
             # neutral; rescale to 0..1 so the two components are
             # comparable and neither dominates just from its native range.
