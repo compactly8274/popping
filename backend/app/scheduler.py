@@ -729,7 +729,7 @@ async def _backfill_embeddings(batch_size: int | None = None) -> None:
 # explicitly said "save for later").
 _INTERACTION_WEIGHTS: dict[str, float] = {
     # ``view`` fires on every card scroll-into-view, including
-    # ones the user has already seen and scrolled past. It's a
+    # ones the user's already seen and scrolled past. It's a
     # "didn't say no" signal, not a "want more of this" signal --
     # the prior weight of 1.0 made it dominate the aggregated
     # vector (3188 views vs 34 ``never`` in one user's data, a
@@ -743,11 +743,23 @@ _INTERACTION_WEIGHTS: dict[str, float] = {
     # to match the positive explicit signals so a heavy clicker
     # can outweigh a moderate ``view`` volume.
     "click": 1.0,
-    # ``dwell`` is the per-card read-time signal. The value is
-    # already in milliseconds (or seconds) so the weight here is
-    # a divisor -- 0.3 means a 10-second read contributes ~3.0
-    # to the aggregated vector, comparable to a single ``click``.
-    "dwell": 0.3,
+    # ``dwell`` is the per-card read-time signal, and the only
+    # value-scaled type: the recompute reads ``Interaction.value``
+    # (dwell seconds) and applies
+    #     contribution = PREF_VECTOR_WEIGHT_DWELL * min(value / 10, 1.0)
+    # via ``_interaction_row_weight`` below. The knob lives in
+    # config (``pref_vector_weight_dwell``, default 0.3, override
+    # with POPPING_PREF_VECTOR_WEIGHT_DWELL) and is read at call
+    # time. The cap keeps a tab left open overnight from
+    # out-weighing a deliberate deep read; the 10s reference keeps
+    # the knob's units interpretable. NOTE: the weight is a
+    # MULTIPLIER on the normalized read time, not a divisor -- the
+    # comment previously here claimed "0.3 means a 10-second read
+    # contributes ~3.0, comparable to a single click", which
+    # contradicted the issue #99 formula and is corrected here
+    # (see the sweep2 PR's notes-for-review for why the default
+    # deliberately stays below click-parity).
+    "dwell": settings.pref_vector_weight_dwell,
     # Explicit positive signals. Bumped from 3.0 to 4.0 so a
     # single thumb-up can outweigh ~20 scroll-by views. The
     # intuition: a user who actually thumbed something is
@@ -769,6 +781,41 @@ _INTERACTION_WEIGHTS: dict[str, float] = {
     # in the absence of additional thumbs.
     "share": 2.0,
 }
+
+
+# Reference read time for the dwell value-scaling (issue #99): a
+# fully-read article contributes the full knob weight; shorter
+# reads scale linearly below it; longer reads cap at it.
+_DWELL_REFERENCE_SECONDS = 10.0
+
+
+def _interaction_row_weight(itype: str, value: float | None) -> float:
+    """Per-row contribution weight for the preference-vector recompute.
+
+    Fixed-weight types (view / click / thumb_up / bookmark /
+    thumb_down / never / share) read ``_INTERACTION_WEIGHTS``.
+    ``dwell`` is value-scaled per issue #99:
+
+        contribution = PREF_VECTOR_WEIGHT_DWELL * min(value / 10, 1.0)
+
+    where the knob (``settings.pref_vector_weight_dwell``, default
+    0.3) is the fully-read cap and ``value`` is the dwell time in
+    seconds. The knob is read at CALL time so an env override
+    actually changes the recompute's behavior (pinned by
+    ``test_pref_vector_dwell_value.py``); ``_INTERACTION_WEIGHTS``
+    keeps a snapshot entry for the validity mask and for any reader
+    that only asks "is this type a signal at all".
+    """
+    if itype == "dwell":
+        knob = settings.pref_vector_weight_dwell
+        try:
+            seconds = float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if seconds < 0.0:
+            seconds = 0.0
+        return knob * min(seconds / _DWELL_REFERENCE_SECONDS, 1.0)
+    return _INTERACTION_WEIGHTS.get(itype, 0.0)
 
 
 # The set of user_ids the recompute should aggregate. In a
@@ -829,8 +876,12 @@ async def _recompute_preference_vector() -> None:
        ``entries.embedding``. Interactions against entries with
        a NULL embedding are skipped silently -- they don't move
        the vector.
-    2. Sum ``entry.embedding * _INTERACTION_WEIGHTS[type]`` for
-       each interaction. The sum is a 384-dim vector.
+    2. Sum ``entry.embedding * _interaction_row_weight(type, value)``
+       for each interaction. The sum is a 384-dim vector. Dwell rows
+       are value-scaled --
+       ``PREF_VECTOR_WEIGHT_DWELL * min(seconds / 10, 1.0)`` per
+       issue #99 -- every other type uses its fixed
+       ``_INTERACTION_WEIGHTS`` entry.
     3. L2-normalize so the cosine math in personal.py
        (``dot(a, b) / (|a| * |b|)``) produces values in the
        expected range. Without normalization a user with many
@@ -904,7 +955,12 @@ async def _recompute_preference_vector() -> None:
                 return
             rows = (
                 await session.execute(
-                    select(Entry.id, Entry.embedding, Interaction.type)
+                    select(
+                        Entry.id,
+                        Entry.embedding,
+                        Interaction.type,
+                        Interaction.value,
+                    )
                     .join(Interaction, Interaction.entry_id == Entry.id)
                     .where(
                         Interaction.user_id.in_(user_ids),
@@ -938,7 +994,7 @@ async def _recompute_preference_vector() -> None:
                                 # embedder's dependency tree).
             valid_mask = [
                 (emb is not None) and (_INTERACTION_WEIGHTS.get(itype, 0.0) != 0.0)
-                for _entry_id, emb, itype in rows
+                for _entry_id, emb, itype, _value in rows
             ]
             if not any(valid_mask):
                 return
@@ -948,8 +1004,17 @@ async def _recompute_preference_vector() -> None:
                 ) if keep and emb is not None],
                 dtype=np.float32,
             )
+            # Dwell rows are value-scaled via the settings knob
+            # (``_interaction_row_weight``); every other type keeps
+            # its fixed ``_INTERACTION_WEIGHTS`` entry. Row shape is
+            # (id, embedding, type, value) -- value joined the
+            # SELECT for the dwell normalization.
             weights = np.asarray(
-                [_INTERACTION_WEIGHTS[r[2]] for r, keep in zip(rows, valid_mask) if keep and r[1] is not None],
+                [
+                    _interaction_row_weight(r[2], r[3])
+                    for r, keep in zip(rows, valid_mask)
+                    if keep and r[1] is not None
+                ],
                 dtype=np.float32,
             )
             n_used = int(embs.shape[0])
@@ -1877,8 +1942,8 @@ async def trigger_now(plugin_name: str) -> dict:
     Accepts both registry-registered plugin class names
     (``bbc_news``, ``hn_top``, etc.) and dynamic ``Source`` row names
     (anything the user has added via Add custom or Track anyway).
-    The class-driven path is the fast one — it goes through the
-    in-memory registry. The dynamic path opens a DB session and
+    The class-driven path is the fast one — it goes through
+    the in-memory registry. The dynamic path opens a DB session and
     dispatches via ``_plugin_for(row)`` so the same code path the
     scheduled tick uses also runs for the manual fetch.
 
