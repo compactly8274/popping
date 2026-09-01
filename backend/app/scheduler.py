@@ -729,7 +729,7 @@ async def _backfill_embeddings(batch_size: int | None = None) -> None:
 # explicitly said "save for later").
 _INTERACTION_WEIGHTS: dict[str, float] = {
     # ``view`` fires on every card scroll-into-view, including
-    # ones the user's already seen and scrolled past. It's a
+    # ones the user has already seen and scrolled past. It's a
     # "didn't say no" signal, not a "want more of this" signal --
     # the prior weight of 1.0 made it dominate the aggregated
     # vector (3188 views vs 34 ``never`` in one user's data, a
@@ -1942,8 +1942,8 @@ async def trigger_now(plugin_name: str) -> dict:
     Accepts both registry-registered plugin class names
     (``bbc_news``, ``hn_top``, etc.) and dynamic ``Source`` row names
     (anything the user has added via Add custom or Track anyway).
-    The class-driven path is the fast one — it goes through
-    the in-memory registry. The dynamic path opens a DB session and
+    The class-driven path is the fast one — it goes through the
+    in-memory registry. The dynamic path opens a DB session and
     dispatches via ``_plugin_for(row)`` so the same code path the
     scheduled tick uses also runs for the manual fetch.
 
@@ -2003,7 +2003,7 @@ async def backfill_now() -> dict:
 # ``ingest:<name>`` used for class-driven sources — different prefix
 # (``dynamic:``) so a ``name`` collision with a registered plugin
 # name can't mask the class-driven job, and so ``reschedule_job`` /
-# ``remove_job`` know they're talking about a row, not a class.
+# ``remove_job`` know they're talking to a row, not a class.
 _DYNAMIC_JOB_PREFIX = "ingest:dynamic:"
 
 
