@@ -13,16 +13,21 @@ which don't need a live provider to exercise.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import time
 
 import pytest
 
+import app.feed_discovery as feed_discovery
 from app.feed_discovery import (
     _slugify,
     _strip_code_fence,
+    _validate_feed_url,
     discover_candidates,
     recent_llm_candidate_count,
 )
+from app.llm import router as llm_router
 from app.models import FeedRecommendationCandidate
 
 
@@ -128,6 +133,63 @@ async def test_discover_candidates_returns_empty_without_crashing(db_session):
     )
     assert created == []
     assert note
+
+
+# --- timeout ceilings (found in a repo-wide audit: the manual --------------
+# --- "find more feeds" endpoint is synchronous and user-waiting, but ------
+# --- had no ceiling on either the LLM call or the per-candidate fetch, ----
+# --- so a slow-but-not-dead provider or feed host could hold the ----------
+# --- request open for minutes) ----------------------------------------------
+
+
+class _SlowProvider:
+    """A fake LLM provider whose complete() never returns in time —
+    stands in for a provider that's slow rather than actually down
+    (a real down provider fails fast with a connection error, which
+    is a different, already-handled path)."""
+
+    name = "slow_test_provider"
+
+    async def complete(self, prompt, max_tokens=800, think=None):
+        await asyncio.sleep(10)
+        return "should never get here"
+
+
+async def test_ask_llm_for_suggestions_times_out_slow_provider(monkeypatch):
+    monkeypatch.setattr(feed_discovery, "_LLM_CALL_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(llm_router, "providers_for", lambda task: [_SlowProvider()])
+
+    start = time.monotonic()
+    suggestions, note = await feed_discovery._ask_llm_for_suggestions(
+        "tech", "context", set(), 5
+    )
+    elapsed = time.monotonic() - start
+
+    assert suggestions == []
+    assert note is not None and "timed out" in note
+    # Bounded by the timeout, not by the provider's 10s sleep.
+    assert elapsed < 2.0
+
+
+async def test_validate_feed_url_times_out_slow_fetch(monkeypatch):
+    monkeypatch.setattr(feed_discovery, "_VALIDATION_FETCH_TIMEOUT_S", 0.05)
+    # Skip the real check_url_safe (which does a live DNS lookup) so
+    # this test's only variable is the fetch timeout, not network
+    # conditions in whatever sandbox it runs in.
+    monkeypatch.setattr(feed_discovery, "check_url_safe", lambda url: (True, ""))
+
+    async def _slow_fetch_rss(url, headers=None):
+        await asyncio.sleep(10)
+        return [{"title": "should never get here"}]
+
+    monkeypatch.setattr(feed_discovery, "fetch_rss", _slow_fetch_rss)
+
+    start = time.monotonic()
+    result = await _validate_feed_url("https://example.com/feed.xml")
+    elapsed = time.monotonic() - start
+
+    assert result is False
+    assert elapsed < 2.0
 
 
 # --- POST /api/feed-recommendations/discover ---------------------------------

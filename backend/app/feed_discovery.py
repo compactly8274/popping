@@ -18,6 +18,7 @@ persisted, so a hallucinated or dead URL never reaches the pool.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -43,6 +44,21 @@ _SANITIZE_RE = re.compile(r"[^a-z0-9_]+")
 _MAX_SUGGESTIONS_REQUESTED = 5
 _BLURB_MAX_LEN = 200
 _LLM_MAX_TOKENS = 800
+
+# Bounds each individual LLM provider attempt and each individual
+# candidate-URL validation fetch, on top of (not instead of) each
+# one's own internal timeout/retry — same reasoning as
+# app.article_summary._LLM_CALL_TIMEOUT_S. Without this, the manual
+# "find more feeds" endpoint (POST /api/feed-recommendations/discover)
+# is a synchronous, user-waiting request with no ceiling: fetch_rss's
+# own timeout+one-retry policy allows up to ~120s per candidate URL,
+# and up to _MAX_SUGGESTIONS_REQUESTED candidates are validated
+# sequentially — a handful of slow-to-respond (not dead, just slow)
+# suggested hosts could hold the request and its DB session open for
+# minutes, exactly the failure mode feed_autodiscovery.py was already
+# patched for.
+_LLM_CALL_TIMEOUT_S = 20.0
+_VALIDATION_FETCH_TIMEOUT_S = 20.0
 
 # Window ``recent_llm_candidate_count`` looks back over. The route
 # layer (``routes/sources.py``) owns the actual cap/policy decision
@@ -108,10 +124,20 @@ async def _ask_llm_for_suggestions(
     last_note: str | None = None
     for candidate in providers:
         try:
-            content = await candidate.complete(prompt, max_tokens=_LLM_MAX_TOKENS)
+            content = await asyncio.wait_for(
+                candidate.complete(prompt, max_tokens=_LLM_MAX_TOKENS),
+                timeout=_LLM_CALL_TIMEOUT_S,
+            )
         except ProviderError as exc:
             logger.warning("feed_discovery: LLM call failed on %s: %s — trying next provider", candidate.name, exc)
             last_note = f"{candidate.name}: {exc}"
+            continue
+        except asyncio.TimeoutError:
+            logger.warning(
+                "feed_discovery: %s took longer than %.0fs — trying next provider",
+                candidate.name, _LLM_CALL_TIMEOUT_S,
+            )
+            last_note = f"{candidate.name}: timed out after {_LLM_CALL_TIMEOUT_S:.0f}s"
             continue
         content = _strip_code_fence(content or "")
         if not content:
@@ -143,7 +169,13 @@ async def _validate_feed_url(url: str) -> bool:
         logger.info("feed_discovery: rejected %s (%s)", url, reason)
         return False
     try:
-        items = await fetch_rss(url)
+        items = await asyncio.wait_for(fetch_rss(url), timeout=_VALIDATION_FETCH_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.info(
+            "feed_discovery: validation fetch for %s took longer than %.0fs",
+            url, _VALIDATION_FETCH_TIMEOUT_S,
+        )
+        return False
     except Exception as exc:  # noqa: BLE001 - any fetch/parse failure disqualifies the suggestion
         logger.info("feed_discovery: validation fetch failed for %s: %s", url, exc)
         return False
