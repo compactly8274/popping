@@ -19,9 +19,11 @@ This test file guards:
   passed through unchanged
 - Empty / non-string inputs are passed through (defensive)
 - The function is exported from api.ts (so other components can use it)
-- All 4 window.open call sites in Card.tsx that could open Reddit
-  URLs are now wrapped in safeExternalUrl (the call site that
-  intentionally excludes is the podcast audio URL)
+- All window.open call sites in Card.tsx for ingested-content URLs
+  are wrapped in safeExternalUrl, including the podcast audio URL —
+  the function also guards against non-http(s) schemes (e.g.
+  ``javascript:``), a risk every ingested URL carries, not just
+  Reddit threads
 """
 from __future__ import annotations
 
@@ -215,17 +217,16 @@ def test_card_uses_safe_external_url_for_related_coverage():
 
 
 @pytest.mark.no_db
-def test_card_does_not_wrap_audio_url():
-    """The podcast audio_url window.open is intentionally NOT
-    wrapped in safeExternalUrl — it's not a Reddit URL. Pin this
-    so a future refactor doesn't blanket-wrap everything."""
+def test_card_wraps_audio_url():
+    """``safeExternalUrl`` isn't just a Reddit host-rewrite: it's also
+    the choke point that rejects non-http(s) schemes (``javascript:``,
+    ``data:``, ...) on URLs sourced from ingested feed content, which
+    ``audio_url`` (a podcast enclosure URL) is just as much an
+    instance of as ``entry.url``. It must be wrapped like every other
+    ingested-URL window.open call site."""
     src = CARD.read_text()
     m = re.search(
-        r"window\.open\(entry\.audio_url!",
+        r"window\.open\(safeExternalUrl\(entry\.audio_url!\)",
         src,
     )
-    assert m, "Couldn't find audio_url window.open"
-    assert "safeExternalUrl" not in m.group(0), (
-        f"audio_url window.open should NOT be wrapped in safeExternalUrl — "
-        f"podcast audio URLs aren't Reddit threads. Got: {m.group(0)!r}"
-    )
+    assert m, "audio_url window.open should be wrapped in safeExternalUrl"

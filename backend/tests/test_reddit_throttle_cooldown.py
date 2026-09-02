@@ -7,6 +7,7 @@ it down. All marked ``no_db`` so they run without Postgres.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from types import SimpleNamespace
 
@@ -85,6 +86,55 @@ async def test_scheduler_spreads_dynamic_jobs():
         assert len(distinct_seconds) == 3
     finally:
         sched.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stagger_false_runs_immediately():
+    """``add_source``/``update_source`` must register the job with
+    ``stagger=False`` so a user-triggered add/edit/reactivate ingests
+    right away. Only the startup walk (``_register_dynamic_source_jobs``,
+    which calls this with the ``stagger=True`` default) should spread
+    first runs across the refresh interval — applying that stagger to
+    a user-facing add/edit would delay the first ingest by up to a
+    full refresh interval (regression: PR #100 dropped the immediate
+    ``next_run_time`` this used to get)."""
+    sched = AsyncIOScheduler(timezone="UTC")
+    sched.start()
+    try:
+        row = _source_row(name="reddit_immediate", interval=3600, source_id=99)
+        scheduler._add_or_replace_dynamic_job(sched, row, stagger=False)
+        job = sched.get_job(scheduler._dynamic_job_id(row.id))
+        assert job.next_run_time is not None
+        now = dt.datetime.now(dt.timezone.utc)
+        # Should fire immediately (well within a few seconds), not up
+        # to 3600s out like the staggered default would allow.
+        assert (job.next_run_time - now).total_seconds() < 5
+    finally:
+        sched.shutdown()
+
+
+def test_add_source_and_update_source_call_sites_pass_stagger_false():
+    """Pin that ``add_source`` and ``update_source`` — the two
+    user-facing call sites (add/edit/reactivate a source) — both
+    pass ``stagger=False`` to ``_add_or_replace_dynamic_job``. Only
+    the startup walk should use the staggered default; a future
+    refactor that drops this kwarg at either call site would
+    reintroduce the "new/edited source waits up to a full refresh
+    interval for its first ingest" regression.
+    """
+    import inspect
+
+    src = inspect.getsource(scheduler)
+    calls = [
+        line.strip()
+        for line in src.splitlines()
+        if "_add_or_replace_dynamic_job(_scheduler, row" in line
+    ]
+    assert len(calls) == 2, f"expected 2 call sites, found {calls}"
+    assert all("stagger=False" in call for call in calls), (
+        f"add_source/update_source must call _add_or_replace_dynamic_job "
+        f"with stagger=False. Got: {calls}"
+    )
 
 
 @pytest.mark.asyncio

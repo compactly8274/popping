@@ -26,6 +26,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
+  safeExternalUrl,
   type LLMTagsResponse,
   type LLMStatus,
   type NotificationStatus,
@@ -1094,7 +1095,7 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
               {bucket.items.map((i) => (
                 <a
                   key={i.id}
-                  href={i.entry_url}
+                  href={safeExternalUrl(i.entry_url)}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="block rounded-ios bg-bg-surface border border-hairline p-2.5
@@ -1370,7 +1371,7 @@ function EntryIdListContent({
             >
               <div className="flex-1 min-w-0">
                 <a
-                  href={e.url}
+                  href={safeExternalUrl(e.url)}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="block text-ios-body text-label-primary active:opacity-60 truncate"

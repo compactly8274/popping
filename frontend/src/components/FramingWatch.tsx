@@ -12,7 +12,7 @@
 // doesn't take up space.
 
 import { useEffect, useState } from 'react'
-import { api, type FramingCluster } from '../api'
+import { api, safeExternalUrl, type FramingCluster } from '../api'
 import { SourceIcon } from './SourceIcon'
 
 // Same six-line duplicated formatter as FeedManager.tsx's timeAgo —
@@ -90,7 +90,7 @@ export function FramingWatch() {
               {c.articles.map((a) => (
                 <li key={a.entry_id}>
                   <a
-                    href={a.url}
+                    href={safeExternalUrl(a.url)}
                     target="_blank"
                     rel="noreferrer"
                     className="flex items-start gap-2 group"

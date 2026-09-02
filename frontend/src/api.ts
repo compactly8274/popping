@@ -33,16 +33,28 @@
  * fetcher, cross-reference sweep, and the in-app
  * ``Discussed on Reddit`` text all keep using the canonical URL.
  *
- * Non-Reddit URLs pass through unchanged.
+ * This is also the one choke point every entry/article/audio href
+ * in the app is expected to be rendered through, because every one
+ * of those URLs ultimately comes from ingested third-party content
+ * (RSS/Atom feeds, scraped pages, Reddit posts) — a malicious or
+ * compromised source could publish a ``javascript:`` or ``data:``
+ * URI as an item's link. Any absolute URL whose scheme isn't
+ * http(s) is replaced with ``'#'`` rather than rendered as-is.
+ * Relative paths (no scheme) and non-Reddit http(s) URLs pass
+ * through unchanged.
  */
 export function safeExternalUrl(url: string): string {
   if (typeof url !== 'string' || !url) return url
   try {
     const u = new URL(url)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      return '#'
+    }
     if (u.hostname === 'reddit.com' || u.hostname === 'www.reddit.com') {
       u.hostname = 'old.reddit.com'
       return u.toString()
     }
+    return u.toString()
   } catch {
     // Not a valid absolute URL (e.g. a relative path); pass through.
   }
