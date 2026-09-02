@@ -24,6 +24,10 @@ name: popping
 #                 network.
 #   - postgres:   not published. Internal-only.
 #   - redis:      not published. Internal-only.
+#   - guard-proxy: not published, and not started at all unless the
+#                 "hardened" profile is enabled. Internal-only egress
+#                 guard for the backend's outbound requests — see
+#                 egress-proxy/README.md.
 #
 # To expose on the LAN, override POPPING_FRONTEND_HOST (0.0.0.0 is the
 # default) and put a reverse proxy in front for TLS + auth.
@@ -57,6 +61,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Optional network-level SSRF hardening — see egress-proxy/README.md
+  # for the full model and how to verify it. Off by default (profile-
+  # gated); enable by setting COMPOSE_PROFILES=hardened plus
+  # HTTP_PROXY/HTTPS_PROXY in .env. Not published — only reachable
+  # from other containers on this compose network.
+  guard-proxy:
+    build: ./egress-proxy
+    restart: unless-stopped
+    profiles: ["hardened"]
 
   backend:
     image: ghcr.io/${POPPING_IMAGE_OWNER:-compactly8274}/popping-backend:${POPPING_IMAGE_TAG:-latest}

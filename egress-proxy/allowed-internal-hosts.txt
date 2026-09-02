@@ -1,0 +1,13 @@
+# Extra internal hostnames allowed through the egress guard (see
+# squid.conf), one per line. Empty by default.
+#
+# Add an entry here only for trusted, operator-configured internal
+# infrastructure the backend legitimately needs to reach on a private
+# address — e.g. a self-hosted Reddit "Hydra" proxy running as
+# another container on this same Docker network:
+#
+#   hydra
+#
+# Do NOT add arbitrary feed/article hosts here — this file is for
+# your own infrastructure, not for working around a blocked fetch.
+# Comment lines (starting with #) and blank lines are ignored.
