@@ -840,13 +840,31 @@ async def _resolve_aggregation_user_ids(
 ) -> tuple[str, ...]:
     """Return the user_ids whose interactions feed the recompute.
 
-    Today this is the same tuple regardless of OIDC state
-    (the homelab case). When OIDC is enabled in a future
-    deployment, this would scope to the OIDC user's sub
-    instead. See the function docstring on
-    ``_recompute_preference_vector`` for the rationale.
+    OIDC off (the homelab case): aggregate over the fixed
+    ``_AGGREGATION_USER_IDS_ALL`` tuple — see that constant's
+    docstring.
+
+    OIDC on: this is a single-operator app, not a multi-tenant one
+    (there's exactly one ``UserProfile`` row, no per-user column),
+    so "the OIDC user" is whichever real sub(s) actually show up in
+    the interactions table — there's no per-request context to read
+    from inside a scheduled background job. Scope to those subs plus
+    "local-bypass" (the same operator hitting from the LAN CIDR
+    bypass is still their own signal); "anonymous" and "default" stay
+    excluded — those are soft-auth artifacts from requests that
+    couldn't be tied to a real identity, and folding them in here
+    would blend an unauthenticated caller's taste into the one
+    account that can see it.
     """
-    return _AGGREGATION_USER_IDS_ALL
+    if not settings.oidc_enabled:
+        return _AGGREGATION_USER_IDS_ALL
+    rows = await session.execute(
+        select(Interaction.user_id)
+        .where(Interaction.user_id.notin_(_AGGREGATION_USER_IDS_ALL))
+        .distinct()
+    )
+    oidc_subs = tuple(r[0] for r in rows.all())
+    return oidc_subs + ("local-bypass",)
 
 
 async def _recompute_preference_vector() -> None:
