@@ -16,6 +16,8 @@ response) — both raise ``YouTubeResolutionError``.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from app.models import Source
@@ -62,6 +64,28 @@ def test_is_youtube_url_rejects_spoofed_subdomain():
     # "youtube.com" as a subdomain of an attacker-controlled domain
     # must not match — only an actual youtube.com/youtu.be host does.
     assert is_youtube_url("https://youtube.com.evil.example/channel/UCxxxx") is False
+
+
+# --- resolve_channel_feed_url: SSRF hook wiring (found in a repo-wide -----
+# --- audit — the scrape-the-page fetch had entry-time and final-URL  -----
+# --- check_url_safe calls but no per-hop ssrf_event_hook, so an       -----
+# --- intermediate redirect hop to a private/loopback address would   -----
+# --- have its connection actually opened before the final check      -----
+# --- discarded the response.                                          -----
+
+
+def test_resolve_channel_feed_url_registers_ssrf_event_hook():
+    src = Path(__file__).resolve().parents[1] / "app" / "youtube.py"
+    text = src.read_text()
+    assert "ssrf_event_hook" in text, (
+        "youtube.py must import ssrf_event_hook from app.url_safety"
+    )
+    assert 'event_hooks={"request": [ssrf_event_hook]}' in text, (
+        "resolve_channel_feed_url's httpx.AsyncClient must register "
+        "ssrf_event_hook as a per-request hook — without it, a redirect "
+        "hop to a private/loopback address is fetched before the "
+        "final-URL check ever runs."
+    )
 
 
 # --- resolve_channel_feed_url: direct /channel/ path (no network) --------

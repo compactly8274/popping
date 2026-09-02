@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from app.url_safety import check_url_safe
+from app.url_safety import check_url_safe, ssrf_event_hook
 
 # Matches any youtube.com subdomain (www, m, music, ...) or the
 # youtu.be short-link host. Anchored to the end of the hostname so
@@ -85,6 +85,14 @@ async def resolve_channel_feed_url(url: str) -> str:
     try:
         async with httpx.AsyncClient(
             timeout=_FETCH_TIMEOUT, follow_redirects=True, max_redirects=5,
+            # Per-hop SSRF guard (same as rss.py's B7 fix). The
+            # entry-time check above and the final-URL check below
+            # only see the URL before and after the whole redirect
+            # chain; this hook fires before EVERY hop in between, so
+            # a redirect to a private/loopback address gets rejected
+            # before the connection is even opened, not after the
+            # response has already been fetched from it.
+            event_hooks={"request": [ssrf_event_hook]},
         ) as client:
             resp = await client.get(url, headers={"User-Agent": _USER_AGENT})
             resp.raise_for_status()
