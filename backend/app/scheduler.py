@@ -1955,7 +1955,7 @@ def _dynamic_source_offset(name: str, interval_seconds: float) -> float:
     restarts (same name -> same offset) and bounded so the first run still
     happens within one interval window.
     """
-    if interval_seconds <= 0:
+    if interval_seconds < 1:
         return 0.0
     # 32 bits of hash is plenty of spread and avoids big-integer math.
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
@@ -1988,24 +1988,50 @@ def _plugin_for(row: Source) -> SourcePlugin | None:
     return None
 
 
-def _add_or_replace_dynamic_job(scheduler: Any, row: Source) -> bool:
+def _add_or_replace_dynamic_job(scheduler: Any, row: Source, *, stagger: bool = True) -> bool:
     """Register (or replace) the scheduler job for a dynamic row.
 
     Returns True if a job was registered, False if the row's type
     has no plugin yet. ``replace_existing=True`` so PATCH refresh-
     interval changes take effect without first removing the job.
+
+    ``stagger`` controls whether the first run is spread across the
+    refresh interval (via ``_dynamic_source_offset``) or fires
+    immediately. Staggering only makes sense for the startup walk,
+    which re-registers every dynamic row at once and would otherwise
+    fire them all in the same second. A user-triggered add/edit/
+    reactivate (``add_source``/``update_source``) should ingest
+    right away so the user gets immediate feedback, not wait up to a
+    full refresh interval.
     """
     plugin = _plugin_for(row)
     if plugin is None:
         return False
     now = dt.datetime.now(dt.timezone.utc)
-    offset_seconds = _dynamic_source_offset(row.name, row.refresh_interval_seconds)
+    offset_seconds = (
+        _dynamic_source_offset(row.name, row.refresh_interval_seconds)
+        if stagger
+        else 0.0
+    )
+    first_run = now + dt.timedelta(seconds=offset_seconds)
     scheduler.add_job(
         _ingest,
         trigger=IntervalTrigger(
             seconds=row.refresh_interval_seconds,
-            start_date=now + dt.timedelta(seconds=offset_seconds),
+            start_date=first_run,
         ),
+        # ``IntervalTrigger.get_next_fire_time`` rounds its first fire
+        # UP to the next whole interval once ``now`` (evaluated a few
+        # microseconds after ``start_date`` above was computed) has
+        # passed ``start_date`` at all — which it always has by the
+        # time ``add_job`` gets around to asking. Left to the trigger,
+        # even ``offset_seconds == 0`` would silently turn into "wait
+        # one full interval", defeating both the immediate (stagger=
+        # False) and the startup-stagger cases. Passing ``next_run_time``
+        # explicitly overrides the trigger's first-fire computation
+        # (subsequent runs are unaffected — they're computed from the
+        # previous fire time, not from ``start_date``).
+        next_run_time=first_run,
         args=[plugin],
         id=_dynamic_job_id(row.id),
         name=f"Ingest {row.name} (dynamic)",
@@ -2124,7 +2150,7 @@ async def add_source(
         return winner
     await session.refresh(row)
     if _scheduler is not None:
-        _add_or_replace_dynamic_job(_scheduler, row)
+        _add_or_replace_dynamic_job(_scheduler, row, stagger=False)
     return row
 
 
@@ -2319,8 +2345,10 @@ async def update_source(
     # Re-add (covers: enabled, refresh / name / url changed, or any
     # combination). ``replace_existing=True`` rebinds the args so
     # the freshly-constructed ``DynamicRssPlugin(row)`` below picks
-    # up the new name/url.
-    _add_or_replace_dynamic_job(_scheduler, row)
+    # up the new name/url. Not staggered: a user re-enabling or
+    # editing a source expects the next ingest to run right away,
+    # not wait up to a full refresh interval.
+    _add_or_replace_dynamic_job(_scheduler, row, stagger=False)
     return row
 
 

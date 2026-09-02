@@ -151,6 +151,16 @@ _GENERIC_SCRAPE_DEFAULT_REFRESH = 7_200
 # 500 to the client. Catching it here returns a clean 422.
 _CATEGORY_MAX = 40
 
+# Column names the frontend reserves for non-category columns (see
+# ``App.tsx``'s ``allSubsColumns``, which always prepends a "Saved"
+# and a "For You" entry ahead of the per-category ones). Those
+# columns are keyed by name in a ``Map``, so a user-created category
+# with one of these names would silently collide with — and
+# overwrite — the real Saved/For You column. Case-insensitive
+# because a differently-cased duplicate ("saved") is just as
+# confusing even though it wouldn't literally collide.
+_RESERVED_CATEGORY_NAMES = {"saved", "for you"}
+
 # Headers we refuse to let users override via ``custom_headers``.
 # ``Cookie`` / ``Authorization`` would let a multi-tenant LAN user
 # forge another user's session; ``Host`` is set by httpx from the
@@ -285,6 +295,11 @@ def _validate_category(value: str) -> None:
         raise HTTPException(
             status_code=422,
             detail=f"category must be {_CATEGORY_MAX} characters or fewer",
+        )
+    if stripped.lower() in _RESERVED_CATEGORY_NAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"category {stripped!r} is reserved for a built-in column",
         )
 
 
@@ -480,7 +495,8 @@ async def create_source_endpoint(
     # leading-slash path prefix, never a full URL (same rule).
     sitemap_url_value = None
     if body.sitemap_url is not None:
-        sitemap_url_value = _validate_url(body.sitemap_url)
+        _validate_url(body.sitemap_url)
+        sitemap_url_value = body.sitemap_url
     link_pattern_value = None
     if body.link_pattern is not None:
         candidate = body.link_pattern
@@ -697,37 +713,50 @@ async def update_source_endpoint(
     # as ``custom_headers`` (which is also stored-but-ignored for
     # generic_scrape since that plugin doesn't make HTTP requests
     # with headers).
-    sitemap_url_value = None
-    if "sitemap_url" in body.model_fields_set and body.sitemap_url is not None:
-        sitemap_url_value = _validate_url(body.sitemap_url)
+    # ``update_source`` uses the ``_UNSET`` sentinel to distinguish
+    # "field missing from the request body, don't touch" from
+    # "explicitly set to None, clear it". Default to ``_UNSET`` here
+    # and only override it when the field was actually present in
+    # the body — passing a bare ``None`` for an omitted field would
+    # wipe out the row's existing value on every unrelated PATCH.
+    sitemap_url_value: str | None = scheduler._UNSET
+    if "sitemap_url" in body.model_fields_set:
+        if body.sitemap_url is not None:
+            _validate_url(body.sitemap_url)
+        sitemap_url_value = body.sitemap_url
     # ``link_pattern`` is a path-prefix filter for the page_links
     # fallback. Strict validation: must be a leading-slash path
     # prefix (e.g. ``/library/``), NEVER a full URL — accepting a
     # full URL would let the user bypass the same-origin safety
     # check that ``_extract_links_from_html`` enforces.
-    link_pattern_value = None
-    if "link_pattern" in body.model_fields_set and body.link_pattern is not None:
-        candidate = body.link_pattern
-        if not candidate.startswith("/"):
-            raise HTTPException(
-                status_code=422,
-                detail="link_pattern must start with '/' (path prefix, not a full URL)",
-            )
-        if "://" in candidate:
-            raise HTTPException(
-                status_code=422,
-                detail="link_pattern must be a path prefix, not a full URL",
-            )
-        link_pattern_value = candidate
+    link_pattern_value: str | None = scheduler._UNSET
+    if "link_pattern" in body.model_fields_set:
+        if body.link_pattern is not None:
+            candidate = body.link_pattern
+            if not candidate.startswith("/"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="link_pattern must start with '/' (path prefix, not a full URL)",
+                )
+            if "://" in candidate:
+                raise HTTPException(
+                    status_code=422,
+                    detail="link_pattern must be a path prefix, not a full URL",
+                )
+            link_pattern_value = candidate
+        else:
+            link_pattern_value = None
     if body.refresh_interval_seconds is not None:
         body.refresh_interval_seconds = _validate_refresh(body.refresh_interval_seconds)
     if body.category is not None:
         _validate_category(body.category)
-    headers = (
-        _validate_custom_headers(body.custom_headers)
-        if body.custom_headers is not None
-        else None
-    )
+    headers: dict | None = scheduler._UNSET
+    if "custom_headers" in body.model_fields_set:
+        headers = (
+            _validate_custom_headers(body.custom_headers)
+            if body.custom_headers is not None
+            else None
+        )
 
     # Built-in rows can be paused / re-categorized (these are
     # row-level state, not class-level). Renaming or re-URLing a

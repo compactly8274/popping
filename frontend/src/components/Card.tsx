@@ -909,7 +909,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       />
       <div className="flex items-center justify-between gap-3 mb-2">
         <a
-          href={entry.url}
+          href={safeExternalUrl(entry.url)}
           target="_blank"
           rel="noopener noreferrer"
           aria-label="open in new tab"
@@ -1082,7 +1082,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       {entry.audio_url && (
         <div className="mt-1.5 flex items-center gap-3">
           <a
-            href={entry.audio_url}
+            href={safeExternalUrl(entry.audio_url)}
             target="_blank"
             rel="noopener noreferrer"
             data-card-interactive
@@ -1090,7 +1090,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
               e.preventDefault()
               e.stopPropagation()
               recordImmediate({ entry_id: entry.id, type: 'click' })
-              window.open(entry.audio_url!, '_blank', 'noopener,noreferrer')
+              window.open(safeExternalUrl(entry.audio_url!), '_blank', 'noopener,noreferrer')
             }}
             className="inline-flex items-center gap-1 text-ios-caption text-accent active:opacity-60"
           >
@@ -1178,7 +1178,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
             related.articles.map((a) => (
               <a
                 key={a.entry_id}
-                href={a.url}
+                href={safeExternalUrl(a.url)}
                 target="_blank"
                 rel="noopener noreferrer"
                 data-card-interactive
