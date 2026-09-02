@@ -840,13 +840,31 @@ async def _resolve_aggregation_user_ids(
 ) -> tuple[str, ...]:
     """Return the user_ids whose interactions feed the recompute.
 
-    Today this is the same tuple regardless of OIDC state
-    (the homelab case). When OIDC is enabled in a future
-    deployment, this would scope to the OIDC user's sub
-    instead. See the function docstring on
-    ``_recompute_preference_vector`` for the rationale.
+    OIDC off (the homelab case): aggregate over the fixed
+    ``_AGGREGATION_USER_IDS_ALL`` tuple — see that constant's
+    docstring.
+
+    OIDC on: this is a single-operator app, not a multi-tenant one
+    (there's exactly one ``UserProfile`` row, no per-user column),
+    so "the OIDC user" is whichever real sub(s) actually show up in
+    the interactions table — there's no per-request context to read
+    from inside a scheduled background job. Scope to those subs plus
+    "local-bypass" (the same operator hitting from the LAN CIDR
+    bypass is still their own signal); "anonymous" and "default" stay
+    excluded — those are soft-auth artifacts from requests that
+    couldn't be tied to a real identity, and folding them in here
+    would blend an unauthenticated caller's taste into the one
+    account that can see it.
     """
-    return _AGGREGATION_USER_IDS_ALL
+    if not settings.oidc_enabled:
+        return _AGGREGATION_USER_IDS_ALL
+    rows = await session.execute(
+        select(Interaction.user_id)
+        .where(Interaction.user_id.notin_(_AGGREGATION_USER_IDS_ALL))
+        .distinct()
+    )
+    oidc_subs = tuple(r[0] for r in rows.all())
+    return oidc_subs + ("local-bypass",)
 
 
 async def _recompute_preference_vector() -> None:
@@ -1476,38 +1494,47 @@ async def _crossref_sweep() -> None:
     to_check: list[tuple[int, str]] = []
     try:
         async with SessionLocal() as session:
-            # Pull all candidate entries. We do an in-Python filter for
-            # "no reddit_thread_url" + "not from a Reddit source"
-            # rather than a GIN-indexed ``NOT (meta ? 'reddit_thread_url')``
-            # predicate — the rows-to-stamp set is small after the
-            # first sweep, so the scan is cheap. The GIN index added
-            # in migration 0012 still helps when the entry count
-            # climbs into the tens of thousands.
-            stmt = (
-                select(Entry.id, Entry.url, Entry.source_id, Entry.meta)
-                .order_by(Entry.id.desc())
-                .limit(_CROSSREF_BATCH * 4)
-            )
-            candidates = (await session.execute(stmt)).all()
-
             # Fetch the set of Source rows that are Reddit-typed so
             # we can skip their entries (their own URL IS the
-            # Reddit thread). One small query, in-Python membership
-            # check after.
+            # Reddit thread) directly in the candidate query below.
             reddit_source_ids = set((
                 await session.scalars(
                     select(SourceModel.id).where(SourceModel.type == "reddit")
                 )
             ).all())
 
-            for row in candidates:
-                if row.source_id in reddit_source_ids:
-                    continue
-                if (row.meta or {}).get("reddit_thread_url"):
-                    continue
-                if not row.url:
-                    continue
-                to_check.append((row.id, row.url))
+            # "Not yet stamped" is pushed into SQL via the GIN-indexed
+            # ``NOT (meta ? 'reddit_thread_url')`` predicate (see
+            # migration 0014, which added the index specifically for
+            # this query) instead of an in-Python filter after an
+            # unconditional ``LIMIT``. Filtering in Python meant the
+            # top-``_CROSSREF_BATCH * 4`` most-recent-by-id rows were
+            # fetched regardless of whether they'd already been
+            # stamped or were Reddit-sourced — on any install where
+            # most recent entries have already been checked (the
+            # steady-state case after the first sweep), the LIMIT
+            # budget was mostly spent on rows the Python loop would
+            # immediately discard, so genuinely-uncheckable-yet
+            # entries could scroll out of the window before ever
+            # being looked at even once. Filtering in SQL means every
+            # row this query returns is a real candidate.
+            stmt = (
+                select(Entry.id, Entry.url)
+                .where(
+                    Entry.url.isnot(None),
+                    # ``meta`` is nullable; ``NULL ? 'key'`` evaluates
+                    # to NULL (excluded by a bare WHERE), not TRUE, so
+                    # COALESCE to an empty object first — a NULL meta
+                    # has no reddit_thread_url key either.
+                    text("NOT (COALESCE(entries.meta, '{}'::jsonb) ? 'reddit_thread_url')"),
+                )
+                .order_by(Entry.id.desc())
+                .limit(_CROSSREF_BATCH * 4)
+            )
+            if reddit_source_ids:
+                stmt = stmt.where(Entry.source_id.notin_(reddit_source_ids))
+            candidates = (await session.execute(stmt)).all()
+            to_check = [(row.id, row.url) for row in candidates]
     except Exception:
         logger.exception("crossref candidate scan failed")
         return

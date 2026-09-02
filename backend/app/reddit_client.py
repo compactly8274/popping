@@ -85,6 +85,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.config import settings
+from app.url_safety import check_url_safe, ssrf_event_hook
 
 logger = logging.getLogger("popping.reddit_client")
 
@@ -224,6 +225,14 @@ def init_client() -> None:
             timeout=_TIMEOUT,
             follow_redirects=True,
             headers=headers,
+            # NOT wrapped in the SSRF guard, unlike every other client
+            # in this module: ``reddit_hydra_url`` is trusted,
+            # operator-configured infrastructure, not a user-supplied
+            # or attacker-influenced target — the documented example
+            # (``.env.example``) is a Docker-internal hostname
+            # (``http://hydra:8080``), which ``check_url_safe`` would
+            # reject as a private address. Guarding this client would
+            # break the one deployment shape it exists for.
         )
         logger.info(
             "reddit_client: proxy mode (url=%s, auth=%s)",
@@ -245,6 +254,13 @@ def init_client() -> None:
                 # honest.
                 "Accept": "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
             },
+            # Per-hop SSRF guard (see rss.py's B7 fix for the full
+            # rationale). ``base_url`` is a hardcoded reddit.com here,
+            # but ``follow_redirects=True`` means Reddit itself (or a
+            # thread-comments path fed a malformed URL) could still
+            # redirect a hop to a private/loopback address without
+            # this.
+            event_hooks={"request": [ssrf_event_hook]},
         )
         # Reset the bucket so the first burst of cross-ref requests
         # after a restart gets a clean slate.
@@ -350,6 +366,9 @@ def _get_client() -> httpx.AsyncClient:
         headers = {"User-Agent": _user_agent()}
         if settings.reddit_hydra_token:
             headers["Authorization"] = f"Bearer {settings.reddit_hydra_token}"
+        # Not SSRF-guarded — see ``init_client``'s comment on
+        # ``_proxy_client``: this is trusted operator infrastructure,
+        # commonly a Docker-internal address by design.
         return httpx.AsyncClient(
             base_url=settings.reddit_hydra_url.rstrip("/"),
             timeout=_TIMEOUT,
@@ -364,6 +383,7 @@ def _get_client() -> httpx.AsyncClient:
             "User-Agent": _user_agent(),
             "Accept": "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
         },
+        event_hooks={"request": [ssrf_event_hook]},
     )
 
 
@@ -377,10 +397,26 @@ async def _get_atom(path: str) -> str:
     Direct-mode calls take a rate-limit token first; proxy-mode
     calls don't (the proxy has its own limiter).
     """
-    if _direct_client is not None and _proxy_client is None:
+    is_direct = _direct_client is not None and _proxy_client is None
+    if is_direct:
         await _take_token()
     client = _get_client()
     async with client.stream("GET", path) as resp:
+        # Re-check the FINAL URL after the redirect chain — direct
+        # mode only. ``ssrf_event_hook`` on the direct client is the
+        # per-hop guard that cuts a redirect chain early; this is the
+        # safety net for the last hop, same pattern as rss.py /
+        # article_extract.py. Skipped for proxy mode: the proxy is
+        # trusted operator infrastructure that's commonly on a
+        # private address by design (see ``init_client``), so
+        # ``resp.url`` there is expected to be "unsafe" by this
+        # check's normal policy.
+        if is_direct:
+            final_safe, final_reason = check_url_safe(str(resp.url))
+            if not final_safe:
+                raise ValueError(
+                    f"reddit_client: {path} redirected to a denied host ({final_reason})"
+                )
         # Surface 429 / 5xx as a typed exception so the scheduler can
         # distinguish throttling from an empty feed and back off one
         # cycle. Check before streaming the body to avoid pulling a
@@ -819,6 +855,37 @@ class _ThreadProxy404(Exception):
     pass
 
 
+def _thread_rss_path(thread_url: str) -> Optional[str]:
+    """Turn a Reddit thread permalink into a relative ``.rss`` path
+    safe to hand to a client scoped to ``base_url="https://www.reddit.com"``
+    (or the proxy, which relays the same path shape).
+
+    Returns ``None`` if ``thread_url`` isn't actually a ``reddit.com``
+    / ``www.reddit.com`` URL. This module's callers are expected to
+    only ever pass Reddit thread URLs (validated by
+    ``routes/entries.py``'s ``_is_reddit_url`` before it's stored as
+    ``reddit_thread_url`` or read from ``row.url``), but this module
+    shouldn't rely on that alone: every other fetcher in the codebase
+    validates its own inputs rather than trusting the caller. Parsing
+    with ``urlparse`` and checking the host explicitly (instead of
+    the previous ``str.startswith("https://www.reddit.com")`` prefix
+    strip) also closes a real bug — a ``thread_url`` that didn't
+    happen to start with that exact literal fell through unstripped,
+    and httpx treats an absolute URL passed as ``path`` as overriding
+    ``base_url`` entirely, sending the request to whatever host was
+    in the string.
+    """
+    parsed = urlparse(thread_url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in (
+        "reddit.com", "www.reddit.com",
+    ):
+        return None
+    path = parsed.path.rstrip("/") + "/.rss"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return path
+
+
 async def fetch_thread_comments(thread_url: str) -> Optional[list[dict]]:
     """Fetch and parse a Reddit thread's comments via its ``.rss``
     feed. Returns a list of ``{"author", "text"}`` dicts, or ``None``
@@ -837,12 +904,13 @@ async def fetch_thread_comments(thread_url: str) -> Optional[list[dict]]:
             raise RedditRateLimited(
                 f"reddit_client: no rate-limit token available for {thread_url}"
             )
-    path = thread_url.rstrip("/") + "/.rss"
-    # Direct-mode client is scoped to https://www.reddit.com — strip
-    # that prefix so ``path`` is relative, matching how every other
-    # caller in this module invokes ``client.stream("GET", path)``.
-    if path.startswith("https://www.reddit.com"):
-        path = path[len("https://www.reddit.com"):]
+    path = _thread_rss_path(thread_url)
+    if path is None:
+        logger.debug(
+            "reddit_client: fetch_thread_comments rejected non-Reddit thread_url %r",
+            thread_url,
+        )
+        return None
     client = _get_client()
     try:
         async with client.stream("GET", path) as resp:
@@ -913,9 +981,13 @@ async def _fetch_thread_comments_direct(thread_url: str) -> Optional[list[dict]]
         raise RedditRateLimited(
             f"reddit_client: no rate-limit token available for {thread_url}"
         )
-    path = thread_url.rstrip("/") + "/.rss"
-    if path.startswith("https://www.reddit.com"):
-        path = path[len("https://www.reddit.com"):]
+    path = _thread_rss_path(thread_url)
+    if path is None:
+        logger.debug(
+            "reddit_client: fetch_thread_comments_direct rejected non-Reddit thread_url %r",
+            thread_url,
+        )
+        return None
     headers = {
         "User-Agent": _user_agent(),
         "Accept": "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
@@ -926,6 +998,7 @@ async def _fetch_thread_comments_direct(thread_url: str) -> Optional[list[dict]]
             timeout=_TIMEOUT,
             follow_redirects=True,
             headers=headers,
+            event_hooks={"request": [ssrf_event_hook]},
         ) as client:
             async with client.stream("GET", path) as resp:
                 resp.raise_for_status()

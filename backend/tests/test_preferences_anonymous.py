@@ -110,3 +110,32 @@ async def test_anonymous_put_is_idempotent_upsert(app_client):
     matching = [i for i in resp.json()["items"] if i["key"] == "column_prefs:tech"]
     assert len(matching) == 1
     assert matching[0]["value"] == {"sort": "newest"}
+
+
+@pytest.mark.asyncio
+async def test_updated_at_advances_on_second_put(app_client):
+    """Regression test: the upsert's ON CONFLICT DO UPDATE SET clause
+    used to reference the column's own current value
+    (``UserPreference.__table__.c.updated_at``) instead of
+    ``func.now()``, which compiles to ``SET updated_at =
+    user_preferences.updated_at`` — a no-op. After the first PUT,
+    ``updated_at`` was frozen forever regardless of how many times
+    the key was subsequently written."""
+    first = await app_client.put(
+        "/api/preferences/column_prefs:updated_at_probe",
+        json={"value": {"sort": "top"}},
+    )
+    assert first.status_code == 200
+    first_updated_at = first.json()["updated_at"]
+
+    second = await app_client.put(
+        "/api/preferences/column_prefs:updated_at_probe",
+        json={"value": {"sort": "newest"}},
+    )
+    assert second.status_code == 200
+    second_updated_at = second.json()["updated_at"]
+
+    assert second_updated_at > first_updated_at, (
+        f"updated_at must advance on a second write to the same key: "
+        f"{first_updated_at!r} -> {second_updated_at!r}"
+    )

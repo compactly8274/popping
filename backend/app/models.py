@@ -249,7 +249,17 @@ class Interaction(Base):
 
     entry: Mapped[Entry] = relationship(back_populates="interactions")
 
-    __table_args__ = (Index("ix_interactions_user_entry", "user_id", "entry_id"),)
+    __table_args__ = (
+        Index("ix_interactions_user_entry", "user_id", "entry_id"),
+        # Mirrors alembic migration 0021 (the History page's
+        # GET /api/interactions/recent query: WHERE user_id = ? AND
+        # type IN (...) ORDER BY created_at DESC LIMIT n). The
+        # ``CREATE INDEX`` itself is migration-managed; this entry
+        # keeps ``Base.metadata.create_all()``-based dev/test setups
+        # consistent with the migration-managed production schema —
+        # same reasoning as ``Entry.fetched_at``'s ``index=True``.
+        Index("ix_interactions_user_type_created", "user_id", "type", "created_at"),
+    )
 
 
 # ---------------------------------------------------------------------------

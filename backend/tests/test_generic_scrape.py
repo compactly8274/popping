@@ -140,3 +140,69 @@ async def test_plugin_fetch_respects_per_poll_cap(db_session, monkeypatch):
     # The URLs past the cap were left unmarked — a second poll can
     # still pick them up rather than skipping them forever.
     assert len(plugin._extracted_urls) == generic_scrape._MAX_NEW_PER_POLL
+
+
+@pytest.mark.asyncio
+async def test_plugin_fetch_runs_extractions_concurrently(db_session, monkeypatch):
+    """Regression test for a bug found in a repo-wide audit: fetch()
+    used to await _extract_one strictly one at a time, so a source
+    whose pages each take several seconds would serialize a full
+    _MAX_NEW_PER_POLL batch into one long scheduler tick. Prove the
+    fix with wall-clock timing: _MAX_NEW_PER_POLL slow (0.2s each)
+    fake extractions must complete in well under
+    _MAX_NEW_PER_POLL * 0.2s (fully sequential), bounded instead by
+    ceil(_MAX_NEW_PER_POLL / _FETCH_CONCURRENCY) * 0.2s."""
+    import asyncio
+    import time
+
+    source = await make_source(db_session, "slow_site", type="generic_scrape")
+    plugin = GenericScrapePlugin(source)
+
+    async def fake_discover_sitemap_urls(url, limit=200):
+        return [f"https://example.com/{i}" for i in range(generic_scrape._MAX_NEW_PER_POLL)]
+
+    async def fake_extract_one(url, custom_headers=None):
+        await asyncio.sleep(0.2)
+        return {"title": f"Article {url}", "url": url}
+
+    monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
+    monkeypatch.setattr(generic_scrape, "_extract_one", fake_extract_one)
+
+    start = time.monotonic()
+    items = await plugin.fetch()
+    elapsed = time.monotonic() - start
+
+    assert len(items) == generic_scrape._MAX_NEW_PER_POLL
+    sequential_worst_case = generic_scrape._MAX_NEW_PER_POLL * 0.2
+    assert elapsed < sequential_worst_case * 0.7, (
+        f"fetch() took {elapsed:.2f}s for {generic_scrape._MAX_NEW_PER_POLL} "
+        f"x 0.2s extractions — looks sequential, not concurrent "
+        f"(fully sequential would be ~{sequential_worst_case:.2f}s)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plugin_fetch_marks_extracted_even_on_extraction_error(db_session, monkeypatch):
+    """A single failing extraction (raised exception, not just a
+    None return) must not crash the whole batch or leave that URL
+    un-marked — it should be skipped and still marked extracted so
+    a permanently-broken URL doesn't get retried forever."""
+    source = await make_source(db_session, "flaky_site", type="generic_scrape")
+    plugin = GenericScrapePlugin(source)
+    urls = [f"https://example.com/{i}" for i in range(3)]
+
+    async def fake_discover_sitemap_urls(url, limit=200):
+        return urls
+
+    async def fake_extract_one(url, custom_headers=None):
+        if url == urls[1]:
+            raise RuntimeError("boom")
+        return {"title": f"Article {url}", "url": url}
+
+    monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
+    monkeypatch.setattr(generic_scrape, "_extract_one", fake_extract_one)
+
+    items = await plugin.fetch()
+
+    assert len(items) == 2
+    assert set(plugin._extracted_urls) == set(urls)

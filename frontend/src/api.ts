@@ -519,9 +519,27 @@ export const api = {
   // Returns the entries in the same order as
   // the input ids. Ids that don't match a row
   // are dropped silently.
-  entriesByIds: (ids: number[]) => {
-    if (ids.length === 0) return Promise.resolve([] as EntryOut[])
-    return jsonFetch<EntryOut[]>(`/api/entries/by-ids?ids=${ids.join(',')}`)
+  entriesByIds: async (ids: number[]) => {
+    if (ids.length === 0) return [] as EntryOut[]
+    // The backend caps a single call at 200 ids (routes/entries.py's
+    // entries_by_ids) and silently truncates anything past that
+    // rather than erroring. Callers here can hold far more than
+    // 200 — the Settings Hidden/Starred/Voted tabs cap at
+    // MAX_HIDDEN/MAX_STARRED/MAX_VOTED (1000/1000/2000, see
+    // lib/preferences.tsx) — so a single un-chunked call would
+    // silently drop everything past the first 200 ids sent (the
+    // oldest entries, since callers pass ids in recency order).
+    // Chunking preserves the full list and keeps each request's
+    // query string a sane length.
+    const CHUNK_SIZE = 200
+    const chunks: number[][] = []
+    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+      chunks.push(ids.slice(i, i + CHUNK_SIZE))
+    }
+    const results = await Promise.all(
+      chunks.map((chunk) => jsonFetch<EntryOut[]>(`/api/entries/by-ids?ids=${chunk.join(',')}`)),
+    )
+    return results.flat()
   },
   ingest: (sourceName: string) =>
     jsonFetch<{ source: string; fetched: number; inserted: number; duplicates: number; error: string | null }>(

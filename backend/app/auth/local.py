@@ -11,6 +11,7 @@ produced the session — they only see ``auth_method`` in the payload.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 from typing import Optional
@@ -129,7 +130,18 @@ async def login_local(
     cfg = oidc_config()
 
     try:
-        sub, email, name = _verify_local_credentials(body.username, body.password)
+        # ``bcrypt.checkpw`` is deliberately slow (its whole point is
+        # a tunable cost factor — typically 100-300ms+ per call) and
+        # is plain synchronous code, so calling it directly here
+        # would block this single-process event loop for that whole
+        # duration on every login attempt: the scheduler's ingest
+        # ticks and every other in-flight request stall along with
+        # it. ``asyncio.to_thread`` runs it off the loop, same fix
+        # already applied to the OIDC discovery fetch (see
+        # ``app.auth.oidc._fetch_discovery_sync``'s docstring).
+        sub, email, name = await asyncio.to_thread(
+            _verify_local_credentials, body.username, body.password
+        )
     except _LocalAuthError:
         # Same response regardless of failure mode (don't leak which
         # field was wrong, don't leak whether local auth is enabled).

@@ -69,6 +69,48 @@ const HEALTH_INTERVAL_MS = 5 * 60_000
 // the seen-set still has the old ids).
 const HIDDEN_RESET_MS = 2 * 60 * 1000
 
+// Structural equality for the plain JSON objects the API returns
+// (Entry, Source — flat scalars plus at most one nested plain
+// object like `meta` / `custom_headers`, no functions/Dates/Maps).
+// Used by `reconcileById` below to decide whether a freshly-fetched
+// row can be swapped for its previous-poll object, or is genuinely
+// unchanged and should keep the OLD reference.
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    return a.every((v, i) => deepEqual(v, b[i]))
+  }
+  const aRec = a as Record<string, unknown>
+  const bRec = b as Record<string, unknown>
+  const aKeys = Object.keys(aRec)
+  if (aKeys.length !== Object.keys(bRec).length) return false
+  return aKeys.every((key) => deepEqual(aRec[key], bRec[key]))
+}
+
+// Every 60s poll (see REFRESH_INTERVAL_MS) hands `refresh()` a
+// brand-new array of brand-new objects, freshly parsed from JSON —
+// even when nothing actually changed since the last poll. Card and
+// Column both memoize on reference equality (see Card.tsx's
+// _cardPropsEqual), so passing the fetch response straight to
+// setEntries/setSources/setForYou defeats that memoization every
+// single tick: a full re-render (including Card's native touchmove
+// listener teardown/re-attach) of every visible card and column
+// once a minute, regardless of whether the feed changed. Reconciling
+// against the previous state — keeping the OLD object reference for
+// any row that's structurally unchanged — lets the memo comparators
+// actually bail out on the common "nothing changed for this row"
+// case.
+function reconcileById<T extends { id: number }>(prev: T[], next: T[]): T[] {
+  if (prev.length === 0) return next
+  const prevById = new Map(prev.map((item) => [item.id, item]))
+  return next.map((item) => {
+    const old = prevById.get(item.id)
+    return old !== undefined && deepEqual(old, item) ? old : item
+  })
+}
+
 // localStorage keys live in ``lib/storage.ts`` so feature
 // modules share one namespaced key registry. Only two keys
 // remain there (mobileColLast, briefCollapsed) -- the rest
@@ -117,6 +159,24 @@ function loadMobileCol(): number {
 // marks are dropped — which is fine, because those entries have
 // long since aged out of the column's view.
 const MAX_PER_COLUMN = 200
+
+// Upper bound on ``seenEntryIdsRef`` (see its declaration below).
+// Unlike readEntries/hiddenEntries/starredEntries, this set is
+// populated automatically on every poll (not by discrete user
+// actions), so a long-running tab left open for days would
+// otherwise accumulate one id per entry ever fetched, forever, with
+// no eviction. 10,000 is generous headroom over any realistic
+// multi-day session's entry volume while still bounding the set's
+// footprint for an install left open indefinitely.
+const MAX_SEEN_ENTRY_IDS = 10_000
+
+// FIFO-evict a Set down to ``max`` entries, keeping the most
+// recently added ones (Set iteration order is insertion order in
+// JS, so the "oldest" ids are simply whatever comes first).
+function capSetFIFO<T>(set: Set<T>, max: number): Set<T> {
+  if (set.size <= max) return set
+  return new Set(Array.from(set).slice(set.size - max))
+}
 
 
 // Per-column Fresh/History section collapse state. The
@@ -1034,12 +1094,12 @@ export function App() {
       } else {
         const merged = new Set(prevSeen)
         for (const id of newSeen) merged.add(id)
-        seenEntryIdsRef.current = merged
+        seenEntryIdsRef.current = capSetFIFO(merged, MAX_SEEN_ENTRY_IDS)
       }
       hiddenAtRef.current = null
-      setEntries(e)
-      setSources(s)
-      setForYou(fy)
+      setEntries((prev) => reconcileById(prev, e))
+      setSources((prev) => reconcileById(prev, s))
+      setForYou((prev) => reconcileById(prev, fy))
       setError(null)
       // Surface a brief success toast so the user knows the
       // pull actually happened — the Refresh button's …→
@@ -2745,6 +2805,8 @@ export function App() {
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         categories={categories}
+        sources={sources}
+        onRefreshSources={async () => { void refresh() }}
         activeSources={activeSources}
         onSourceToggle={toggleSourceAndMaybeClose}
         onClearAllFilters={clearSourceFilters}

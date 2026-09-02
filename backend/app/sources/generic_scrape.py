@@ -21,6 +21,7 @@ dedicated DB table.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 from collections import OrderedDict
@@ -39,6 +40,19 @@ logger = logging.getLogger("popping.sources.generic_scrape")
 # sitemap with thousands of URLs drains its backlog gradually over
 # many poll cycles rather than fetching everything in one burst.
 _MAX_NEW_PER_POLL = 10
+
+# How many of this poll's (up to _MAX_NEW_PER_POLL) candidate fetches
+# run concurrently, rather than strictly one-at-a-time. Found in a
+# repo-wide audit: a source whose pages take 5-10s each could turn
+# one scheduled poll into a 1-2 minute serialized job, holding that
+# scheduler slot the whole time for no correctness reason. Kept
+# modest (unlike scheduler.py's thumbnail-fetch concurrency of 10,
+# which fans out across many DIFFERENT hosts) because every fetch
+# here hits the SAME host — this is the "courtesy" source type
+# (see _GENERIC_SCRAPE_DEFAULT_REFRESH's rationale in
+# routes/sources.py), so a handful of concurrent connections instead
+# of a full burst of 10.
+_FETCH_CONCURRENCY = 3
 
 # How many candidate URLs to even ask the sitemap for. Independent of
 # _MAX_NEW_PER_POLL — we want to see enough of the sitemap to find
@@ -377,30 +391,52 @@ class GenericScrapePlugin(SourcePlugin):
             candidates = await _discover_page_links(
                 self.url, self.link_pattern, limit=_MAX_SITEMAP_CANDIDATES
             )
-        items: list[dict] = []
-        attempted = 0
+        batch: list[str] = []
         for url in candidates:
             if url in self._extracted_urls:
                 continue
-            if attempted >= _MAX_NEW_PER_POLL:
+            if len(batch) >= _MAX_NEW_PER_POLL:
                 # Leave the rest for the next poll — see
                 # _MAX_NEW_PER_POLL. Deliberately NOT marked as
                 # extracted, so they're candidates again next cycle
                 # instead of being skipped forever.
                 break
-            attempted += 1
-            # B4 fix: pass custom_headers through to _extract_one
-            # so user-supplied headers (e.g. a custom User-Agent
-            # or Authorization) are actually used by the HTTP
-            # fetch. Previously the headers were stored on the
-            # Source row but never passed to fetch_html.
-            item = await _extract_one(url, custom_headers=self.custom_headers)
+            batch.append(url)
+
+        # Fetch the batch concurrently (bounded — see
+        # _FETCH_CONCURRENCY) instead of one at a time: a source
+        # whose pages take several seconds each would otherwise
+        # serialize a full _MAX_NEW_PER_POLL batch into a single long
+        # scheduler tick for no correctness reason (each URL's fetch
+        # and extraction is independent of every other's).
+        sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+        async def _bounded_extract(url: str) -> dict | None:
+            async with sem:
+                # B4 fix: pass custom_headers through to _extract_one
+                # so user-supplied headers (e.g. a custom User-Agent
+                # or Authorization) are actually used by the HTTP
+                # fetch. Previously the headers were stored on the
+                # Source row but never passed to fetch_html.
+                return await _extract_one(url, custom_headers=self.custom_headers)
+
+        results = await asyncio.gather(
+            *(_bounded_extract(url) for url in batch), return_exceptions=True,
+        )
+
+        items: list[dict] = []
+        for url, result in zip(batch, results):
             # Use the bounded helper (FIFO eviction at
             # ``_MAX_EXTRACTED_URLS``) instead of ``.add()`` to keep
             # the in-memory set's footprint fixed.
             self._mark_extracted(url)
-            if item is not None:
-                items.append(item)
+            if isinstance(result, BaseException):
+                logger.debug(
+                    "generic_scrape: extraction failed for %s: %s", url, result,
+                )
+                continue
+            if result is not None:
+                items.append(result)
         return items
 
     # normalize() is inherited from SourcePlugin's default

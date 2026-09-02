@@ -27,8 +27,8 @@
 // Drawer stays slim so it's a quick filter panel, not a settings
 // pile. Tap "All settings…" to open the full Settings.
 
-import { useEffect, useRef, useState } from 'react'
-import { api, type Source } from '../api'
+import { useEffect, useRef } from 'react'
+import type { Source } from '../api'
 import { SourceIcon } from './SourceIcon'
 import type { SettingsTab } from './Settings'
 
@@ -36,6 +36,16 @@ type Props = {
   open: boolean
   onClose: () => void
   categories: string[]
+  // Source list, owned by App (the same fetch that already feeds
+  // FeedManager/Settings — see App.tsx's `refresh()`). The Drawer
+  // used to fetch its own copy on every open, which meant an extra
+  // network round-trip every time plus a staleness window against
+  // whatever Settings/FeedManager had just changed. Passed as a
+  // prop instead, same pattern as <Settings sources={sources} />.
+  sources: Source[]
+  // Re-run App's own source fetch. Wired to the "Couldn't load
+  // sources" retry row below, same as FeedManager's onRefresh.
+  onRefreshSources?: () => Promise<void>
   // Active source filter (multi-select). Empty set = no filter.
   activeSources: Set<string>
   onSourceToggle: (name: string) => void
@@ -69,6 +79,8 @@ export function Drawer({
   open,
   onClose,
   categories,
+  sources,
+  onRefreshSources,
   activeSources,
   onSourceToggle,
   onClearAllFilters,
@@ -86,72 +98,16 @@ export function Drawer({
   // the new preset's name.
   onSavePreset,
 }: Props) {
-  const [sources, setSources] = useState<Source[]>([])
-  const [sourcesError, setSourcesError] = useState<string | null>(null)
 
   // The brief-generation error and notifications / LLM state have
   // been moved to the Settings overlay. The Drawer is now slim —
   // Sources filter, Jump to column, and a link to Settings.
-
-  // Each fetch function is its own retry-able handler. Storing them
-  // as ``useCallback`` so the chip can call them directly on tap.
   //
-  // Cancellation: a ref tracks whether the Drawer is still open
-  // for the most recent fetch. The ref is set on each fetch and
-  // cleared when the Drawer unmounts / closes; each .then
-  // bail-out check skips setState on a stale fetch. Without this,
-  // closing the Drawer mid-fetch leaves the promise in flight;
-  // the later .then calls hit an unmounted component and React
-  // logs a "state update on an unmounted component" warning.
-  // Slice 22 fix: the aliveRef effect previously had NO deps array,
-  // so it ran on every render. Sequence on each commit was:
-  //   1. aliveRef.current = true
-  //   2. cleanup runs → aliveRef.current = false
-  //   3. effect runs again → aliveRef.current = true
-  // The ref flickered false between renders, so an async ``.then``
-  // callback that landed during step 2 read stale ``false`` and
-  // silently dropped its ``setState``. The drawer would stay empty
-  // (sources list stale) until the next user action triggered a
-  // re-fetch.
-  //
-  // Drawer is mounted unconditionally by App (visibility is gated by
-  // the ``open`` prop, not by mount/unmount — see App.tsx:2723), so
-  // the original "alive = true on every (re)open" intent was never
-  // what the code did. Adding ``[]`` deps so the effect runs once on
-  // mount is the right fix:
-  //   - Mount → aliveRef.current = true (and stays true)
-  //   - Unmount (which only happens when App itself unmounts, i.e.
-  //     page navigation away) → cleanup sets it to false
-  //   - ``.then`` callbacks check this flag and skip setState only
-  //     when the component is actually gone, which is the correct
-  //     guard
-  //
-  // The Esc/swipe/focus-trap effects below already use ``[open, ...]``
-  // deps correctly — they were the model for what should have been
-  // written here.
-  const aliveRef = useRef(true)
-  useEffect(() => {
-    aliveRef.current = true
-    return () => {
-      aliveRef.current = false
-    }
-  }, [])
-  const refetchSources = (): Promise<void> => {
-    setSourcesError(null)
-    return api.sources().then((rows) => {
-      if (!aliveRef.current) return
-      setSources(rows)
-    }).catch((err) => {
-      if (!aliveRef.current) return
-      setSources([])
-      setSourcesError((err as Error).message)
-    })
-  }
-
-  useEffect(() => {
-    if (!open) return
-    refetchSources()
-  }, [open])
+  // ``sources`` is a prop from App (see Props above) rather than a
+  // component-owned fetch — the Drawer used to call ``api.sources()``
+  // itself on every open, duplicating App's own already-fetched
+  // state and adding a network round-trip + staleness window on
+  // every open. Same pattern as ``<Settings sources={sources} />``.
 
   // Esc dismisses the drawer. Mirrors the iOS sheet pattern where
   // the swipe-down and back-tap gestural dismiss are also Esc on a
@@ -463,17 +419,18 @@ export function Drawer({
               ) : undefined
             }
           >
-            {sourcesError ? (
-              <GroupedRow
-                onClick={refetchSources}
-                title="Couldn't load sources"
-                subtitle={`tap to retry — ${sourcesError}`}
-                tone="destructive"
-              />
-            ) : sources.length === 0 ? (
-              <p className="px-4 py-3 text-ios-body text-label-secondary">
-                loading…
-              </p>
+            {sources.length === 0 ? (
+              onRefreshSources ? (
+                <GroupedRow
+                  onClick={() => { void onRefreshSources() }}
+                  title="No sources loaded"
+                  subtitle="tap to retry"
+                />
+              ) : (
+                <p className="px-4 py-3 text-ios-body text-label-secondary">
+                  no sources configured
+                </p>
+              )
             ) : (
               // The Sources list is a checkbox list, not a button
               // list. Visually honest: each row is a checkbox + label,
