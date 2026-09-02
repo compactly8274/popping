@@ -34,7 +34,7 @@ import logging
 import time
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
@@ -183,12 +183,16 @@ async def _db_set(key: str, value: str) -> None:
         async with session.begin():
             stmt = pg_insert(AppSetting).values(key=key, value=value)
             # ``index_elements`` is the conflict target — the primary
-            # key. On conflict, overwrite the value (but not the
-            # ``updated_at`` — that's automatic via the column's
-            # server-side default on the next non-conflict write).
+            # key. ``updated_at`` must be listed explicitly: an
+            # ``ON CONFLICT DO UPDATE SET`` clause only touches
+            # columns named in ``set_`` — unlike a plain ``UPDATE``,
+            # it does NOT fall back to the column's own
+            # ``onupdate=func.now()`` default for anything omitted —
+            # so leaving it out here meant ``updated_at`` silently
+            # never changed after the row's first insert.
             stmt = stmt.on_conflict_do_update(
                 index_elements=["key"],
-                set_={"value": stmt.excluded.value},
+                set_={"value": stmt.excluded.value, "updated_at": func.now()},
             )
             await session.execute(stmt)
 

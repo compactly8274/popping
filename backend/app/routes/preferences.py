@@ -56,7 +56,7 @@ import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -249,7 +249,16 @@ async def put_preference(
         .values(user_id=user_id, key=key, value=body.value)
         .on_conflict_do_update(
             index_elements=["user_id", "key"],
-            set_={"value": body.value, "updated_at": UserPreference.__table__.c.updated_at},
+            # ``func.now()``, not the column's own current value: an
+            # ON CONFLICT DO UPDATE SET clause only touches columns
+            # explicitly listed here (unlike a plain UPDATE, it does
+            # NOT fall back to the column's ``onupdate=func.now()``
+            # default for anything omitted), so referencing
+            # ``UserPreference.__table__.c.updated_at`` here would
+            # compile to ``SET updated_at = user_preferences.updated_at``
+            # — a no-op that freezes the timestamp at insert time
+            # forever.
+            set_={"value": body.value, "updated_at": func.now()},
         )
         .returning(UserPreference.updated_at)
     )

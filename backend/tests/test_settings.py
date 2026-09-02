@@ -83,6 +83,41 @@ async def test_put_llm_omitted_key_field_leaves_existing_value_untouched(app_cli
     assert resp.json()["groq_api_key_set"] is True
 
 
+async def test_app_setting_updated_at_advances_on_second_write(db_session):
+    """Regression test: ``_db_set``'s ON CONFLICT DO UPDATE clause
+    used to omit ``updated_at`` entirely from its ``set_`` dict,
+    under the (incorrect) assumption that the column's own
+    ``onupdate=func.now()`` default would fire automatically — it
+    doesn't for an upsert's DO UPDATE SET, which only touches columns
+    named explicitly. ``updated_at`` was silently frozen at the
+    row's original insert time forever."""
+    from sqlalchemy import select
+
+    from app.models import AppSetting
+
+    await runtime_settings._db_set("test_probe_key", "first-value")
+    first_row = (
+        await db_session.execute(
+            select(AppSetting).where(AppSetting.key == "test_probe_key")
+        )
+    ).scalar_one()
+    first_updated_at = first_row.updated_at
+    db_session.expire(first_row)
+
+    await runtime_settings._db_set("test_probe_key", "second-value")
+    second_row = (
+        await db_session.execute(
+            select(AppSetting).where(AppSetting.key == "test_probe_key")
+        )
+    ).scalar_one()
+
+    assert second_row.value == "second-value"
+    assert second_row.updated_at > first_updated_at, (
+        f"updated_at must advance on a second write: "
+        f"{first_updated_at!r} -> {second_row.updated_at!r}"
+    )
+
+
 def test_secret_keys_are_a_subset_of_settings_fields():
     # seed_from_env iterates _SETTINGS_FIELDS and skips anything in
     # _SECRET_KEYS — a typo'd/removed entry here would silently start
