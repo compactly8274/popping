@@ -83,18 +83,3 @@ def normalize_subreddit(value: str) -> Optional[str]:
         return None
 
     return s.lower()
-
-
-def is_reddit_url(value: str) -> bool:
-    """True if ``value`` looks like it points at a Reddit URL or shorthand.
-    Used by the source route to decide which URL validator to call —
-    keeps the create endpoint's behaviour parallel to the per-subreddit
-    plugin's input expectations."""
-    if not value:
-        return False
-    s = value.strip().lower()
-    if s.startswith("r/") or s.startswith("/r/"):
-        return True
-    if "reddit.com" in s:
-        return True
-    return False
