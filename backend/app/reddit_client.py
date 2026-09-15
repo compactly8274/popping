@@ -169,6 +169,89 @@ _bucket_lock = asyncio.Lock()
 # Reddit per-URL.
 _crossref_cache: dict[str, tuple[float, list[dict]]] = {}
 
+# ---------------------------------------------------------------------------
+# OAuth app-only token cache (script-type app).
+#
+# When REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are both set, the direct
+# client fetches an app-only bearer from oauth.reddit.com and caches it
+# until near expiry, refreshing on 401. Without creds these stay inert.
+# ---------------------------------------------------------------------------
+
+# Token cached as (access_token, expires_at_monotonic) with a safety
+# margin so we never send a token that's moments from expiry.
+_oauth_token: Optional[str] = None
+_oauth_expires_at: float = 0.0
+_OAUTH_SAFETY_MARGIN_S = 30.0
+_OAUTH_TOKEN_LOCK = asyncio.Lock()
+
+
+def _oauth_enabled() -> bool:
+    return bool(settings.reddit_client_id) and bool(settings.reddit_client_secret)
+
+
+async def _fresh_oauth_token() -> Optional[str]:
+    """Return a bearer token (cached or freshly fetched), or None if OAuth
+    isn't configured / the exchange fails."""
+    if not _oauth_enabled():
+        return None
+    now = time.monotonic()
+    if _oauth_token and now < _oauth_expires_at - _OAUTH_SAFETY_MARGIN_S:
+        return _oauth_token
+    # Single-flight the fetch so concurrent direct calls don't each hit the
+    # token endpoint at once.
+    async with _OAUTH_TOKEN_LOCK:
+        if _oauth_token and now < _oauth_expires_at - _OAUTH_SAFETY_MARGIN_S:
+            return _oauth_token
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.post(
+                    "https://oauth.reddit.com/api/v1/access_token",
+                    data={"grant_type": "client_credentials"},
+                    auth=(
+                        settings.reddit_client_id,
+                        settings.reddit_client_secret,
+                    ),
+                    headers={"User-Agent": _user_agent()},
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                token = payload.get("access_token")
+                expires = payload.get("expires_in")
+                if not token or not isinstance(expires, (int, float)):
+                    logger.warning(
+                        "reddit_client: OAuth token response missing access_token/expires_in"
+                    )
+                    return None
+                _oauth_token = token
+                _oauth_expires_at = time.monotonic() + float(expires)
+                return _oauth_token
+        except Exception as exc:  # httpx.HTTPError, json decode, etc.
+            logger.warning("reddit_client: OAuth token fetch failed: %s", exc)
+            return None
+
+
+async def _oauth_request_hook(request: httpx.Request) -> None:
+    """Attach the OAuth bearer to every outgoing direct request. Only
+    applies to reddit.com traffic; the token endpoint call is exempt."""
+    host = request.url.host or ""
+    if host == "oauth.reddit.com":
+        return  # never auth the token endpoint itself
+    token = await _fresh_oauth_token()
+    if token:
+        request.headers["Authorization"] = f"bearer {token}"
+
+
+async def _oauth_response_hook(response: httpx.Response) -> None:
+    """Invalidate the cached token on an explicit 401 so the next request
+    refreshes it."""
+    global _oauth_token, _oauth_expires_at
+    if response.status_code == 401:
+        _oauth_token = None
+        _oauth_expires_at = 0.0
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # Mode detection

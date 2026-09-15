@@ -120,7 +120,9 @@ def test_direct_client_and_direct_fallback_register_ssrf_hook():
     # constructions must all carry the hook.
     direct_blocks = src.count('base_url="https://www.reddit.com"')
     assert direct_blocks >= 3, "expected at least 3 direct-mode client constructions"
-    assert src.count('event_hooks={"request": [ssrf_event_hook]}') >= 3, (
+    # The exact event_hooks shape changed when OAuth hooks were added:
+    # SSRF hook must remain present in every direct-mode request hook list.
+    assert src.count('[ssrf_event_hook, _oauth_request_hook]') >= 3, (
         "expected the SSRF hook on: init_client's _direct_client, "
         "_get_client's direct fallback, and _fetch_thread_comments_direct's "
         "one-off client"
