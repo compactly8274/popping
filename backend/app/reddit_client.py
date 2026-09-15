@@ -260,7 +260,10 @@ def init_client() -> None:
             # thread-comments path fed a malformed URL) could still
             # redirect a hop to a private/loopback address without
             # this.
-            event_hooks={"request": [ssrf_event_hook]},
+            event_hooks={
+                "request": [ssrf_event_hook, _oauth_request_hook],
+                "response": [_oauth_response_hook],
+            },
         )
         # Reset the bucket so the first burst of cross-ref requests
         # after a restart gets a clean slate.
@@ -383,7 +386,10 @@ def _get_client() -> httpx.AsyncClient:
             "User-Agent": _user_agent(),
             "Accept": "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
         },
-        event_hooks={"request": [ssrf_event_hook]},
+        event_hooks={
+            "request": [ssrf_event_hook, _oauth_request_hook],
+            "response": [_oauth_response_hook],
+        },
     )
 
 
@@ -1015,7 +1021,10 @@ async def _fetch_thread_comments_direct(thread_url: str) -> Optional[list[dict]]
             timeout=_TIMEOUT,
             follow_redirects=True,
             headers=headers,
-            event_hooks={"request": [ssrf_event_hook]},
+            event_hooks={
+                "request": [ssrf_event_hook, _oauth_request_hook],
+                "response": [_oauth_response_hook],
+            },
         ) as client:
             async with client.stream("GET", path) as resp:
                 # Same distinction as fetch_thread_comments: a 429/5xx
