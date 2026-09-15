@@ -752,15 +752,13 @@ export function App() {
   const byCategory = useMemo(() => {
     const grouped = new Map<string, Entry[]>()
     for (const e of visibleEntries) {
-      const sourceName = sourcesById.get(e.source_id)
-      const src = sourceName != null ? sourcesByName.get(sourceName) : undefined
-      const cat = src?.category ?? 'other'
+      const cat = categoriesBySourceId.get(e.source_id) ?? 'other'
       const arr = grouped.get(cat) ?? []
       arr.push(e)
       grouped.set(cat, arr)
     }
     return grouped
-  }, [visibleEntries, sourcesByName, sourcesById])
+  }, [visibleEntries, categoriesBySourceId])
 
   const categories = useMemo(() => Array.from(byCategory.keys()).sort(), [byCategory])
   const visibleForYou = useMemo(

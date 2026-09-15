@@ -929,6 +929,23 @@ async def fetch_thread_comments(thread_url: str) -> Optional[list[dict]]:
                 # Fall through to the direct-from-Reddit path below
                 # by raising and catching outside the with block.
                 raise _ThreadProxy404
+            # A 429/5xx here is a transient throttle, not "this
+            # thread has no comments" — the same distinction
+            # ``_get_atom`` makes for listing fetches. Without this,
+            # a proxy (or Reddit) rate-limit blip got folded into the
+            # generic ``httpx.HTTPError`` handler below, which
+            # returns ``None`` — and the caller
+            # (``entry_reddit_comment_summary_endpoint``) persists
+            # any ``None``/empty result as a PERMANENT "no summary"
+            # cache entry, so a single transient 429 permanently
+            # broke comment summaries for that entry. Raising
+            # ``RedditRateLimited`` instead routes through the
+            # caller's existing not-cached, "try again shortly" path.
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                raise RedditRateLimited(
+                    f"reddit_client: {thread_url} throttled by proxy "
+                    f"(status={resp.status_code})"
+                )
             resp.raise_for_status()
             cl = resp.headers.get("content-length")
             if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
@@ -1001,6 +1018,16 @@ async def _fetch_thread_comments_direct(thread_url: str) -> Optional[list[dict]]
             event_hooks={"request": [ssrf_event_hook]},
         ) as client:
             async with client.stream("GET", path) as resp:
+                # Same distinction as fetch_thread_comments: a 429/5xx
+                # from Reddit itself is a transient throttle, not "no
+                # comments" — must not fall into the generic
+                # HTTPError handler below, which the caller would
+                # cache as a permanent failure.
+                if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                    raise RedditRateLimited(
+                        f"reddit_client: {thread_url} throttled by Reddit "
+                        f"(status={resp.status_code})"
+                    )
                 resp.raise_for_status()
                 cl = resp.headers.get("content-length")
                 if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:

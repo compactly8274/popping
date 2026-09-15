@@ -135,6 +135,52 @@ async def test_fetch_thread_comments_raises_rate_limited_when_bucket_empty(isola
         await fetch_thread_comments("https://www.reddit.com/r/test/comments/abc123/a_thread/")
 
 
+@pytest.mark.asyncio
+async def test_fetch_thread_comments_raises_rate_limited_on_proxy_429(isolated_bucket):
+    """Regression: a 429 from the proxy used to fall into the generic
+    ``httpx.HTTPError`` handler and return ``None``, which the route
+    then persisted as a PERMANENT "no summary" cache entry — a single
+    transient proxy rate-limit blip broke comment summaries for that
+    entry forever. Must raise ``RedditRateLimited`` instead, matching
+    ``_get_atom``'s 429/5xx handling for listing fetches, so the route
+    takes its existing not-cached "try again shortly" path."""
+    import httpx
+
+    def _handler(request):
+        return httpx.Response(429, text="Too Many Requests")
+
+    reddit_client._proxy_client = httpx.AsyncClient(
+        base_url="http://proxy.internal", transport=httpx.MockTransport(_handler)
+    )
+    reddit_client._direct_client = None
+
+    with pytest.raises(RedditRateLimited):
+        await fetch_thread_comments("https://www.reddit.com/r/test/comments/abc123/a_thread/")
+
+
+@pytest.mark.asyncio
+async def test_fetch_thread_comments_direct_raises_rate_limited_on_429(isolated_bucket):
+    """Same fix, direct-from-Reddit fallback path."""
+    import httpx
+    from unittest.mock import AsyncMock, patch
+
+    def _handler(request):
+        return httpx.Response(429, text="Too Many Requests")
+
+    real_async_client = httpx.AsyncClient
+
+    def _client_with_mock_transport(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(_handler)
+        return real_async_client(*args, **kwargs)
+
+    with patch.object(reddit_client, "_try_take_token", new=AsyncMock(return_value=True)), \
+         patch("app.reddit_client.httpx.AsyncClient", side_effect=_client_with_mock_transport):
+        with pytest.raises(RedditRateLimited):
+            await reddit_client._fetch_thread_comments_direct(
+                "https://www.reddit.com/r/test/comments/abc123/a_thread/"
+            )
+
+
 # --- app.reddit_comment_summary.summarize_comments ------------------------
 
 

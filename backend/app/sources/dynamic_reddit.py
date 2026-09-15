@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from collections import OrderedDict
 
 from app.models import Source
 from app import reddit_client
@@ -70,7 +71,17 @@ _throttled_sources: dict[str, bool] = {}
 # hour). The set is process-local; a process restart re-emits the
 # warning once, which is the right cadence for an operator who
 # hasn't fixed the config.
-_warned_disabled: set[str] = set()
+#
+# Unlike ``_throttled_sources`` (actively popped every tick) and
+# ``reddit_client._crossref_cache`` (TTL-evicted lazily), entries
+# here are only ever added, never removed — a source repeatedly
+# renamed or deleted-and-recreated over the process's lifetime would
+# otherwise accumulate stale names forever. FIFO-capped the same way
+# ``generic_scrape.py``'s ``_extracted_urls`` is; cardinality is tiny
+# in practice (a homelab install's Reddit source count), so the cap
+# is generous headroom, not a tight budget.
+_MAX_WARNED_DISABLED = 500
+_warned_disabled: "OrderedDict[str, None]" = OrderedDict()
 
 
 class DynamicRedditPlugin(SourcePlugin):
@@ -144,7 +155,9 @@ class DynamicRedditPlugin(SourcePlugin):
         # log.
         if reddit_client.is_disabled():
             if self.name not in _warned_disabled:
-                _warned_disabled.add(self.name)
+                _warned_disabled[self.name] = None
+                while len(_warned_disabled) > _MAX_WARNED_DISABLED:
+                    _warned_disabled.popitem(last=False)
                 logger.warning(
                     "dynamic_reddit: row %r skipped — Reddit client is "
                     "disabled (no REDDIT_HYDRA_URL proxy and "
