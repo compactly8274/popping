@@ -143,6 +143,18 @@ class Settings(BaseSettings):
     # fully off" state and surfaces as
     # ``reddit_client: disabled`` at startup.
     reddit_direct_disabled: bool = False
+    # Reddit OAuth app-only auth (script-type app). When BOTH
+    # ``REDDIT_CLIENT_ID`` and ``REDDIT_CLIENT_SECRET`` are set, the
+    # direct Reddit client fetches an app-only bearer token from
+    # ``oauth.reddit.com/api/v1/access_token`` (client_credentials
+    # grant) and attaches it to every direct request. This is the fix
+    # for Reddit's 403 "blocked by network security" page on the .json
+    # comment-thread endpoint — authenticated app traffic is exempt.
+    # Script type is correct here: single-owner, server-side, no
+    # redirect URI / consent flow (unlike a "web app" which would need
+    # the authorization-code grant for authorizing other users).
+    reddit_client_id: str = ""
+    reddit_client_secret: str = ""
 
     # --- Notifications (phase 2+) -----------------------------------------
     pushover_user_key: str = ""
