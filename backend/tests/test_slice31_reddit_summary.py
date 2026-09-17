@@ -198,9 +198,18 @@ def test_summary_endpoint_calls_reddit_helper_for_reddit_urls():
 def test_summary_endpoint_uses_post_body_direct_when_no_llm():
     body = _function_body(ENTRY_ROUTES.read_text(), "entry_summary_endpoint")
     assert body
-    assert "final = post_body" in body, (
+    # The post-body fallback must go through ``_truncate_summary`` —
+    # the un-truncated form once cached 4000+-char raw article text
+    # as the card's "summary" (2026-09-17 bug report: Reddit entries
+    # showed the whole article instead of a summary).
+    assert "_truncate_summary(post_body)" in body, (
         "entry_summary_endpoint must use the Reddit post body as the "
-        "summary when the LLM call fails / isn't configured."
+        "summary when the LLM call fails / isn't configured, capped "
+        "by _truncate_summary."
+    )
+    assert "final = post_body" not in body, (
+        "the raw post body must not be cached verbatim — it must be "
+        "truncated to _SUMMARY_MAX_CHARS first."
     )
 
 
