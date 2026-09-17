@@ -37,13 +37,20 @@ _LLM_CALL_TIMEOUT_S = 20.0
 
 
 def _build_prompt(title: str, article_text: str) -> str:
+    # "Reply with the summary itself" + "no preamble" — the earlier
+    # phrasing ("Write a summary...") let some models open with
+    # meta text ("The user wants a 3-4 sentence summary…"), which
+    # then got cached as the card's summary. The imperative "Reply
+    # with the summary itself" plus a ``stop`` sequence on the
+    # first newline+quote pattern keeps the output to the summary
+    # alone.
     return (
-        "Write a summary in exactly 3-4 sentences of plain prose (no "
-        "headers, no bullet lists) of the following news article. "
-        "Cover the main point and the most important supporting "
-        "details. Do not editorialize or add information not present "
-        "in the article, and do not mention that you are "
-        f"summarizing.\n\nHeadline: {title}\n\nArticle:\n{article_text}"
+        "Summarize the following news article in 3-4 sentences of "
+        "plain prose. Reply with the summary itself and nothing else "
+        "— no preamble, no headers, no bullet lists, no meta-commentary "
+        "about the task. Do not editorialize or add information not "
+        "present in the article.\n\n"
+        f"Headline: {title}\n\nArticle:\n{article_text}"
     )
 
 
@@ -65,7 +72,17 @@ async def summarize_article(title: str, article_text: str) -> str | None:
                 # (True) can burn the whole _SUMMARY_MAX_TOKENS budget
                 # on its CoT preamble and never reach the actual
                 # summary — see Provider.complete's docstring.
-                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS, think=False),
+                candidate.complete(
+                    prompt,
+                    max_tokens=_SUMMARY_MAX_TOKENS,
+                    think=False,
+                    # Halt on the first paragraph break after a quote
+                    # or period — a cheap guard against models that
+                    # keep going into analysis after 3-4 sentences.
+                    # Ollama-native ``stop``; other providers accept
+                    # and apply it as a stop-string too.
+                    stop=["\n\n"],
+                ),
                 timeout=_LLM_CALL_TIMEOUT_S,
             )
         except ProviderError as exc:

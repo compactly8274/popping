@@ -818,8 +818,12 @@ async def entry_summary_endpoint(
                     # gives the user the OP's question / context,
                     # which is the whole point of expanding the
                     # card. Truncated to ``_SUMMARY_MAX_CHARS``
-                    # below.
-                    final = post_body
+                    # NOW (not "below" as the old comment claimed
+                    # — nothing below truncates this path; the
+                    # raw post body used to be cached verbatim,
+                    # producing 4000+-char "summaries" that were
+                    # just the whole article).
+                    final = _truncate_summary(post_body)
         elif llm_router.providers_for("brief"):
             article_text = await fetch_article_text(row.url)
             if article_text:

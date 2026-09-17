@@ -40,6 +40,13 @@ class OllamaProvider(Provider):
             "prompt": prompt,
             "stream": False,
             "options": {"num_predict": max_tokens},
+            # Pin the model in VRAM for 30 min after the last call —
+            # the Ollama default (5m) lets the model evict between the
+            # periodic ingest jobs, so a user-triggered summary tap
+            # pays the full cold load (8-12s measured on the homelab's
+            # Ollama host) before generation even starts. See the
+            # matching comment in ``ollama_cloud.py``.
+            "keep_alive": "30m",
         }
         if stop:
             # Ollama's native ``stop`` field. Halts generation the
