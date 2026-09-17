@@ -276,7 +276,13 @@ export function Drawer({
         role="dialog"
         aria-modal="true"
         aria-label="menu"
-        className={`fixed z-40 bg-bg-app shadow-2xl flex flex-col
+        // ``touch-pan-y`` matches the swipe-left dismiss handler
+        // below: horizontal pans are handled in JS (the dismiss
+        // gesture), vertical scrolling of the drawer body stays
+        // native. Without it a mostly-horizontal touch can be
+        // claimed by the browser for scrolling an ancestor before
+        // the JS preventDefault engages.
+        className={`fixed z-40 bg-bg-app shadow-2xl flex flex-col touch-pan-y-zoom
                     inset-y-0 right-0 top-0 left-auto h-full w-[88vw] max-w-[420px] rounded-l-ios-lg
                     md:w-[360px] md:rounded-none
                     transition-transform duration-300 ease-out

@@ -2575,7 +2575,7 @@ export function App() {
             </section>
           )}
           {viewKind === 'all' && <FramingWatch />}
-          <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-y-auto">
+          <main className="hidden md:grid md:grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 p-4 flex-1 overflow-x-clip overflow-y-auto">
             {columns
               .filter((col) => viewKind === 'multisub' || col.name !== 'For You')
               .map((col, ci) => (

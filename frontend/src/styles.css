@@ -2,10 +2,33 @@
 @tailwind components;
 @tailwind utilities;
 
+@layer utilities {
+  /* Swipe-surface touch-action: vertical panning stays native, all
+     horizontal panning is handed to the JS swipe handlers, and
+     pinch-zoom is preserved (plain ``touch-pan-y`` would disable it
+     — an accessibility regression). Applied to the Card article and
+     the Drawer panel, the two surfaces with JS swipe gestures. */
+  .touch-pan-y-zoom {
+    touch-action: pan-y pinch-zoom;
+  }
+}
+
 @layer base {
   html, body, #root { height: 100%; }
   html { color-scheme: dark; }
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background-color: #000000; color: #ffffff; }
+  /* The app is a vertical feed — the document must never pan
+     horizontally. A stray overflowing element (long unbroken URL in
+     a summary, wide chip row, etc.) otherwise makes the page itself
+     horizontally scrollable, and a card swipe then pans the content
+     instead of dragging the card. ``overflow-x: clip`` on both html
+     and body kills the horizontal pan at the root without creating
+     a scroll container (clip, not hidden), while vertical scrolling
+     keeps working everywhere. */
+  html, body { overflow-x: clip; }
+  /* Long unbroken tokens (URLs pasted in summaries/titles) wrap
+     instead of stretching the layout. */
+  body { overflow-wrap: break-word; }
   /* Prevent the iOS / Safari "page is loading" white flash that
      happens between the first paint and the JS module load. The
      inline <style> in index.html already paints black pre-JS; this

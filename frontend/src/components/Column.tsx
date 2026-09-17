@@ -478,7 +478,14 @@ export function ColumnInner({
           </div>
         )}
       </header>
-      <div className="flex-1 overflow-y-auto space-y-2 pr-1">
+      {/* ``overflow-x-clip``: a mid-swipe card translateX (up to
+          88px) must not widen this scroller — ``overflow-y-auto``
+          alone would leave overflow-x at ``auto`` and give the
+          browser a horizontally-pannable region mid-swipe, so the
+          gesture pans the whole list instead of dragging the card.
+          ``clip`` (not ``hidden``) keeps the element scrollable and
+          avoids creating a scroll container on the X axis. */}
+      <div className="flex-1 overflow-x-clip overflow-y-auto space-y-2 pr-1">
         {entryCount === 0 ? (
           // Slice 19: context-aware empty state. The source's
           // ``last_fetch_at`` / ``last_error`` / ``error_count``

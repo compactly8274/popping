@@ -75,7 +75,7 @@ export function SearchResults({
               : `${entries.length} for "${query}"`}
         </span>
       </header>
-      <div className="flex-1 overflow-y-auto space-y-2 pr-1">
+      <div className="flex-1 overflow-x-clip overflow-y-auto space-y-2 pr-1">
         {error ? (
           <p className="text-ios-body text-red-400 px-1" role="alert">
             search failed — {error}

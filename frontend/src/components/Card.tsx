@@ -892,7 +892,17 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchCancel}
         onContextMenu={onContextMenu}
-        className={`group relative rounded-ios-lg bg-bg-surface border p-4 pl-5
+        // ``touch-pan-y`` tells the browser this element only ever
+        // scrolls vertically under native control — horizontal pans
+        // belong to the JS swipe lock below. Without it, mobile
+        // browsers can claim a predominantly-horizontal touch for
+        // native scrolling of an ancestor (the column list, or the
+        // page itself if anything overflows) BEFORE the touchmove
+        // lock engages, so the swipe pans the content instead of
+        // dragging the card. Vertical scrolling starting on the card
+        // stays fully native; horizontal gestures are delivered to
+        // JS untouched.
+        className={`group relative touch-pan-y-zoom rounded-ios-lg bg-bg-surface border p-4 pl-5
                     hover:-translate-y-px hover:shadow-glow-md
                     active:scale-[0.985] active:shadow-glow-sm
                     transition-[transform,box-shadow,border-color,opacity,filter] duration-200
@@ -1053,7 +1063,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       {redditSummaryExpanded && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap"
+          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap break-words"
         >
           {redditSummaryError ? (
             <span className="italic">couldn't generate a summary — try again later</span>
@@ -1125,7 +1135,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       {podcastSummaryExpanded && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap"
+          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap break-words"
         >
           {podcastSummaryError ? (
             <span className="italic">couldn't generate a summary — try again later</span>
@@ -1236,7 +1246,7 @@ export function CardInner({ entry, sourceName, sourceFaviconPath, unread, select
       {expanded && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap"
+          className="mt-2 text-ios-caption text-label-secondary leading-relaxed whitespace-pre-wrap break-words"
         >
           {summaryError
             ? <span className="italic">couldn't load summary</span>
