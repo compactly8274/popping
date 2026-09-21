@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import html
+import json
 import re
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -607,6 +609,83 @@ def _is_reddit_url(url: str | None) -> bool:
     return host in ("reddit.com", "www.reddit.com")
 
 
+def _is_hn_url(url: str | None) -> bool:
+    """True if ``url`` is a Hacker News item/comment permalink."""
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        host = url.split("/", 3)[2] if "://" in url else ""
+    except IndexError:
+        return False
+    return host in ("news.ycombinator.com", "hn.premii.com")
+
+
+def _hn_self_text(row) -> str:
+    """Return Hacker News self-post text stored in ``meta['summary']``.
+
+    The HN source plugin stores the raw item's ``text`` field in
+    ``meta['summary']`` (link posts have an empty ``text``). This is
+    HTML from the Firebase API, so strip tags and normalize whitespace
+    before using it as an article body."""
+    meta = row.meta or {}
+    html_text = meta.get("summary", "")
+    if not isinstance(html_text, str) or not html_text:
+        return ""
+    return _clean_summary(html_text)
+
+
+async def _fetch_hn_top_comments_text(hn_id: int | None, top_n: int = 8) -> str:
+    """Fetch top-level comments for a HN item from the Firebase API.
+
+    Used as a fallback when the external article can't be extracted
+    (403, paywall, SPA, empty body). Summarizing the HN discussion is
+    still useful — it tells the user what the community is saying about
+    the link. Only top-level comments are fetched; nested threads are
+    summarised by their top-level parent's own text to keep the volume
+    reasonable."""
+    if hn_id is None:
+        return ""
+    url = f"https://hacker-news.firebaseio.com/v0/item/{hn_id}.json"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers={"User-Agent": "Popping/0.2"})
+            resp.raise_for_status()
+            item = resp.json()
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+        return ""
+    if not item or item.get("deleted") or item.get("dead"):
+        return ""
+    kids = item.get("kids") or []
+    if not kids:
+        return ""
+
+    async def _one(comment_id: int) -> str:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://hacker-news.firebaseio.com/v0/item/{comment_id}.json",
+                    headers={"User-Agent": "Popping/0.2"},
+                )
+                resp.raise_for_status()
+                data = resp.json() or {}
+        except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+            return ""
+        if not data or data.get("deleted") or data.get("dead"):
+            return ""
+        text = data.get("text", "")
+        if not text:
+            return ""
+        return _clean_summary(text)
+
+    comments = await asyncio.gather(*(_one(cid) for cid in kids[:top_n]))
+    # Drop short / noisy comments and join the rest.
+    useful = [c for c in comments if len(c) >= 20]
+    if not useful:
+        return ""
+    header = "Hacker News discussion:\n\n"
+    return header + "\n\n".join(f"- {c}" for c in useful)
+
+
 async def _fetch_reddit_post_body(url: str) -> str:
     """Fetch a Reddit thread's post body via its ``.rss`` feed.
 
@@ -824,12 +903,38 @@ async def entry_summary_endpoint(
                     # producing 4000+-char "summaries" that were
                     # just the whole article).
                     final = _truncate_summary(post_body)
-        elif llm_router.providers_for("brief"):
+        elif _is_hn_url(row.url):
+            # Hacker News self-posts (Ask HN, Show HN, etc.) carry
+            # the OP text in ``meta['summary']`` populated by the
+            # HN source plugin. Link posts have an empty ``text``
+            # field, so this path naturally becomes a no-op for
+            # them and we fall through to ``fetch_article_text``.
+            hn_text = _hn_self_text(row)
+            if hn_text:
+                if llm_router.providers_for("brief"):
+                    llm_summary = await summarize_article(row.title, hn_text)
+                    if llm_summary:
+                        final = _truncate_summary(llm_summary.strip())
+                if not final:
+                    final = _truncate_summary(hn_text)
+        if not final and llm_router.providers_for("brief"):
             article_text = await fetch_article_text(row.url)
             if article_text:
                 llm_summary = await summarize_article(row.title, article_text)
                 if llm_summary:
                     final = _truncate_summary(llm_summary.strip())
+            # External article fetch failed / returned empty. For HN
+            # link posts, the discussion comments are often the only
+            # usable source of context.
+            if not final and _is_hn_url(row.url):
+                hn_id = (row.meta or {}).get("hn_id")
+                hn_comments = await _fetch_hn_top_comments_text(hn_id)
+                if hn_comments:
+                    llm_summary = await summarize_article(row.title, hn_comments)
+                    if llm_summary:
+                        final = _truncate_summary(llm_summary.strip())
+                    if not final:
+                        final = _truncate_summary(hn_comments)
 
         if not final:
             final = _extract_fallback_summary(row)
