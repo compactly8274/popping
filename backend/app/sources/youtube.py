@@ -18,7 +18,7 @@ ASR/transcript summarization was added later.
 from __future__ import annotations
 
 from app.models import Source
-from app.sources.base import SourcePlugin
+from app.sources.base import SourcePlugin, row_fetch_target
 from app.sources.rss import fetch_rss
 
 
@@ -37,6 +37,8 @@ class DynamicYouTubePlugin(SourcePlugin):
         self.url = source_row.url
         self.refresh_interval_seconds = source_row.refresh_interval_seconds
         self.source_id = source_row.id
+        # The address this instance fetches (see ``SourcePlugin.fetch_target``).
+        self.fetch_target = row_fetch_target(source_row)
 
     async def fetch(self) -> list[dict]:
         return await fetch_rss(self.url, headers=self._source_row.custom_headers)

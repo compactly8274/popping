@@ -11,21 +11,22 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_, select
+from sqlalchemy import BigInteger, all_, bindparam, func, or_, select, true
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import reddit_client
 from app.article_extract import fetch_article_text
 from app.article_summary import summarize_article
-from app.auth.deps import require_user
+from app.auth.deps import current_user, require_user, resolve_user_id
 from app.config import settings
 from app.db import get_session
 from app.llm import router as llm_router
 from app.models import Entry, Source, StoryCluster
 from app.podcast_asr import asr_available, transcribe_audio
 from app.podcast_transcript import fetch_transcript_text, summarize_transcript
-from app.reddit_client import fetch_thread_comments
 from app.reddit_comment_summary import summarize_comments
+from app.routes.preferences import hidden_entry_ids, is_entry_id
 from app.schemas import (
     EntryListOut,
     EntryOut,
@@ -127,22 +128,10 @@ def _escape_like(term: str) -> str:
 # for the common case of a populated cache, expensive slow-
 # path (lock + re-check) for the cache-miss case.
 #
-# The cap is a leak guard, not a memory bound. ``asyncio.Lock``
-# is a few hundred bytes; 256 entries × ~500 B is ~125 KB,
-# which is fine. The cap prevents a pathological workload
-# (an attacker hammering 10k distinct entry ids) from
-# accumulating one lock per id forever. When the cap is hit
-# we return a throwaway lock — the lock still serializes
-# locally for the requesting task (so two concurrent
-# requests for the SAME id beyond the cap still serialize),
-# but two requests for DIFFERENT ids beyond the cap each get
-# their own lock and can race. The trade-off (mild stampede
-# for the 257+ distinct id) is strictly better than leaking
-# locks per request.
-#
-# This mirrors ``app.auth.oidc._get_discovery_lock`` — same
-# dict-of-locks + guard + cap pattern, kept identical for
-# readability.
+# The cap bounds memory if someone requests thousands of distinct
+# entry ids. When it's reached, idle locks (not currently held) are
+# evicted first; only if every tracked lock is in use do we hand out
+# an untracked lock, which gives up dedup for that one call.
 _SUMMARY_LOCKS_MAX = 256
 _summary_locks: dict[int, asyncio.Lock] = {}
 _summary_locks_guard = asyncio.Lock()
@@ -152,10 +141,8 @@ async def _get_summary_lock(entry_id: int) -> asyncio.Lock:
     """Return a process-wide ``asyncio.Lock`` for ``entry_id``.
 
     First call for a given id allocates a lock and stores it.
-    Subsequent calls return the same lock. When the cap is
-    hit, returns a throwaway untracked lock (a fresh
-    ``asyncio.Lock()`` per call) — see the module-level
-    comment for the trade-off.
+    Subsequent calls return the same lock. At the cap, idle
+    locks are evicted; see the module-level comment.
     """
     # Fast path: the common case is a single concurrent request
     # per entry. Reading the dict under no lock is safe because
@@ -169,11 +156,9 @@ async def _get_summary_lock(entry_id: int) -> asyncio.Lock:
         if lock is not None:
             return lock
         if len(_summary_locks) >= _SUMMARY_LOCKS_MAX:
-            # Return a fresh, untracked lock. The caller still
-            # serializes locally for THIS call, but doesn't
-            # share the lock with any other in-flight request.
-            # Mild cold-start stampede is possible for ids
-            # beyond the cap; preferred over leaking locks.
+            for idle_id in [k for k, v in _summary_locks.items() if not v.locked()]:
+                del _summary_locks[idle_id]
+        if len(_summary_locks) >= _SUMMARY_LOCKS_MAX:
             return asyncio.Lock()
         lock = asyncio.Lock()
         _summary_locks[entry_id] = lock
@@ -282,9 +267,200 @@ def _clean_summary(raw: str | None) -> str:
     return text
 
 
+# The preview text under a card's headline (D34): about 300 characters,
+# cut on a word boundary. The 800-character cap stays the full
+# summary's (the Summary arrow).
+_PREVIEW_MAX_CHARS = 300
+
+# What Reddit's feed sends for a link post, after ``_clean_summary``:
+# ``submitted by /u/name [link] [comments]``. A self post has the OP's
+# text in front of the same trailer. The trailer goes either way; a
+# link post is then empty.
+_REDDIT_TRAILER_RE = re.compile(r"\s*submitted by\s+\S+\s+\[link\]\s+\[comments\]\s*$", re.IGNORECASE)
+
+# Letters and digits only, lower-cased: a blurb that is the title again
+# with other punctuation, spacing or case is still the title.
+_WORD_CHARS_RE = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def _cut_preview(text: str) -> str:
+    if len(text) <= _PREVIEW_MAX_CHARS:
+        return text
+    cut = text[:_PREVIEW_MAX_CHARS]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip() + "…"
+
+
+def card_preview(title: str | None, cached_summary: str | None, feed_summary: str | None) -> str | None:
+    """The blurb a card shows under its headline, or None for none.
+
+    The cached AI summary when there is one with text, else the
+    feed's own blurb (``meta.summary``), cleaned like the summary
+    endpoint cleans it (tags stripped, entities unescaped, whitespace
+    collapsed) with Reddit's link-post trailer dropped, and cut to
+    about 300 characters on a word boundary. None when nothing is
+    left, or when the text only repeats the title (case, spacing
+    and punctuation aside): a card with no preview looks as it did.
+
+    Computed in the projection, not stored: no column, no migration,
+    and old bundles ignore the field.
+    """
+    text = (cached_summary or "").strip()
+    if not text:
+        text = _REDDIT_TRAILER_RE.sub("", _clean_summary(feed_summary))
+    if not text:
+        return None
+    text = _cut_preview(text)
+    if _WORD_CHARS_RE.sub("", text).lower() == _WORD_CHARS_RE.sub("", title or "").lower():
+        return None
+    return text
+
+
+# Card projection — the columns every card-shaped response selects
+# (``EntryListOut``, and ``EntryOut`` for by-ids, which adds the feed's
+# name). No ``meta`` JSONB blob: the dashboard only ever reads
+# meta.summary lazily via the per-card summary endpoint, so dropping
+# it from the list payload saves ~100 KB per dashboard refresh. The
+# few meta keys a card does render are pulled out with ``->>`` below.
+# ``_card_out`` turns a row of these into the response dict.
+_CARD_COLUMNS = (
+    Entry.id,
+    Entry.source_id,
+    Entry.title,
+    Entry.url,
+    Entry.published_at,
+    Entry.fetched_at,
+    Entry.composite_score,
+    Entry.personal_score,
+    Entry.raw_score,
+    Entry.cached_summary,
+    Entry.image_url,
+    Entry.image_path,
+    # Framing Watch cluster membership — a real column, no JSONB
+    # extraction needed. Non-null only for entries grouped with
+    # 2+ other outlets' coverage of the same story (see
+    # app.framing). Drives the card's "Related coverage" button.
+    Entry.story_cluster_id,
+    # Reddit cross-reference footer. Pulled out of the JSONB blob
+    # via the ``->>`` operator so the list payload doesn't have to
+    # ship ``meta`` itself — the rest of meta is unused by the
+    # list render. ``->>`` returns the unescaped text (vs
+    # ``->`` which returns JSON-encoded with quotes); NULL when
+    # the key is absent → both columns NULL → ``EntryListOut``
+    # defaults both to None and the card skips the footer. The
+    # GIN index added in migration 0014 keeps the meta scan
+    # cheap on large entry tables.
+    Entry.meta.op("->>")("reddit_thread_url").label("reddit_thread_url"),
+    Entry.meta.op("->>")("reddit_comment_count").label("reddit_comment_count_text"),
+    # Podcast episode audio, same pull-out-of-meta pattern. NULL
+    # for every non-podcast entry — the card only renders the
+    # "Listen" affordance when audio_url is non-null.
+    Entry.meta.op("->>")("audio_url").label("audio_url"),
+    Entry.meta.op("->>")("duration_seconds").label("duration_seconds_text"),
+    # Podcasting 2.0 transcript URL, when the feed publishes one.
+    # NULL for everything else — the card only shows "Summarize
+    # episode" when this is non-null (see
+    # POST /entries/{id}/podcast_summary).
+    Entry.meta.op("->>")("transcript_url").label("transcript_url"),
+    # The feed's own blurb, for the preview under the headline (D34).
+    # Only ``card_preview``'s input: ``_card_out`` turns it into
+    # ``preview`` and the blurb itself never reaches the response.
+    Entry.meta.op("->>")("summary").label("feed_summary_text"),
+)
+_CARD_COLUMN_NAMES = tuple(c.name for c in _CARD_COLUMNS)
+
+
+def _card_out(row) -> dict:
+    """One ``_CARD_COLUMNS`` row as the response dict.
+
+    ``reddit_comment_count`` and ``duration_seconds`` project as text
+    (JSONB ``->>`` always returns text). The schema expects
+    Optional[int]; coerce here so pydantic doesn't reject the value
+    with a 422.
+
+    ``RowMapping`` (the type ``Result.mappings().all()`` yields in
+    SA 2.0) is a read-only ``Mapping`` — no ``pop``, no
+    ``__setitem__``. Copy to a fresh dict per row so we can rename
+    the projected ``..._text`` column to the schema field name and
+    coerce the type in place without fighting the immutable view.
+    """
+    data = dict(row)
+    raw_count = data.pop("reddit_comment_count_text", None)
+    if raw_count is not None:
+        try:
+            data["reddit_comment_count"] = int(raw_count)
+        except (TypeError, ValueError):
+            # Defensive: the JSONB value should always parse as an
+            # int (the sweep writes ``int(...)``). If a manual SQL
+            # write or a bad migration left a non-int string,
+            # null it out rather than 422 the whole list.
+            data["reddit_comment_count"] = None
+    raw_duration = data.pop("duration_seconds_text", None)
+    if raw_duration is not None:
+        try:
+            data["duration_seconds"] = int(raw_duration)
+        except (TypeError, ValueError):
+            data["duration_seconds"] = None
+    data["preview"] = card_preview(data.get("title"), data.get("cached_summary"), data.pop("feed_summary_text", None))
+    return data
+
+
+def window_start(max_age_hours: int) -> dt.datetime:
+    """The oldest ``fetched_at`` a ``max_age_hours`` window keeps.
+
+    The window is by arrival, not by ``published_at``: a story a feed
+    dated last week but that landed today is new to the reader, and
+    ``fetched_at`` is indexed (0008, and with the score in 0026).
+    """
+    return dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
+
+
+def not_hidden(hidden_ids: list[int]):
+    """``entries.id <> ALL(:hidden_ids)``, the ids bound as one array
+    rather than one parameter per id (a hidden list holds up to 1000).
+    ``<> ALL``, not ``<> ANY``: ``id <> ANY(array)`` is true whenever
+    the array holds any other id, so it would exclude nothing."""
+    return Entry.id != all_(
+        bindparam("hidden_ids", hidden_ids, type_=ARRAY(BigInteger))
+    )
+
+
+def _arrival_order(c) -> tuple:
+    """Newest arrival first. ``c`` is ``Entry`` or a subquery's ``.c``.
+
+    Used once a window is set: inside a 2-day window, a cut by score
+    would drop a new story that hasn't scored yet. ``id`` breaks ties
+    between rows of one poll, which share a ``fetched_at`` (the
+    transaction time), so the cut is the same on every call."""
+    return (c.fetched_at.desc(), c.published_at.desc().nullslast(), c.id.desc())
+
+
+def _score_order(c) -> tuple:
+    return (c.composite_score.desc(), c.published_at.desc().nullslast())
+
+
+def _best_in_source_order(c) -> tuple:
+    """A feed's stories, best score first (D28): a busy feed keeps its
+    ``per_source_cap`` best-scoring stories in the window, not its
+    newest. ``fetched_at`` and ``id`` make the cut deterministic when
+    scores tie (one poll's rows share a ``fetched_at``)."""
+    return (c.composite_score.desc(), c.fetched_at.desc(), c.id.desc())
+
+
+def _rank_in_source(c):
+    """Each row's rank within its feed, in ``_best_in_source_order``."""
+    return (
+        func.row_number()
+        .over(partition_by=c.source_id, order_by=_best_in_source_order(c))
+        .label("rn_src")
+    )
+
+
 @router.get("/entries", response_model=list[EntryListOut])
 async def list_entries(
     session: AsyncSession = Depends(get_session),
+    user: dict | None = Depends(current_user),
     category: str | None = Query(default=None, description="Filter by source category"),
     # ``source`` is now repeated: ``?source=bbc&source=reuters``. FastAPI
     # gives us a list of values. We use ``Source.name.in_(...)`` rather
@@ -321,74 +497,52 @@ async def list_entries(
             "the query to something other than 'the whole dashboard'."
         ),
     ),
+    max_age_hours: int | None = Query(
+        default=None,
+        ge=1,
+        le=8760,
+        description=(
+            "Only stories that arrived (fetched_at) in the last N hours. "
+            "With it, the cut to `limit` / `per_category_limit` is by "
+            "arrival, newest first, so a new low-score story isn't cut. "
+            "The window 'All' sends 8760."
+        ),
+    ),
+    per_source_cap: int | None = Query(
+        default=None,
+        ge=1,
+        le=200,
+        description=(
+            "At most N stories per feed, its best-scoring ones in the "
+            "window. Needs `max_age_hours` (422 without it)."
+        ),
+    ),
+    active_only: bool = Query(
+        default=False, description="Leave out paused feeds' stories."
+    ),
 ) -> list[EntryListOut]:
-    # Slim column projection — the list endpoint returns EntryListOut
-    # (no meta JSONB blob). The dashboard only ever reads meta.summary
-    # lazily via the per-card summary endpoint, so dropping it from
-    # the list payload saves ~100 KB per dashboard refresh.
-    columns = (
-        Entry.id,
-        Entry.source_id,
-        Entry.title,
-        Entry.url,
-        Entry.published_at,
-        Entry.fetched_at,
-        Entry.composite_score,
-        Entry.personal_score,
-        Entry.raw_score,
-        Entry.cached_summary,
-        Entry.image_url,
-        Entry.image_path,
-        # Framing Watch cluster membership — a real column, no JSONB
-        # extraction needed. Non-null only for entries grouped with
-        # 2+ other outlets' coverage of the same story (see
-        # app.framing). Drives the card's "Related coverage" button.
-        Entry.story_cluster_id,
-        # Reddit cross-reference footer. Pulled out of the JSONB blob
-        # via the ``->>`` operator so the list payload doesn't have to
-        # ship ``meta`` itself — the rest of meta is unused by the
-        # list render. ``->>`` returns the unescaped text (vs
-        # ``->`` which returns JSON-encoded with quotes); NULL when
-        # the key is absent → both columns NULL → ``EntryListOut``
-        # defaults both to None and the card skips the footer. The
-        # GIN index added in migration 0014 keeps the meta scan
-        # cheap on large entry tables.
-        Entry.meta.op("->>")("reddit_thread_url").label("reddit_thread_url"),
-        Entry.meta.op("->>")("reddit_comment_count").label("reddit_comment_count_text"),
-        # Podcast episode audio, same pull-out-of-meta pattern. NULL
-        # for every non-podcast entry — the card only renders the
-        # "Listen" affordance when audio_url is non-null.
-        Entry.meta.op("->>")("audio_url").label("audio_url"),
-        Entry.meta.op("->>")("duration_seconds").label("duration_seconds_text"),
-        # Podcasting 2.0 transcript URL, when the feed publishes one.
-        # NULL for everything else — the card only shows "Summarize
-        # episode" when this is non-null (see
-        # POST /entries/{id}/podcast_summary).
-        Entry.meta.op("->>")("transcript_url").label("transcript_url"),
-    )
-    stmt = select(*columns).join(Source, Entry.source_id == Source.id)
-    if q:
-        # When a search query is set, order by recency within the
-        # search result set. The default composite_score sort is
-        # misleading for search — a high-scored story from last week
-        # that happens to mention "AI" would beat a fresh story
-        # actually about AI, and the user has no signal that this
-        # is the ordering they got.
-        stmt = stmt.order_by(Entry.published_at.desc().nullslast())
-    else:
-        stmt = stmt.order_by(
-            Entry.composite_score.desc(), Entry.published_at.desc().nullslast()
-        )
+    if per_source_cap is not None and max_age_hours is None:
+        # Unwindowed, the cap would rank every row the table has ever
+        # held per feed. The client always pairs them (All is 8760).
+        raise HTTPException(status_code=422, detail="per_source_cap needs max_age_hours")
+
+    # Every filter goes in one of these lists and into the innermost
+    # select of whichever path runs below: each path builds fresh
+    # selects over a subquery, which would drop a ``.where`` added to an
+    # outer one. Feed filters and story filters are kept apart because
+    # the capped flat path applies them at different levels.
+    feed_filters = []
+    story_filters = []
     if category:
-        stmt = stmt.where(Source.category == category)
+        feed_filters.append(Source.category == category)
     if source:
         # ``in_`` with an empty list matches nothing; treat it as "no
         # filter" so a frontend bug that sends ``source=`` doesn't
         # silently zero the response.
         if len(source) == 1:
-            stmt = stmt.where(Source.name == source[0])
+            feed_filters.append(Source.name == source[0])
         else:
-            stmt = stmt.where(Source.name.in_(source))
+            feed_filters.append(Source.name.in_(source))
     if q:
         # JSONB ``.astext`` gives us the underlying string so ILIKE
         # works. Postgres needs the cast to be explicit; ``meta``
@@ -399,7 +553,7 @@ async def list_entries(
         # make the backslash literal — see
         # https://www.postgresql.org/docs/current/functions-matching.html).
         pattern = f"%{_escape_like(q)}%"
-        stmt = stmt.where(
+        story_filters.append(
             or_(
                 Entry.title.ilike(pattern, escape="\\"),
                 Entry.meta["summary"].astext.ilike(pattern, escape="\\"),
@@ -410,7 +564,21 @@ async def list_entries(
         # but ignore larger values — a search for a common substring
         # could otherwise try to return tens of thousands of rows.
         limit = min(limit, _SEARCH_LIMIT_CAP)
+    if active_only:
+        feed_filters.append(Source.active.is_(True))
+    if max_age_hours is not None:
+        story_filters.append(Entry.fetched_at >= window_start(max_age_hours))
+    if not q:
+        # Hidden stories stay out of every list but search, which is
+        # how a hidden story is found again. Old bundles also filter
+        # them on the device; doing it here keeps them from using up
+        # a category's or a feed's slots.
+        hidden = await hidden_entry_ids(session, resolve_user_id(user))
+        if hidden:
+            story_filters.append(not_hidden(hidden))
+    filters = [*feed_filters, *story_filters]
 
+    windowed = max_age_hours is not None
     if per_category_limit is not None and not category and not source and not q:
         # Per-category windowed query instead of one global top-`limit`.
         # ``ROW_NUMBER() OVER (PARTITION BY category ORDER BY ...)``
@@ -418,59 +586,88 @@ async def list_entries(
         # low-scoring category still gets its top
         # ``per_category_limit`` rows even if every one of them would
         # rank below `limit` in a single cross-category ordering.
+        pool = (
+            select(*_CARD_COLUMNS, Source.category.label("source_category"))
+            .join(Source, Entry.source_id == Source.id)
+            .where(*filters)
+        )
+        if per_source_cap is not None:
+            # The per-feed cap is cut first, in its own subquery, so a
+            # category still gets its full ``per_category_limit`` from
+            # what the cap leaves.
+            capped = pool.add_columns(_rank_in_source(Entry)).subquery("capped")
+            pool = select(
+                *[capped.c[name] for name in _CARD_COLUMN_NAMES], capped.c.source_category
+            ).where(capped.c.rn_src <= per_source_cap)
+        pool = pool.subquery("pool")
+        # Windowed, each category keeps its newest arrivals (the
+        # per-feed cap above is the part that ranks by score, D28).
         rn = (
             func.row_number()
             .over(
-                partition_by=Source.category,
-                order_by=(Entry.composite_score.desc(), Entry.published_at.desc().nullslast()),
+                partition_by=pool.c.source_category,
+                order_by=_arrival_order(pool.c) if windowed else _score_order(pool.c),
             )
             .label("rn")
         )
-        ranked = (
-            select(*columns, rn)
-            .join(Source, Entry.source_id == Source.id)
-            .subquery()
-        )
-        column_names = [c.name for c in columns]
+        ranked = select(*[pool.c[name] for name in _CARD_COLUMN_NAMES], rn).subquery("ranked")
         stmt = (
-            select(*[ranked.c[name] for name in column_names])
+            select(*[ranked.c[name] for name in _CARD_COLUMN_NAMES])
             .where(ranked.c.rn <= per_category_limit)
-            .order_by(ranked.c.composite_score.desc(), ranked.c.published_at.desc().nullslast())
+            .order_by(*(_arrival_order(ranked.c) if windowed else _score_order(ranked.c)))
         )
     else:
+        # The flat path: a category or source filter (a wider tab, a
+        # saved view, a custom tab), search, or a plain top-`limit`.
+        if per_source_cap is None:
+            stmt = (
+                select(*_CARD_COLUMNS)
+                .join(Source, Entry.source_id == Source.id)
+                .where(*filters)
+            )
+            cols = Entry
+        else:
+            # Each feed's ``per_source_cap`` best stories, as a LATERAL
+            # top-N per matching feed: the same cut as ``_rank_in_source``,
+            # planned per feed. For a long window ("All", 8760 h) Postgres
+            # walks the feed's rows in score order on
+            # ``ix_entries_source_score`` and stops at the cap, so it costs
+            # about feeds x cap rows instead of ranking every row the
+            # window holds (430 ms -> 4 ms on 400k rows). For a short one
+            # it reads the feed's window rows through the ``fetched_at``
+            # and ``source_id`` indexes, as the ``row_number`` form does.
+            # The plans are in docs/ux-notes/PR4b.md.
+            best = (
+                select(*_CARD_COLUMNS)
+                .where(Entry.source_id == Source.id, *story_filters)
+                .order_by(*_best_in_source_order(Entry))
+                .limit(per_source_cap)
+                .lateral("best")
+            )
+            stmt = (
+                select(*[best.c[name] for name in _CARD_COLUMN_NAMES])
+                .select_from(Source)
+                .join(best, true())
+                .where(*feed_filters)
+            )
+            cols = best.c
+        if windowed:
+            # Cut by arrival, so a wide tab is the newest ``limit`` of
+            # its window rather than its top ``limit`` by score.
+            stmt = stmt.order_by(*_arrival_order(cols))
+        elif q:
+            # When a search query is set, order by recency within the
+            # search result set. The default composite_score sort is
+            # misleading for search — a high-scored story from last week
+            # that happens to mention "AI" would beat a fresh story
+            # actually about AI, and the user has no signal that this
+            # is the ordering they got.
+            stmt = stmt.order_by(cols.published_at.desc().nullslast())
+        else:
+            stmt = stmt.order_by(*_score_order(cols))
         stmt = stmt.limit(limit)
     rows = (await session.execute(stmt)).mappings().all()
-    # ``reddit_comment_count`` projects as text (JSONB ``->>`` always
-    # returns text). The schema expects Optional[int]; coerce here so
-    # pydantic doesn't reject the value with a 422.
-    #
-    # ``RowMapping`` (the type ``Result.mappings().all()`` yields in
-    # SA 2.0) is a read-only ``Mapping`` — no ``pop``, no
-    # ``__setitem__``. Copy to a fresh dict per row so we can rename
-    # the projected ``..._text`` column to the schema field name and
-    # coerce the type in place without fighting the immutable view.
-    out: list[EntryListOut] = []
-    for r in rows:
-        data = dict(r)
-        raw_count = data.pop("reddit_comment_count_text", None)
-        if raw_count is not None:
-            try:
-                data["reddit_comment_count"] = int(raw_count)
-            except (TypeError, ValueError):
-                # Defensive: the JSONB value should always parse as an
-                # int (the sweep writes ``int(...)``). If a manual SQL
-                # write or a bad migration left a non-int string,
-                # null it out rather than 422 the whole list.
-                data["reddit_comment_count"] = None
-        raw_duration = data.pop("duration_seconds_text", None)
-        if raw_duration is not None:
-            try:
-                data["duration_seconds"] = int(raw_duration)
-            except (TypeError, ValueError):
-                data["duration_seconds"] = None
-        out.append(EntryListOut.model_validate(data))
-    return out
-
+    return [EntryListOut.model_validate(_card_out(r)) for r in rows]
 
 
 @router.get("/entries/by-ids", response_model=list[EntryOut])
@@ -481,21 +678,18 @@ async def entries_by_ids(
         description="Comma-separated entry ids to fetch (max 200).",
     ),
 ) -> list[EntryOut]:
-    """Resolve a list of entry ids to full EntryOut
-    rows, joined with source name.
+    """Resolve a list of entry ids to cards, with the feed's name.
 
-    Used by the Settings overlay's Hidden and
-    Starred tabs to render a list of the entries
-    the user has hidden or starred (the ids are
-    in localStorage; the dashboard's `entries`
-    state doesn't include hidden entries).
+    Used by Saved and by the Settings overlay's Hidden, Starred and
+    Voted lists, for stories the loaded tabs don't hold (an old save,
+    a hidden story). It returns the same card fields as
+    ``/api/entries`` (``_CARD_COLUMNS``: image, cached summary, Reddit
+    thread, audio, transcript, cluster), so a story loaded by id
+    renders the same card, plus ``source_name``.
 
-    The endpoint is unauth'd — same pattern as
-    `/api/entries`. In a homelab / single-user
-    deployment, the bypass covers the common
-    case; in an OIDC deployment, the row-level
-    data isn't sensitive (no PII, just article
-    metadata).
+    Gated like every other API route (``main.py``'s ``_api_deps``):
+    open with OIDC off (the single-user LAN case), a session with it
+    on.
 
     Cap at 200 ids so a careless client can't
     turn this into a full-table scan.
@@ -507,58 +701,35 @@ async def entries_by_ids(
     """
     if not ids.strip():
         return []
-    # Parse + validate ids. The pydantic model
-    # will reject non-numeric strings; we use
-    # ``int(v)`` inside a list comprehension so
-    # a single bad value doesn't fail the whole
-    # call (the entry is just dropped).
+    # Parse + validate ids. A bad value (not a number, or outside
+    # 1..2**63-1, the ``entries.id`` BIGINT range) is dropped rather
+    # than failing the whole call: an id past the range can't match a
+    # row, and binding it would raise in the driver (a 500).
     raw_ids = [s.strip() for s in ids.split(",") if s.strip()]
     parsed: list[int] = []
     for v in raw_ids:
         try:
-            parsed.append(int(v))
+            entry_id = int(v)
         except ValueError:
             continue
+        if is_entry_id(entry_id):
+            parsed.append(entry_id)
     if not parsed:
         return []
     # Cap the count to prevent abuse.
     if len(parsed) > 200:
         parsed = parsed[:200]
-    # Query: select entries by id, join source for
-    # the name. Same column projection as the
-    # list_entries endpoint (no meta JSONB).
     stmt = (
-        select(Entry, Source.name)
+        select(*_CARD_COLUMNS, Source.name.label("source_name"))
         .join(Source, Entry.source_id == Source.id)
         .where(Entry.id.in_(parsed))
     )
-    result = await session.execute(stmt)
-    rows = result.all()
+    rows = (await session.execute(stmt)).mappings().all()
     # Build a map for O(1) lookup, then return in
     # the input order (preserves the user's
     # localStorage ordering, which is recency).
-    by_id = {row[0].id: (row[0], row[1]) for row in rows}
-    out: list[EntryOut] = []
-    for eid in parsed:
-        if eid not in by_id:
-            continue
-        entry, source_name = by_id[eid]
-        out.append(
-            EntryOut(
-                id=entry.id,
-                source_id=entry.source_id,
-                source_name=source_name,
-                title=entry.title,
-                url=entry.url,
-                published_at=entry.published_at,
-                fetched_at=entry.fetched_at,
-                composite_score=entry.composite_score,
-                personal_score=entry.personal_score,
-                raw_score=entry.raw_score,
-                meta=entry.meta or {},
-            )
-        )
-    return out
+    by_id = {row["id"]: row for row in rows}
+    return [EntryOut.model_validate(_card_out(by_id[eid])) for eid in parsed if eid in by_id]
 
 
 def _truncate_summary(text: str) -> str:
@@ -648,7 +819,7 @@ async def _fetch_hn_top_comments_text(hn_id: int | None, top_n: int = 8) -> str:
     url = f"https://hacker-news.firebaseio.com/v0/item/{hn_id}.json"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers={"User-Agent": "Popping/0.2"})
+            resp = await client.get(url, headers={"User-Agent": settings.user_agent})
             resp.raise_for_status()
             item = resp.json()
     except (httpx.HTTPError, ValueError, json.JSONDecodeError):
@@ -664,7 +835,7 @@ async def _fetch_hn_top_comments_text(hn_id: int | None, top_n: int = 8) -> str:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     f"https://hacker-news.firebaseio.com/v0/item/{comment_id}.json",
-                    headers={"User-Agent": "Popping/0.2"},
+                    headers={"User-Agent": settings.user_agent},
                 )
                 resp.raise_for_status()
                 data = resp.json() or {}

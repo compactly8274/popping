@@ -1,24 +1,25 @@
 // Client-side buffering of engagement events.
 //
-// The dashboard renders 20-50 visible cards at once; firing one
-// POST per ``view`` would hammer the backend as the user scrolls.
-// These helpers batch events into an in-memory queue and flush
-// them on ``requestIdleCallback`` (with a setTimeout fallback for
-// browsers that don't ship rIC — Safari before 16.4, Firefox before
-// 126). On ``pagehide`` (visibilitychange hidden OR window unload)
-// we switch to ``navigator.sendBeacon`` so the request survives the
-// tab closing.
+// A ``view`` is recorded when a story is used up (PR3c, D3): opened
+// (App's ``openEntry``, on any layout) or, on the phone, scrolled past
+// (App's ``markSeen``), not when its card is drawn. A scroll can use up
+// several at once, and one POST per ``view`` would hammer the backend.
+// These helpers batch events into an in-memory queue and flush them on
+// ``requestIdleCallback`` (with a setTimeout fallback for browsers that
+// don't ship rIC — Safari before 16.4, Firefox before 126). On
+// ``pagehide`` (visibilitychange hidden OR window unload) we switch to
+// ``navigator.sendBeacon`` so the request survives the tab closing.
 //
 // Click events bypass the queue and fire immediately — they are
 // sparse, the user expects immediate feedback (the link they're
 // clicking should open), and one extra POST on a click is negligible.
 //
 // De-duplication: views are deduplicated by entry id via a
-// Set<number> so re-renders (e.g. category filter toggles) don't
-// fire duplicate events for cards already on screen. The set is
-// session-scoped — we deliberately don't persist it across page
-// reloads; a return visit is a fresh "view" signal for the
-// recommendation ranker.
+// Set<number>, so a story sends one view per session even if it is
+// opened and also scrolled past, or seen on scroll again (a tab that
+// starts over). The set is session-scoped — we deliberately don't
+// persist it across page reloads; a return visit is a fresh "view"
+// signal for the recommendation ranker.
 //
 // Failure handling: if a flush POST fails (network blip, 5xx), we
 // drop the events. Engagement signals are advisory; losing a few
@@ -57,8 +58,38 @@ const seen = new Set<number>()
 let flushScheduled = false
 const uninstalled = false
 
+// When a story last opened from this page (Date.now()), 0 for never.
+// The update check (useUpdateCheck.ts) leaves alone a page that hid
+// right after opening one, so the story's card is still there when the
+// user comes back to vote on or save it.
+let storyOpenedAt = 0
+
+// POSTs on the way (batches and immediate events), so the flush before
+// a reload can let them land instead of cutting them off.
+const inFlight = new Set<Promise<unknown>>()
+
+function track(p: Promise<unknown>): void {
+  inFlight.add(p)
+  void p.finally(() => inFlight.delete(p))
+}
+
 // Cap matches the backend's _BATCH_MAX so a queued flush never 422s.
 const MAX_QUEUE = 50
+
+// Events held back until their Undo window closes (D25): a Hide's
+// ``never`` waits while its toast offers Undo, so a hide taken back
+// never reaches the ranking. ``holdInteraction`` adds one; its
+// ``release`` sends it and ``cancel`` drops it. The page hiding sends
+// whatever is still held (``onPageHide``), ahead of the queue: the
+// toast's timer may never fire again, and a signal is better than none.
+const held = new Set<InteractionEvent>()
+
+/** Moves every held event to the front of the queue. */
+function queueHeld(): void {
+  if (held.size === 0) return
+  queue.unshift(...held)
+  held.clear()
+}
 
 // ---- flushing ----
 
@@ -68,14 +99,14 @@ async function flush(): Promise<void> {
   // Drain atomically. Anything appended during the request goes into
   // a fresh buffer the next flush picks up.
   const batch = queue.splice(0, queue.length)
-  try {
-    await api.recordInteractionBatch(batch)
-  } catch (err) {
+  const sent = api.recordInteractionBatch(batch).catch((err) => {
     // Best-effort; the events are advisory. Log in dev so a developer
     // debugging "why isn't the ranking changing" can see the network
     // issue but don't toast the user — engagement is in the background.
     if (import.meta.env.DEV) console.warn('interactions: batch flush failed', err)
-  }
+  })
+  track(sent)
+  await sent
 }
 
 function scheduleFlush(): void {
@@ -107,6 +138,7 @@ function scheduleFlush(): void {
 // drain the queue before knowing the beacon succeeded — the
 // fallback path then needs the events.
 function onPageHide(): void {
+  queueHeld()
   if (queue.length === 0) return
   // Drain into a local snapshot BEFORE attempting any send, so a
   // failed sendBeacon still has the events to fall back to. We swap
@@ -177,22 +209,62 @@ export function recordBatched(event: InteractionEvent): void {
  * synchronously) and for one-off preference changes (thumb_up /
  * thumb_down / never) where latency matters. */
 export function recordImmediate(event: InteractionEvent): void {
+  // Every way a card opens its story records a ``click``.
+  if (event.type === 'click') noteStoryOpened()
   // Drop in-page dedup for non-view events — a thumb_down click on
   // an already-voted card could legitimately mean "double down" in
   // a future UI even if it doesn't today.
-  void api
+  const sent = api
     .recordInteraction(event)
     .catch((err) => {
       if (import.meta.env.DEV)
         console.warn('interactions: immediate flush failed', err)
     })
+  track(sent)
 }
 
-/** For tests / dev tools: drain the queue right now without waiting
- * for rIC. Returns a promise that resolves when the in-flight POST
- * settles. */
-export function flushNow(): Promise<void> {
-  return flush()
+/** Holds ``event`` back until ``release`` sends it (the Undo toast
+ * expired) or ``cancel`` drops it (Undo). Either is a no-op once the
+ * other has run, or once the page hiding has sent it. A Hide's
+ * ``never`` goes through here (D25). */
+export function holdInteraction(event: InteractionEvent): { release: () => void; cancel: () => void } {
+  held.add(event)
+  return {
+    release: () => {
+      if (!held.delete(event)) return
+      recordImmediate(event)
+    },
+    cancel: () => {
+      held.delete(event)
+    },
+  }
+}
+
+/** For tests: number of events held back. */
+export function heldCount(): number {
+  return held.size
+}
+
+/** Records that a story opened. ``recordImmediate`` does it for every
+ * ``click``; the paths that open a story without one (the alternatives
+ * under a card, the context menu's "Open in new tab") call it. */
+export function noteStoryOpened(): void {
+  storyOpenedAt = Date.now()
+}
+
+/** When a story last opened from this page, 0 for never. */
+export function lastStoryOpenAt(): number {
+  return storyOpenedAt
+}
+
+/** Drain the queue right now without waiting for rIC (tests, dev
+ * tools, and the flush before a reload onto a new build). Resolves when
+ * that POST and every one already on the way have settled. A held
+ * event goes too: the reload takes its Undo toast with it. */
+export async function flushNow(): Promise<void> {
+  queueHeld()
+  await flush()
+  await Promise.allSettled(Array.from(inFlight))
 }
 
 /** For tests: number of events currently buffered. */

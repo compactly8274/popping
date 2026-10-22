@@ -65,6 +65,7 @@ export function SourceIcon({ src, name, size = 16 }: Props) {
       <span
         aria-hidden="true"
         title={name}
+        // eslint-disable-next-line no-restricted-syntax -- decorative letter inside an 18px icon, hidden from screen readers
         className="shrink-0 inline-flex items-center justify-center rounded-sm text-[9px] font-semibold text-white/90 leading-none"
         style={{
           width: size,

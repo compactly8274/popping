@@ -2,23 +2,24 @@
 
 When ``sources.sitemap_url`` is set on a ``generic_scrape`` row,
 the plugin should pass *that* URL to
-``discover_sitemap_urls`` (which feeds it to
-``trafilatura.sitemaps.sitemap_search``) instead of the page URL.
-``trafilatura.sitemap_search`` parses a URL directly when it's a
-sitemap, but tries to *find* the sitemap when given a page URL —
-the home-vs-sitemap distinction matters, and the wrong one was
-returning 0 candidates on real sites like theprogress.com.
+``discover_sitemap_entries`` instead of the page URL. The crawl
+parses a URL directly when it's a sitemap, but tries to *find* the
+sitemap when given a page URL — the home-vs-sitemap distinction
+matters, and the wrong one was returning 0 candidates on real sites
+like theprogress.com.
 
 These tests are at the plugin level; they don't touch Postgres
 or do real network I/O. The wire tests assert the plugin
 behavior:
 
-  1. ``sitemap_url=None`` (the default) → ``discover_sitemap_urls``
+  1. ``sitemap_url=None`` (the default) → ``discover_sitemap_entries``
      is called with ``self.url`` (the page URL). Backwards
      compatible with every existing row.
   2. ``sitemap_url='https://example.com/sitemap.xml'`` →
-     ``discover_sitemap_urls`` is called with that URL instead
+     ``discover_sitemap_entries`` is called with that URL instead
      of ``self.url``. The user's manual override wins.
+  When neither the sitemap nor the page lists anything, the feed has
+  no list of articles: ``NoArticleListError`` (``[no list]``, PR10b).
   3. The candidate dedup (``_extracted_urls``) and the
      ``_MAX_NEW_PER_POLL`` cap still apply after the override.
   4. ``probe`` (the row-free version used by the Test endpoint)
@@ -33,6 +34,7 @@ behavior:
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import inspect
 import sys
 from pathlib import Path
@@ -40,6 +42,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+from app.article_detect import Candidate
+from app.sources.base import NoArticleListError
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "backend"))
@@ -100,14 +105,15 @@ async def test_plugin_falls_back_to_self_url_when_sitemap_url_is_none():
     """
     plugin = _make_plugin(_make_row(url="https://example.com", sitemap_url=None))
 
-    with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=[])) as mock:
-        result = await plugin.fetch()
+    with patch("app.sources.generic_scrape.discover_sitemap_entries", new=AsyncMock(return_value=[])) as mock, \
+         patch("app.sources.generic_scrape._discover_page_links", new=AsyncMock(return_value=[])):
+        with pytest.raises(NoArticleListError):
+            await plugin.fetch()
 
     mock.assert_awaited_once()
     args, kwargs = mock.call_args
     # First positional arg = the sitemap URL the plugin passes
     assert args[0] == "https://example.com"
-    assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +137,10 @@ async def test_plugin_uses_sitemap_url_when_set():
         _make_row(url="https://theprogress.com", sitemap_url=direct)
     )
 
-    with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=[])) as mock:
-        result = await plugin.fetch()
+    with patch("app.sources.generic_scrape.discover_sitemap_entries", new=AsyncMock(return_value=[])) as mock, \
+         patch("app.sources.generic_scrape._discover_page_links", new=AsyncMock(return_value=[])):
+        with pytest.raises(NoArticleListError):
+            await plugin.fetch()
 
     mock.assert_awaited_once()
     args, kwargs = mock.call_args
@@ -158,8 +166,10 @@ async def test_plugin_falls_back_on_empty_string_sitemap_url():
         _make_row(url="https://example.com", sitemap_url="")
     )
 
-    with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=[])) as mock:
-        await plugin.fetch()
+    with patch("app.sources.generic_scrape.discover_sitemap_entries", new=AsyncMock(return_value=[])) as mock, \
+         patch("app.sources.generic_scrape._discover_page_links", new=AsyncMock(return_value=[])):
+        with pytest.raises(NoArticleListError):
+            await plugin.fetch()
 
     mock.assert_awaited_once()
     args, kwargs = mock.call_args
@@ -183,26 +193,29 @@ async def test_plugin_dedup_works_with_sitemap_url_override():
     plugin = _make_plugin(_make_row(url="https://example.com", sitemap_url=direct))
 
     fake_candidates = [
-        "https://example.com/a",
-        "https://example.com/b",
-        "https://example.com/c",
+        Candidate("https://example.com/a", None, None),
+        Candidate("https://example.com/b", None, None),
+        Candidate("https://example.com/c", None, None),
     ]
+    published = dt.datetime.now(dt.timezone.utc)
 
     # Mock _extract_one to return a dummy item for any URL.
     # B4 followup: accept custom_headers kwarg to match the real
     # _extract_one signature (fetch() passes custom_headers=self.custom_headers).
-    async def fake_extract(url: str, custom_headers=None):
-        return {"title": url.split("/")[-1], "url": url, "text": "x", "published_at": None, "summary": "x", "image_url": None}
+    # Dated, so the undated cap (two a poll) doesn't apply.
+    async def fake_extract(url: str, custom_headers=None, **kwargs):
+        return {"title": url.split("/")[-1], "url": url, "text": "x", "published_at": published, "summary": "x", "image_url": None}
 
     with patch(
-        "app.sources.generic_scrape.discover_sitemap_urls",
+        "app.sources.generic_scrape.discover_sitemap_entries",
         new=AsyncMock(return_value=fake_candidates),
     ), patch("app.sources.generic_scrape._extract_one", side_effect=fake_extract):
         # First poll: all three candidates get extracted.
         items_1 = await plugin.fetch()
         # Second poll: all three are in _extracted_urls, so
         # the loop sees them and skips them. Result: empty
-        # list (the candidates are exhausted from the dedup).
+        # list (the candidates are exhausted from the dedup),
+        # and no error: the sitemap still lists articles.
         items_2 = await plugin.fetch()
 
     assert len(items_1) == 3
@@ -255,8 +268,8 @@ async def test_probe_ignores_sitemap_url_override():
     """
     from app.sources.generic_scrape import probe
 
-    with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=[])) as mock:
-        await probe("https://example.com/sitemap.xml", limit=3)
+    with patch("app.sources.generic_scrape.discover_sitemap_entries", new=AsyncMock(return_value=[])) as mock:
+        assert await probe("https://example.com/sitemap.xml", limit=3) == []
 
     mock.assert_awaited_once()
     args, kwargs = mock.call_args
@@ -264,10 +277,12 @@ async def test_probe_ignores_sitemap_url_override():
     # sourced from a row's sitemap_url override.
     assert args[0] == "https://example.com/sitemap.xml"
     # And the second arg is limit=max(limit*3, 10) = 10 (not 3).
-    # ``discover_sitemap_urls(url, limit=...)`` is a Python
+    # ``discover_sitemap_entries(url, limit=...)`` is a Python
     # call where ``limit`` is a keyword argument — it shows
     # up in mock.call_args.kwargs, not args.
     assert kwargs.get("limit") == 10
+    # probe never raises: a site it can't read previews as nothing.
+    assert kwargs.get("raise_errors") is False
 
 
 # ---------------------------------------------------------------------------

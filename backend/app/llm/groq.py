@@ -1,66 +1,30 @@
-"""Groq provider. OpenAI-compatible at ``/openai/v1/chat/completions``.
-
-Groq uses the same chat-completions schema as OpenAI; the only
-difference is the base URL and the Authorization scheme.
-"""
+"""Groq provider: OpenAI-compatible chat completions at Groq's URL."""
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-import httpx
+from app.llm.openai import OpenAIProvider
 
-from app.config import settings
-from app.llm.base import Provider, ProviderError
+# gpt-oss models reason before answering, and Groq counts those hidden
+# reasoning tokens against max_tokens. With the callers' budgets (600
+# for a Brief, 120 for scoring) the reasoning used them all up and the
+# reply came back 200 with empty content. Low effort keeps the
+# reasoning short; the headroom covers it on top of the caller's budget.
+_REASONING_HEADROOM = 1024
 
-logger = logging.getLogger("popping.llm.groq")
 
-
-class GroqProvider(Provider):
+class GroqProvider(OpenAIProvider):
     name = "groq"
 
-    def __init__(self, model: str, api_key: str) -> None:
-        self._model = model
-        self._api_key = api_key
+    def _default_base_url(self) -> str:
+        return "https://api.groq.com/openai/v1"
 
-    async def complete(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 512,
-        stop: list[str] | None = None,
-        think: bool = True,
-    ) -> str:
-        # ``think`` is an Ollama-specific knob (see Provider.complete's
-        # docstring) — accepted for call-site uniformity across the
-        # provider chain, unused here.
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {
-            "authorization": f"Bearer {self._api_key}",
-            "content-type": "application/json",
+    def _payload_overrides(self, max_tokens: int) -> dict[str, Any]:
+        if "gpt-oss" not in self._model:
+            return {}
+        return {
+            "max_tokens": max_tokens + _REASONING_HEADROOM,
+            "reasoning_effort": "low",
+            "include_reasoning": False,
         }
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        if stop:
-            payload["stop"] = stop
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-        except httpx.HTTPError as exc:
-            raise ProviderError(f"groq transport error: {exc}") from exc
-        if resp.status_code != 200:
-            raise ProviderError(
-                f"groq returned {resp.status_code}: {resp.text[:200]}"
-            )
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            raise ProviderError("groq returned no choices")
-        text = (choices[0].get("message") or {}).get("content", "")
-        if not text:
-            raise ProviderError("groq returned empty message content")
-        return text

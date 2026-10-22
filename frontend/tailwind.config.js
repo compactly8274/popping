@@ -6,6 +6,9 @@
 // pure black with neutral grays stacked on top.
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
+  // Hover styles only where a real pointer can hover. On a phone a tap
+  // otherwise leaves the hover look stuck (a card stays "lifted").
+  future: { hoverOnlyWhenSupported: true },
   theme: {
     extend: {
       colors: {
@@ -91,9 +94,9 @@ export default {
           '0%':   { opacity: '0', transform: 'translateY(2px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
-        // Sheet slide — used by the Drawer on mobile. Slides up
-        // from the bottom edge with the iOS spring-ish feel (we use
-        // a plain ease-out instead of a spring library).
+        // Sheet slide — used by the Settings sheet on phones (PR5).
+        // Slides up from the bottom edge with the iOS spring-ish feel
+        // (a plain ease-out instead of a spring library).
         sheetUp: {
           '0%':   { transform: 'translateY(100%)' },
           '100%': { transform: 'translateY(0)' },

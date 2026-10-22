@@ -25,7 +25,6 @@ import asyncio
 import datetime as dt
 import time
 from collections import defaultdict
-from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession

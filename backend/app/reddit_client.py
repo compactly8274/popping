@@ -63,7 +63,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import time
 # Slice 23 (security): use ``defusedxml`` instead of the stdlib
@@ -78,8 +77,8 @@ import time
 # Aliased as ``ET`` so the existing call sites (``ET.fromstring(...)``,
 # ``root.findall(...)``) don't change — only the import does.
 from defusedxml import ElementTree as ET
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime
+from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -124,15 +123,6 @@ _DIRECT_BURST = 1.0
 # aligned with the listings' freshness.
 _CROSSREF_CACHE_TTL_S = 15 * 60
 
-# Default User-Agent. Reddit's RSS endpoints don't require a contact
-# string the way the JSON endpoints do (the JS challenge is what
-# the JSON endpoint uses to enforce contact, and the RSS endpoint
-# doesn't do JS challenges). Still, a contact UA is good hygiene.
-_DEFAULT_USER_AGENT = "Popping/0.2 (+https://github.com/compactly8274/popping)"
-_DEFAULT_USER_AGENT_WITH_CONTACT = (
-    "Popping/0.2 (+https://github.com/compactly8274/popping; "
-    "contact: phil@philjnewman.com)"
-)
 
 # Atom XML namespaces. Reddit's hot.rss feed declares both ATOM
 # (the feed itself) and MRSS (media thumbnails). The cross-ref
@@ -173,8 +163,13 @@ _crossref_cache: dict[str, tuple[float, list[dict]]] = {}
 # OAuth app-only token cache (script-type app).
 #
 # When REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are both set, the direct
-# client fetches an app-only bearer from oauth.reddit.com and caches it
-# until near expiry, refreshing on 401. Without creds these stay inert.
+# client fetches an app-only bearer from www.reddit.com/api/v1/access_token
+# and caches it until near expiry, dropping it on 401. Without creds these
+# stay inert.
+#
+# Caveat: Reddit documents bearer requests as belonging on
+# oauth.reddit.com, but this client fetches public RSS from
+# www.reddit.com. Whether the bearer helps there is unverified.
 # ---------------------------------------------------------------------------
 
 # Token cached as (access_token, expires_at_monotonic) with a safety
@@ -192,6 +187,7 @@ def _oauth_enabled() -> bool:
 async def _fresh_oauth_token() -> Optional[str]:
     """Return a bearer token (cached or freshly fetched), or None if OAuth
     isn't configured / the exchange fails."""
+    global _oauth_token, _oauth_expires_at
     if not _oauth_enabled():
         return None
     now = time.monotonic()
@@ -205,7 +201,7 @@ async def _fresh_oauth_token() -> Optional[str]:
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                 resp = await client.post(
-                    "https://oauth.reddit.com/api/v1/access_token",
+                    "https://www.reddit.com/api/v1/access_token",
                     data={"grant_type": "client_credentials"},
                     auth=(
                         settings.reddit_client_id,
@@ -233,8 +229,7 @@ async def _fresh_oauth_token() -> Optional[str]:
 async def _oauth_request_hook(request: httpx.Request) -> None:
     """Attach the OAuth bearer to every outgoing direct request. Only
     applies to reddit.com traffic; the token endpoint call is exempt."""
-    host = request.url.host or ""
-    if host == "oauth.reddit.com":
+    if request.url.path == "/api/v1/access_token":
         return  # never auth the token endpoint itself
     token = await _fresh_oauth_token()
     if token:
@@ -278,13 +273,30 @@ def is_disabled() -> bool:
     )
 
 
+class RedditDisabledError(Exception):
+    """A subreddit feed was due while Reddit is off on this server
+    (``is_disabled()``). The scheduler raises it before fetching and
+    records ``[reddit off]``: a setup state, not a failure, so the
+    feed is never backed off or stopped for it."""
+
+
+def is_direct_mode() -> bool:
+    """True when Reddit calls go straight to reddit.com through the
+    per-process token bucket (no proxy URL, direct mode not disabled),
+    so every subreddit fetch spends one of ``_DIRECT_RPS``'s calls.
+    """
+    return not settings.reddit_hydra_url and not settings.reddit_direct_disabled
+
+
+def direct_call_interval_seconds() -> float:
+    """Seconds between two direct-mode calls (``_DIRECT_RPS``)."""
+    return 1.0 / _DIRECT_RPS
+
+
 def _user_agent() -> str:
     """User-Agent string for Reddit calls.
     """
-    ua = os.environ.get("REDDIT_USER_AGENT", "").strip()
-    if ua:
-        return ua
-    return _DEFAULT_USER_AGENT_WITH_CONTACT
+    return settings.reddit_user_agent.strip() or settings.user_agent
 
 
 # ---------------------------------------------------------------------------

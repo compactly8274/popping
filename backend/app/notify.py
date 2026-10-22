@@ -129,19 +129,22 @@ class PushoverNotifier(Notifier):
 
     name = "pushover"
     _ENDPOINT = "https://api.pushover.net/1/messages.json"
+    _TITLE_MAX = 250
+    _MESSAGE_MAX = 1024
 
     def __init__(self, user_key: str, app_token: str) -> None:
         self._user = user_key
         self._token = app_token
 
     async def send(self, *, title: str, body: str, url: Optional[str] = None) -> None:
-        # Pushover enforces a 512-char title and 1024-char body — clip
-        # generously below to avoid surprise 4xx.
+        # Pushover rejects (400) a title over 250 chars or a message
+        # over 1024, and a daily Brief is often longer than that, so
+        # clip to the limits instead of losing the whole notification.
         payload = {
             "token": self._token,
             "user": self._user,
-            "title": title[:250],
-            "message": body[:4000],
+            "title": title[: self._TITLE_MAX],
+            "message": body if len(body) <= self._MESSAGE_MAX else body[: self._MESSAGE_MAX - 1] + "…",
         }
         if url:
             # Strip control bytes (CR/LF/NUL/etc.) before the

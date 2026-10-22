@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A news site's index: a plain sitemap whose name says nothing, a
+     monthly post archive, Ghost-style pages and tags sitemaps, and the
+     news sitemap listed last. -->
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://www.example.com/sitemap-1.xml</loc></sitemap>
+  <sitemap><loc>https://www.example.com/sitemaps/sitemap-posts-2026-10.xml</loc></sitemap>
+  <sitemap><loc>https://www.example.com/sitemap-pages.xml</loc></sitemap>
+  <sitemap><loc>https://www.example.com/sitemap-tags.xml</loc></sitemap>
+  <sitemap><loc>https://www.example.com/news-sitemap.xml</loc></sitemap>
+</sitemapindex>

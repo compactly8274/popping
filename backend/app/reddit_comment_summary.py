@@ -9,10 +9,9 @@ short discussion summary via the same LLM provider chain
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
-from app.llm import ProviderError, router
+from app.llm import complete_with_fallback
 
 logger = logging.getLogger("popping.reddit_comment_summary")
 
@@ -56,35 +55,13 @@ async def summarize_comments(title: str, comments: list[dict]) -> str | None:
     ``app.podcast_transcript.summarize_transcript``."""
     if not comments:
         return None
-    providers = router.providers_for("brief")
-    if not providers:
-        logger.info("reddit_comment_summary: no LLM provider configured — skipping")
-        return None
-    prompt = _build_prompt(title, comments)
-    for candidate in providers:
-        try:
-            content = await asyncio.wait_for(
-                # think=False — see app.article_summary's matching
-                # comment / Provider.complete's docstring: a thinking
-                # model can burn the whole token budget on CoT and
-                # never reach the actual summary.
-                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS, think=False),
-                timeout=_LLM_CALL_TIMEOUT_S,
-            )
-        except ProviderError as exc:
-            logger.warning(
-                "reddit_comment_summary: LLM call failed on %s: %s — trying next provider",
-                candidate.name, exc,
-            )
-            continue
-        except asyncio.TimeoutError:
-            logger.warning(
-                "reddit_comment_summary: %s took longer than %.0fs — trying next provider",
-                candidate.name, _LLM_CALL_TIMEOUT_S,
-            )
-            continue
-        content = (content or "").strip()
-        if content:
-            return content
-    logger.warning("reddit_comment_summary: all configured LLM providers failed")
-    return None
+    summary, _ = await complete_with_fallback(
+        "brief",
+        _build_prompt(title, comments),
+        log_name="reddit_comment_summary",
+        timeout=_LLM_CALL_TIMEOUT_S,
+        max_tokens=_SUMMARY_MAX_TOKENS,
+        # think=False: see app.article_summary.
+        think=False,
+    )
+    return summary

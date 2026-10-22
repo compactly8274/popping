@@ -7,7 +7,7 @@ import react from '@vitejs/plugin-react'
 // container by checking VITE_BACKEND_URL (set in docker-compose env_file).
 const backend = process.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
-// /api and /assets are routed to the backend in BOTH dev and preview.
+// /api, /assets and /auth are routed to the backend in BOTH dev and preview.
 // The dev server uses ``server.proxy``; ``vite preview`` uses
 // ``preview.proxy`` (same shape, separate code path). They share the
 // same target/changeOrigin because the backend hostname is identical
@@ -29,10 +29,30 @@ const proxy = {
     target: backend,
     changeOrigin: true,
   },
+  // OIDC + local login routes live at the backend root, not under /api.
+  // changeOrigin stays false so the backend sees the public Host, which
+  // its cookies and OIDC redirect_uri are built against.
+  '/auth': {
+    target: backend,
+    changeOrigin: false,
+  },
 }
+
+// Vite rejects requests whose Host header isn't localhost or an IP.
+// List extra hostnames for the dev server here, e.g.
+// POPPING_ALLOWED_HOSTS=popping.example.com. (Production uses nginx.)
+const allowedHosts = (process.env.POPPING_ALLOWED_HOSTS || '')
+  .split(',')
+  .map((h) => h.trim())
+  .filter(Boolean)
 
 export default defineConfig({
   plugins: [react()],
+  // When this bundle was built, for the build line in Settings (PR1r).
+  // ``define`` inlines the literal, so the CSP is unaffected.
+  define: {
+    __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+  },
   build: {
     // Build output goes to ``/static/`` instead of Vite's default
     // ``/assets/`` so the path doesn't collide with the backend's
@@ -49,12 +69,14 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5173,
+    allowedHosts,
     proxy,
     allowedHosts: ['popping.verasaidthat.ca', '*.verasaidthat.ca', 'localhost', '127.0.0.1'],
   },
   preview: {
     host: '0.0.0.0',
     port: 5173,
+    allowedHosts,
     proxy,
     allowedHosts: ['popping.verasaidthat.ca', '*.verasaidthat.ca', 'localhost', '127.0.0.1'],
   },

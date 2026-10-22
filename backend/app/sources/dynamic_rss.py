@@ -29,7 +29,7 @@ podcast-specific dynamic source) follows the same pattern.
 from __future__ import annotations
 
 from app.models import Source
-from app.sources.base import SourcePlugin
+from app.sources.base import SourcePlugin, row_fetch_target
 from app.sources.rfd import _is_rfd_url, rfd_normalize_dynamic
 from app.sources.rss import fetch_rss
 
@@ -61,6 +61,8 @@ class DynamicRssPlugin(SourcePlugin):
         # Lets the scheduler compute this job's id (``ingest:dynamic:<id>``)
         # for backoff rescheduling without reaching into ``_source_row``.
         self.source_id = source_row.id
+        # The address this instance fetches (see ``SourcePlugin.fetch_target``).
+        self.fetch_target = row_fetch_target(source_row)
 
     async def fetch(self) -> list[dict]:
         # ``custom_headers`` overrides the default User-Agent for

@@ -3,57 +3,65 @@
 // The dashboard keeps several user-visible pieces of state in
 // per-user server-backed storage:
 //
-//   - readEntries     per-column "I marked this card read" ids
+//   - seenEntries     per-category "I've seen this story" ids (PR3b)
+//   - readEntries     per-column "I marked this card read" ids, from
+//                     builds before PR3b: read, never written
 //   - lastViewed      per-column "I last saw this column at" ISO timestamps
+//                     (before PR3b; read only so Reset can delete them)
 //   - columnPrefs     per-column sort/min-score/max-age
-//   - columnSections  per-column Fresh/History section collapse
+//   - columnSections  per-column Fresh/History section collapse (before
+//                     PR3b; read only so Reset can delete them)
 //   - hiddenEntries   per-user "hide this entry" ids
 //   - starredEntries  per-user saved-for-later entry ids
+//   - votedEntries    per-user entry id -> up / down
 //   - filterPresets   user-saved filter+prefs views
 //   - historyGroupBy  History tab grouping (``entry`` or ``none``)
+//   - categoryLayout  the tab order and the hidden tabs
 //
-// All eight used to live in localStorage. They were per-device
-// there, so a phone and a laptop saw different read state, different
-// "+N new" counts, different sort orders, etc. The server-backed
-// store fixes that -- on every device, the same user_id sees the
-// same state.
+// They used to live in localStorage. They were per-device there, so a
+// phone and a laptop saw different read state, different sort orders,
+// etc. The server-backed store fixes that -- on every device, the same
+// user_id sees the same state.
 //
-// Why a React context (not a Zustand store, not a hook per key)?
+// How it syncs (PR2b; the rules and their tests are in
+// ``lib/prefSync.ts``, which this provider wires to React, the API and
+// the page's lifecycle):
 //
-//   - All eight keys share one round-trip on first load
-//     (``GET /api/preferences``).
-//   - Writes are debounced per-key, so the consumer code is
-//     ``setX(...)`` and the provider handles the network.
-//   - Optimistic updates: a write is reflected in the in-memory
-//     state immediately, the network call goes out in the
-//     background. A failed write reverts. The UX feels
-//     localStorage-fast while the truth lives on the server.
-//
-// Why not just call the API from each consumer?
-//
-//   - The same debounce/coalesce logic would have to live in eight
-//     places. Centralizing it in the provider means the consumer
-//     code is "I want to set this value" and the transport is one
-//     module's concern.
-//   - The localStorage seed (one-way migration of any values the
-//     user had on this device before the deploy) is a property of
-//     "the moment we load from the server", which is the
-//     provider's job, not each consumer's.
+//   - Set keys (read marks, hides, saves, votes) are written as
+//     changes: ``addIds`` / ``removeIds`` / ``setVotes`` queue a PATCH
+//     of just that change, so two devices, or two calls in one tick,
+//     never undo each other. The other keys are whole values and stay
+//     PUT (``setColumnPrefs`` etc.).
+//   - Optimistic: a write shows at once. The screen is the server's
+//     value with every write not yet acknowledged applied on top.
+//   - Set keys go out in a 1 s batch, the others in a 250 ms one.
+//     Leaving the page (hidden, pagehide, beforeunload) sends what is
+//     queued with ``keepalive``.
+//   - ``resync()`` reads what changed on the server since the last
+//     read (App calls it on each poll); ``resync({ full: true })``
+//     reads everything, which is also how deleted rows arrive (App
+//     calls it when the page comes back to the front).
+//   - A write that doesn't get through is tried again (2, 4, 8 s, and
+//     again when the page comes back); one the server refuses is
+//     dropped. Each ends in one toast. A write still unanswered after
+//     30 s, or when the page comes back, is not sent again: the next
+//     full read shows whether it landed.
 //
 // Server contract
 // ---------------
 //
-// ``GET  /api/preferences``           -> ``{ items: [{key, value, updated_at}] }``
-// ``PUT  /api/preferences/{key}``     body: ``{ value: any }``   -> the row
-// ``DEL  /api/preferences/{key}``     -> 204
+// ``GET    /api/preferences[?since=<iso>]``  -> ``{ items: [{key, value, updated_at}] }``
+// ``PUT    /api/preferences/{key}``   body: ``{ value: any }``   -> the row
+// ``PATCH  /api/preferences/{key}``   body: ``{add?, remove?}`` or ``{set?}`` -> the row
+// ``DELETE /api/preferences/{key}``   -> 204
 //
-// The server treats ``key`` as an opaque string. We use namespaced
-// shapes (``read_entries:<columnId>``, ``last_viewed:<columnId>``,
-// ``column_prefs:<columnId>``, ``column_sections:<columnId>``,
-// ``hidden_entries``, ``starred_entries``, ``filter_presets``,
-// ``history_group_by``) so the schema can grow without a backend
-// migration. The constant ``PREFERENCE_KEYS`` below is the source
-// of truth for which keys exist.
+// We use namespaced keys (``seen:<category>``, ``read_entries:<columnId>``,
+// ``last_viewed:<columnId>``, ``column_prefs:<columnId>``,
+// ``column_sections:<columnId>``, ``hidden_entries``,
+// ``starred_entries``, ``voted_entries``, ``filter_presets``,
+// ``history_group_by``, ``category_layout``) on the server's allowlist
+// (routes/preferences.py). The constant ``PREFERENCE_KEYS`` below is
+// the source of truth for which keys exist.
 
 import {
   createContext,
@@ -61,18 +69,29 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from 'react'
-import { api } from '../api'
+import { api, ApiError } from '../api'
+import {
+  coerceIds,
+  coerceVotes,
+  createPrefSync,
+  legacySeedPlan,
+  type PrefSync,
+  type Rows,
+  type SyncTransport,
+  type Vote,
+} from './prefSync'
 import { safeGetItem, safeRemoveItem } from './storage'
+import { normalizeLayout, type CategoryLayout } from './categories'
+import { toast } from '../components/Toast'
 
 // ---------------------------------------------------------------------------
 // Key registry. Single source of truth for which preference keys exist
-// and which shape their value takes. Backend is opaque to key shape --
-// the server stores whatever JSONB you give it. The TypeScript types
-// here are the contract.
+// and which shape their value takes. The server stores whatever JSONB a
+// PUT gives it (set keys it checks and trims); the TypeScript types here
+// are the contract.
 // ---------------------------------------------------------------------------
 
 /**
@@ -85,15 +104,20 @@ export type ReadEntriesValue = number[]
 export type LastViewedValue = string
 
 /**
- * One column's sort/filter preferences. Matches the
- * ``ColumnPrefs`` type in App.tsx -- duplicated here to avoid a
- * circular import (App imports this module, this module would
- * have to import App's ColumnPrefs otherwise).
+ * One column's sort/filter preferences. Matches ``TabPrefs`` in
+ * ``lib/sorting.ts`` (Column's ``ColumnPrefs``), which reads it:
+ * ``top`` and ``oldest`` are older builds' values, and ``minScore`` is
+ * kept in the shape but no longer filters. ``window`` is the tab's
+ * window (``lib/window``, PR4d); rows older builds wrote hold a numeric
+ * ``maxAgeHours`` instead, which is read (``windowOf``). New writes
+ * keep ``maxAgeHours`` null next to ``window``, so an older build still
+ * open somewhere keeps ``window`` when it writes the row.
  */
 export type ColumnPrefsValue = {
-  sort: 'top' | 'newest' | 'oldest'
+  sort: 'top' | 'newest' | 'oldest' | 'best'
   minScore: number
-  maxAgeHours: number | null
+  window?: '1d' | '2d' | '7d' | 'all'
+  maxAgeHours?: number | null
 }
 
 /** One column's Fresh/History section collapse state. */
@@ -104,6 +128,11 @@ export type ColumnSectionsValue = {
 
 /** The History tab's group-by mode. */
 export type HistoryGroupByValue = 'entry' | 'none'
+
+/** The tab order and the hidden tabs (``lib/categories.ts``). One whole
+ *  value, written by PUT on every change; a stale read can't undo a
+ *  change still on its way (PR2b's per-key write sequence). */
+export type CategoryLayoutValue = CategoryLayout
 
 /**
  * Per-entry vote direction. Keyed by entry id (as a string — JSON
@@ -127,16 +156,17 @@ export type FilterPresetValue = {
 }
 
 /**
- * The flat shape of the preferences state. Each top-level key is
- * the server-side preference key; the type is the decoded value.
- *
- * The server response is a list of {key, value}; the provider
- * decodes it into this object on first load.
+ * The flat shape of the preferences state, decoded from the server's
+ * rows (see ``decodeState``).
  */
 export type PreferencesState = {
-  // Per-column maps keyed by source id. Source ids are strings in
-  // the dashboard (e.g. ``"hacker-news-top"``) and we follow the
-  // same convention here.
+  // Seen marks, keyed by the story's category (``seen:<category>``):
+  // where every mark goes from PR3b on, wherever the story was seen.
+  seenEntries: Record<string, ReadEntriesValue>
+  // Per-column maps keyed by the column's name (a category, "For You",
+  // "Saved", "Search" ...). ``read_entries`` rows are the read marks of
+  // builds before PR3b: still read (a story marked there counts as
+  // seen), never written.
   readEntries: Record<string, ReadEntriesValue>
   lastViewed: Record<string, LastViewedValue>
   columnPrefs: Record<string, ColumnPrefsValue>
@@ -151,10 +181,14 @@ export type PreferencesState = {
   // Per-user singletons (one value, not a map).
   filterPresets: FilterPresetValue[]
   historyGroupBy: HistoryGroupByValue
+  // Null until the tabs have been reordered or hidden once (every
+  // device then shows the default order).
+  categoryLayout: CategoryLayoutValue | null
 }
 
 /** Helper: which server-side keys exist, and what TS type each holds. */
 export const PREFERENCE_KEYS = {
+  seen: 'seen',
   readEntries: 'read_entries',
   lastViewed: 'last_viewed',
   columnPrefs: 'column_prefs',
@@ -164,54 +198,125 @@ export const PREFERENCE_KEYS = {
   votedEntries: 'voted_entries',
   filterPresets: 'filter_presets',
   historyGroupBy: 'history_group_by',
+  categoryLayout: 'category_layout',
 } as const
 
-// Default state for a brand-new user (server has no rows yet).
-// Mirrors the ``DEFAULT_PREFS`` constant in App.tsx; values are
-// chosen to match the existing localStorage defaults so the
-// migration is transparent.
-const DEFAULT_STATE: PreferencesState = {
-  readEntries: {},
-  lastViewed: {},
-  columnPrefs: {},
-  columnSections: {},
-  hiddenEntries: [],
-  starredEntries: [],
-  votedEntries: {},
-  filterPresets: [],
-  historyGroupBy: 'entry',
+/** A key whose value is a set of story ids: changed with ``addIds`` /
+ *  ``removeIds``, never written whole. New seen marks go only to
+ *  ``seen:<category>`` (PR3b); ``read_entries:*`` is only read. */
+export type IdSetKey =
+  | typeof PREFERENCE_KEYS.starredEntries
+  | typeof PREFERENCE_KEYS.hiddenEntries
+  | `${typeof PREFERENCE_KEYS.readEntries}:${string}`
+  | `seen:${string}`
+
+// ``MAX_PRESETS`` is the cap on saved filter presets. The set keys'
+// caps (``MAX_HIDDEN`` and the rest) live in ``lib/prefSync.ts``,
+// which prunes to them.
+export const MAX_PRESETS = 50
+
+// Empty values shared by every decode, so a key with no row keeps one
+// reference across renders (Column's memo compares by reference).
+const NO_IDS: number[] = []
+const NO_VOTES: VotedEntriesValue = {}
+const NO_PRESETS: FilterPresetValue[] = []
+
+// ---------------------------------------------------------------------------
+// Decoding rows into the typed state.
+// ---------------------------------------------------------------------------
+
+type Decoded = { rows: Rows; state: PreferencesState }
+
+const PER_COLUMN = [
+  ['seenEntries', PREFERENCE_KEYS.seen],
+  ['readEntries', PREFERENCE_KEYS.readEntries],
+  ['lastViewed', PREFERENCE_KEYS.lastViewed],
+  ['columnPrefs', PREFERENCE_KEYS.columnPrefs],
+  ['columnSections', PREFERENCE_KEYS.columnSections],
+] as const
+
+const isObject = (v: unknown): v is object => !!v && typeof v === 'object' && !Array.isArray(v)
+
+// One per-column value, or undefined when it has the wrong shape.
+function columnValue(field: (typeof PER_COLUMN)[number][0], value: unknown): unknown {
+  switch (field) {
+    case 'seenEntries':
+    case 'readEntries':
+      return coerceIds(value)
+    case 'lastViewed':
+      return typeof value === 'string' ? value : undefined
+    default:
+      return isObject(value) ? value : undefined
+  }
+}
+
+/**
+ * The typed state for ``rows``. Each part (a per-column map, a list)
+ * whose rows didn't change since ``prev`` is ``prev``'s object, and
+ * with nothing changed ``prev.state`` itself comes back, so a resync
+ * re-renders only what it changed. Unknown keys are ignored (a
+ * newer build's keys).
+ */
+function decodeState(rows: Rows, prev: Decoded | null): PreferencesState {
+  if (prev && prev.rows === rows) return prev.state
+  const changed = (key: string) => !prev || prev.rows[key] !== rows[key]
+  const anyChanged = (prefix: string) => {
+    if (!prev) return true
+    for (const k of Object.keys(rows)) if (k.startsWith(prefix) && rows[k] !== prev.rows[k]) return true
+    for (const k of Object.keys(prev.rows)) if (k.startsWith(prefix) && !(k in rows)) return true
+    return false
+  }
+  const next = { ...(prev?.state ?? {}) } as PreferencesState
+  let same = !!prev
+  for (const [field, name] of PER_COLUMN) {
+    const prefix = `${name}:`
+    if (!anyChanged(prefix)) continue
+    same = false
+    const map: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(rows)) {
+      if (!k.startsWith(prefix)) continue
+      const value = columnValue(field, v)
+      if (value !== undefined) map[k.slice(prefix.length)] = value
+    }
+    ;(next as Record<string, unknown>)[field] = map
+  }
+  const single = <K extends keyof PreferencesState>(field: K, key: string, decode: (v: unknown) => PreferencesState[K]) => {
+    if (prev && !changed(key)) return
+    same = false
+    next[field] = decode(rows[key])
+  }
+  single('hiddenEntries', PREFERENCE_KEYS.hiddenEntries, (v) => (v === undefined ? NO_IDS : coerceIds(v)))
+  single('starredEntries', PREFERENCE_KEYS.starredEntries, (v) => (v === undefined ? NO_IDS : coerceIds(v)))
+  single('votedEntries', PREFERENCE_KEYS.votedEntries, (v) => (v === undefined ? NO_VOTES : coerceVotes(v)))
+  single('filterPresets', PREFERENCE_KEYS.filterPresets, (v) => (Array.isArray(v) ? (v as FilterPresetValue[]) : NO_PRESETS))
+  single('historyGroupBy', PREFERENCE_KEYS.historyGroupBy, (v) => (v === 'none' ? 'none' : 'entry'))
+  single('categoryLayout', PREFERENCE_KEYS.categoryLayout, normalizeLayout)
+  return same && prev ? prev.state : next
+}
+
+// A decoder that remembers its last answer, so the render and
+// ``latest()`` share one object per set of rows.
+function makeDecoder() {
+  let last: Decoded | null = null
+  return (rows: Rows): PreferencesState => {
+    const state = decodeState(rows, last)
+    last = { rows, state }
+    return state
+  }
 }
 
 // ---------------------------------------------------------------------------
-// API shapes (server contract).
-// ---------------------------------------------------------------------------
-
-interface PreferenceRow {
-  key: string
-  value: unknown
-  updated_at: string
-}
-
-// ---------------------------------------------------------------------------
-// LocalStorage seed (one-way migration of pre-deploy state).
+// LocalStorage seed (a one-way migration from builds before the server
+// store).
 //
-// On the first launch after this migration ships, the user has
-// localStorage entries from before the deploy (e.g. their read
-// state, sort/filter prefs). The server has nothing. We POST each
-// localStorage value to the server, then delete the localStorage
-// entry. The next launch will hit the server directly. This is
-// a "one-way migration" -- once the seed runs, localStorage is
-// authoritative no more; the server is.
-//
-// Why the seed is one-shot and not idempotent: re-seeding would
-// overwrite a server value the user might have changed on another
-// device between the seed and the next launch. The ``seeded`` flag
-// in localStorage gates it to one run per browser.
-//
-// The localStorage entries that back the seed are the OLD keys
-// (``STORAGE_KEYS.readEntries`` etc.). After the seed runs we
-// remove those entries from localStorage. The new code only
-// reads from the server.
+// Those builds kept these values in localStorage. On the first launch
+// with an old value there, it is written to the server once, as a
+// union: set keys add only the ids the server lacks (never a whole-list
+// PUT, which could take saves made on another device), and the other
+// keys are written only where the server has no row. That happens after
+// the first full GET has read the server's rows; only then are the old
+// entries removed and the ``seeded`` flag set, so a failed GET keeps
+// them for the next launch.
 // ---------------------------------------------------------------------------
 
 const SEED_FLAG_KEY = 'popping.v1.preferences.seeded'
@@ -234,131 +339,69 @@ const LEGACY_STORAGE_KEYS = {
   historyGroupBy: 'popping.v1.history.groupBy',
 } as const
 
-/**
- * Read the localStorage values that the old code used to write,
- * POST them to the server as the new keys, then remove the
- * localStorage entries. Idempotent via the ``seeded`` flag.
- *
- * Returns the seeded state to bootstrap the in-memory state
- * before the server's response has landed. (We still do the
- * GET on first mount; this just gives the user an instant
- * paint with their old data while the network is in flight.)
- */
-function seedFromLocalStorage(): PreferencesState | null {
-  // The seed runs at most once per browser. ``safeGetItem`` returns
-  // null in SSR / private mode -- we treat that as "no seed
-  // needed" and let the server be the source from the start.
-  if (typeof window === 'undefined') return null
-  if (safeGetItem(SEED_FLAG_KEY) === '1') return null
-
-  const out: PreferencesState = { ...DEFAULT_STATE }
-
-  // Per-column maps. The old keys stored a single JSON blob; we
-  // split it into one server row per source id so the schema can
-  // grow without a backend migration.
+/** What an old build left in localStorage, as server rows (key ->
+ *  value). Null once the seed has run. Reads only. */
+function readLegacy(): Rows | null {
+  if (typeof window === 'undefined' || safeGetItem(SEED_FLAG_KEY) === '1') return null
+  const out: Record<string, unknown> = {}
+  const parse = (key: string): unknown => {
+    const raw = safeGetItem(key)
+    if (!raw) return undefined
+    try {
+      return JSON.parse(raw)
+    } catch {
+      // Corrupt: dropped with the rest once the seed has run.
+      return undefined
+    }
+  }
+  // Per-column maps. The old keys stored one JSON blob each; on the
+  // server each column is its own row.
   for (const [localKey, prefKey] of [
-    [LEGACY_STORAGE_KEYS.readEntries, PREFERENCE_KEYS.readEntries] as const,
-    [LEGACY_STORAGE_KEYS.lastViewed, PREFERENCE_KEYS.lastViewed] as const,
-    [LEGACY_STORAGE_KEYS.columnPrefs, PREFERENCE_KEYS.columnPrefs] as const,
-    [LEGACY_STORAGE_KEYS.columnSections, PREFERENCE_KEYS.columnSections] as const,
-  ]) {
-    const raw = safeGetItem(localKey)
-    if (!raw) continue
-    try {
-      const parsed = JSON.parse(raw)
-      if (parsed && typeof parsed === 'object') {
-        // POST one row per top-level key. Each row's value is the
-        // inner value (the per-column map fragment).
-        for (const [columnId, value] of Object.entries(parsed)) {
-          const key = `${prefKey}:${columnId}`
-          // Fire-and-forget -- the GET on first mount will pick
-          // these up via the server's response. We don't await.
-          void api.setPreference(key, value)
-        }
-        // Bootstrap the in-memory state from the same blob so the
-        // first paint has the user's data, not a flash of empty
-        // columns.
-        switch (prefKey) {
-          case PREFERENCE_KEYS.readEntries:
-            out.readEntries = parsed as Record<string, ReadEntriesValue>
-            break
-          case PREFERENCE_KEYS.lastViewed:
-            out.lastViewed = parsed as Record<string, LastViewedValue>
-            break
-          case PREFERENCE_KEYS.columnPrefs:
-            out.columnPrefs = parsed as Record<string, ColumnPrefsValue>
-            break
-          case PREFERENCE_KEYS.columnSections:
-            out.columnSections = parsed as Record<
-              string,
-              ColumnSectionsValue
-            >
-            break
-        }
-      }
-    } catch {
-      // Corrupt localStorage value. Drop it and let the server be
-      // the source of truth going forward.
-    }
-    safeRemoveItem(localKey)
+    [LEGACY_STORAGE_KEYS.readEntries, PREFERENCE_KEYS.readEntries],
+    [LEGACY_STORAGE_KEYS.lastViewed, PREFERENCE_KEYS.lastViewed],
+    [LEGACY_STORAGE_KEYS.columnPrefs, PREFERENCE_KEYS.columnPrefs],
+    [LEGACY_STORAGE_KEYS.columnSections, PREFERENCE_KEYS.columnSections],
+  ] as const) {
+    const parsed = parse(localKey)
+    if (!isObject(parsed)) continue
+    for (const [columnId, value] of Object.entries(parsed)) if (columnId) out[`${prefKey}:${columnId}`] = value
   }
-
-  // Per-user lists. Each was a single JSON blob in the old code.
-  for (const [localKey, prefKey, target] of [
-    [LEGACY_STORAGE_KEYS.hiddenEntries, PREFERENCE_KEYS.hiddenEntries, 'hiddenEntries'] as const,
-    [LEGACY_STORAGE_KEYS.starredEntries, PREFERENCE_KEYS.starredEntries, 'starredEntries'] as const,
-    [LEGACY_STORAGE_KEYS.filterPresets, PREFERENCE_KEYS.filterPresets, 'filterPresets'] as const,
-  ]) {
-    const raw = safeGetItem(localKey)
-    if (!raw) continue
-    try {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) {
-        void api.setPreference(prefKey, parsed)
-        // Bootstrap in-memory state from the seed.
-        if (target === 'hiddenEntries') {
-          out.hiddenEntries = parsed as number[]
-        } else if (target === 'starredEntries') {
-          out.starredEntries = parsed as number[]
-        } else {
-          out.filterPresets = parsed as FilterPresetValue[]
-        }
-      }
-    } catch {
-      // Same as above -- drop and continue.
-    }
-    safeRemoveItem(localKey)
+  for (const [localKey, prefKey] of [
+    [LEGACY_STORAGE_KEYS.hiddenEntries, PREFERENCE_KEYS.hiddenEntries],
+    [LEGACY_STORAGE_KEYS.starredEntries, PREFERENCE_KEYS.starredEntries],
+    [LEGACY_STORAGE_KEYS.filterPresets, PREFERENCE_KEYS.filterPresets],
+  ] as const) {
+    const parsed = parse(localKey)
+    if (Array.isArray(parsed)) out[prefKey] = parsed
   }
-
-  // Singleton: historyGroupBy. Old code stored it as 'entry' / 'none'.
+  // Old code stored the History grouping as a bare 'entry' / 'none'.
   const groupBy = safeGetItem(LEGACY_STORAGE_KEYS.historyGroupBy)
-  if (groupBy === 'entry' || groupBy === 'none') {
-    void api.setPreference(PREFERENCE_KEYS.historyGroupBy, groupBy)
-    out.historyGroupBy = groupBy
-  }
-  if (groupBy) safeRemoveItem(LEGACY_STORAGE_KEYS.historyGroupBy)
+  if (groupBy === 'entry' || groupBy === 'none') out[PREFERENCE_KEYS.historyGroupBy] = groupBy
+  return out
+}
 
-  // Mark the seed done. If any of the POSTs above fail, the user
-  // gets the next launch's GET to refill the state from the
-  // server (which by then has whatever did land).
+function finishLegacy() {
+  for (const key of Object.values(LEGACY_STORAGE_KEYS)) safeRemoveItem(key)
   try {
     window.localStorage?.setItem(SEED_FLAG_KEY, '1')
   } catch {
-    // Best-effort. The next launch will re-seed (worse: extra
-    // POSTs but no data loss). Tolerate.
+    // Best-effort. The next launch reads the old keys again, finds
+    // them gone and sets the flag then.
   }
+}
 
-  // Return the bootstrap state if we found anything to seed; null
-  // otherwise (the consumer falls through to the GET).
-  const foundAnything =
-    Object.keys(out.readEntries).length > 0 ||
-    Object.keys(out.lastViewed).length > 0 ||
-    Object.keys(out.columnPrefs).length > 0 ||
-    Object.keys(out.columnSections).length > 0 ||
-    out.hiddenEntries.length > 0 ||
-    out.starredEntries.length > 0 ||
-    out.filterPresets.length > 0
-  return foundAnything ? out : null
+// ---------------------------------------------------------------------------
+// Transport.
+// ---------------------------------------------------------------------------
+
+const transport: SyncTransport = {
+  get: async (since, signal) => (await api.getPreferences(since, signal)).items,
+  patch: (key, delta, keepalive) => api.patchPreference(key, delta, { keepalive }),
+  put: (key, value, keepalive) => api.setPreference(key, value, { keepalive }),
+  delete: async (key, keepalive) => {
+    const res = await api.deletePreference(key, { keepalive })
+    if (!res.ok) throw new ApiError(`${res.status} ${res.statusText} for DELETE ${key}`, undefined, res.status)
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -369,380 +412,222 @@ export interface PreferencesContextValue {
   /** Full state. Consumers select into it via the typed setters
    *  below; they don't read this object directly. */
   state: PreferencesState
-  /** True until the first GET /api/preferences resolves (or the
-   *  seed finishes). Consumers that need the state before the
-   *  first paint can gate on this. */
+  /** True until the first GET /api/preferences settles. Consumers that
+   *  need the state before the first paint can gate on this. */
   loading: boolean
-  /** True after the localStorage seed has been applied. Stays true
-   *  for the lifetime of the page once the seed has run. */
+  /** True once a full GET /api/preferences has answered and its rows
+   *  are in ``state``. False while the first is on the way, and after
+   *  it failed until a later one (a poll) gets through: ``state`` then
+   *  holds only the defaults and this page's own writes, so a
+   *  preference that is missing from it may only be unread. */
+  loaded: boolean
+  /** True once the localStorage seed has run (with the first full
+   *  GET). */
   seeded: boolean
 
-  // Per-key setters. Each does an optimistic in-memory update +
-  // a debounced PUT to the server. They are stable across renders
-  // (useCallback with empty dep) so consumers can put them in
-  // their useEffect dep arrays without thrash.
+  /** ``state`` as of now, including writes made earlier in this tick.
+   *  For handlers that Column's memo keeps across renders, which would
+   *  read an old ``state`` from their closure. */
+  latest: () => PreferencesState
 
-  /** Update the read-set for one column. Used for both marking an
-   *  entry read and any "unread" action; the full ``readEntries``
-   *  map is exposed via ``state`` for the consumer that needs the
-   *  union (e.g. the "is this card read?" check in Card.tsx). */
-  setReadEntries: (
-    columnId: string,
-    ids: ReadEntriesValue,
-  ) => void
+  // Set keys: changes, never whole lists. Each shows at once and queues
+  // a PATCH of just that change. Stable across renders.
 
-  /** Record that the user just visited a column. Replaces the
-   *  old ``lastViewed`` effect. */
-  setLastViewed: (columnId: string, iso: string) => void
+  /** Add story ids to a set key. Over the key's cap the oldest ids go
+   *  (never these, nor ``keep``), in the same PATCH. */
+  addIds: (key: IdSetKey, ids: number[], keep?: Iterable<number>) => void
+  /** Remove story ids from a set key. */
+  removeIds: (key: IdSetKey, ids: number[]) => void
+  /** Set (or clear, via ``null``) votes, by entry id. */
+  setVotes: (changes: Record<number, Vote | null>) => void
 
-  /** Forget that the user ever visited a column. Used by the
-   *  column-mark-read Undo action -- the cleared
-   *  ``lastViewed`` is what makes the "+N new" chip
-   *  repopulate on the next refresh. The provider issues a
-   *  ``DELETE /api/preferences/last_viewed:<columnId>`` so
-   *  the row is actually gone on the server (vs. PUTing a
-   *  sentinel that the consumer would have to special-case). */
-  clearLastViewed: (columnId: string) => void
+  // The other keys: whole values, PUT. Stable across renders.
+  // (``last_viewed:*`` and ``column_sections:*`` are no longer written
+  // from PR3b on: the "+N new" chip and the Fresh / History folds went.
+  // Reset still deletes their rows.)
 
-  /** Update the sort/filter prefs for one column. Replaces the
-   *  old ``columnPrefs`` effect. */
+  /** Update the sort/filter prefs for one column. */
   setColumnPrefs: (columnId: string, prefs: ColumnPrefsValue) => void
-
-  /** Update the Fresh/History section collapse for one column. */
-  setColumnSections: (
-    columnId: string,
-    sections: ColumnSectionsValue,
-  ) => void
-
-  /** Add or remove an entry from the "hide" set. */
-  setHiddenEntries: (ids: number[]) => void
-
-  /** Add or remove an entry from the "starred" set. */
-  setStarredEntries: (ids: number[]) => void
-
-  /** Set (or clear, via ``null``) one entry's vote direction. */
-  setEntryVote: (entryId: number, direction: 'up' | 'down' | null) => void
 
   /** Replace the saved-presets list. */
   setFilterPresets: (presets: FilterPresetValue[]) => void
 
   /** Set the History tab's group-by mode. */
   setHistoryGroupBy: (mode: HistoryGroupByValue) => void
+
+  /** Replace the tab order and hidden tabs (one PUT per change). */
+  setCategoryLayout: (layout: CategoryLayoutValue) => void
+
+  /** Read the server's rows: by default only those changed since the
+   *  last read (each poll), with ``full`` all of them, which is also how
+   *  deleted rows arrive (the page coming back to the front). One read
+   *  at a time; calls during one share it. */
+  resync: (opts?: { full?: boolean }) => Promise<void>
+
+  /** Send every write still queued, or waiting on a retry, now; wait for
+   *  those and the writes already on the way. True when none of them is
+   *  left to retry: each was saved, or refused for good, or answered with
+   *  a 404 or 405 (a server rolled back to before PATCH), which a reload
+   *  onto the matching build is the cure for. The reload onto a new
+   *  build runs it first and doesn't reload on false (PR1r). */
+  flushPending: () => Promise<boolean>
+
+  /** Run ``fn`` before the queue is read when the page leaves or
+   *  ``flushPending`` runs (collectors that drain into ``addIds``).
+   *  Returns the unregister function. */
+  registerBeforeFlush: (fn: () => void) => () => void
+
+  /** Reset only, which reloads next. ``drop`` names the keys Reset
+   *  deletes: their queued writes and retries are dropped, and nothing
+   *  more is queued or sent for them, not even when the page goes
+   *  (otherwise the reload's leave flush would write the rows back after
+   *  Reset's DELETEs). Writes for every other key (saves, hides, votes,
+   *  saved views) go now. Waits for those and the writes on the way, at
+   *  most 3 s: a request that never settles must not stop Reset. */
+  discardPending: (drop: (key: string) => boolean) => Promise<void>
 }
 
 const PreferencesContext = createContext<PreferencesContextValue | null>(null)
+
+// When the last "couldn't save" toast showed: one per burst.
+const FAILURE_TOAST_MS = 30_000
 
 /**
  * Provider. Mounts once at the top of the React tree. Children
  * get the ``usePreferences()`` hook.
  *
  * Lifecycle:
- *   1. Mount: kick off the localStorage seed (if not done yet)
- *      and the first GET in parallel. The seed bootstrap paints
- *      instantly if anything was found; the GET overwrites with
- *      the server's view (which is the truth for multi-device).
- *   2. Mount, after first GET: debounced-sync mode. Every
- *      setter is an optimistic in-memory update + a 250ms
- *      trailing-edge PUT.
- *   3. Unmount: flush any pending PUTs via ``navigator.sendBeacon``
- *      so a tab close doesn't drop the last write.
+ *   1. Mount: a full GET. Its rows become ``state``; then the
+ *      localStorage seed (if an old build left anything) is written.
+ *   2. Writes: optimistic in ``state`` at once, then batched to the
+ *      server (``lib/prefSync.ts``).
+ *   3. Hidden, pagehide, beforeunload: queued writes go with
+ *      ``keepalive``. Back in front: writes still unanswered are given
+ *      up on (App's full GET shows what the server holds), and failed
+ *      ones are tried again.
  */
 export function PreferencesProvider({ children }: { children: ReactNode }) {
-  // Initialize from the seed so the first paint is instant if the
-  // user had localStorage data. The GET then runs in the
-  // background; whichever lands first sets ``state``, and any
-  // later response overwrites. The seed and the GET are racing
-  // by design -- the seed wins on the first launch (because we
-  // already have the data in memory), the GET wins on every
-  // subsequent launch (no seed runs).
-  const [state, setState] = useState<PreferencesState>(() => {
-    const seeded = seedFromLocalStorage()
-    return seeded ?? DEFAULT_STATE
-  })
+  const [rows, setRows] = useState<Rows>({})
   const [loading, setLoading] = useState(true)
+  const [loaded, setLoaded] = useState(false)
   const [seeded, setSeeded] = useState(false)
+  const [decode] = useState(makeDecoder)
 
-  // First-mount GET. Runs once per provider lifetime.
-  useEffect(() => {
-    let cancelled = false
-    void (async () => {
-      try {
-        const resp = await api.getPreferences()
-        if (cancelled) return
-        // Decode the server's per-key list into our typed state.
-        // Unknown keys are ignored (forward-compat: a future
-        // preference lands without breaking older frontends).
-        const next: PreferencesState = { ...DEFAULT_STATE }
-        for (const row of resp.items) {
-          applyRowToState(next, row)
-        }
-        // If we also ran the seed, the seed's POSTs are
-        // in-flight. The server's response might not include
-        // them yet. Merge: server wins on conflict (the user
-        // might have changed a value on another device between
-        // seed and GET), seed wins on keys the server doesn't
-        // have yet.
-        setState((prev) => mergeStateFromServer(prev, next))
+  const [sync] = useState((): PrefSync => {
+    let legacy = readLegacy()
+    let failureToastAt = -Infinity
+    const engine = createPrefSync({
+      transport,
+      onRows: setRows,
+      onLoad: (ok) => {
+        setLoading(false)
+        if (!ok) return
+        setLoaded(true)
         setSeeded(true)
-      } catch (err) {
-        // The server is unreachable. Fall back to whatever the
-        // seed gave us. The user gets a degraded experience
-        // (no multi-device sync) but the app still works.
-        if (import.meta.env.DEV) {
-          console.warn('preferences: initial GET failed', err)
-        }
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [])
+        if (!legacy) return
+        const plan = legacySeedPlan(legacy, engine.rows())
+        for (const [key, ids] of plan.adds) engine.addIds(key, ids)
+        for (const [key, value] of plan.puts) engine.put(key, value)
+        legacy = null
+        finishLegacy()
+      },
+      onError: (kind) => {
+        const now = Date.now()
+        if (now - failureToastAt <= FAILURE_TOAST_MS) return
+        failureToastAt = now
+        toast(
+          kind === 'unsaved'
+            ? "Couldn't save your latest changes to Popping. They'll be lost when the app reloads."
+            : "Couldn't save that change. Reload Popping to try again.",
+          'error',
+        )
+      },
+      visible: () => typeof document === 'undefined' || document.visibilityState !== 'hidden',
+    })
+    return engine
+  })
 
-  // Debounced sync. Each setter writes to ``state`` immediately
-  // (optimistic) and schedules a PUT 250ms later. If the same key
-  // is written again before the timer fires, the timer resets
-  // (trailing-edge debounce). The PUT is the latest value.
-  //
-  // Why debounce? The "mark read" path can fire many times per
-  // second (user scrolling past 30 cards). Without debounce we'd
-  // PUT 30 times; with it, the final state lands in one PUT.
-  //
-  // Why not throttle? Throttle would drop intermediate writes;
-  // debounce coalesces them and the final value is the truth.
-  const pendingRef = useRef<Map<string, unknown>>(new Map())
-  const timerRef = useRef<number | null>(null)
-
-  const scheduleSync = useCallback(() => {
-    if (timerRef.current !== null) return
-    timerRef.current = window.setTimeout(() => {
-      timerRef.current = null
-      const batch = Array.from(pendingRef.current.entries())
-      pendingRef.current.clear()
-      for (const [key, value] of batch) {
-        // Fire-and-forget. Failure logs in dev; the in-memory
-        // state is still the truth for this session, and the
-        // next mount's GET will reconcile.
-        void api.setPreference(key, value).catch((err) => {
-          if (import.meta.env.DEV) {
-            console.warn(`preferences: PUT ${key} failed`, err)
-          }
-        })
-      }
-    }, 250)
-  }, [])
-
-  // Flush on tab close. ``navigator.sendBeacon`` is the only
-  // fetch variant that survives a tab close; the rest are
-  // cancelled with the page.
+  // First-mount GET. (Under StrictMode's second run it joins the first.)
   useEffect(() => {
-    const flush = () => {
-      if (pendingRef.current.size === 0) return
-      const batch = Array.from(pendingRef.current.entries())
-      pendingRef.current.clear()
-      if (timerRef.current !== null) {
-        window.clearTimeout(timerRef.current)
-        timerRef.current = null
-      }
-      for (const [key, value] of batch) {
-        try {
-          // ``sendBeacon`` needs a Blob or FormData; we send
-          // the JSON string as a Blob with the right MIME.
-          const blob = new Blob(
-            [JSON.stringify({ value })],
-            { type: 'application/json' },
-          )
-          navigator.sendBeacon?.(`/api/preferences/${encodeURIComponent(key)}`, blob)
-        } catch {
-          // Best-effort. The user lost a write -- tolerable
-          // for engagement signals, less tolerable for read
-          // state, but there's no recovery path from a
-          // closing tab.
-        }
-      }
+    void sync.resync({ full: true })
+  }, [sync])
+
+  // Leaving and coming back. ``visibilitychange: hidden`` is the one a
+  // home-screen app gets when a story opens; ``pagehide`` and
+  // ``beforeunload`` cover a closing tab and a reload.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') sync.leave()
+      else sync.resume()
     }
-    window.addEventListener('pagehide', flush)
-    window.addEventListener('beforeunload', flush)
+    const onLeave = () => sync.leave()
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', onLeave)
+    window.addEventListener('beforeunload', onLeave)
     return () => {
-      window.removeEventListener('pagehide', flush)
-      window.removeEventListener('beforeunload', flush)
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', onLeave)
+      window.removeEventListener('beforeunload', onLeave)
     }
-  }, [])
+  }, [sync])
 
-  // ---- per-key setters ----
-  //
-  // All setters follow the same pattern: setState for the optimistic
-  // update, then enqueue the server write via pendingRef + scheduleSync.
+  const state = useMemo(() => decode(rows), [decode, rows])
+  const latest = useCallback(() => decode(sync.rows()), [decode, sync])
 
-  const setReadEntries = useCallback(
-    (columnId: string, ids: ReadEntriesValue) => {
-      setState((prev) => ({
-        ...prev,
-        readEntries: { ...prev.readEntries, [columnId]: ids.slice(-MAX_PER_COLUMN) },
-      }))
-      pendingRef.current.set(
-        `${PREFERENCE_KEYS.readEntries}:${columnId}`,
-        ids.slice(-MAX_PER_COLUMN),
-      )
-      scheduleSync()
-    },
-    [scheduleSync],
-  )
-
-  const setLastViewed = useCallback(
-    (columnId: string, iso: string) => {
-      setState((prev) => ({
-        ...prev,
-        lastViewed: { ...prev.lastViewed, [columnId]: iso },
-      }))
-      pendingRef.current.set(`${PREFERENCE_KEYS.lastViewed}:${columnId}`, iso)
-      scheduleSync()
-    },
-    [scheduleSync],
-  )
-
-  // Delete the row, not PUT a sentinel. The server's
-  // ``DELETE /api/preferences/{key}`` is idempotent (204 whether
-  // or not the row existed), so this is safe to call when the
-  // key is already gone. The local state is updated to remove
-  // the key so a re-render immediately reflects the absence.
-  const clearLastViewed = useCallback(
-    (columnId: string) => {
-      setState((prev) => {
-        if (!(columnId in prev.lastViewed)) return prev
-        const next = { ...prev.lastViewed }
-        delete next[columnId]
-        return { ...prev, lastViewed: next }
-      })
-      const key = `${PREFERENCE_KEYS.lastViewed}:${columnId}`
-      pendingRef.current.delete(key)
-      // Fire-and-forget. The DELETE endpoint returns 204; we
-      // don't care about the body. Failure logs in dev.
-      void api.deletePreference(key).catch((err) => {
-        if (import.meta.env.DEV) {
-          console.warn(`preferences: DELETE ${key} failed`, err)
-        }
-      })
-    },
-    [],
-  )
+  const addIds = useCallback((key: IdSetKey, ids: number[], keep?: Iterable<number>) => sync.addIds(key, ids, keep), [sync])
+  const removeIds = useCallback((key: IdSetKey, ids: number[]) => sync.removeIds(key, ids), [sync])
+  const setVotes = useCallback((changes: Record<number, Vote | null>) => sync.setVotes(changes), [sync])
 
   const setColumnPrefs = useCallback(
-    (columnId: string, prefs: ColumnPrefsValue) => {
-      setState((prev) => ({
-        ...prev,
-        columnPrefs: { ...prev.columnPrefs, [columnId]: prefs },
-      }))
-      pendingRef.current.set(`${PREFERENCE_KEYS.columnPrefs}:${columnId}`, prefs)
-      scheduleSync()
-    },
-    [scheduleSync],
+    (columnId: string, prefs: ColumnPrefsValue) => sync.put(`${PREFERENCE_KEYS.columnPrefs}:${columnId}`, prefs),
+    [sync],
   )
-
-  const setColumnSections = useCallback(
-    (columnId: string, sections: ColumnSectionsValue) => {
-      setState((prev) => ({
-        ...prev,
-        columnSections: { ...prev.columnSections, [columnId]: sections },
-      }))
-      pendingRef.current.set(`${PREFERENCE_KEYS.columnSections}:${columnId}`, sections)
-      scheduleSync()
-    },
-    [scheduleSync],
-  )
-
-  const setHiddenEntries = useCallback(
-    (ids: number[]) => {
-      const trimmed = ids.slice(-MAX_HIDDEN)
-      setState((prev) => ({ ...prev, hiddenEntries: trimmed }))
-      pendingRef.current.set(PREFERENCE_KEYS.hiddenEntries, trimmed)
-      scheduleSync()
-    },
-    [scheduleSync],
-  )
-
-  const setStarredEntries = useCallback(
-    (ids: number[]) => {
-      const trimmed = ids.slice(-MAX_STARRED)
-      setState((prev) => ({ ...prev, starredEntries: trimmed }))
-      pendingRef.current.set(PREFERENCE_KEYS.starredEntries, trimmed)
-      scheduleSync()
-    },
-    [scheduleSync],
-  )
-
-  // Sets (or clears, via ``direction: null``) a single entry's vote.
-  // Unlike setHiddenEntries/setStarredEntries (which take the full
-  // replacement array — the caller already computed it), this takes
-  // just the one entry that changed because Card.tsx's vote buttons
-  // only know "toggle this entry's direction," not the whole map.
-  const setEntryVote = useCallback(
-    (entryId: number, direction: 'up' | 'down' | null) => {
-      setState((prev) => {
-        const nextVotes = { ...prev.votedEntries }
-        if (direction === null) {
-          delete nextVotes[String(entryId)]
-        } else {
-          nextVotes[String(entryId)] = direction
-        }
-        const trimmed = trimVotedEntries(nextVotes)
-        pendingRef.current.set(PREFERENCE_KEYS.votedEntries, trimmed)
-        return { ...prev, votedEntries: trimmed }
-      })
-      scheduleSync()
-    },
-    [scheduleSync],
-  )
-
   const setFilterPresets = useCallback(
-    (presets: FilterPresetValue[]) => {
-      setState((prev) => ({ ...prev, filterPresets: presets }))
-      pendingRef.current.set(PREFERENCE_KEYS.filterPresets, presets)
-      scheduleSync()
-    },
-    [scheduleSync],
+    (presets: FilterPresetValue[]) => sync.put(PREFERENCE_KEYS.filterPresets, presets),
+    [sync],
   )
-
   const setHistoryGroupBy = useCallback(
-    (mode: HistoryGroupByValue) => {
-      setState((prev) => ({ ...prev, historyGroupBy: mode }))
-      pendingRef.current.set(PREFERENCE_KEYS.historyGroupBy, mode)
-      scheduleSync()
-    },
-    [scheduleSync],
+    (mode: HistoryGroupByValue) => sync.put(PREFERENCE_KEYS.historyGroupBy, mode),
+    [sync],
+  )
+  const setCategoryLayout = useCallback(
+    (layout: CategoryLayoutValue) => sync.put(PREFERENCE_KEYS.categoryLayout, layout),
+    [sync],
   )
 
   const value = useMemo<PreferencesContextValue>(
     () => ({
       state,
       loading,
+      loaded,
       seeded,
-      setReadEntries,
-      setLastViewed,
-      clearLastViewed,
+      latest,
+      addIds,
+      removeIds,
+      setVotes,
       setColumnPrefs,
-      setColumnSections,
-      setHiddenEntries,
-      setStarredEntries,
-      setEntryVote,
       setFilterPresets,
       setHistoryGroupBy,
+      setCategoryLayout,
+      resync: sync.resync,
+      flushPending: sync.flushPending,
+      registerBeforeFlush: sync.registerBeforeFlush,
+      discardPending: sync.discardPending,
     }),
     [
       state,
       loading,
+      loaded,
       seeded,
-      setReadEntries,
-      setLastViewed,
-      clearLastViewed,
+      latest,
+      addIds,
+      removeIds,
+      setVotes,
       setColumnPrefs,
-      setColumnSections,
-      setHiddenEntries,
-      setStarredEntries,
-      setEntryVote,
       setFilterPresets,
       setHistoryGroupBy,
+      setCategoryLayout,
+      sync,
     ],
   )
 
@@ -762,146 +647,4 @@ export function usePreferences(): PreferencesContextValue {
     )
   }
   return ctx
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers.
-// ---------------------------------------------------------------------------
-
-// Caps mirror the old localStorage caps. Keeping them in one
-// place so a future "raise the cap" change is a one-line edit.
-// Exported because the consumer (App.tsx) also trims on
-// write in some code paths (e.g. the "restore hidden" path
-// that pulls from a ref) and needs the same number.
-export const MAX_PER_COLUMN = 200
-export const MAX_HIDDEN = 1000
-export const MAX_STARRED = 1000
-// Votes accumulate one entry at a time as the user scrolls, so the
-// cap needs more headroom than hidden/starred (deliberate actions).
-export const MAX_VOTED = 2000
-// ``MAX_PRESETS`` is the cap on saved filter presets. Lives
-// here rather than in storage.ts because presets moved
-// server-side with the rest of the preferences.
-export const MAX_PRESETS = 50
-
-/**
- * Trim ``votes`` down to ``MAX_VOTED`` entries when over cap,
- * dropping the numerically-smallest entry ids first. Entry ids are
- * an auto-increment PK, so the smallest ids are the oldest entries —
- * a reasonable "drop the stuff that's aged out of view anyway"
- * heuristic without needing to track vote timestamps separately
- * (unlike hiddenEntries/starredEntries, a plain JS object has no
- * reliable insertion-order enumeration once its keys look numeric —
- * they get reordered ascending — so "oldest entry id" is the only
- * cheap ordering available here).
- */
-function trimVotedEntries(votes: VotedEntriesValue): VotedEntriesValue {
-  const ids = Object.keys(votes)
-  if (ids.length <= MAX_VOTED) return votes
-  const sorted = ids.map(Number).sort((a, b) => a - b)
-  const toDrop = sorted.slice(0, ids.length - MAX_VOTED)
-  const out = { ...votes }
-  for (const id of toDrop) delete out[String(id)]
-  return out
-}
-
-/**
- * Decode one server row into the right field of a PreferencesState.
- * Unknown keys are ignored -- forward-compat for future
- * preference types.
- */
-function applyRowToState(out: PreferencesState, row: PreferenceRow) {
-  const { key, value } = row
-  if (key.startsWith(`${PREFERENCE_KEYS.readEntries}:`)) {
-    const columnId = key.slice(`${PREFERENCE_KEYS.readEntries}:`.length)
-    if (Array.isArray(value)) {
-      out.readEntries[columnId] = (value as unknown[]).filter(
-        (x): x is number => typeof x === 'number',
-      )
-    }
-  } else if (key.startsWith(`${PREFERENCE_KEYS.lastViewed}:`)) {
-    const columnId = key.slice(`${PREFERENCE_KEYS.lastViewed}:`.length)
-    if (typeof value === 'string') {
-      out.lastViewed[columnId] = value
-    }
-  } else if (key.startsWith(`${PREFERENCE_KEYS.columnPrefs}:`)) {
-    const columnId = key.slice(`${PREFERENCE_KEYS.columnPrefs}:`.length)
-    if (value && typeof value === 'object') {
-      out.columnPrefs[columnId] = value as ColumnPrefsValue
-    }
-  } else if (key.startsWith(`${PREFERENCE_KEYS.columnSections}:`)) {
-    const columnId = key.slice(`${PREFERENCE_KEYS.columnSections}:`.length)
-    if (value && typeof value === 'object') {
-      out.columnSections[columnId] = value as ColumnSectionsValue
-    }
-  } else if (key === PREFERENCE_KEYS.hiddenEntries) {
-    if (Array.isArray(value)) {
-      out.hiddenEntries = (value as unknown[]).filter(
-        (x): x is number => typeof x === 'number',
-      )
-    }
-  } else if (key === PREFERENCE_KEYS.starredEntries) {
-    if (Array.isArray(value)) {
-      out.starredEntries = (value as unknown[]).filter(
-        (x): x is number => typeof x === 'number',
-      )
-    }
-  } else if (key === PREFERENCE_KEYS.votedEntries) {
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      const filtered: VotedEntriesValue = {}
-      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-        if (v === 'up' || v === 'down') filtered[k] = v
-      }
-      out.votedEntries = filtered
-    }
-  } else if (key === PREFERENCE_KEYS.filterPresets) {
-    if (Array.isArray(value)) {
-      out.filterPresets = value as FilterPresetValue[]
-    }
-  } else if (key === PREFERENCE_KEYS.historyGroupBy) {
-    if (value === 'entry' || value === 'none') {
-      out.historyGroupBy = value
-    }
-  }
-}
-
-/**
- * Merge the server's view of the state on top of the local
- * (seeded) view. Used on first mount to reconcile the seed with
- * the server's response. Server wins on key collision; seed
- * wins on keys the server doesn't have.
- */
-function mergeStateFromServer(
-  seed: PreferencesState,
-  server: PreferencesState,
-): PreferencesState {
-  return {
-    readEntries: { ...seed.readEntries, ...server.readEntries },
-    lastViewed: { ...seed.lastViewed, ...server.lastViewed },
-    columnPrefs: { ...seed.columnPrefs, ...server.columnPrefs },
-    columnSections: { ...seed.columnSections, ...server.columnSections },
-    hiddenEntries:
-      server.hiddenEntries.length > 0
-        ? server.hiddenEntries
-        : seed.hiddenEntries,
-    starredEntries:
-      server.starredEntries.length > 0
-        ? server.starredEntries
-        : seed.starredEntries,
-    // Object spread (not "either seed or server") — there's no
-    // localStorage seed for votes (a new preference key, never
-    // stored client-side before this), so this always reduces to
-    // ``server.votedEntries`` in practice; spread keeps the shape
-    // consistent with the other maps above rather than introducing
-    // a third merge idiom.
-    votedEntries: { ...seed.votedEntries, ...server.votedEntries },
-    filterPresets:
-      server.filterPresets.length > 0
-        ? server.filterPresets
-        : seed.filterPresets,
-    historyGroupBy:
-      server.historyGroupBy !== DEFAULT_STATE.historyGroupBy
-        ? server.historyGroupBy
-        : seed.historyGroupBy,
-  }
 }

@@ -1,41 +1,37 @@
-// iOS-style full-screen grouped-list Drawer.
+// The Menu: the panel behind the one top-bar button (≡).
 //
-// On every viewport the Drawer is a right-side panel that slides in
-// from the right edge: on mobile (<md) it fills the viewport from
-// the right at near-full height (88vh), on desktop (md+) it's a
-// 360px right sidebar. Anchoring to the right matches the position
-// of the hamburger button in the top bar so tapping the hamburger
-// makes the panel grow from beneath the tap target — no eye-jump
-// from one side of the screen to the other.
+// On every viewport it is a right-side panel that slides in from the
+// right edge: 88vw (max 420px) on phones, a 360px sidebar on desktop.
+// Anchoring it to the right puts it under the ≡ button, so the panel
+// grows from beneath the tap target.
 //
-// Swipe-to-dismiss on mobile: touch begins anywhere inside the
-// drawer, drags leftward, releases past 100px → drawer closes.
-// Mirrors the iOS right-edge gesture (Mail, Settings, Music).
+// Swipe to dismiss on phones: a mostly sideways drag of more than
+// 100px either way closes it (rightward is the way it slides out).
 //
-// The body is three iOS-style grouped sections:
+// The body is iOS-style grouped sections:
 //
-//   1. QUICK SETTINGS         — link to the full Settings overlay
-//   2. JUMP TO COLUMN         — by-category navigation
-//   3. SOURCES                — multi-select filter (tap-to-filter)
+//   1. (no label)        — Settings, Edit tabs, and Save current view
+//   2. JUMP TO COLUMN    — every tab the strip shows, in its order
+//   3. SOURCES           — the multi-select filter; each row's › opens
+//                          that feed in Settings
 //
-// Each section has a small uppercase ``UPPERCASE LABEL`` header in
-// ``text-ios-caption text-label-tertiary`` (the iOS "section header"
-// treatment). Rows are 44px tall, the iOS HIG minimum tap target.
-//
-// Feeds / LLM / Notifications / Reset are no longer in the Drawer —
-// they moved to the Settings overlay (see ``Settings.tsx``). The
-// Drawer stays slim so it's a quick filter panel, not a settings
-// pile. Tap "All settings…" to open the full Settings.
+// Rows are at least 44px tall, the iOS HIG minimum tap target. While
+// closed the panel is inert, so Tab never lands in it.
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import type { Source } from '../api'
 import { SourceIcon } from './SourceIcon'
+import { ChevronRight, GroupedRow, GroupedSection } from './Grouped'
+import { categoryLabel, sourceLabel } from '../lib/labels'
 import type { SettingsTab } from './Settings'
 
 type Props = {
   open: boolean
   onClose: () => void
-  categories: string[]
+  // The tabs the strip shows after Brief, in strip order (App's
+  // ``orderColumns().shown``), so a hidden tab is never offered.
+  tabs: ReadonlyArray<{ key: string; label: string }>
   // Source list, owned by App (the same fetch that already feeds
   // FeedManager/Settings — see App.tsx's `refresh()`). The Drawer
   // used to fetch its own copy on every open, which meant an extra
@@ -53,61 +49,62 @@ type Props = {
   // …" header's clear-all button so the user doesn't have to untick
   // each row individually.
   onClearAllFilters?: () => void
-  // "Scroll to column" support. The Drawer's category list calls
-  // back with the category name; App owns the column refs and
-  // scrolls the right one into view.
-  onCategoryJump?: (category: string) => void
-  // Wipe namespaced localStorage keys + reload. App owns the
-  // actual reset so the source of truth (App's ``useState``
-  // mirrors) resets in lockstep. No longer used by the Drawer
-  // itself (the action moved to Settings) but kept in the
-  // signature so legacy callers don't fail to compile.
-  onResetLocalState?: () => void
-  // Open the full Settings overlay. Wired by App. The Drawer
-  // uses this in its "All settings…" quick-action row.
+  // "Scroll to column" support. The Jump to column list calls back
+  // with the tab's key; App owns the column refs and scrolls the
+  // right one into view.
+  onCategoryJump?: (key: string) => void
+  // Open the Settings overlay (the Settings row).
   onOpenSettings?: (tab?: SettingsTab) => void
+  // Open the tab editor (the Edit tabs row). It takes focus itself.
+  onEditTabs?: () => void
+  // Open one feed in Settings → Feeds (each source row's ›).
+  onEditSource?: (id: number) => void
   // Save the current source filter + column prefs as a
   // named preset. The Drawer collects the name via a
   // native prompt and calls the callback with the
   // trimmed name. Caller is responsible for actually
   // writing the preset to localStorage.
-  onSavePreset?: () => void
+  // Save the current filter and column settings as a named view.
+  onSavePreset?: (name: string) => void
 }
 
 
 export function Drawer({
   open,
   onClose,
-  categories,
+  tabs,
   sources,
   onRefreshSources,
   activeSources,
   onSourceToggle,
   onClearAllFilters,
   onCategoryJump,
-  // Reset hook. No longer used inside the Drawer (the action
-  // moved to Settings) but kept in the destructuring so the
-  // function signature stays aligned with the Props type.
-  onResetLocalState: _onResetLocalState,
   onOpenSettings,
-  // ``onSavePreset`` is a callback the parent (App)
-  // wires to its ``savePreset`` + a ``window.prompt``
-  // for the name. Used by the "Save current view"
-  // row in the Quick settings section. The
-  // callback returns nothing — the parent toasts
+  onEditTabs,
+  onEditSource,
+  // App wires this to ``savePreset`` and a name prompt, and toasts
   // the new preset's name.
   onSavePreset,
 }: Props) {
+  // Set by a row that hands over to Settings, which takes focus
+  // itself; otherwise closing returns focus to the ≡ button.
+  const handingOff = useRef(false)
 
-  // The brief-generation error and notifications / LLM state have
-  // been moved to the Settings overlay. The Drawer is now slim —
-  // Sources filter, Jump to column, and a link to Settings.
-  //
-  // ``sources`` is a prop from App (see Props above) rather than a
-  // component-owned fetch — the Drawer used to call ``api.sources()``
-  // itself on every open, duplicating App's own already-fetched
-  // state and adding a network round-trip + staleness window on
-  // every open. Same pattern as ``<Settings sources={sources} />``.
+  // Save current view: an inline name field, no browser prompt.
+  const [namingView, setNamingView] = useState(false)
+  const [viewName, setViewName] = useState('')
+  const viewNameRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (open) return
+    setNamingView(false)
+    setViewName('')
+  }, [open])
+  const saveView = () => {
+    const name = viewName.trim()
+    if (!name || !onSavePreset) return
+    onSavePreset(name)
+    onClose()
+  }
 
   // Esc dismisses the drawer. Mirrors the iOS sheet pattern where
   // the swipe-down and back-tap gestural dismiss are also Esc on a
@@ -128,22 +125,14 @@ export function Drawer({
     return () => window.removeEventListener('keydown', onKey, true)
   }, [open, onClose])
 
-  // Swipe-left dismiss on mobile. Mirrors the iOS right-edge
-  // gesture (Mail, Settings, Music): touch begins anywhere inside
-  // the drawer's body, drags leftward, releases past a 100px
-  // threshold → drawer closes. Set up via addEventListener (not
-  // JSX onTouch*) so we can pass ``{ passive: false }`` and
-  // ``preventDefault`` — JSX touch handlers default to passive on
-  // touchmove for scroll performance. Without ``preventDefault`` the
-  // page scrolls underneath the drawer mid-gesture, which feels
-  // broken.
-  //
-  // ``SWIPE_DISMISS_PX`` is the drag distance (px) past which a
-  // release fires the close. ``SWIPE_DIRECTION`` is the sign of
-  // the delta we care about — negative for leftward swipes. The
-  // reverse direction (rightward) is intentionally not handled
-  // because the drawer is anchored to the right edge; pulling it
-  // back toward the right doesn't make semantic sense.
+  // Swipe to dismiss on phones: a touch anywhere in the panel that
+  // drags mostly sideways, more than 100px either way, closes it.
+  // Rightward is the direction the right-anchored panel slides out;
+  // leftward is kept for those used to it. Set up via
+  // addEventListener (not JSX onTouch*) so touchmove can be
+  // ``{ passive: false }`` and call ``preventDefault`` — without it
+  // the page scrolls underneath mid-gesture. Mostly vertical drags
+  // are left alone, so the list still scrolls.
   const SWIPE_DISMISS_PX = 100
   useEffect(() => {
     if (!open) return
@@ -151,19 +140,21 @@ export function Drawer({
     if (!drawer) return
 
     let startX = 0
+    let startY = 0
     let armed = false
 
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length !== 1) return
       startX = e.touches[0].clientX
+      startY = e.touches[0].clientY
       armed = true
     }
     const onTouchMove = (e: TouchEvent) => {
       if (!armed) return
       const dx = e.touches[0].clientX - startX
-      if (dx < -10) {
-        // First non-trivial leftward motion — block the underlying
-        // page scroll from kicking in.
+      const dy = e.touches[0].clientY - startY
+      if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy)) {
+        // A sideways drag: keep the page from scrolling underneath.
         e.preventDefault()
       }
     }
@@ -174,7 +165,8 @@ export function Drawer({
       // ended and the finger is no longer on screen.
       const touch = e.changedTouches[0]
       const dx = touch.clientX - startX
-      if (dx < -SWIPE_DISMISS_PX) onClose()
+      const dy = touch.clientY - startY
+      if (Math.abs(dx) > SWIPE_DISMISS_PX && Math.abs(dx) > Math.abs(dy)) onClose()
     }
     const onTouchCancel = () => {
       armed = false
@@ -201,6 +193,24 @@ export function Drawer({
   // focus ring still follows their focus).
   const drawerRef = useRef<HTMLElement | null>(null)
   const firstFocusableRef = useRef<HTMLElement | null>(null)
+
+  // Closed: inert and hidden from assistive tech (React 18 has no
+  // ``inert`` prop). Closing returns focus to the ≡ button unless a
+  // row is handing over to Settings.
+  const wasOpen = useRef(open)
+  useEffect(() => {
+    const el = drawerRef.current
+    if (el) {
+      el.toggleAttribute('inert', !open)
+      if (open) el.removeAttribute('aria-hidden')
+      else el.setAttribute('aria-hidden', 'true')
+    }
+    if (wasOpen.current && !open && !handingOff.current) {
+      document.querySelector<HTMLElement>('button[aria-label="open menu"]')?.focus()
+    }
+    handingOff.current = false
+    wasOpen.current = open
+  }, [open])
   useEffect(() => {
     if (!open) return
     const drawer = drawerRef.current
@@ -248,27 +258,21 @@ export function Drawer({
       <div
         onClick={onClose}
         aria-hidden="true"
-        className={`fixed inset-0 z-30 bg-black/60 md:bg-black/40 supports-[backdrop-filter]:backdrop-blur-sm transition-opacity duration-200 ${
+        className={`fixed inset-0 z-30 bg-black/60 md:bg-black/40 supports-[backdrop-filter]:backdrop-blur-sm motion-safe:transition-opacity motion-safe:duration-200 ${
           open ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       />
 
-      {/* Mobile: bottom sheet, slides up to fill the viewport (the iOS
-          Settings app presentation). Desktop (md+): slides in from
-          the left as a 360px sidebar. The two animations are
-          independent CSS classes so the swap is breakpoint-clean —
-          the mobile sheet never shows on desktop and vice versa. */}
+      {/* A panel anchored to the right edge on every width: 88vw (max
+          420px) on phones, 360px on desktop. It slides in from the
+          right with a transform; the same classes serve both widths. */}
       <aside
         ref={(el) => {
           drawerRef.current = el
-          // First focusable child: the Done button is rendered
-          // before everything else in the header so it lands as
-          // ``focusables[0]`` above. We capture it explicitly
-          // because ``querySelectorAll`` runs against the live
-          // tree which is fine for the Tab cycle but the
-          // initial focus wants the explicit Done button —
-          // not a child that may not exist on first render
-          // (e.g. the "Clear local state" row is conditional).
+          // Initial focus goes to the Done button, found by its label
+          // rather than by position (it sits after the title in the
+          // header), so focus never starts on a row that may not
+          // exist on first render.
           firstFocusableRef.current = el?.querySelector<HTMLElement>(
             'button[aria-label="close menu"]',
           ) ?? null
@@ -284,42 +288,38 @@ export function Drawer({
         // the JS preventDefault engages.
         className={`fixed z-40 bg-bg-app shadow-2xl flex flex-col touch-pan-y-zoom
                     inset-y-0 right-0 top-0 left-auto h-full w-[88vw] max-w-[420px] rounded-l-ios-lg
+                    pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]
+                    pr-[env(safe-area-inset-right)]
                     md:w-[360px] md:rounded-none
-                    transition-transform duration-300 ease-out
+                    motion-safe:transition-transform motion-safe:duration-300 ease-out
                     ${open
                       ? 'translate-x-0'
                       : 'translate-x-full'
                     }`}
       >
-        {/* Vertical grabber on mobile — the small vertical line at
-            the top-LEFT of the drawer, mirroring the iOS right-edge
-            sheet's affordance. ``md:hidden`` because desktop drawers
-            don't need a grabber (they have a visible edge against
-            the dimmed backdrop). The element is not interactive; it
-            just signals "this is a panel you can dismiss by
-            swiping left." */}
+        {/* Vertical grabber on phones — the small line at the top-left
+            of the panel, the iOS side-sheet affordance that says "swipe
+            to dismiss". Below the status bar on notched phones.
+            ``md:hidden``: the desktop sidebar has a visible edge. */}
         <div
           aria-hidden="true"
-          className="md:hidden absolute top-3 left-2 h-10 w-1 rounded-full bg-label-tertiary"
+          className="md:hidden absolute top-[calc(env(safe-area-inset-top)+0.75rem)] left-2 h-10 w-1 rounded-full bg-label-tertiary"
         />
-        {/* Header row — large title "Menu" on the right (matches
-            the right-anchored panel), Done button on the left. The
-            hairlines at the bottom is the standard iOS grouped-list
-            section break. We use ``flex-row-reverse``-equivalent
-            ordering by simply swapping the children: Done first,
-            then the title. ``pl-10 md:pl-4`` on the Done button
-            leaves room for the vertical grabber on mobile. */}
-        <div className="flex items-center justify-between px-4 pt-3 pb-3 md:pt-5 md:pb-4 border-b border-hairline shrink-0">
+        {/* Header row — iOS sheet layout: title "Menu" on the leading
+            edge, Done on the trailing edge, with the standard hairline
+            under it. ``pl-10 md:pl-0`` on the title leaves room for the
+            vertical grabber on phones. */}
+        <div className="flex items-center justify-between gap-3 px-4 pt-3 pb-3 md:pt-5 md:pb-4 border-b border-hairline shrink-0">
+          <h2 className="min-w-0 flex-1 truncate pl-10 md:pl-0 text-2xl md:text-ios-large-title font-bold text-label-primary tracking-tight">
+            Menu
+          </h2>
           <button
             onClick={onClose}
             aria-label="close menu"
-            className="min-h-[32px] min-w-[32px] flex items-center justify-center rounded-ios text-accent active:bg-bg-elevated pl-10 md:pl-0"
+            className="shrink-0 min-h-[44px] min-w-[44px] px-2 flex items-center justify-center rounded-ios text-ios-body font-semibold text-accent active:bg-bg-elevated"
           >
-            <span className="text-ios-body font-normal">Done</span>
+            Done
           </button>
-          <h2 className="text-2xl md:text-ios-large-title font-bold text-label-primary tracking-tight">
-            Menu
-          </h2>
         </div>
 
         {/* Body. ``min-h-0`` lets the nav actually shrink below its
@@ -329,75 +329,87 @@ export function Drawer({
             the viewport). ``p-4`` matches iOS grouped-list left/
             right margins. Background ``bg-bg-app`` keeps the section
             gaps from showing the sheet's underlying surface. */}
-        <nav className="flex-1 min-h-0 overflow-y-auto bg-bg-app pb-8">
-          <GroupedSection label="Quick settings">
+        <nav className="flex-1 min-h-0 overflow-y-auto overscroll-contain bg-bg-app pb-8">
+          <GroupedSection>
             <GroupedRow
               onClick={() => {
-                // Open the History tab in the Settings overlay.
-                // The Settings overlay is owned by App; the Drawer
-                // routes to the right tab via ``onOpenSettings``
-                // which App wires to ``openSettings('history')``.
-                // Close the Drawer so the user lands on the
-                // History view immediately. Same pattern as the
-                // "All settings..." link below.
-                onOpenSettings?.('history')
+                handingOff.current = true
+                onOpenSettings?.('feeds')
                 onClose()
               }}
-              title="History"
-              subtitle="review your reads · hides · saves"
+              title="Settings"
+              subtitle="Feeds, AI, history, saved"
               showChevron
             />
-            {/* 'Save current view' row. The user can
-                capture the current source filter +
-                per-column prefs as a named preset. The
-                chip strip above the dashboard shows the
-                saved presets; tapping a chip applies
-                the saved view, and tapping its "\u22ef"
-                opens rename / update-to-current / delete.
-                Without this row the user has no way to
-                create a preset \u2014 the ``savePreset``
-                callback in App was dead code before this
-                row was added.
-                The Drawer closes after the prompt so
-                the user sees the new chip on the
-                strip immediately. */}
-            {onSavePreset && (
+            {onEditTabs && (
               <GroupedRow
                 onClick={() => {
-                  onSavePreset()
+                  handingOff.current = true
+                  onEditTabs()
                   onClose()
                 }}
-                title="Save current view"
-                subtitle="capture the current filter + per-column prefs as a named preset"
+                title="Edit tabs"
                 showChevron
               />
             )}
-            <GroupedRow
-              onClick={() => {
-                // The Settings overlay is owned by App. The Drawer
-                // tells App to open it via the callback the parent
-                // wires up; we close the Drawer so the user lands
-                // on the Settings overlay immediately. This
-                // pattern matches the column-jump row above.
-                onOpenSettings?.()
-                onClose()
-              }}
-              title="All settings…"
-              subtitle="feeds · LLM · notifications · reset"
-              showChevron
-            />
+            {/* Saves the current source filter and column settings as
+                a named view; its chip appears above the dashboard. */}
+            {onSavePreset &&
+              (namingView ? (
+                <div className="flex items-center gap-2 px-4 py-1 border-b border-hairline last:border-b-0">
+                  <input
+                    ref={viewNameRef}
+                    type="text"
+                    aria-label="name for this view"
+                    placeholder="Name this view"
+                    enterKeyHint="done"
+                    autoCorrect="off"
+                    value={viewName}
+                    onChange={(e) => setViewName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        saveView()
+                      }
+                    }}
+                    className="flex-1 min-w-0 min-h-[44px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-body text-label-primary placeholder:text-label-tertiary"
+                  />
+                  <button
+                    type="button"
+                    onPointerDown={(e) => e.preventDefault()}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={saveView}
+                    disabled={!viewName.trim()}
+                    className="shrink-0 min-h-[44px] px-3 rounded-ios bg-accent text-white text-ios-body font-medium active:opacity-80 disabled:opacity-40"
+                  >
+                    Save
+                  </button>
+                </div>
+              ) : (
+                <GroupedRow
+                  onClick={() => {
+                    // Focus inside the same tap, or iOS won't raise the
+                    // keyboard.
+                    flushSync(() => setNamingView(true))
+                    viewNameRef.current?.focus()
+                  }}
+                  title="Save current view"
+                  subtitle="keep this layout to come back to"
+                  showChevron
+                />
+              ))}
           </GroupedSection>
 
-          {categories.length > 0 && (
+          {tabs.length > 0 && (
             <GroupedSection label="Jump to column">
-              {categories.map((c) => (
-                // Each category is its own row. Tap → close drawer
-                // and scroll the desktop grid to that column.
+              {tabs.map((t) => (
+                // Each tab is its own row. Tap → close drawer and select
+                // that tab (the phone's strip, the desktop grid's column).
                 <GroupedRow
-                  key={c}
-                  title={c}
+                  key={t.key}
+                  title={t.label}
                   onClick={() => {
-                    onCategoryJump?.(c)
+                    onCategoryJump?.(t.key)
                     onClose()
                   }}
                   showChevron
@@ -410,7 +422,7 @@ export function Drawer({
             label="Sources"
             footnote={
               activeSources.size > 0
-                ? `filtering: ${Array.from(activeSources).join(', ')}`
+                ? `Showing only: ${Array.from(activeSources).map(sourceLabel).join(', ')}`
                 : undefined
             }
             action={
@@ -418,7 +430,7 @@ export function Drawer({
                 <button
                   onClick={onClearAllFilters}
                   aria-label="clear all source filters"
-                  className="text-ios-body text-accent active:opacity-60"
+                  className="min-h-[44px] px-2 -mr-2 text-ios-body text-accent active:opacity-60"
                 >
                   Clear
                 </button>
@@ -430,51 +442,69 @@ export function Drawer({
                 <GroupedRow
                   onClick={() => { void onRefreshSources() }}
                   title="No sources loaded"
-                  subtitle="tap to retry"
+                  subtitle="Tap to try again"
                 />
               ) : (
                 <p className="px-4 py-3 text-ios-body text-label-secondary">
-                  no sources configured
+                  No feeds yet.
                 </p>
               )
             ) : (
-              // The Sources list is a checkbox list, not a button
-              // list. Visually honest: each row is a checkbox + label,
-              // so the multi-select semantics match what the chip-bar
-              // in the header does. ``<label>`` makes the entire row
-              // clickable, which matches the previous tap-target size.
-              // App's ``toggleSourceAndMaybeClose`` closes the drawer
-              // on the first selection so the user can see the
-              // filtered dashboard immediately — subsequent taps don't
-              // close, so they can keep picking without the panel
-              // ping-ponging shut.
+              // A checkbox list: each row's label toggles the filter, the
+              // same multi-select as the chip bar in the header. App's
+              // ``toggleSourceAndMaybeClose`` closes the Menu on the
+              // first pick so the filtered dashboard shows; later taps
+              // keep it open. The › beside each row is a separate
+              // button (not inside the label), so it never toggles the
+              // filter: it opens that feed in Settings.
               <>
                 {sources.map((s) => {
                   const active = activeSources.has(s.name)
                   return (
-                    <label
+                    <div
                       key={s.id}
-                      className={`flex items-center gap-3 px-4 min-h-[44px] cursor-pointer transition border-b border-hairline last:border-b-0 ${
-                        active ? 'bg-bg-elevated' : 'active:bg-bg-elevated'
-                      }`}
+                      className={`flex items-center border-b border-hairline last:border-b-0 ${active ? 'bg-bg-elevated' : ''}`}
                     >
-                      <input
-                        type="checkbox"
-                        checked={active}
-                        onChange={() => onSourceToggle(s.name)}
-                        className="shrink-0 h-4 w-4 accent-accent"
-                        aria-label={`filter by ${s.name}`}
-                      />
-                      {/* SourceIcon. Falls back to a colored letter
-                          when the favicon hasn't been fetched yet. */}
-                      <SourceIcon src={s.favicon_path} name={s.name} size={18} />
-                      <span className="flex-1 min-w-0 truncate text-ios-body text-label-primary">
-                        {s.name}
-                      </span>
-                      <span className="shrink-0 text-ios-caption text-label-tertiary">
-                        {s.category}
-                      </span>
-                    </label>
+                      <label
+                        className={`flex flex-1 min-w-0 items-center gap-3 pl-4 ${onEditSource ? '' : 'pr-4'} min-h-[44px] cursor-pointer transition ${
+                          active ? '' : 'active:bg-bg-elevated'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={active}
+                          onChange={() => onSourceToggle(s.name)}
+                          className="shrink-0 h-4 w-4 accent-accent"
+                          aria-label={`filter by ${sourceLabel(s.name)}`}
+                        />
+                        {/* SourceIcon. Falls back to a colored letter
+                            when the favicon hasn't been fetched yet. */}
+                        <SourceIcon src={s.favicon_path} name={s.name} size={18} />
+                        <span className="flex-1 min-w-0 truncate text-ios-body text-label-primary">
+                          {sourceLabel(s.name)}
+                        </span>
+                        {/* Desktop only: on phones the panel is too narrow
+                            for a name, a category and the › side by side,
+                            and the name matters more for picking. */}
+                        <span className="hidden md:inline shrink min-w-0 max-w-[40%] truncate text-ios-caption text-label-tertiary">
+                          {categoryLabel(s.category)}
+                        </span>
+                      </label>
+                      {onEditSource && (
+                        <button
+                          type="button"
+                          aria-label={`edit ${sourceLabel(s.name)}`}
+                          onClick={() => {
+                            handingOff.current = true
+                            onEditSource(s.id)
+                            onClose()
+                          }}
+                          className="w-11 h-11 shrink-0 flex items-center justify-center text-label-tertiary active:bg-bg-elevated"
+                        >
+                          <ChevronRight className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
                   )
                 })}
               </>
@@ -486,138 +516,3 @@ export function Drawer({
     </>
   )
 }
-
-// ---------------------------------------------------------------------------
-// iOS grouped-list primitives
-// ---------------------------------------------------------------------------
-
-// Section. The iOS convention is to render an uppercase label in
-// ``text-label-tertiary`` above a rounded card of rows. The label has
-// generous left/right padding (``px-4``) and a small bottom margin.
-// The card is a single rounded ``bg-bg-surface`` block; rows inside
-// are separated by ``border-hairline`` so dividers extend to the
-// edges of the card (not full bleed). ``footnote`` sits below the
-// card in ``text-ios-caption text-label-secondary`` — useful for
-// explanatory copy (e.g. "filtering: reuters, hackernews").
-//
-// ``action`` (e.g. a "Clear" button) renders on the right side of
-// the label row, like the "Edit" button next to the "Reminders"
-// header in iOS Settings.
-function GroupedSection({
-  label,
-  footnote,
-  action,
-  children,
-}: {
-  label: string
-  footnote?: string
-  action?: React.ReactNode
-  children: React.ReactNode
-}) {
-  return (
-    <div className="mt-6 first:mt-2">
-      <div className="flex items-end justify-between px-4 mb-2">
-        <h3 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
-          {label}
-        </h3>
-        {action}
-      </div>
-      {/* The rows go inside a single rounded card so the iOS grouped-
-          list visual works: rounded card on the page, hairline
-          dividers between rows, no outside border. ``overflow-hidden``
-          keeps the first/last row from poking past the card corners. */}
-      <div className="mx-4 rounded-ios bg-bg-surface overflow-hidden">
-        {children}
-      </div>
-      {footnote && (
-        <p className="px-4 mt-2 text-ios-caption text-label-secondary">
-          {footnote}
-        </p>
-      )}
-    </div>
-  )
-}
-
-// Single iOS-style row. ``title`` is the primary text, ``subtitle``
-// is the secondary line beneath it (font-300, ``label-secondary``).
-// Renders as a 44px-tall button when ``onClick`` is set — the entire
-// row is the tap target. When used as a static display (no
-// ``onClick``) it falls back to a non-button ``<div>``.
-//
-// ``tone`` recolors the chevron-area / title when there's a state to
-// surface (success / warning / destructive) — iOS uses these for
-// health-check rows in Settings → Battery, for example.
-function GroupedRow({
-  title,
-  subtitle,
-  onClick,
-  showChevron,
-  tone,
-}: {
-  title: React.ReactNode
-  subtitle?: React.ReactNode
-  onClick?: () => void
-  showChevron?: boolean
-  tone?: 'success' | 'warning' | 'destructive'
-}) {
-  const toneClass =
-    tone === 'success'
-      ? 'text-emerald-400'
-      : tone === 'warning'
-      ? 'text-amber-400'
-      : tone === 'destructive'
-      ? 'text-red-400'
-      : 'text-label-primary'
-  const content = (
-    <>
-      <div className="flex-1 min-w-0">
-        <div className={`text-ios-body ${toneClass} truncate`}>{title}</div>
-        {subtitle && (
-          <div className="text-ios-caption text-label-secondary truncate">
-            {subtitle}
-          </div>
-        )}
-      </div>
-      {showChevron && (
-        <ChevronRight className="shrink-0 w-4 h-4 text-label-tertiary" />
-      )}
-    </>
-  )
-  const baseClass =
-    'flex items-center gap-3 px-4 min-h-[44px] border-b border-hairline last:border-b-0'
-  if (onClick) {
-    return (
-      <button
-        type="button"
-        onClick={onClick}
-        className={`${baseClass} w-full text-left active:bg-bg-elevated`}
-      >
-        {content}
-      </button>
-    )
-  }
-  return <div className={baseClass}>{content}</div>
-}
-
-// iOS chevron — used for navigation rows. Right-pointing, single 1.5
-// stroke. Pulled inline (rather than into an icon library) because
-// the Drawer is the only consumer.
-function ChevronRight({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.75}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      <polyline points="9 6 15 12 9 18" />
-    </svg>
-  )
-}
-
-
-

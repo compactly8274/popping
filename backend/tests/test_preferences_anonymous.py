@@ -30,8 +30,36 @@ def test_resolve_user_id_prefers_sub():
 async def test_anonymous_round_trip_put_get_list_delete(app_client):
     # PUT with no auth at all must succeed (200), not 401.
     resp = await app_client.put(
+        "/api/preferences/column_prefs:1",
+        json={"value": {"sort": "top"}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["value"] == {"sort": "top"}
+
+    resp = await app_client.get("/api/preferences/column_prefs:1")
+    assert resp.status_code == 200
+    assert resp.json()["value"] == {"sort": "top"}
+
+    resp = await app_client.get("/api/preferences")
+    assert resp.status_code == 200
+    keys = [item["key"] for item in resp.json()["items"]]
+    assert "column_prefs:1" in keys
+
+    resp = await app_client.delete("/api/preferences/column_prefs:1")
+    assert resp.status_code == 204
+
+    resp = await app_client.get("/api/preferences/column_prefs:1")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_anonymous_round_trip_patch_get_list_delete(app_client):
+    """Read state is a set key, which changes by PATCH (a PUT of it is
+    a 409, see ``test_preferences_put_set_keys.py``). With no auth at
+    all, that must succeed too."""
+    resp = await app_client.patch(
         "/api/preferences/read_entries:1",
-        json={"value": [101, 102]},
+        json={"add": [101, 102]},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["value"] == [101, 102]
@@ -63,16 +91,12 @@ async def test_column_id_with_uppercase_and_space_is_accepted(app_client):
     A lowercase-only charset silently 400'd every one of those, so
     read-state / last-viewed / column-prefs never persisted for them.
     """
-    # NOTE: a columnId containing a literal ``/`` (e.g. a Reddit
-    # source's display name "r/technology" as the multi-source-filter
-    # column id) is NOT covered here — that 404s at the route-matching
-    # layer (``/api/preferences/{key}`` uses Starlette's default
-    # ``str`` converter, which doesn't match ``/`` even when percent-
-    # encoded) rather than the allowlist. That's a separate, pre-
-    # existing routing limitation, not something this regex fixes.
+    # A columnId containing a literal ``/`` (e.g. "r/technology", or a
+    # category like "News/Tech") is covered by
+    # ``test_preferences_delta.py::test_slash_keys_round_trip_through_every_route``.
     for key in (
         "last_viewed:Saved",
-        "read_entries:For You",
+        "column_sections:For You",
         "column_prefs:Filtering",
     ):
         resp = await app_client.put(f"/api/preferences/{key}", json={"value": "x"})
@@ -81,6 +105,15 @@ async def test_column_id_with_uppercase_and_space_is_accepted(app_client):
         resp = await app_client.get(f"/api/preferences/{key}")
         assert resp.status_code == 200
         assert resp.json()["value"] == "x"
+
+    # Read state for those columns is a set key, written by PATCH.
+    for key in ("read_entries:For You", "seen:For You"):
+        resp = await app_client.patch(f"/api/preferences/{key}", json={"add": [7]})
+        assert resp.status_code == 200, f"{key} -> {resp.status_code} {resp.text}"
+
+        resp = await app_client.get(f"/api/preferences/{key}")
+        assert resp.status_code == 200
+        assert resp.json()["value"] == [7]
 
 
 @pytest.mark.asyncio

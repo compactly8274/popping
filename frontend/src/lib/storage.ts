@@ -4,17 +4,29 @@
 // What lives here now
 // -------------------
 //
-// Only two keys remain in localStorage as of the server-side
-// preferences migration (2026-07-02):
+// Five keys live in localStorage (two kept through the server-side
+// preferences migration of 2026-07-02, three added later):
 //
-//   - ``mobileColLast`` -- the column index the user was last
-//     viewing on the mobile swipe layout. Per-device because
-//     "the column the user is currently looking at" has no
-//     meaning when shared across two devices.
+//   - ``mobileTab`` -- the key of the tab the phone shows
+//     (``lib/columns.ts``: ``meta:foryou``, ``cat:news`` ...).
+//     Per-device because "the tab the user is currently looking
+//     at" has no meaning when shared across two devices.
+//
+//   - ``mobileColLast`` -- the index ``mobileTab`` replaced. Read
+//     once, to migrate, and removed when ``mobileTab`` is first
+//     written.
 //
 //   - ``briefCollapsed`` -- whether the BriefCard is collapsed
 //     in the drawer. Same argument: a screen position, not
 //     data.
+//
+//   - ``briefTone`` -- the Brief tone picked on this device
+//     (Short, Story or Alerts), so a reload keeps it.
+//
+//   - ``firstRunAt`` -- when this device first loaded the read model
+//     (PR3b, D33): stories fetched more than 48 hours before it count
+//     as seen here, so the first deploy doesn't open every tab at
+//     99+. Per-device on purpose: nothing is written to the server.
 //
 // What moved off localStorage
 // ---------------------------
@@ -37,22 +49,28 @@
 //   - historyGroupBy  -> History tab group-by mode
 //
 // ``STORAGE_KEYS`` is kept as a frozen record so the namespacing
-// is still centralised. The two remaining entries are device-
-// only; new server-backed keys should NOT be added here.
+// is still centralised. The entries are device-only; new
+// server-backed keys should NOT be added here.
 
 const SCHEMA = 'v1'
 const NAMESPACE = 'popping'
 
 export const STORAGE_KEYS = {
-  // The last mobile-view column index (0..N-1). Tracked so swiping
-  // between columns on phone doesn't reset position on refresh.
-  // Pure screen position; per-device is correct (the user looking
-  // at column 3 on their phone shouldn't shift their laptop to
-  // column 3 too).
+  // The phone's tab, by key, so a reload (or a tab that comes or
+  // goes around it) keeps the phone where it was. Pure screen
+  // position; per-device is correct (the user looking at News on
+  // their phone shouldn't move their laptop to News too).
+  mobileTab: `${NAMESPACE}.${SCHEMA}.mobileTab`,
+  // The old phone column index (-1 = Brief, 0..N-1), from before
+  // tab keys. Only read to migrate it into ``mobileTab``.
   mobileColLast: `${NAMESPACE}.${SCHEMA}.mobileCol.last`,
   // BriefCard collapse preference. Boolean stored as '0' / '1' to
   // match the codebase's storage convention.
   briefCollapsed: `${NAMESPACE}.${SCHEMA}.brief.collapsed`,
+  // The Brief tone ('terse' | 'narrative' | 'alert'), checked on read.
+  briefTone: `${NAMESPACE}.${SCHEMA}.brief.tone`,
+  // When this device first loaded the read model (ms since the epoch).
+  firstRunAt: `${NAMESPACE}.${SCHEMA}.firstRunAt`,
 } as const
 
 export function safeGetItem(key: string): string | null {

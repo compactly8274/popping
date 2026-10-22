@@ -69,12 +69,19 @@ export interface Entry {
   published_at: string | null
   // ISO timestamp of when the row landed in our DB (server `fetched_at`).
   // Distinct from `published_at` (source article publish time). The
-  // frontend uses this for "new since last refresh" + read/unread.
+  // frontend uses this for a tab's "Hide if older than" and for the
+  // read model's first-deploy baseline (lib/feedOrder.ts, D33).
   fetched_at: string | null
   composite_score: number
   personal_score: number
   raw_score: number
   meta: Record<string, unknown> | null
+  // The blurb under the headline (D34, PR5a): the cached AI summary
+  // when there is one, else the feed's own description cleaned and
+  // cut to about 300 characters, computed by the server for every
+  // list row. Null (or absent, from an older server) means none, and
+  // the card looks as it did without one.
+  preview?: string | null
   // Thumbnail (if the source ships one). Path is relative to /assets.
   image_url: string | null
   image_path: string | null
@@ -117,6 +124,8 @@ export interface EntryOut extends Entry {
 export interface Source {
   id: number
   name: string
+  /** What the user calls the feed; null = a label derived from ``name``. */
+  display_name?: string | null
   type: string
   category: string
   url: string
@@ -139,6 +148,10 @@ export interface Source {
   // re-enabling) from a manually-paused one (routine user choice).
   // See ``app.models.Source.auto_disabled``.
   auto_disabled: boolean
+  // Website (generic_scrape) rows only: where to find the site's page
+  // list, and which links count as articles. Null = the defaults.
+  sitemap_url: string | null
+  link_pattern: string | null
   // Net thumbs score across every entry from this source:
   // sum(thumb_up) - sum(thumb_down). 0 = never voted on (or an even
   // split). Powers the FeedManager row badge so a net-negative
@@ -149,7 +162,7 @@ export interface Source {
 /** Result of ``POST /api/sources/test``. ``ok`` is the only field the
  * UI branches on; the rest are diagnostic. ``error_kind`` is a short
  * enum the frontend maps to a friendly message — see
- * ``friendlyTestError`` in the AddCustomTab code for the lookup. */
+ * ``friendlyTestError`` in lib/apiErrors.ts for the lookup. */
 export interface SourceTestResult {
   ok: boolean
   status_code: number | null
@@ -164,13 +177,14 @@ export interface SourceTestResult {
     | 'invalid_url'
     | 'unsupported_type'
     | 'network_error'
+    | 'invalid_headers'
     | 'unknown'
     | null
   error: string | null
-  // Set when the submitted URL was an Apple Podcasts show page
-  // (podcasts.apple.com/.../id<N>) resolved server-side to its
-  // actual RSS feed URL. Null for every other URL, including one
-  // that was already a direct feed URL.
+  // Set when the submitted URL was resolved server-side to a feed: an
+  // Apple Podcasts show page (podcasts.apple.com/.../id<N>) or any
+  // YouTube channel, handle, playlist or video link. Null for every
+  // other URL, including one that was already a direct feed URL.
   resolved_url: string | null
 }
 
@@ -179,7 +193,6 @@ export interface Health {
   sources: number
   entries: number
   db: string
-  redis: string
   last_fetch: string | null
 }
 
@@ -259,30 +272,35 @@ export interface LLMTagsResponse {
 
 // Thrown by ``jsonFetch`` on a non-2xx response. ``detail`` carries
 // FastAPI's parsed error body (a string, or the list-of-field-errors
-// shape from a 422) when the response had one, so callers like
-// ``parseApiError`` can surface the actual reason instead of just the
-// HTTP status line.
+// shape from a 422) when the response had one, and ``status`` the
+// HTTP status, so lib/apiErrors.ts can say what went wrong in plain
+// words instead of showing the status line.
 export class ApiError extends Error {
   detail?: unknown
-  constructor(message: string, detail?: unknown) {
+  status: number
+  constructor(message: string, detail?: unknown, status = 0) {
     super(message)
     this.name = 'ApiError'
     this.detail = detail
+    this.status = status
+  }
+}
+
+async function errorDetail(resp: Response): Promise<unknown> {
+  try {
+    const body = await resp.json()
+    return (body as { detail?: unknown } | null)?.detail
+  } catch {
+    // Response body wasn't JSON (or was empty) — no field-level
+    // detail available; the status-line message is all we have.
+    return undefined
   }
 }
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, { credentials: 'include', ...init })
   if (!resp.ok) {
-    let detail: unknown
-    try {
-      const body = await resp.json()
-      detail = (body as { detail?: unknown } | null)?.detail
-    } catch {
-      // Response body wasn't JSON (or was empty) — no field-level
-      // detail available; the status-line message is all we have.
-    }
-    throw new ApiError(`${resp.status} ${resp.statusText} for ${url}`, detail)
+    throw new ApiError(`${resp.status} ${resp.statusText} for ${url}`, await errorDetail(resp), resp.status)
   }
   return resp.json() as Promise<T>
 }
@@ -334,6 +352,15 @@ export const api = {
       // high-volume category can't crowd a slower one out of the
       // response entirely.
       perCategoryLimit?: number
+      // The window (PR4b, D5): only stories fetched in the last
+      // ``maxAgeHours`` (1..8760). With it, a category's cut is by
+      // arrival, not by score.
+      maxAgeHours?: number
+      // At most this many stories per feed in the window, its
+      // best-scoring (D28). Needs ``maxAgeHours`` (422 alone).
+      perSourceCap?: number
+      // Only feeds that aren't paused.
+      activeOnly?: boolean
     },
   ) => {
     const params = new URLSearchParams()
@@ -351,6 +378,9 @@ export const api = {
     if (opts?.perCategoryLimit) {
       params.set('per_category_limit', String(opts.perCategoryLimit))
     }
+    if (opts?.maxAgeHours) params.set('max_age_hours', String(opts.maxAgeHours))
+    if (opts?.perSourceCap) params.set('per_source_cap', String(opts.perSourceCap))
+    if (opts?.activeOnly) params.set('active_only', 'true')
     const q = params.toString()
     return jsonFetch<Entry[]>(`/api/entries${q ? `?${q}` : ''}`)
   },
@@ -362,6 +392,8 @@ export const api = {
    * scheduler registers an ingest job for the new row immediately. */
   createSource: (body: {
     name: string
+    // What the user typed for the feed's name, shown as typed.
+    display_name?: string
     type?: string
     category: string
     url: string
@@ -408,7 +440,7 @@ export const api = {
    * anything — a dead URL or a site sitemap-based discovery just
    * doesn't work on; nothing was created. */
   autoAddSource: (url: string, category: string = 'other') =>
-    jsonFetch<{ found: boolean; kind: 'rss' | 'generic_scrape' | null; source: Source | null }>(
+    jsonFetch<{ found: boolean; kind: 'rss' | 'generic_scrape' | 'youtube_channel' | null; source: Source | null }>(
       '/api/sources/auto',
       {
         method: 'POST',
@@ -421,7 +453,11 @@ export const api = {
    * ``name`` and ``url`` are now editable for dynamic rows. The
    * backend rejects PATCH on built-ins (BBC, HN, etc.) with a 400
    * and returns 409 on a name collision. URL changes clear the
-   * cached favicon; the next ingest re-downloads. */
+   * cached favicon; the next ingest re-downloads.
+   *
+   * ``keepalive`` lets the request finish after the page is hidden
+   * (the feed editor's saves on app switch); its body must stay under
+   * 64 KB, which a one-field PATCH always is. ``signal`` aborts it. */
   updateSource: (
     id: number,
     body: {
@@ -429,18 +465,26 @@ export const api = {
       active?: boolean
       category?: string
       name?: string
+      // Free-text name shown in the app; null clears it.
+      display_name?: string | null
       url?: string
       // Per-source HTTP header overrides (e.g. ``{User-Agent: ...}``).
-      // Send ``{}`` (empty object) to clear an existing override;
-      // omit the field to leave it untouched. Cookie/Authorization
-      // /Host are rejected by the backend.
+      // Send null to clear an existing override; omit the field to
+      // leave it untouched. Cookie, Authorization, Host and the
+      // framing headers are rejected by the backend.
       custom_headers?: Record<string, string> | null
+      // Website (generic_scrape) rows only. Send null to clear.
+      sitemap_url?: string | null
+      link_pattern?: string | null
     },
+    opts: { keepalive?: boolean; signal?: AbortSignal } = {},
   ) =>
     jsonFetch<Source>(`/api/sources/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      keepalive: opts.keepalive,
+      signal: opts.signal,
     }),
   /** Drop a dynamic source row + its scheduler job. 400 if the row
    * is a built-in (BBC, HN, etc.). */
@@ -448,8 +492,10 @@ export const api = {
     fetch(`/api/sources/${id}`, {
       method: 'DELETE',
       credentials: 'include',
-    }).then((resp) => {
-      if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} for /api/sources/${id}`)
+    }).then(async (resp) => {
+      if (!resp.ok) {
+        throw new ApiError(`${resp.status} ${resp.statusText} for /api/sources/${id}`, await errorDetail(resp), resp.status)
+      }
     }),
   /** Curated list of feeds the user might want to add, minus any
    * they already have. Phase 5 is static; Phase 8 re-ranks by
@@ -498,10 +544,12 @@ export const api = {
 
   /** Personal top-N feed. Requires auth when OIDC is enabled; local
    * bypass users always pass through. */
-  forYou: (opts?: { limit?: number; category?: string }) => {
+  forYou: (opts?: { limit?: number; category?: string; maxAgeHours?: number }) => {
     const params = new URLSearchParams()
     if (opts?.limit) params.set('limit', String(opts.limit))
     if (opts?.category) params.set('category', opts.category)
+    // The window (PR4b): only stories fetched in the last ``maxAgeHours``.
+    if (opts?.maxAgeHours) params.set('max_age_hours', String(opts.maxAgeHours))
     const q = params.toString()
     return jsonFetch<Entry[]>(`/api/foryou${q ? `?${q}` : ''}`)
   },
@@ -526,7 +574,7 @@ export const api = {
     // rather than erroring. Callers here can hold far more than
     // 200 — the Settings Hidden/Starred/Voted tabs cap at
     // MAX_HIDDEN/MAX_STARRED/MAX_VOTED (1000/1000/2000, see
-    // lib/preferences.tsx) — so a single un-chunked call would
+    // lib/prefSync.ts) — so a single un-chunked call would
     // silently drop everything past the first 200 ids sent (the
     // oldest entries, since callers pass ids in recency order).
     // Chunking preserves the full list and keeps each request's
@@ -786,44 +834,74 @@ export const api = {
 
   // ---- Per-user preferences (read state, sort/filter, hides, etc.) ----
   // See ``lib/preferences.tsx`` for the React context that wraps
-  // these. The endpoints are the low-level transport; the
-  // provider does debouncing, optimistic updates, and the
-  // localStorage-seed-on-first-launch.
+  // these, and ``lib/prefSync.ts`` for how writes are batched, sent
+  // as changes, retried and merged with what the server sends back.
+  // The endpoints are the low-level transport.
   //
-  // The server treats the key as an opaque string. The frontend
-  // uses namespaced keys (``read_entries:<columnId>`` etc.);
-  // the backend just stores whatever JSONB you give it under
-  // that key.
+  // The server checks the key against an allowlist of namespaces
+  // (``read_entries:<columnId>`` etc., routes/preferences.py) and
+  // stores a PUT's value as given. ``keepalive`` lets a write finish
+  // after the page has gone (the leave flush).
 
-  /** Fetch all of the caller's preferences in one round-trip.
-   *  Returned as a flat list of (key, value) rows; the provider
-   *  decodes this into the typed ``PreferencesState`` shape. */
-  getPreferences: () =>
+  /** Fetch the caller's preferences in one round-trip: all of them, or
+   *  with ``since`` only the rows updated after it (an ISO time with a
+   *  zone). A since read can't report deleted rows. */
+  getPreferences: (since?: string | null, signal?: AbortSignal) =>
     jsonFetch<{ items: Array<{ key: string; value: unknown; updated_at: string }> }>(
-      '/api/preferences',
+      since ? `/api/preferences?since=${encodeURIComponent(since)}` : '/api/preferences',
+      { signal },
     ),
 
-  /** Upsert one preference. Idempotent -- the server is
-   *  "latest-value-wins" on the (user_id, key) primary key. The
-   *  value is opaque; pass any JSON-serializable shape. */
-  setPreference: (key: string, value: unknown) =>
+  /** Upsert one preference that isn't a set key. Idempotent -- the
+   *  server is "latest-value-wins" on the (user_id, key) primary key.
+   *  The value is opaque; pass any JSON-serializable shape. Set keys
+   *  (saves, hides, votes, read marks) are never PUT: two devices'
+   *  lists would overwrite each other. They take ``patchPreference``. */
+  setPreference: (key: string, value: unknown, opts: { keepalive?: boolean } = {}) =>
     jsonFetch<{ key: string; value: unknown; updated_at: string }>(
       `/api/preferences/${encodeURIComponent(key)}`,
       {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ value }),
+        keepalive: opts.keepalive,
       },
     ),
 
+  /** Change one set key: ``{add, remove}`` for the id lists, ``{set}``
+   *  (``null`` clears) for ``voted_entries``. The server applies
+   *  ``remove`` before ``add`` under a row lock and answers with the
+   *  whole new row. Empty lists are left out of the body. */
+  patchPreference: (
+    key: string,
+    delta: { add: number[]; remove: number[] } | { set: Record<string, 'up' | 'down' | null> },
+    opts: { keepalive?: boolean } = {},
+  ) => {
+    const body: Record<string, unknown> = {}
+    if ('set' in delta) body.set = delta.set
+    else {
+      if (delta.add.length) body.add = delta.add
+      if (delta.remove.length) body.remove = delta.remove
+    }
+    return jsonFetch<{ key: string; value: unknown; updated_at: string }>(
+      `/api/preferences/${encodeURIComponent(key)}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        keepalive: opts.keepalive,
+      },
+    )
+  },
+
   /** Delete one preference. Idempotent -- 204 whether or not
-   *  the row existed. Not currently called by the frontend;
-   *  included for completeness (e.g. a future "reset all
-   *  preferences" button). */
-  deletePreference: (key: string) =>
+   *  the row existed. Used by Reset and by the column-mark-read
+   *  Undo (``last_viewed:<columnId>``). */
+  deletePreference: (key: string, opts: { keepalive?: boolean } = {}) =>
     fetch(`/api/preferences/${encodeURIComponent(key)}`, {
       method: 'DELETE',
       credentials: 'include',
+      keepalive: opts.keepalive,
     }),
 }
 

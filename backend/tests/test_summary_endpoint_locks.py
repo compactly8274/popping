@@ -64,40 +64,44 @@ async def test_get_summary_lock_returns_different_locks_for_different_ids():
 
 @pytest.mark.no_db
 @pytest.mark.asyncio
-async def test_cap_above_max_returns_throwaway_lock_not_stored():
-    """When the dict is at the cap, the helper returns a fresh
-    untracked ``asyncio.Lock()`` rather than allocating a new
-    entry. The throwaway lock still serializes locally for
-    the requesting task (two concurrent requests for the SAME
-    id beyond the cap still serialize on the throwaway), but
-    the dict size is bounded — a leak guard for a long-lived
-    process that sees > ``_SUMMARY_LOCKS_MAX`` distinct ids.
-    """
-    # Snapshot the current size so we don't disturb other tests.
+async def test_cap_evicts_idle_locks_so_dedup_keeps_working():
+    """At the cap, idle locks are evicted and the new id gets a
+    tracked lock, so two requests for it still share one lock."""
     snapshot = dict(entries._summary_locks)
     try:
-        # Saturate the dict to the cap.
         for i in range(entries._SUMMARY_LOCKS_MAX - len(entries._summary_locks)):
             await entries._get_summary_lock(50_000 + i)
-        # One more call must return a throwaway that is NOT
-        # added to the dict.
         sentinel_id = 99_999
+        first = await entries._get_summary_lock(sentinel_id)
+        second = await entries._get_summary_lock(sentinel_id)
+        assert first is second
+        assert len(entries._summary_locks) <= entries._SUMMARY_LOCKS_MAX
+    finally:
+        entries._summary_locks.clear()
+        entries._summary_locks.update(snapshot)
+
+
+@pytest.mark.no_db
+@pytest.mark.asyncio
+async def test_cap_with_all_locks_held_returns_untracked_lock():
+    """If every tracked lock is in use, the helper hands out an
+    untracked lock rather than growing past the cap."""
+    snapshot = dict(entries._summary_locks)
+    held: list[asyncio.Lock] = []
+    try:
+        entries._summary_locks.clear()
+        for i in range(entries._SUMMARY_LOCKS_MAX):
+            lock = await entries._get_summary_lock(50_000 + i)
+            await lock.acquire()
+            held.append(lock)
+        sentinel_id = 99_999
+        extra = await entries._get_summary_lock(sentinel_id)
         assert sentinel_id not in entries._summary_locks
-        throwaway = await entries._get_summary_lock(sentinel_id)
-        try:
-            assert isinstance(throwaway, asyncio.Lock)
-            assert sentinel_id not in entries._summary_locks, (
-                "beyond-cap lock must not be added to the dict"
-            )
-            # The throwaway is still a real, acquirable lock.
-            async with throwaway:
-                pass
-        finally:
-            # The throwaway isn't tracked, so nothing to clean up
-            # in the dict. (The lock object itself is GC'd.)
+        async with extra:
             pass
     finally:
-        # Restore the dict so other tests aren't affected.
+        for lock in held:
+            lock.release()
         entries._summary_locks.clear()
         entries._summary_locks.update(snapshot)
 

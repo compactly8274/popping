@@ -1,58 +1,48 @@
-FROM python:3.12-slim
+# --- Build stage ------------------------------------------------------------
+FROM python:3.12.13-slim AS build
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN python -m venv /venv
+ENV PATH=/venv/bin:$PATH
+# Own directory: ``pip install .`` from / makes setuptools scan the whole
+# filesystem (including /proc) for packages and never finishes.
+WORKDIR /build
+
+# CPU-only torch (the PyPI build bundles ~2 GB of CUDA libraries). Kept out
+# of requirements.lock because it comes from the PyTorch index; bump it
+# together with scripts/lock.sh.
+ARG TORCH_VERSION=2.14.1
+RUN pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+
+COPY requirements.lock ./
+RUN pip install -r requirements.lock
+
+COPY pyproject.toml ./
+COPY app ./app
+RUN pip install --no-deps .
+
+# --- Runtime stage ----------------------------------------------------------
+FROM python:3.12.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PATH=/venv/bin:$PATH
+
+RUN useradd --uid 10001 --create-home app
+COPY --from=build /venv /venv
 
 WORKDIR /app
+COPY alembic.ini ./
+COPY alembic ./alembic
+# Mount points for the assets and model-cache volumes; a fresh named
+# volume inherits this ownership.
+RUN mkdir -p /app/assets /home/app/.cache && chown app:app /app/assets /home/app/.cache
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        # ca-certificates: python:3.12-slim's OpenSSL ships without a
-        # CA bundle, so httpx's default verify=True fails on any
-        # source whose chain isn't in the (empty) system store. The
-        # resulting SSL: CERTIFICATE_VERIFY_FAILED shows up in
-        # scheduler logs as a single-source ingest failure, but the
-        # more pernicious effect is that a couple of CDNs (BBC iChef
-        # thumbnails, some news feeds) intermittently 502 when the
-        # chain rotates and the new root isn't covered. Installing
-        # ca-certificates pulls in the standard Mozilla bundle and
-        # makes ``httpx.Client(verify=True)`` actually work end-to-end.
-        ca-certificates \
-        gcc libpq-dev curl \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY pyproject.toml ./
-# Install CPU-only torch first (saves ~600 MB vs CUDA build), then the
-# rest of the deps. The empty --extra-index-url below prevents pip from
-# also hitting the default PyPI for torch; if pip falls back there it
-# will still install a usable CPU-only wheel.
-RUN pip install --upgrade pip \
-    && pip install --index-url https://download.pytorch.org/whl/cpu torch \
-    && pip install -e . --no-deps \
-    && pip install -e .
-
-COPY . .
-
+USER app
 EXPOSE 8000
 
-# Stable production CMD — no auto-reload. alembic upgrade head runs
-# once at startup so a fresh pgdata volume is auto-initialized. Local
-# dev with hot-reload is opted into via docker-compose.override.yml's
-# `command:` override (see docker-compose.override.yml.example), which
-# replaces this CMD with the --reload variant. Keeping --reload out of
-# the production image avoids two failure modes this codebase has hit:
-#
-# 1. ``watchfiles`` triggers on any file mutation inside /app — runtime
-#    artefacts (cached thumbnails under /app/assets/thumbs, alembic's
-#    WAL writes, etc.) cause spurious restarts. Each restart briefly
-#    disconnects the Vite proxy on the frontend container, surfacing
-#    as ECONNREFUSED on /api/* and a blank dashboard for the duration
-#    of the reload (~1-2 s).
-#
-# 2. Pinning to a specific image SHA loses the "edit-and-reload" loop
-#    users expect from dev mode but gains the user-visible stability
-#    they expect from prod. The override gives both modes their own
-#    command without diverging Dockerfiles.
+# Migrations run at startup so a fresh database volume is initialised.
+# Dev hot-reload overrides this command in docker-compose.override.yml.
 CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]

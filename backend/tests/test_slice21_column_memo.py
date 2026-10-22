@@ -93,20 +93,26 @@ def test_column_comparator_function_exists():
 
 @pytest.mark.no_db
 @pytest.mark.parametrize("prop", [
+    "columnKey",
+    "label",
+    "sourceName",
+    "noOwnFeeds",
     "sections",
+    "unseenCount",
+    "nextTab",
+    "generation",
+    "trackSeen",
     "sourcesById",
     "sourcesByName",
-    "newCount",
     "selectedId",
     "prefs",
-    "totalCount",
     "categoriesBySourceId",
     "faviconBySourceId",
     "expandedSummaries",
     "starredSet",
-    "hiddenSet",
     "votedMap",
-    "sectionsCollapsed",
+    "sentinelRoot",
+    "scrollerRef",
 ])
 def test_column_comparator_checks_prop(prop):
     """The comparator must compare each data-driven prop by reference.
@@ -128,20 +134,20 @@ def test_column_comparator_checks_prop(prop):
 
 
 # ---------------------------------------------------------------------------
-# 3. All 9 App handlers are wrapped in useCallback
+# 3. The App handlers are wrapped in useCallback
 # ---------------------------------------------------------------------------
 
 
 HANDLERS = [
     "markColumnRead",
+    "hideStory",
+    "starStory",
     "toggleSource",
     "onSourceRenamed",
     "toggleSourceAndMaybeClose",
     "clearSourceFilters",
     "jumpToCategory",
     "setPrefsFor",
-    "setColumnSection",
-    "sectionsCollapsedFor",
 ]
 
 
@@ -150,7 +156,7 @@ HANDLERS = [
 def test_app_handler_uses_usecallback(handler):
     """Each handler must be a ``useCallback`` so its identity is stable.
 
-    Without this, the JSX ``onMarkRead={() => markColumnRead(col.name)}``
+    Without this, the JSX ``onMarkAll={() => markColumnRead(col.key)}``
     inline closures re-allocate every render. The Column.memo comparator
     intentionally ignores callback props, so the memo *would* skip
     anyway — but Card.memo is more permissive and these handlers are
@@ -169,42 +175,15 @@ def test_app_handler_uses_usecallback(handler):
     )
 
 
-@pytest.mark.no_db
-def test_sections_collapsed_uses_memo_cache():
-    """``sectionsCollapsedFor`` returns from a useMemo cache for stable identity.
-
-    The Column.memo comparator uses ``===`` on ``sectionsCollapsed``,
-    so the App layer must return a stable object reference per column
-    name. A naive lookup returning a fresh ``{ new, history }`` per
-    render would always defeat the memo on this prop alone.
-    """
-    src = APP.read_text()
-    assert "sectionsCollapsedCache" in src, (
-        "Expected a useMemo-backed cache to give sectionsCollapsedFor "
-        "stable identity. Without it, Column.memo skips are "
-        "defeated for every Column."
-    )
-    assert re.search(
-        r"sectionsCollapsedCache\s*=\s*useMemo", src
-    ), "sectionsCollapsedCache should be a useMemo"
-    assert re.search(
-        r"sectionsCollapsedFor\s*=\s*useCallback", src
-    ), "sectionsCollapsedFor should itself be a useCallback"
-    assert "sectionsCollapsedCache[columnName]" in src, (
-        "sectionsCollapsedFor must read from the cache, not build "
-        "a fresh object per call."
-    )
-
-
 # ---------------------------------------------------------------------------
-# 4. No naked const = arrow for the 9 handlers (regression guard)
+# 4. No naked const = arrow for the handlers (regression guard)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.no_db
 @pytest.mark.parametrize("handler", HANDLERS)
 def test_app_handler_not_naked_arrow(handler):
-    """Negative test — none of the 9 handlers should be plain ``const = arrow``."""
+    """Negative test — none of the handlers should be plain ``const = arrow``."""
     src = APP.read_text()
     # Match: const h = (args) => { ... but NOT inside useCallback
     # A naked arrow would be: ``const h = (name: string) => {``

@@ -34,10 +34,13 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.deps import current_user
+from app.auth.deps import current_user, resolve_user_id
+from app.brief import _HISTORICAL_SOURCE_SLUGS
 from app.config import settings
 from app.db import get_session
-from app.models import Entry, Source, UserProfile
+from app.models import Entry, Source
+from app.routes.entries import card_preview, not_hidden, window_start
+from app.routes.preferences import hidden_entry_ids
 from app.schemas import EntryListOut
 from app.scoring import composite as composite_scorer
 from app.scoring import convergence
@@ -51,6 +54,12 @@ async def foryou(
     user: dict | None = Depends(current_user),
     limit: int = Query(default=50, ge=1, le=200),
     category: str | None = Query(default=None, description="Filter by source category"),
+    max_age_hours: int | None = Query(
+        default=None,
+        ge=1,
+        le=8760,
+        description="Only stories that arrived (fetched_at) in the last N hours.",
+    ),
 ) -> list[EntryListOut]:
     """Top-N personal feed.
 
@@ -60,9 +69,10 @@ async def foryou(
          still have room to climb into the result.
       2. Apply the convergence multiplier to the stored composite_score.
       3. Re-sort and trim to ``limit``.
-    """
-    profile = await session.scalar(select(UserProfile).where(UserProfile.id == 1))
 
+    Paused feeds and the caller's hidden stories are always left out,
+    before the over-fetch, so they never use up candidate slots.
+    """
     over_fetch = min(max(limit * 4, 200), 500)
     # Slim SELECT: we project only the columns the frontend renders plus
     # the source fields needed for the convergence slug lookup.
@@ -99,6 +109,9 @@ async def foryou(
             # _Row builder below (see comment there).
             Entry.meta.op("->>")("reddit_thread_url").label("reddit_thread_url"),
             Entry.meta.op("->>")("reddit_comment_count").label("reddit_comment_count_text"),
+            # The feed's blurb, for the card's preview (D34); the
+            # ``_Row`` builder turns it into ``preview``.
+            Entry.meta.op("->>")("summary").label("feed_summary_text"),
             # Source fields needed for category filter and potential
             # future re-weighting.  Joining here eliminates the second
             # round-trip the previous code did to hydrate Source rows.
@@ -106,11 +119,25 @@ async def foryou(
             Source.source_weight.label("source_weight"),
         )
         .join(Source, Entry.source_id == Source.id)
+        # On this day stays in its own tab: its stories are history,
+        # not today's news, the same reason the brief leaves them out.
+        .where(Source.name.notin_(_HISTORICAL_SOURCE_SLUGS))
+        # For You never wants a paused feed. Unconditional rather than
+        # an opt-in parameter, so bundles that predate the window get
+        # it too.
+        .where(Source.active.is_(True))
         .order_by(Entry.composite_score.desc(), Entry.published_at.desc().nullslast())
         .limit(over_fetch)
     )
     if category:
         stmt = stmt.where(Source.category == category)
+    if max_age_hours is not None:
+        stmt = stmt.where(Entry.fetched_at >= window_start(max_age_hours))
+    # Same defensive read as ``/api/entries``: a malformed stored value
+    # reads as fewer ids, never as an error.
+    hidden = await hidden_entry_ids(session, resolve_user_id(user))
+    if hidden:
+        stmt = stmt.where(not_hidden(hidden))
     rows = (await session.execute(stmt)).all()
     if not rows:
         return []
@@ -121,7 +148,7 @@ async def foryou(
         __slots__ = (
             "id", "source_id", "title", "url", "published_at", "fetched_at",
             "composite_score", "personal_score", "raw_score",
-            "image_url", "image_path", "cached_summary",
+            "image_url", "image_path", "cached_summary", "preview",
             "reddit_thread_url", "reddit_comment_count",
         )
         def __init__(self, raw):
@@ -137,6 +164,8 @@ async def foryou(
             self.image_url = raw.image_url
             self.image_path = raw.image_path
             self.cached_summary = raw.cached_summary
+            # Same projection as ``/api/entries`` (``_card_out``).
+            self.preview = card_preview(raw.title, raw.cached_summary, getattr(raw, "feed_summary_text", None))
             self.reddit_thread_url = raw.reddit_thread_url
             # ``reddit_comment_count`` projects as text from JSONB
             # (``->>`` is always text). Coerce to int so the

@@ -21,7 +21,6 @@ from typing import Any
 
 import httpx
 
-from app.config import settings
 from app.llm.base import Provider, ProviderError
 from app.llm.tags import _THINKING_MODELS
 
@@ -92,7 +91,10 @@ class OllamaCloudProvider(Provider):
             raise ProviderError(
                 f"ollama cloud returned {resp.status_code}: {resp.text[:200]}"
             )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProviderError(f"ollama cloud returned invalid JSON: {exc}") from exc
         text = data.get("response", "")
         thinking = data.get("thinking", "")
         # Only substitute the thinking field for models we know put

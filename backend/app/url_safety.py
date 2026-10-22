@@ -95,6 +95,9 @@ _DENIED_NETWORKS: list[ipaddress._BaseNetwork] = [
         "127.0.0.0/8",
         "0.0.0.0/8",
         "10.0.0.0/8",
+        # CGNAT. Also where Tailscale assigns node addresses, so a
+        # tailnet service would otherwise be reachable.
+        "100.64.0.0/10",
         "172.16.0.0/12",
         "192.168.0.0/16",
         "169.254.0.0/16",
@@ -120,6 +123,11 @@ _DENIED_NETWORKS: list[ipaddress._BaseNetwork] = [
         "fc00::/7",
         "fe80::/10",
         "::ffff:0:0/96",
+        # Prefixes that embed an IPv4 address (NAT64, 6to4, Teredo) and
+        # can route to private IPv4 space through a translator.
+        "64:ff9b::/96",
+        "2002::/16",
+        "2001::/32",
     )
 ]
 

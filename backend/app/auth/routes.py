@@ -176,6 +176,15 @@ async def login(return_to: str = "/") -> Response:
 # ---------------------------------------------------------------------------
 
 
+def _email_allowed(email: object, allowlist: str) -> bool:
+    """True when ``allowlist`` (comma-separated) is empty or contains
+    ``email``, compared case-insensitively."""
+    allowed = {e.strip().lower() for e in allowlist.split(",") if e.strip()}
+    if not allowed:
+        return True
+    return isinstance(email, str) and email.lower() in allowed
+
+
 @router.get("/auth/callback")
 async def callback(
     request: Request,
@@ -246,6 +255,9 @@ async def callback(
     # if oversized — that case almost certainly means the IdP is
     # misconfigured and we don't want a truncated sub silently
     # colliding with an existing session row.
+    if not _email_allowed(email, settings.oidc_allowed_emails):
+        logger.warning("OIDC login rejected: %r is not in OIDC_ALLOWED_EMAILS", email)
+        raise HTTPException(status_code=403, detail="This account is not allowed to sign in")
     if not isinstance(sub, str) or len(sub) > _OIDC_CLAIM_MAX:
         logger.warning("OIDC 'sub' over %d bytes — rejecting", _OIDC_CLAIM_MAX)
         raise HTTPException(status_code=502, detail="OIDC 'sub' too long")

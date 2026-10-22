@@ -1,13 +1,12 @@
 # Dev override for docker compose. Auto-loaded when present next to
 # docker-compose.yml. Switches backend + frontend to build from source
-# with hot-reload bind mounts; postgres and redis stay as in the base.
+# with hot-reload bind mounts; postgres stays as in the base.
 #
 # To use: copy this file to docker-compose.override.yml and run
 # `docker compose up`. The override is auto-merged.
 #
-# Don't commit your personal override — the .example suffix keeps it
-# ignored by git's example rule (no, it doesn't, but it's a convention
-# to copy + gitignore the real one).
+# Don't commit your personal override — docker-compose.override.yml is
+# listed in .gitignore.
 
 services:
   backend:
@@ -19,7 +18,7 @@ services:
     # Production image (default compose) uses a stable CMD without
     # --reload — see backend/Dockerfile. This override replaces the
     # production CMD so dev mode gets the edit-and-restart loop while
-    # prod stays pinned to a specific image SHA without spurious
+    # prod runs a stable image without spurious
     # restarts from watchfiles triggering on runtime artefacts
     # (thumbs cache, alembic WAL, etc.).
     command:
@@ -33,7 +32,11 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: build
     pull_policy: never
+    # The build stage has node + the source; run the Vite dev server on
+    # the same port nginx uses in production so the base port mapping fits.
+    command: ["npm", "run", "dev", "--", "--port", "8080"]
     environment:
       VITE_BACKEND_URL: http://backend:8000
     volumes:

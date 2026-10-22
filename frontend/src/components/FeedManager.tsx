@@ -1,217 +1,137 @@
-// Phase 5 FeedManager — Drawer section for adding, editing, and
-// removing dynamic RSS feeds. Three tabs:
+// Settings › Feeds: adding, editing and removing feeds. Three tabs:
 //
-//   • My feeds — the existing source list, with per-row actions:
-//     toggle active, edit metadata, edit refresh interval, delete
-//     (works for both dynamic and built-in rows). Plugin-backed
-//     rows have url/name fields locked (the plugin owns them) but
-//     can still be deleted — permanently: the backend records the
-//     deletion so the plugin doesn't recreate the row on its next
-//     scheduled tick or after a backend restart.
+//   • My feeds — the feed list. Tapping a row opens its editor
+//     (feeds/FeedEditor.tsx), which saves each field on its own:
+//     name, address, category, how often to check, headers, pause,
+//     check now and delete. Built-in feeds keep their name, address,
+//     headers and interval; they can still be paused, recategorised
+//     and deleted (the backend records the deletion so the plugin
+//     doesn't recreate the row).
 //
-//   • Recommended — curated list from GET /api/feed-recommendations,
+//   • Suggested — curated list from GET /api/feed-recommendations,
 //     minus anything the user already has. Tap "Add" to fire
 //     POST /api/sources.
 //
-//   • Add custom — name + URL + category form for an RSS URL not in
-//     the curated list. Client-side URL validation; the backend is
-//     the source of truth on errors and returns 422 with field-level
-//     details.
+//   • Add — the Auto feed box (paste any link) and the manual form
+//     (name, address, type, category, interval, headers). The backend
+//     is the source of truth on errors and returns 422 with
+//     field-level details, shown under the field.
 //
-// Errors flow up to App's red banner via `onError` so the
-// visual treatment matches refresh failures — single, consistent
-// error surface across the dashboard.
+// Add has a "Test" button next to "Add feed" so the user can probe
+// the URL with the same plugin Add would use, no DB write. The result
+// is shown inline: "Looks good (42 items)" with sample titles, or the
+// reason it failed with the raw error. Test doesn't change the form.
 //
-// Add Custom has a "Test" button next to "Add feed" so the user
-// can probe the URL with the same plugin Add would use, no DB
-// write. The result is shown inline: green "Looks good (42
-// items)" with sample titles, or red "Site blocks automated
-// access" with the raw error. The Add flow always succeeds
-// against URLs that pass Test (modulo name conflicts that show
-// up at Add time). The Test step is non-destructive and
-// reversible — tapping it doesn't change the form state.
+// Every add shows the feed at once (``onSourceAdded``) and its toast
+// has an Edit action that opens the new feed's editor.
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type Source } from '../api'
 import { SourceIcon } from './SourceIcon'
+import { CategoryPicker } from './feeds/CategoryPicker'
+import { FeedEditor } from './feeds/FeedEditor'
+import { HeadersEditor } from './feeds/HeadersEditor'
+import { categoryLabel, sourceLabel } from '../lib/labels'
+import {
+  PODCAST_DEFAULT_REFRESH,
+  REFRESH_PRESETS,
+  YOUTUBE_DEFAULT_REFRESH,
+  classifyPaste,
+  cleanDisplayName,
+  isStale,
+  normalizeFeedInput,
+  normalizeName,
+  refreshLabel,
+  suggestName,
+  timeAgo,
+  uniqueSlug,
+} from '../lib/feedRules'
+import { CATEGORY_OPTIONS, resolveNewCategory } from '../lib/categories'
+import { type HeaderMap } from '../lib/headers'
+import { fieldSaveMessage, friendlyTestError, parseApiError } from '../lib/apiErrors'
 import { toast } from './Toast'
+import { usePreferences } from '../lib/preferences'
 
 type Props = {
   sources: Source[]
+  // A quiet refresh of App's sources and stories.
   onRefresh: () => Promise<void>
   onError: (msg: string) => void
-  // Bubbles up from ``SourceRow`` when the user renames a source via
-  // the inline edit form. See ``App.tsx`` — the parent remaps
-  // ``activeSources`` synchronously so the chip bar stays consistent
-  // through the rename.
-  onSourceRenamed?: (oldName: string, newName: string) => void
+  // Open this feed's row (the Menu's ›, a card's source name, a
+  // ?source= link). A new ``focusNonce`` repeats the request for the
+  // same feed.
+  focusSourceId?: number | null
+  focusNonce?: number
+  // A feed was added here: App shows it at once, before the next poll.
+  onSourceAdded?: (row: Source) => void
+  // A feed was deleted from its editor.
+  onSourceDeleted?: (id: number) => void
+  // Open a feed's editor (the Edit action on an "Added …" toast).
+  onEditSource?: (id: number) => void
 }
 
 type Tab = 'mine' | 'recommended' | 'add'
 
-// Refresh interval presets the user picks from. Values are seconds;
-// the dropdown renders the human label. Keeps the UI to a single
-// choice rather than a freeform input — typos would silently break
-// scheduling otherwise.
-const REFRESH_PRESETS: Array<{ value: number; label: string }> = [
-  { value: 900,   label: '15 min' },
-  { value: 3600,  label: '1 hour' },
-  { value: 21600, label: '6 hours' },
-  { value: 86400, label: '24 hours' },
-]
+// After an add: the row (to show it at once) and the toast to show.
+type OnCreated = (row: Source, message: string) => void
 
-// Mirrors the backend's _PODCAST_DEFAULT_REFRESH (routes/sources.py)
-// — episodes publish far less often than news, so the "Podcast"
-// radio bumps the refresh dropdown to this instead of the 1h
-// plain-RSS default.
-const PODCAST_DEFAULT_REFRESH = 21600
-
-// Mirrors the backend's _YOUTUBE_DEFAULT_REFRESH — same rationale as
-// podcasts, most channels post far less than hourly.
-const YOUTUBE_DEFAULT_REFRESH = 21600
-
-// Categories the user can pick from when adding a custom source.
-// Existing source categories + a couple of common extras the
-// recommendations list uses. Free-form text is also accepted in the
-// backend (the column is just a 40-char string), but a dropdown is
-// friendlier than asking the user to type "tech" vs "news" — and it
-// matches existing column groupings.
-const CATEGORY_OPTIONS = [
-  'news',
-  'tech',
-  'vulns',
-  'science',
-  'finance',
-  'policy',
-  'longform',
-  'deals',
-  'podcast',
-  'video',
-  // Leisure categories (0019_leisure_feed_recommendations) — kept
-  // after the original work-adjacent set so the dropdown reads as
-  // "the usual suspects, then the fun stuff" rather than an
-  // alphabetical shuffle that'd bury either group.
-  'sports',
-  'entertainment',
-  'gaming',
-  'food',
-  'music',
-  'other',
-]
-
-// Names of the registered plugin sources (BBC, HN, GitHub Releases,
-// NVD, CISA, Wikipedia OTD). These rows ARE user-deletable — the
-// "delete" button isn't gated by this set. It only drives the
-// "built-in" badge (url/name locked, managed by the plugin's own
-// schedule) and the row/url-field lock in the edit form below.
-const KNOWN_BUILT_INS = new Set([
-  'bbc_news',
-  'hn_top',
-  'github_releases',
-  'wikipedia_on_this_day',
-  'nvd_recent',
-  'cisa_kev',
-])
-
-function isBuiltIn(source: Source): boolean {
-  return KNOWN_BUILT_INS.has(source.name)
+// The open row is part of the URL only until the user moves on: then
+// ``source`` goes, keeping the history entry's state (App's Done reads
+// it).
+function clearSourceParam() {
+  const u = new URL(window.location.href)
+  if (!u.searchParams.has('source')) return
+  u.searchParams.delete('source')
+  window.history.replaceState(window.history.state, '', u.toString())
 }
 
-function refreshLabel(seconds: number): string {
-  const preset = REFRESH_PRESETS.find((p) => p.value === seconds)
-  if (preset) return preset.label
-  if (seconds < 60) return `${seconds}s`
-  if (seconds < 3600) return `${Math.round(seconds / 60)} min`
-  if (seconds < 86400) return `${Math.round(seconds / 3600)} h`
-  return `${Math.round(seconds / 86400)} d`
-}
-
-// Same shape as Card.tsx's ``timeAgo`` — kept duplicated rather than
-// extracted to a shared module because the function is six lines
-// and the call sites are UI-local. If a third caller appears, lift
-// it to ``frontend/src/lib/format.ts``.
-function timeAgo(iso: string | null): string {
-  if (!iso) return 'never'
-  const ms = Date.now() - new Date(iso).getTime()
-  if (ms < 0) return 'just now'
-  const mins = Math.floor(ms / 60000)
-  if (mins < 60) return `${mins}m ago`
-  const hours = Math.floor(mins / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
-}
-
-// True when ``last_fetch_at`` is older than 2× the configured
-// refresh interval — heuristic for "the scheduler should have run by
-// now but hasn't (or just ran and didn't update last_fetch_at
-// because of a fetch error)." The 2× grace is generous because
-// scheduler jobs queue up if multiple sources hit at once.
-function isStale(source: Source): boolean {
-  if (!source.last_fetch_at) return true
-  const ageMs = Date.now() - new Date(source.last_fetch_at).getTime()
-  return ageMs > source.refresh_interval_seconds * 2 * 1000
-}
-
-// Friendly message lookup for the Test step. Maps the backend's
-// ``error_kind`` enum (see ``SourceTestResult`` in api.ts and
-// ``SourceTestResult`` in backend/app/schemas.py) to user-facing
-// copy. The ``name`` slot in name_conflict / invalid_url messages
-// is interpolated by the caller via the raw ``error`` string when
-// it adds info beyond the kind.
-function friendlyTestError(
-  kind: string | null,
-  raw: string | null,
-): string {
-  switch (kind) {
-    case 'not_found':
-      return "Couldn't find a feed at that URL. Double-check the address."
-    case 'forbidden':
-      return 'This site blocks automated access. Try adding a User-Agent header (Advanced → Custom headers).'
-    case 'timeout':
-      return 'Feed took too long to respond. The site may be slow or down.'
-    case 'parse_error':
-      return "Got a response but it didn't look like a feed. Is this a valid RSS/Atom URL?"
-    case 'name_conflict':
-      return raw ? `Name conflict — ${raw}` : 'A source with this name already exists.'
-    case 'invalid_url':
-      return raw ? `Invalid URL — ${raw}` : "That URL isn't valid."
-    case 'unsupported_type':
-      return raw ? `Unsupported type — ${raw}` : "This feed type isn't supported yet."
-    case 'network_error':
-      return "Couldn't reach the URL. Check your network or the site's status."
-    case 'unknown':
-    default:
-      return raw ? `Something went wrong — ${raw}` : 'Something went wrong. Try again.'
-  }
-}
-
-function parseApiError(err: unknown, fallback: string): string {
-  // FastAPI returns 422 with `{detail: [{loc: [...], msg: "..."}, ...]}`
-  // (validation errors) or `{detail: "..."}` (a plain HTTPException).
-  // ``jsonFetch`` (api.ts) attaches that parsed `detail` to the thrown
-  // ``ApiError``, so check it before falling back to the generic
-  // "<status> <statusText>" message — otherwise the specific,
-  // useful reason never gets a chance to show.
-  const e = err as { message?: string; detail?: unknown }
-  if (Array.isArray(e.detail)) {
-    return e.detail
-      .map((d: unknown) =>
-        d && typeof d === 'object' && typeof (d as { msg?: unknown }).msg === 'string'
-          ? (d as { msg: string }).msg
-          : JSON.stringify(d),
-      )
-      .join('; ')
-  }
-  if (typeof e.detail === 'string') return e.detail
-  if (typeof e.message === 'string') return e.message
-  return fallback
-}
-
-export function FeedManager({ sources, onRefresh, onError, onSourceRenamed }: Props) {
+export function FeedManager({
+  sources,
+  onRefresh,
+  onError,
+  focusSourceId,
+  focusNonce,
+  onSourceAdded,
+  onSourceDeleted,
+  onEditSource,
+}: Props) {
   const [tab, setTab] = useState<Tab>('mine')
-  const [editingInterval, setEditingInterval] = useState<number | null>(null)
-  const [editingRowId, setEditingRowId] = useState<number | null>(null)
+  // One open row at a time, so the Menu's › can open a given feed.
+  const [openRowId, setOpenRowId] = useState<number | null>(null)
+  const pendingScroll = useRef<number | null>(null)
+
+  // Asked to show a feed: My feeds, that row open, scrolled to the top
+  // of the sheet once it has rendered.
+  useEffect(() => {
+    if (focusSourceId == null) return
+    setTab('mine')
+    setOpenRowId(focusSourceId)
+    pendingScroll.current = focusSourceId
+  }, [focusSourceId, focusNonce])
+  useEffect(() => {
+    const id = pendingScroll.current
+    if (id == null) return
+    const row = document.getElementById(`feed-${id}`)
+    if (!row) return
+    pendingScroll.current = null
+    row.scrollIntoView({ block: 'start' })
+  })
+
+  const toggleRow = (id: number) => {
+    setOpenRowId((cur) => (cur === id ? null : id))
+    clearSourceParam()
+  }
+  const deleted = (id: number) => {
+    setOpenRowId(null)
+    clearSourceParam()
+    if (onSourceDeleted) onSourceDeleted(id)
+    else void onRefresh()
+  }
+  // Every add shows the feed at once and offers its editor.
+  const created: OnCreated = (row, message) => {
+    onSourceAdded?.(row)
+    toast(message, onEditSource ? { kind: 'info', action: { label: 'Edit', onClick: () => onEditSource(row.id) } } : 'info')
+  }
   // Stable Set of source names. ``RecommendedTab``'s useEffect
   // depends on this and would otherwise refire on every parent
   // render (parent constructs ``new Set(...)`` inline today).
@@ -224,37 +144,36 @@ export function FeedManager({ sources, onRefresh, onError, onSourceRenamed }: Pr
     <div className="space-y-2">
       <div className="flex gap-1" role="tablist" aria-label="feed manager tabs">
         <TabButton active={tab === 'mine'} onClick={() => setTab('mine')}>
-          My feeds ({sources.length})
+          My feeds
         </TabButton>
         <TabButton active={tab === 'recommended'} onClick={() => setTab('recommended')}>
-          Recommended
+          Suggested
         </TabButton>
         <TabButton active={tab === 'add'} onClick={() => setTab('add')}>
-          Add custom
+          Add
         </TabButton>
       </div>
 
       {tab === 'mine' && (
         <MyFeedsTab
           sources={sources}
-          editingInterval={editingInterval}
-          setEditingInterval={setEditingInterval}
-          editingRowId={editingRowId}
-          setEditingRowId={setEditingRowId}
+          openRowId={openRowId}
+          onToggleRow={toggleRow}
           onRefresh={onRefresh}
-          onError={onError}
-          onSourceRenamed={onSourceRenamed}
+          onDeleted={deleted}
         />
       )}
       {tab === 'recommended' && (
         <RecommendedTab
+          sources={sources}
           existingNames={existingNames}
           onAdded={onRefresh}
+          onCreated={created}
           onError={onError}
         />
       )}
       {tab === 'add' && (
-        <AddCustomTab onAdded={onRefresh} onError={onError} />
+        <AddCustomTab sources={sources} onAdded={onRefresh} onCreated={created} />
       )}
     </div>
   )
@@ -274,7 +193,7 @@ function TabButton({
       role="tab"
       aria-selected={active}
       onClick={onClick}
-      className={`flex-1 min-h-[36px] rounded-ios text-ios-body transition ${
+      className={`flex-1 min-w-0 min-h-[44px] px-1 rounded-ios text-ios-body max-[359px]:text-[15px] whitespace-nowrap truncate transition ${
         active
           ? 'bg-bg-elevated text-accent'
           : 'bg-bg-surface text-label-primary active:bg-bg-elevated'
@@ -286,624 +205,117 @@ function TabButton({
 }
 
 // ---------------------------------------------------------------------------
-// My feeds — existing source list with per-row actions
+// My feeds — the source list; tapping a row opens its editor
 // ---------------------------------------------------------------------------
 
 function MyFeedsTab({
   sources,
-  editingInterval,
-  setEditingInterval,
-  editingRowId,
-  setEditingRowId,
+  openRowId,
+  onToggleRow,
   onRefresh,
-  onError,
-  onSourceRenamed,
+  onDeleted,
 }: {
   sources: Source[]
-  editingInterval: number | null
-  setEditingInterval: (id: number | null) => void
-  // ID of the row currently in inline edit mode. Mutually exclusive
-  // with ``editingInterval`` for that row — editing the metadata
-  // closes any open interval picker on the same row.
-  editingRowId: number | null
-  setEditingRowId: (id: number | null) => void
+  openRowId: number | null
+  onToggleRow: (id: number) => void
   onRefresh: () => Promise<void>
-  onError: (msg: string) => void
-  onSourceRenamed?: (oldName: string, newName: string) => void
+  onDeleted: (id: number) => void
 }) {
+  // While a row is open the list keeps the order it had when the row
+  // opened (new feeds go at the end): the server sorts by category and
+  // name, so a rename or a new category would otherwise move the row
+  // being edited out from under the finger.
+  const frozen = useRef<{ open: number; order: number[] } | null>(null)
+  if (openRowId == null) frozen.current = null
+  else if (frozen.current?.open !== openRowId) frozen.current = { open: openRowId, order: sources.map((s) => s.id) }
+  const order = frozen.current?.order
+  const shown = useMemo(() => {
+    if (!order) return sources
+    const byId = new Map(sources.map((s) => [s.id, s]))
+    const kept = order.flatMap((id) => (byId.has(id) ? [byId.get(id)!] : []))
+    return [...kept, ...sources.filter((s) => !order.includes(s.id))]
+  }, [sources, order])
+
   if (sources.length === 0) {
-    return <p className="text-ios-body text-label-secondary italic px-1">no sources yet</p>
+    return <p className="text-ios-body text-label-secondary italic px-1">No feeds yet. Add one from Suggested or Add.</p>
   }
   return (
     <ul className="space-y-1">
-      {sources.map((s) => (
-        <li key={s.id}>
-          <SourceRow
-            source={s}
-            isEditingInterval={editingInterval === s.id}
-            onStartEditInterval={() => setEditingInterval(s.id)}
-            onCancelEditInterval={() => setEditingInterval(null)}
-            isEditing={editingRowId === s.id}
-            onStartEdit={() => {
-              setEditingInterval(null)
-              setEditingRowId(s.id)
-            }}
-            onCancelEdit={() => setEditingRowId(null)}
-            onRefresh={onRefresh}
-            onError={onError}
-            onRenamed={(oldName, newName) => {
-              setEditingRowId(null)
-              onSourceRenamed?.(oldName, newName)
-            }}
-          />
+      {shown.map((s) => (
+        <li key={s.id} id={`feed-${s.id}`} className="scroll-mt-2">
+          <SourceRow source={s} open={openRowId === s.id} onToggle={() => onToggleRow(s.id)} />
+          {openRowId === s.id && (
+            <FeedEditor source={s} sources={sources} onDeleted={onDeleted} onRefresh={onRefresh} />
+          )}
         </li>
       ))}
     </ul>
   )
 }
 
+// One feed in the list: name, then a caption with its category, how
+// fresh it is and any problem. The whole line is the button that opens
+// the editor.
 function SourceRow({
   source,
-  isEditingInterval,
-  onStartEditInterval,
-  onCancelEditInterval,
-  isEditing,
-  onStartEdit,
-  onCancelEdit,
-  onRefresh,
-  onError,
-  onRenamed,
+  open,
+  onToggle,
 }: {
   source: Source
-  isEditingInterval: boolean
-  onStartEditInterval: () => void
-  onCancelEditInterval: () => void
-  isEditing: boolean
-  onStartEdit: () => void
-  onCancelEdit: () => void
-  onRefresh: () => Promise<void>
-  onError: (msg: string) => void
-  onRenamed?: (oldName: string, newName: string) => void
+  open: boolean
+  onToggle: () => void
 }) {
-  const builtIn = isBuiltIn(source)
-  const [busy, setBusy] = useState(false)
-  // Inline two-tap delete confirm. ``confirmingDelete`` swaps the
-  // single ``delete`` button into a ``confirm delete`` + ``cancel``
-  // pair, scoped to this row. Auto-cancels after
-  // ``CONFIRM_TIMEOUT_MS`` so an abandoned confirm doesn't linger
-  // forever (user opened delete, looked away, came back). The native
-  // ``window.confirm`` modal was jarring inside a drawer — competing
-  // iOS sheet for the user's attention. Inline keep the gesture in
-  // the drawer's frame.
-  const CONFIRM_TIMEOUT_MS = 4000
-  const [confirmingDelete, setConfirmingDelete] = useState(false)
-
-  const toggleActive = async () => {
-    setBusy(true)
-    try {
-      await api.updateSource(source.id, { active: !source.active })
-      await onRefresh()
-    } catch (err) {
-      onError(parseApiError(err, 'failed to update source'))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const setInterval = async (seconds: number) => {
-    setBusy(true)
-    try {
-      await api.updateSource(source.id, { refresh_interval_seconds: seconds })
-      await onRefresh()
-      onCancelEditInterval()
-    } catch (err) {
-      onError(parseApiError(err, 'failed to update refresh interval'))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const onDelete = async () => {
-    // Inline two-tap — the first tap set ``confirmingDelete`` to
-    // true (button became "confirm delete"). This is the second tap.
-    // Works the same for built-in and dynamic rows — see
-    // ``KNOWN_BUILT_INS`` above.
-    setBusy(true)
-    try {
-      await api.deleteSource(source.id)
-      setConfirmingDelete(false)
-      await onRefresh()
-    } catch (err) {
-      onError(parseApiError(err, 'failed to delete source'))
-      setConfirmingDelete(false)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  // Auto-cancel the confirm after a few seconds. Reset the timer on
-  // each new confirmation so a user who taps, waits, taps again gets
-  // a fresh window. ``useRef`` avoids re-firing the effect when only
-  // the timeout id changes.
-  useEffect(() => {
-    if (!confirmingDelete) return
-    const t = window.setTimeout(() => setConfirmingDelete(false), CONFIRM_TIMEOUT_MS)
-    return () => window.clearTimeout(t)
-  }, [confirmingDelete])
-
-  // Edit form local state — initialized from props so the user
-  // always sees the current row values, not stale defaults. Reset
-  // on each edit-start so cancelling a rename and starting again
-  // doesn't show the previously-typed (and rejected) values.
-  const [editName, setEditName] = useState(source.name)
-  const [editUrl, setEditUrl] = useState(source.url)
-  const [editCategory, setEditCategory] = useState(source.category)
-  // ``editHeaders`` is a JSON-string textarea. Empty string means
-  // "no override" (custom_headers column will be cleared on save);
-  // any non-empty value must parse to a ``str → str`` map. We keep
-  // it as a string rather than a parsed object because the user
-  // expects to see exactly what they typed, and showing parsed keys
-  // back to them in a different order would feel broken.
-  const [editHeaders, setEditHeaders] = useState(
-    source.custom_headers ? JSON.stringify(source.custom_headers) : '',
-  )
-  // Parse error from the last editHeaders change. Surfaced inline
-  // so the user sees why Save is disabled rather than getting a
-  // generic 422 on submit.
-  const [headersError, setHeadersError] = useState<string | null>(null)
-
-  // When edit mode opens, seed the inputs from the current row. Use
-  // an effect keyed on ``isEditing`` rather than re-deriving in the
-  // ``useState`` initializer because React only runs the initializer
-  // once — closing + reopening edit mode would otherwise show stale
-  // text from the previous edit.
-  useEffect(() => {
-    if (isEditing) {
-      setEditName(source.name)
-      setEditUrl(source.url)
-      setEditCategory(source.category)
-      setEditHeaders(
-        source.custom_headers ? JSON.stringify(source.custom_headers) : '',
-      )
-      setHeadersError(null)
-    }
-  }, [isEditing, source.name, source.url, source.category, source.custom_headers])
-
-  // Live-validate the headers textarea. Treat empty as "no override";
-  // for non-empty, try-parse and confirm it's a flat string→string map.
-  // We do this on every keystroke so the Save button can flip between
-  // enabled and disabled without a click round-trip.
-  const parsedHeaders = (() => {
-    if (!editHeaders.trim()) return { ok: true as const, value: null as Record<string, string> | null }
-    try {
-      const parsed = JSON.parse(editHeaders)
-      if (
-        typeof parsed !== 'object' ||
-        parsed === null ||
-        Array.isArray(parsed) ||
-        Object.entries(parsed).some(
-          ([k, v]) => typeof k !== 'string' || typeof v !== 'string',
-        )
-      ) {
-        return { ok: false as const, error: 'must be a flat {"Header": "value"} map' }
-      }
-      return { ok: true as const, value: parsed as Record<string, string> }
-    } catch {
-      return { ok: false as const, error: 'invalid JSON' }
-    }
-  })()
-  // Push the error string into state so the inline error renders,
-  // but only if it changed (avoids re-renders on every keystroke
-  // when the message is the same).
-  useEffect(() => {
-    const next = parsedHeaders.ok ? null : parsedHeaders.error
-    if (next !== headersError) setHeadersError(next)
-  }, [parsedHeaders.ok, parsedHeaders.error]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const saveEdit = async () => {
-    const nameChanged = editName.trim() !== source.name
-    const urlChanged = editUrl.trim() !== source.url
-    const categoryChanged = editCategory.trim() !== source.category
-    // Compare parsed headers against the source's current map. We
-    // parse the textarea first so trailing-whitespace differences
-    // don't accidentally trigger a no-op PATCH.
-    const headersChanged =
-      JSON.stringify(parsedHeaders.value ?? null) !==
-      JSON.stringify(source.custom_headers ?? null)
-    if (
-      !nameChanged &&
-      !urlChanged &&
-      !categoryChanged &&
-      !headersChanged
-    ) {
-      // Nothing to save — close the form so the user doesn't think
-      // the click was eaten by a bug.
-      onCancelEdit()
-      return
-    }
-    if (!parsedHeaders.ok) {
-      // Guard against the rare race where the user clicks Save with
-      // an invalid textarea. The button is disabled when not
-      // ``parsedHeaders.ok`` but we re-check here as a safety net.
-      return
-    }
-    setBusy(true)
-    try {
-      const body: {
-        name?: string
-        url?: string
-        category?: string
-        // ``null`` clears the column; an object sets/replaces it.
-        custom_headers?: Record<string, string> | null
-      } = {}
-      if (nameChanged) body.name = editName.trim()
-      if (urlChanged) body.url = editUrl.trim()
-      if (categoryChanged) body.category = editCategory.trim()
-      if (headersChanged) body.custom_headers = parsedHeaders.value
-      const updated = await api.updateSource(source.id, body)
-      const oldName = source.name
-      const newName = updated.name
-      await onRefresh()
-      if (nameChanged && oldName !== newName) {
-        // Bubble up so App can remap the active filter chip in the
-        // same render cycle as the refresh.
-        onRenamed?.(oldName, newName)
-      } else {
-        // No rename — close edit mode without triggering the remap.
-        onCancelEdit()
-      }
-    } catch (err) {
-      onError(parseApiError(err, 'failed to save changes'))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  if (isEditing) {
-    // Inline edit form — replaces the read-only row chrome while
-    // open. The fields mirror what's editable via PATCH (name +
-    // url + category). ``url`` is locked for built-ins because the
-    // backend rejects it with a 400 anyway; locking client-side
-    // avoids the user typing something that would just bounce.
-    return (
-      <div className={`px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0 space-y-2 ${busy ? 'opacity-60' : ''}`}>
-        <label className="block">
-          <span className="text-label-tertiary text-[11px] uppercase tracking-wide">name</span>
-          <input
-            type="text"
-            value={editName}
-            onChange={(e) => setEditName(e.target.value)}
-            disabled={busy || builtIn}
-            className="mt-0.5 w-full bg-bg-elevated border border-hairline rounded-ios px-2 py-1 text-ios-body text-label-primary disabled:opacity-50"
-            autoFocus
-            spellCheck={false}
-          />
-        </label>
-        <label className="block">
-          <span className="text-label-tertiary text-[11px] uppercase tracking-wide">url</span>
-          <input
-            type="url"
-            value={editUrl}
-            onChange={(e) => setEditUrl(e.target.value)}
-            disabled={busy || builtIn}
-            className="mt-0.5 w-full bg-bg-elevated border border-hairline rounded-ios px-2 py-1 text-ios-body text-label-primary disabled:opacity-50"
-            spellCheck={false}
-          />
-          {builtIn && (
-            <span className="block text-label-tertiary text-[10px] mt-0.5">
-              built-in — url is bound to the plugin
-            </span>
-          )}
-        </label>
-        <label className="block">
-          <span className="text-label-tertiary text-[11px] uppercase tracking-wide">category</span>
-          <input
-            type="text"
-            value={editCategory}
-            onChange={(e) => setEditCategory(e.target.value)}
-            disabled={busy}
-            className="mt-0.5 w-full bg-bg-elevated border border-hairline rounded-ios px-2 py-1 text-ios-body text-label-primary disabled:opacity-50"
-            list="feed-category-options"
-            spellCheck={false}
-          />
-          <datalist id="feed-category-options">
-            {CATEGORY_OPTIONS.map((c) => (
-              <option key={c} value={c} />
-            ))}
-          </datalist>
-        </label>
-        {/*
-          Custom HTTP headers. Hidden for built-ins — the URL is
-          locked too, and overriding headers on a built-in would
-          defeat the point of the static plugin contract. Empty
-          textarea means "use defaults"; non-empty must parse as a
-          flat str→str map. ``User-Agent`` is the only override
-          anyone realistically needs (CBC blocks our default UA),
-          but the textarea lets power users add e.g.
-          ``Accept-Language`` for region-gated feeds.
-        */}
-        {!builtIn && (
-          <label className="block">
-            <span className="text-label-tertiary text-[11px] uppercase tracking-wide">
-              custom headers (JSON)
-            </span>
-            <textarea
-              value={editHeaders}
-              onChange={(e) => setEditHeaders(e.target.value)}
-              disabled={busy}
-              rows={3}
-              spellCheck={false}
-              placeholder='{"User-Agent": "Mozilla/5.0 ..."}'
-              className="mt-0.5 w-full bg-bg-elevated border border-hairline rounded-ios px-2 py-1 text-ios-caption text-label-primary font-mono disabled:opacity-50"
-            />
-            {headersError && (
-              <span className="block text-red-400 text-[10px] mt-0.5">
-                {headersError}
-              </span>
-            )}
-            {!headersError && editHeaders.trim() && (
-              <span className="block text-label-tertiary text-[10px] mt-0.5">
-                sent on every fetch; clear to use defaults
-              </span>
-            )}
-          </label>
-        )}
-        <div className="flex items-center gap-2 pt-1">
-          <button
-            onClick={saveEdit}
-            disabled={busy || !parsedHeaders.ok}
-            className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
-          >
-            save
-          </button>
-          <button
-            onClick={onCancelEdit}
-            disabled={busy}
-            className="text-ios-caption text-label-secondary active:opacity-60 disabled:opacity-40"
-          >
-            cancel
-          </button>
-          {!builtIn && source.url !== editUrl && (
-            <span
-              className="text-ios-caption text-amber-400 ml-auto"
-              title="changing the url clears the cached favicon; the next ingest re-downloads"
-            >
-              ⚠ favicon resets
-            </span>
-          )}
-        </div>
-      </div>
-    )
-  }
-
+  const stale = isStale(source)
   return (
-    <div className={`px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0 ${busy ? 'opacity-60' : ''}`}>
-      <div className="flex items-center gap-2 min-w-0">
+    <div className="text-ios-caption border-b border-hairline">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="w-full min-h-[44px] flex items-center gap-2 min-w-0 text-left"
+      >
         {/* SourceIcon — colored-letter fallback when the favicon
-            hasn't landed yet. ``size={14}`` matches the original
-            w-3.5 h-3.5 img (14px). */}
+            hasn't landed yet. */}
         <SourceIcon src={source.favicon_path} name={source.name} size={14} />
         <span
-          className={`truncate font-medium ${
-            !source.active
-              ? 'text-label-secondary line-through'
-              : isStale(source)
-                ? 'text-label-secondary italic'
-                : 'text-label-primary'
+          className={`min-w-0 truncate text-ios-body font-medium ${
+            !source.active ? 'text-label-secondary line-through' : stale ? 'text-label-secondary italic' : 'text-label-primary'
           }`}
-          title={
-            isStale(source)
-              ? `last fetched ${timeAgo(source.last_fetch_at)} — refresh interval is ${refreshLabel(source.refresh_interval_seconds)}`
-              : undefined
-          }
         >
-          {source.name}
+          {sourceLabel(source.name)}
         </span>
-        <span className="text-label-tertiary shrink-0 text-[11px]">{source.category}</span>
-        {/* Auto-disabled chips take precedence over the plain
-            "paused" chip — the distinction matters: a paused source
-            is a user choice (no action needed); an auto-disabled
-            source has hit the scheduler's consecutive-failure
-            threshold and needs ``last_error`` review before a manual
-            re-enable is worthwhile. ``auto_disabled`` is computed on
-            the backend (``Source.auto_disabled``) so the frontend
-            doesn't have to know the threshold value. */}
+        <span
+          aria-hidden="true"
+          className={`ml-auto shrink-0 text-label-tertiary transition-transform ${open ? 'rotate-90' : ''}`}
+        >
+          ›
+        </span>
+      </button>
+      {/* Caption line, always shown: category, freshness, then status.
+          It sits under the name rather than beside it, so the name
+          keeps the width it needs on a phone; it wraps when long. */}
+      <div className="-mt-2 pb-2 pl-[22px] flex flex-wrap items-center gap-x-2 gap-y-0.5">
+        <span className="max-w-full truncate text-label-secondary">{categoryLabel(source.category)}</span>
+        <span className={stale ? 'text-amber-400' : 'text-label-tertiary'}>
+          updated {timeAgo(source.last_fetch_at)} · every {refreshLabel(source.refresh_interval_seconds)}
+        </span>
+        {/* Stopped by the scheduler (after repeated failures) reads
+            differently from paused by the user: the first needs a look
+            at the problem before resuming. */}
         {source.auto_disabled ? (
-          <span
-            className="text-ios-caption text-red-400 shrink-0"
-            title={
-              source.last_error
-                ? `auto-disabled after ${source.error_count} consecutive failures — last: ${source.last_error}`
-                : `auto-disabled after ${source.error_count} consecutive failures`
-            }
-          >
-            auto-disabled
-          </span>
+          <span className="shrink-0 text-red-300">stopped after {source.error_count} failed checks</span>
         ) : (
-          !source.active && (
-            <span className="text-ios-caption text-amber-400 shrink-0">paused</span>
-          )
+          !source.active && <span className="shrink-0 text-amber-400">paused</span>
         )}
-        {/* Quantitative error chip. ``error_count > 1`` shows the
-            number so the user can distinguish a chronic failure
-            (``⚠ 144``) from a one-off (``⚠`` alone is fine for
-            ``error_count === 1``). Gated on the count rather than
-            ``last_error`` truthiness so a source that recovered
-            between fetches but still has a nonzero counter doesn't
-            silently flash a warning. */}
-        {source.error_count > 0 && (
-          <span
-            className="text-ios-caption text-red-400 shrink-0"
-            title={
-              source.last_error
-                ? `${source.error_count} consecutive failure${source.error_count === 1 ? '' : 's'} — last: ${source.last_error}`
-                : `${source.error_count} consecutive failure${source.error_count === 1 ? '' : 's'}`
-            }
-          >
-            ⚠ {source.error_count > 1 ? source.error_count : ''}
-          </span>
+        {!source.auto_disabled && source.error_count > 0 && (
+          <span className="shrink-0 text-red-300">⚠ {source.error_count > 1 ? source.error_count : ''}</span>
         )}
-        {/* Net vote score — sum(thumb_up) - sum(thumb_down) across
-            every entry from this source. Omitted at exactly 0 (never
-            voted on, or an even split — neither is actionable) so
-            most rows stay quiet; only sources the user has a real
-            opinion on get a badge. Negative (a source they keep
-            downvoting) is the one worth surfacing loudly — red, with
-            the minus sign JS already gives negative numbers.
-            Positive gets a quieter green; there's no "clean this up"
-            action implied by a source the user likes. */}
+        {/* Net vote score across this feed's stories; only shown when
+            it isn't 0. Negative is the one worth noticing. */}
         {source.net_vote_score !== 0 && (
-          <span
-            className={`shrink-0 text-ios-caption font-semibold ${
-              source.net_vote_score < 0 ? 'text-red-400' : 'text-emerald-400'
-            }`}
-            title={`net vote score: ${source.net_vote_score > 0 ? '+' : ''}${source.net_vote_score} (thumbs up minus thumbs down across this source's entries)`}
-          >
+          <span className={`shrink-0 font-semibold ${source.net_vote_score < 0 ? 'text-red-300' : 'text-emerald-400'}`}>
             {source.net_vote_score > 0 ? '+' : ''}
             {source.net_vote_score}
-          </span>
-        )}
-      </div>
-      <div className="flex items-center gap-2 mt-1">
-        <button
-          onClick={toggleActive}
-          disabled={busy}
-          className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
-          aria-label={source.active ? 'pause source' : 'resume source'}
-        >
-          {source.active ? 'pause' : 'resume'}
-        </button>
-        <button
-          onClick={onStartEdit}
-          disabled={busy}
-          className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
-          aria-label={`edit ${source.name}`}
-        >
-          edit
-        </button>
-        {/* Last-fetched caption. Renders inline with the action
-            buttons so the user can read at-a-glance freshness
-            without hovering for a tooltip. ``text-label-tertiary``
-            keeps it secondary to the action affordances. Stale
-            sources get ``text-amber-400`` to flag the row without
-            using up another glyph in the title row. */}
-        <span
-          className={`text-ios-caption text-label-tertiary ${
-            isStale(source) ? 'text-amber-400' : ''
-          }`}
-          title={
-            source.last_fetch_at
-              ? `last fetch: ${new Date(source.last_fetch_at).toLocaleString()}`
-              : 'never fetched'
-          }
-        >
-          · fetched {timeAgo(source.last_fetch_at)}
-        </span>
-        {isEditingInterval ? (
-          <select
-            value={source.refresh_interval_seconds}
-            onChange={(e) => setInterval(Number(e.target.value))}
-            disabled={busy}
-            className="text-ios-caption rounded-ios bg-bg-elevated border border-hairline px-1 py-0.5 text-label-primary"
-            aria-label="refresh interval"
-          >
-            {REFRESH_PRESETS.map((p) => (
-              <option key={p.value} value={p.value}>
-                every {p.label}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <button
-            onClick={onStartEditInterval}
-            disabled={busy}
-            className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
-            aria-label="edit refresh interval"
-          >
-            every {refreshLabel(source.refresh_interval_seconds)}
-          </button>
-        )}
-        {isEditingInterval && (
-          <button
-            onClick={onCancelEditInterval}
-            disabled={busy}
-            className="text-ios-caption text-label-secondary active:opacity-60 disabled:opacity-40"
-          >
-            cancel
-          </button>
-        )}
-        {/* Fetch-now button. Power-user affordance: force an
-            immediate ingest without waiting for the next scheduler
-            tick. The backend's POST /api/ingest/{name} endpoint
-            returns the same ``IngestResult`` shape, so we surface
-            the row + inserted counts in a toast. We sit the button
-            to the LEFT of the delete button (which is ``ml-auto``)
-            so the destructive action stays at the far right. */}
-        {!confirmingDelete && (
-          <button
-            onClick={async () => {
-              setBusy(true)
-              try {
-                const r = await api.ingest(source.name)
-                if (r.error) {
-                  toast(`${source.name}: ${r.error}`, 'error')
-                } else {
-                  toast(
-                    `Fetched ${r.fetched} from ${r.source}` +
-                      (r.inserted > 0 ? ` (${r.inserted} new)` : ''),
-                    'info',
-                  )
-                }
-                await onRefresh()
-              } catch (err) {
-                onError(parseApiError(err, 'fetch failed'))
-              } finally {
-                setBusy(false)
-              }
-            }}
-            disabled={busy}
-            className="text-ios-caption text-accent active:opacity-60 disabled:opacity-40"
-            aria-label={`fetch ${source.name} now`}
-          >
-            fetch
-          </button>
-        )}
-        {!confirmingDelete && (
-          <button
-            onClick={() => setConfirmingDelete(true)}
-            disabled={busy}
-            className="ml-auto text-ios-caption text-red-400 active:opacity-60 disabled:opacity-40"
-            aria-label={`delete ${source.name}`}
-          >
-            delete
-          </button>
-        )}
-        {confirmingDelete && (
-          <>
-            <button
-              onClick={onDelete}
-              disabled={busy}
-              className="ml-auto text-ios-caption text-red-400 active:opacity-60 disabled:opacity-40 font-semibold"
-              aria-label={`confirm delete ${source.name}`}
-            >
-              confirm delete
-            </button>
-            <button
-              onClick={() => setConfirmingDelete(false)}
-              disabled={busy}
-              className="text-ios-caption text-label-secondary active:opacity-60 disabled:opacity-40"
-              aria-label={`cancel delete ${source.name}`}
-            >
-              cancel
-            </button>
-          </>
-        )}
-        {builtIn && !confirmingDelete && (
-          <span
-            className="text-ios-caption text-label-tertiary"
-            title="built-in source — url/name are locked to the plugin. Deleting it is permanent."
-          >
-            built-in
           </span>
         )}
       </div>
@@ -939,12 +351,16 @@ type Recommendation = {
 }
 
 function RecommendedTab({
+  sources,
   existingNames,
   onAdded,
+  onCreated,
   onError,
 }: {
+  sources: Source[]
   existingNames: Set<string>
   onAdded: () => Promise<void>
+  onCreated: OnCreated
   onError: (msg: string) => void
 }) {
   const [recs, setRecs] = useState<Recommendation[] | null>(null)
@@ -987,12 +403,13 @@ function RecommendedTab({
     setDiscoverMsg(null)
     try {
       const result = await api.discoverFeeds()
+      const where = categoryLabel(result.category)
       setDiscoverMsg(
         result.added > 0
-          ? `found ${result.added} new feed${result.added === 1 ? '' : 's'} in ${result.category}`
+          ? `Found ${result.added} new feed${result.added === 1 ? '' : 's'} for ${where}`
           : result.note
-            ? `couldn't find feeds for ${result.category}: ${result.note}`
-            : `nothing new found for ${result.category} this time`,
+            ? `No new feeds for ${where}: ${result.note}`
+            : `Nothing new for ${where} this time`,
       )
       if (result.added > 0) await fetchRecs()
     } catch (err) {
@@ -1012,11 +429,14 @@ function RecommendedTab({
     // interval on first list refresh, before the backend's
     // response comes back.
     const isReddit = rec.type === 'reddit'
+    // An existing spelling of the category ("News") is reused, so the
+    // feed joins that column instead of starting a second one.
+    const category = resolveCategory(rec.category, sources)
     try {
-      await api.createSource({
+      const row = await api.createSource({
         name: rec.name,
         type: rec.type ?? 'rss',
-        category: rec.category,
+        category,
         url: rec.url,
         refresh_interval_seconds: isReddit ? 900 : 3600,
         // Recommendation-supplied header overrides (e.g. CBC's
@@ -1026,12 +446,13 @@ function RecommendedTab({
         // backend default (empty map → use source-plugin defaults).
         custom_headers: rec.default_headers ?? undefined,
       })
+      onCreated(row, `Added ${sourceLabel(rec.name)} to ${categoryLabel(category)}`)
       await onAdded()
       // Optimistically remove from the local list so the row
       // disappears immediately rather than after the next refresh.
       setRecs((prev) => (prev ? prev.filter((r) => r.name !== rec.name) : prev))
     } catch (err) {
-      onError(parseApiError(err, `failed to add ${rec.name}`))
+      toast(`Couldn't add ${sourceLabel(rec.name)}: ${fieldSaveMessage(err, 'name', rec.name, sourceLabel)}`, 'error')
     } finally {
       setAdding(null)
     }
@@ -1042,16 +463,16 @@ function RecommendedTab({
   // the curated pool is fully added (the most likely time they'd
   // actually want it).
   const findMoreHeader = (
-    <div className="px-3 pt-1 pb-2 flex items-center gap-2 border-b border-hairline">
+    <div className="pt-1 pb-2 flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-hairline">
       <button
         onClick={findMore}
         disabled={discovering}
-        className="shrink-0 min-h-[28px] rounded-ios border border-accent text-accent active:opacity-60 disabled:opacity-40 px-2 py-0.5 text-ios-caption"
+        className="shrink-0 min-h-[44px] rounded-ios border border-accent text-accent active:opacity-60 disabled:opacity-40 px-3 text-ios-caption"
       >
-        {discovering ? 'looking…' : '🔎 find more feeds'}
+        {discovering ? 'Looking…' : '🔎 Find more feeds'}
       </button>
       {discoverMsg && (
-        <span className="text-ios-caption text-label-tertiary truncate">{discoverMsg}</span>
+        <span className="min-w-0 text-ios-caption text-label-tertiary break-words">{discoverMsg}</span>
       )}
     </div>
   )
@@ -1060,7 +481,7 @@ function RecommendedTab({
     return (
       <>
         {findMoreHeader}
-        <p className="text-ios-body text-label-secondary italic px-3 py-2">loading…</p>
+        <p className="text-ios-body text-label-secondary italic py-2">Loading…</p>
       </>
     )
   }
@@ -1068,8 +489,8 @@ function RecommendedTab({
     return (
       <>
         {findMoreHeader}
-        <p className="text-ios-body text-label-secondary italic px-3 py-2">
-          you've added all the recommended feeds — try Find more feeds or the Add custom tab
+        <p className="text-ios-body text-label-secondary italic py-2">
+          You've added every suggested feed. Try Find more feeds, or the Add tab.
         </p>
       </>
     )
@@ -1081,29 +502,26 @@ function RecommendedTab({
         {recs.map((r) => (
           <li
             key={r.name}
-            className="px-3 py-2 text-ios-caption border-b border-hairline last:border-b-0"
+            className="py-2 text-ios-caption border-b border-hairline last:border-b-0"
           >
             <div className="flex items-center gap-2 min-w-0">
-              <span className="truncate font-medium text-label-primary">{r.name}</span>
-              <span className="text-label-tertiary shrink-0 text-[11px]">{r.category}</span>
+              <span className="min-w-0 truncate text-ios-body font-medium text-label-primary">{sourceLabel(r.name)}</span>
+              <span className="text-label-tertiary shrink-0 text-[11px]">{categoryLabel(r.category)}</span>
               {r.source === 'llm' && (
-                <span
-                  className="shrink-0 inline-flex items-center rounded-full bg-accent-soft px-1.5 text-[10px] uppercase tracking-wide text-accent"
-                  title="found via AI feed discovery"
-                >
+                <span className="shrink-0 inline-flex items-center rounded-full bg-accent-soft px-1.5 text-[11px] uppercase tracking-wide text-accent">
                   found for you
                 </span>
               )}
               <button
                 onClick={() => add(r)}
                 disabled={adding === r.name}
-                className="ml-auto shrink-0 min-h-[28px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white px-2 py-0.5 text-ios-caption"
-                aria-label={`add ${r.name}`}
+                className="ml-auto shrink-0 min-h-[44px] min-w-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white px-3 text-ios-caption"
+                aria-label={`add ${sourceLabel(r.name)}`}
               >
-                {adding === r.name ? 'adding…' : 'Add'}
+                {adding === r.name ? 'Adding…' : 'Add'}
               </button>
             </div>
-            <p className="text-ios-caption text-label-secondary mt-0.5">{r.blurb}</p>
+            <p className="text-ios-caption text-label-secondary mt-0.5 break-words">{r.blurb}</p>
           </li>
         ))}
       </ul>
@@ -1112,24 +530,36 @@ function RecommendedTab({
 }
 
 // ---------------------------------------------------------------------------
-// Auto feed — one URL in, one source out. Sits above the manual
-// "Add custom" form as a shortcut: paste any site's URL (not
-// necessarily a feed URL) and the backend finds its real feed, or
-// falls back to periodic sitemap-based scraping if it doesn't have
-// one. Deliberately its own tiny form with its own state — a true
-// one-click flow, not a "prefill the manual form and let the user
-// review" step, matching what was asked for ("I put in a url, and it
-// goes and finds the RSS feed automatically then adds it"). The
-// resulting source's name is auto-derived from the feed's hostname;
-// rename it afterward from the row list like any other source.
+// Auto feed — one link in, one source out. Sits above the manual form
+// as a shortcut: paste any site's link (not necessarily a feed) and the
+// backend finds its real feed, or falls back to checking the page for
+// new articles if it has none. YouTube links, @handles and channel IDs
+// go to the backend's YouTube branch; a subreddit or an Apple Podcasts
+// page fills in the form below instead, since those need its type.
+// The source's name comes from the link; rename it afterward from the
+// row list like any other source.
 // ---------------------------------------------------------------------------
 
+type FeedType = 'rss' | 'reddit' | 'podcast' | 'youtube_channel' | 'generic_scrape'
+
+// An existing spelling of a default category ("Video", "News") is
+// reused, so a new feed doesn't start a second column with the same
+// label (columns group by the stored string).
+function resolveCategory(category: string, sources: Source[]): string {
+  const r = resolveNewCategory(category, sources.map((s) => s.category), CATEGORY_OPTIONS, categoryLabel)
+  return r.ok ? r.value : category
+}
+
 function AutoFeedBlock({
+  sources,
   onAdded,
-  onError,
+  onCreated,
+  onPrefill,
 }: {
+  sources: Source[]
   onAdded: () => Promise<void>
-  onError: (msg: string) => void
+  onCreated: OnCreated
+  onPrefill: (type: 'reddit' | 'podcast', url: string) => void
 }) {
   const [autoUrl, setAutoUrl] = useState('')
   const [autoSubmitting, setAutoSubmitting] = useState(false)
@@ -1141,18 +571,14 @@ function AutoFeedBlock({
   const [autoMessage, setAutoMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
   const trackAnyway = async () => {
-    const trimmed = autoUrl.trim()
+    const trimmed = normalizeFeedInput('generic_scrape', autoUrl)
     if (!trimmed) return
     setTrackSubmitting(true)
     try {
-      // Mirror the backend's ``_slugify_hostname`` so the
-      // auto-derived name matches what the manual form's
-      // ``Auto Feed`` path would have produced for the same
-      // URL. The backend's ``_free_source_name`` de-duplicates
-      // against existing rows and built-in plugin names —
-      // relying on it here means a user clicking "Track anyway"
-      // on the same URL twice gets the existing row, not a
-      // duplicate.
+      // Mirror the backend's ``_slugify_hostname`` so the name
+      // matches what Auto-add would have produced for the same
+      // link, then step past names already taken (POST answers 409
+      // on a duplicate name).
       const host = (() => {
         try {
           return new URL(trimmed).hostname || 'site'
@@ -1160,19 +586,24 @@ function AutoFeedBlock({
           return 'site'
         }
       })().toLowerCase().replace(/^www\./, '')
-      const name = (host.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'site').slice(0, 100)
-      await api.createSource({
+      const base = (host.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'site').slice(0, 100)
+      const taken = new Set(sources.map((s) => s.name))
+      let name = base
+      for (let n = 2; taken.has(name); n++) name = `${base}_${n}`
+      const category = resolveCategory('news', sources)
+      const row = await api.createSource({
         name,
         type: 'generic_scrape',
-        category: 'news',
+        category,
         url: trimmed,
+        refresh_interval_seconds: 7200,
       })
-      toast(`Tracking: ${name} — scraping for new articles`, 'info')
+      onCreated(row, `Added ${sourceLabel(name)} to ${categoryLabel(category)}. Popping will check the page for new articles.`)
       setAutoUrl('')
       setAutoMessage(null)
       await onAdded()
     } catch (err) {
-      onError(parseApiError(err, 'failed to add scrape source'))
+      setAutoMessage({ kind: 'err', text: fieldSaveMessage(err, 'url', trimmed, sourceLabel) })
     } finally {
       setTrackSubmitting(false)
     }
@@ -1181,28 +612,42 @@ function AutoFeedBlock({
   const autoAdd = async () => {
     const trimmed = autoUrl.trim()
     if (!trimmed) {
-      setAutoMessage({ kind: 'err', text: 'paste a URL first' })
+      setAutoMessage({ kind: 'err', text: 'Paste a link first.' })
+      return
+    }
+    const kind = classifyPaste(trimmed)
+    if (kind === 'reddit' || kind === 'podcast') {
+      onPrefill(kind, trimmed)
+      setAutoUrl('')
+      setAutoMessage(null)
       return
     }
     setAutoSubmitting(true)
     setAutoMessage(null)
     try {
-      const result = await api.autoAddSource(trimmed)
-      if (result.found && result.source) {
-        const note = result.kind === 'generic_scrape'
-          ? ' — no native feed found, tracking via periodic scraping instead'
-          : ''
-        toast(`Feed added: ${result.source.name}${note}`, 'info')
+      const result =
+        kind === 'youtube'
+          ? await api.autoAddSource(trimmed, resolveCategory('video', sources))
+          : await api.autoAddSource(normalizeFeedInput('rss', trimmed), resolveCategory('other', sources))
+      const added = result.found ? result.source : null
+      if (added) {
+        const label = sourceLabel(added.name)
+        if (sources.some((s) => s.id === added.id)) {
+          onCreated(added, `Already added: ${label}`)
+        } else {
+          const note = result.kind === 'generic_scrape' ? '. It has no feed, so Popping will check the page for new articles.' : ''
+          onCreated(added, `Added ${label} to ${categoryLabel(added.category)}${note}`)
+        }
         setAutoUrl('')
         await onAdded()
       } else {
         setAutoMessage({
           kind: 'err',
-          text: "couldn't find a feed (or anything scrapeable) at that URL",
+          text: "Popping couldn't find a feed or a page list at that address.",
         })
       }
     } catch (err) {
-      onError(parseApiError(err, 'auto feed failed'))
+      setAutoMessage({ kind: 'err', text: fieldSaveMessage(err, 'url', trimmed, sourceLabel) })
     } finally {
       setAutoSubmitting(false)
     }
@@ -1215,12 +660,18 @@ function AutoFeedBlock({
         <span className="text-ios-caption uppercase tracking-wide text-label-tertiary">Auto feed</span>
       </div>
       <p className="text-ios-caption text-label-secondary">
-        Paste any site's URL — we'll find its RSS feed automatically, or track it via
-        periodic scraping if it doesn't have one.
+        Paste any site's link. Popping finds its feed, or checks the page for new articles if it has none. YouTube
+        links, @handles and channel IDs work too.
       </p>
       <div className="flex items-center gap-2">
         <input
-          type="text"
+          type="url"
+          inputMode="url"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          enterKeyHint="go"
+          aria-label="link to add"
           value={autoUrl}
           onChange={(e) => setAutoUrl(e.target.value)}
           onKeyDown={(e) => {
@@ -1231,36 +682,35 @@ function AutoFeedBlock({
           }}
           placeholder="https://example.com"
           disabled={autoSubmitting}
-          className="flex-1 min-h-[36px] rounded-ios bg-bg-surface border border-hairline px-2 text-label-primary placeholder:text-label-tertiary disabled:opacity-50"
+          className="flex-1 min-w-0 min-h-[44px] rounded-ios bg-bg-surface border border-hairline px-3 text-ios-body text-label-primary placeholder:text-label-tertiary disabled:opacity-50"
         />
         <button
           type="button"
           onClick={() => void autoAdd()}
           disabled={autoSubmitting}
-          className="shrink-0 min-h-[36px] rounded-ios bg-accent text-white px-3 text-ios-caption font-medium active:opacity-70 disabled:opacity-40"
+          className="shrink-0 min-h-[44px] rounded-ios bg-accent text-white px-3 text-ios-caption font-medium active:opacity-70 disabled:opacity-40"
         >
           {autoSubmitting ? 'Looking…' : 'Auto-add'}
         </button>
       </div>
       {autoMessage && (
         <div className="space-y-2">
-          <p className={`text-ios-caption ${autoMessage.kind === 'err' ? 'text-red-400' : 'text-label-secondary'}`}>
+          <p className={`text-ios-caption break-words ${autoMessage.kind === 'err' ? 'text-red-300' : 'text-label-secondary'}`}>
             {autoMessage.text}
           </p>
           {autoMessage.kind === 'err' &&
             autoMessage.text.includes("couldn't find a feed") && (
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <button
                   type="button"
                   onClick={() => void trackAnyway()}
                   disabled={trackSubmitting || !autoUrl.trim()}
-                  className="shrink-0 min-h-[32px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-caption font-medium text-label-primary active:opacity-70 disabled:opacity-40"
-                  title="Add this URL as a generic_scrape source: the dashboard will periodically fetch it and extract new articles via its sitemap, even though no RSS feed exists."
+                  className="shrink-0 min-h-[44px] rounded-ios bg-bg-surface border border-hairline px-3 text-ios-caption font-medium text-label-primary active:opacity-70 disabled:opacity-40"
                 >
                   {trackSubmitting ? 'Tracking…' : 'Track this URL anyway'}
                 </button>
                 <span className="text-ios-caption text-label-tertiary">
-                  adds a scrape source instead
+                  Popping checks the page for new articles instead
                 </span>
               </div>
             )}
@@ -1271,32 +721,62 @@ function AutoFeedBlock({
 }
 
 // ---------------------------------------------------------------------------
-// Add custom — paste-a-URL form
+// Add — the manual form
 // ---------------------------------------------------------------------------
 
+// Types whose fetcher sends custom headers; subreddits ignore them.
+const HEADER_TYPES: FeedType[] = ['rss', 'podcast', 'youtube_channel', 'generic_scrape']
+
+// A Test whose YouTube lookup worked but whose feed fetch didn't.
+const YOUTUBE_FEED_DOWN_KINDS = ['not_found', 'timeout', 'network_error', 'unknown']
+
+type TestOutcome = {
+  kind: 'ok' | 'err'
+  message: string
+  itemCount?: number
+  sampleTitles?: string[]
+  // The feed the server resolved the link to (a YouTube channel or
+  // playlist, an Apple Podcasts show). Add sends it, so the server
+  // doesn't look the link up a second time.
+  resolvedUrl?: string
+}
+
+const fieldClass =
+  'w-full min-h-[44px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-body text-label-primary placeholder:text-label-tertiary'
+const labelClass = 'block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1'
+const radioLabelClass = 'flex items-center gap-2 min-h-[44px] text-ios-body text-label-primary'
+
+function isWebAddress(v: string): boolean {
+  try {
+    const u = new URL(v)
+    return u.protocol === 'http:' || u.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
 function AddCustomTab({
+  sources,
   onAdded,
-  onError,
+  onCreated,
 }: {
+  sources: Source[]
   onAdded: () => Promise<void>
-  onError: (msg: string) => void
+  onCreated: OnCreated
 }) {
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [category, setCategory] = useState('news')
+  // The category picker lists categories in tab order.
+  const tabOrder = usePreferences().state.categoryLayout?.order
   const [refresh, setRefresh] = useState<number>(3600)
-  // Subtype selector — drives both the URL placeholder/label and the
-  // client-side validation. ``"rss"`` (default) takes a feed URL;
-  // ``"reddit"`` takes a subreddit reference (``r/python`` or full
-  // ``https://www.reddit.com/r/python``); ``"podcast"`` also takes a
-  // feed URL (podcast feeds are RSS-shaped — the backend extracts
-  // the episode audio + duration from the same fetch); ``"youtube_channel"``
-  // takes any shape of YouTube link (channel, handle, custom, or
-  // video URL) — the backend resolves it to the channel's video RSS
-  // feed the same way it resolves Apple Podcasts show pages. The
-  // backend applies the same dispatch in
-  // ``routes/sources.create_source_endpoint`` so the field reaches
-  // ``POST /api/sources`` as ``type``.
+  // Subtype selector — drives the address label, the validation and
+  // the request. ``"rss"`` (default) takes a feed URL; ``"reddit"`` a
+  // subreddit reference (``r/python`` or a reddit.com/r/python link);
+  // ``"podcast"`` a podcast feed or an Apple Podcasts show page;
+  // ``"youtube_channel"`` any YouTube link, @handle or channel ID,
+  // which the backend resolves to the channel's video feed;
+  // ``"generic_scrape"`` a page without a feed.
   const [sourceType, setSourceType] = useState<
     'rss' | 'reddit' | 'podcast' | 'youtube_channel' | 'generic_scrape'
   >('rss')
@@ -1311,73 +791,98 @@ function AddCustomTab({
   const [sitemapUrl, setSitemapUrl] = useState('')
   const [linkPattern, setLinkPattern] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  // Test step. ``testing`` is true while the request is in flight;
-  // ``testResult`` holds the last result so the user can see
-  // "Looks good (42 items)" until they edit the form again. The
-  // result auto-clears on any form change so the user doesn't
-  // accidentally trust a stale result after editing the URL.
+  // Test step. ``testResult`` holds the last result so the user can
+  // see it until they edit the form again; it clears on any change to
+  // the name, address or type so a stale "Looks good" isn't trusted.
   const [testing, setTesting] = useState(false)
-  const [testResult, setTestResult] = useState<{
-    kind: 'ok' | 'err'
-    message: string
-    itemCount?: number
-    sampleTitles?: string[]
-    // Set when the tested URL was an Apple Podcasts show page the
-    // backend resolved to its real feed URL. We don't rewrite the
-    // ``url`` field's own state to match — doing so would trip the
-    // "clear stale test result on any form change" effect below and
-    // wipe this very result out from under itself. Add already
-    // resolves the same way server-side, so the row that gets
-    // created uses the real feed URL regardless of what's still
-    // showing in the input.
-    resolvedUrl?: string
-  } | null>(null)
-  // Inline validation state mirrors the submit validator. ``urlError``
-  // and ``nameError`` show why Test / Add are disabled; they clear
-  // as soon as the form is fixed.
+  const [testResult, setTestResult] = useState<TestOutcome | null>(null)
+  // Inline validation, shown under each field. The address error
+  // waits until the field has been left once, so it doesn't nag
+  // while the address is being typed.
   const [urlError, setUrlError] = useState<string | null>(null)
   const [nameError, setNameError] = useState<string | null>(null)
+  const [urlTouched, setUrlTouched] = useState(false)
+  // True while the New-category field holds text not yet added. Add
+  // waits, or the feed would land in the previous category.
+  const [categoryDraft, setCategoryDraft] = useState(false)
+  const [headersOpen, setHeadersOpen] = useState(false)
+  const [headers, setHeaders] = useState<HeaderMap | null>(null)
+  const [headersOk, setHeadersOk] = useState(true)
+  // Bumped to start the headers over (after Add, or on Subreddit).
+  const [headersKey, setHeadersKey] = useState(0)
+  const formRef = useRef<HTMLFormElement>(null)
 
-  // Shared validator. Returns ``null`` on success, an error
-  // string on failure. ``validateForm`` is called by both
-  // ``submit`` and ``test`` so the form's "Add" and "Test" buttons
-  // share the same input rules.
-  const validateForm = (): string | null => {
-    const trimmedName = name.trim().toLowerCase()
-    const trimmedUrl = url.trim()
-    if (!trimmedName) return 'name is required'
-    if (!/^[a-z0-9_]{1,120}$/.test(trimmedName)) {
-      return 'name must be lowercase letters, digits, or underscore (1-120 chars)'
+  const existingNames = useMemo(() => new Set(sources.map((s) => s.name)), [sources])
+  const takesHeaders = HEADER_TYPES.includes(sourceType)
+  const headersBlocked = takesHeaders && !headersOk
+  const normalized = normalizeFeedInput(sourceType, url)
+  const suggested = name.trim() ? null : suggestName(sourceType, normalized, existingNames, testResult?.resolvedUrl)
+
+  const chooseType = (t: FeedType) => {
+    setSourceType(t)
+    // Picking "Podcast" or "YouTube" bumps the refresh default to 6h
+    // (episodes and videos are infrequent; see _PODCAST_DEFAULT_REFRESH
+    // and _YOUTUBE_DEFAULT_REFRESH on the backend) unless the user has
+    // already changed it from the plain-RSS default. 2h is the
+    // backend default for generic_scrape: one poll can mean several
+    // page fetches.
+    if (t === 'rss') {
+      if (refresh === PODCAST_DEFAULT_REFRESH) setRefresh(3600)
+    } else if (t === 'reddit') {
+      if (refresh === PODCAST_DEFAULT_REFRESH) setRefresh(900)
+      setHeaders(null)
+      setHeadersOk(true)
+      setHeadersOpen(false)
+      setHeadersKey((k) => k + 1)
+    } else if (t === 'podcast') {
+      if (refresh === 3600) setRefresh(PODCAST_DEFAULT_REFRESH)
+      if (category === 'news') setCategory(resolveCategory('podcast', sources))
+    } else if (t === 'youtube_channel') {
+      if (refresh === 3600) setRefresh(YOUTUBE_DEFAULT_REFRESH)
+      if (category === 'news') setCategory(resolveCategory('video', sources))
+    } else if (t === 'generic_scrape') {
+      if (refresh === 3600 || refresh === PODCAST_DEFAULT_REFRESH) setRefresh(7200)
     }
-    if (!trimmedUrl) return 'url is required'
+  }
+
+  // Auto feed handed over a subreddit or an Apple Podcasts link.
+  const prefill = (t: 'reddit' | 'podcast', link: string) => {
+    chooseType(t)
+    setUrl(link)
+    requestAnimationFrame(() => formRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }))
+  }
+
+  // Shared validator for Test and Add. Returns ``null`` on success,
+  // the message to show on failure.
+  const validateForm = (): string | null => {
+    const trimmedUrl = normalizeFeedInput(sourceType, url)
+    if (cleanDisplayName(name).length > 120) return 'Keep the name to 120 characters or fewer.'
+    if (!trimmedUrl) return sourceType === 'reddit' ? 'Type a subreddit, like r/python.' : 'Paste the address first.'
     if (
       sourceType === 'rss' ||
       sourceType === 'podcast' ||
       sourceType === 'youtube_channel' ||
       sourceType === 'generic_scrape'
     ) {
-      try {
-        new URL(trimmedUrl)
-      } catch {
-        return 'url is not a valid URL'
+      if (!isWebAddress(trimmedUrl)) {
+        return sourceType === 'youtube_channel'
+          ? 'Paste a channel link, video link, @handle or channel ID.'
+          : 'Use a web address that starts with https://'
       }
     } else if (sourceType === 'reddit') {
-      if (trimmedUrl.length < 3) {
-        return 'enter a subreddit like r/python or a full reddit.com/r/python URL'
-      }
+      if (trimmedUrl.length < 3) return 'Type a subreddit, like r/python.'
     }
     return null
   }
 
   // Re-validate on every form change so the Add / Test buttons
-  // reflect whether the form is submittable. Errors are surfaced
-  // inline below the field (not via toast) — toasts are for
-  // action confirmations, not "this field is empty."
+  // reflect whether the form is submittable. Errors show under the
+  // field (not as a toast): toasts are for confirmations.
   useEffect(() => {
-    setNameError(name.trim() ? null : 'name is required')
-    const trimmedUrl = url.trim()
+    setNameError(cleanDisplayName(name).length > 120 ? 'Keep it to 120 characters or fewer.' : null)
+    const trimmedUrl = normalizeFeedInput(sourceType, url)
     if (!trimmedUrl) {
-      setUrlError('url is required')
+      setUrlError(null)
     } else if (
       sourceType === 'rss' ||
       sourceType === 'podcast' ||
@@ -1385,13 +890,17 @@ function AddCustomTab({
       sourceType === 'generic_scrape'
     ) {
       try {
-        new URL(trimmedUrl)
-        setUrlError(null)
+        const parsed = new URL(trimmedUrl)
+        setUrlError(parsed.protocol === 'http:' || parsed.protocol === 'https:' ? null : 'Use a web address that starts with https://')
       } catch {
-        setUrlError('url is not a valid URL')
+        setUrlError(
+          sourceType === 'youtube_channel'
+            ? 'Paste a channel link, video link, @handle or channel ID.'
+            : 'Use a web address that starts with https://',
+        )
       }
     } else if (sourceType === 'reddit') {
-      setUrlError(trimmedUrl.length < 3 ? 'enter a subreddit like r/python' : null)
+      setUrlError(trimmedUrl.length < 3 ? 'Type a subreddit, like r/python.' : null)
     } else {
       setUrlError(null)
     }
@@ -1400,32 +909,100 @@ function AddCustomTab({
     setTestResult(null)
   }, [name, url, sourceType])
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault()
+  // Probe the address with the same plugin Add would use, no DB
+  // write. Returns the outcome too, so Add can wait on it.
+  const test = async (): Promise<TestOutcome | null> => {
+    setUrlTouched(true)
     const err = validateForm()
     if (err) {
-      onError(err)
+      setTestResult({ kind: 'err', message: err })
+      return null
+    }
+    setTesting(true)
+    setTestResult(null)
+    let outcome: TestOutcome
+    try {
+      const typedSlug = normalizeName(cleanDisplayName(name))
+      const result = await api.testSource({
+        name: typedSlug || undefined,
+        type: sourceType,
+        category,
+        url: normalizeFeedInput(sourceType, url),
+        ...(takesHeaders && headers ? { custom_headers: headers } : {}),
+      })
+      const resolvedUrl = result.resolved_url ?? undefined
+      if (result.ok) {
+        const n = result.item_count ?? 0
+        outcome = {
+          kind: 'ok',
+          message: `Looks good: found ${n} recent item${n === 1 ? '' : 's'}.`,
+          itemCount: n,
+          sampleTitles: result.sample_titles,
+          resolvedUrl,
+        }
+      } else if (sourceType === 'youtube_channel' && resolvedUrl && YOUTUBE_FEED_DOWN_KINDS.includes(result.error_kind ?? 'unknown')) {
+        outcome = {
+          kind: 'err',
+          message: "Found the channel, but YouTube's feed isn't answering right now. You can add it anyway; Popping will keep checking.",
+          resolvedUrl,
+        }
+      } else {
+        outcome = { kind: 'err', message: friendlyTestError(result.error_kind, result.error, sourceLabel), resolvedUrl }
+      }
+    } catch (e) {
+      outcome = { kind: 'err', message: fieldSaveMessage(e, 'url', url, sourceLabel) }
+    } finally {
+      setTesting(false)
+    }
+    setTestResult(outcome)
+    return outcome
+  }
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setUrlTouched(true)
+    if (categoryDraft || headersBlocked) return
+    const err = validateForm()
+    if (err) {
+      setTestResult({ kind: 'err', message: err })
       return
     }
     setSubmitting(true)
+    let sendUrl = normalized
     try {
-      const trimmedName = name.trim().toLowerCase()
-      const trimmedUrl = url.trim()
+      let outcome = testResult
+      // The typed name is shown as typed; the feed's internal id is
+      // derived from it (or from the address) and never shown.
+      const displayName = cleanDisplayName(name)
+      const typedSlug = normalizeName(displayName).slice(0, 100)
+      let feedName = typedSlug
+        ? uniqueSlug(typedSlug, existingNames)
+        : suggested ?? suggestName(sourceType, normalized, existingNames, testResult?.resolvedUrl)
+      if (!feedName) {
+        // A YouTube video link or a non-Latin handle: the name comes
+        // from the channel, which Test looks up.
+        outcome = await test()
+        if (!outcome?.resolvedUrl) return
+        feedName = suggestName(sourceType, normalized, existingNames, outcome.resolvedUrl)
+        if (!feedName) {
+          setTestResult({ kind: 'err', message: 'Type a name for this feed.' })
+          return
+        }
+      }
+      sendUrl = outcome?.resolvedUrl ?? normalized
       // Slice 20: only send the discovery hints when type='generic_scrape'
-      // (other types ignore them server-side). Empty-string values are
-      // coerced to undefined so the backend sees a missing field and
-      // leaves the column NULL — the legacy ``Source.sitemap_url`` /
-      // ``Source.link_pattern`` columns default to NULL for non-scrapes
-      // and that's the right semantics for a "use the default discovery"
-      // intent.
+      // (other types ignore them server-side). Empty values are left out
+      // so the backend leaves the columns NULL (= default discovery).
       const trimmedSitemapUrl = sitemapUrl.trim()
       const trimmedLinkPattern = linkPattern.trim()
-      await api.createSource({
-        name: trimmedName,
+      const row = await api.createSource({
+        name: feedName,
+        ...(displayName ? { display_name: displayName } : {}),
         type: sourceType,
         category,
-        url: trimmedUrl,
+        url: sendUrl,
         refresh_interval_seconds: refresh,
+        ...(takesHeaders && headers ? { custom_headers: headers } : {}),
         ...(sourceType === 'generic_scrape' && trimmedSitemapUrl
           ? { sitemap_url: trimmedSitemapUrl }
           : {}),
@@ -1433,198 +1010,115 @@ function AddCustomTab({
           ? { link_pattern: trimmedLinkPattern }
           : {}),
       })
-      // Success — celebrate with a toast. The toast stays for the
-      // standard 1.5s but the user can keep typing / closing the
-      // Settings overlay; the toast is purely confirmatory.
-      toast(`Feed Added: ${trimmedName}`, 'info')
+      onCreated(row, `Added ${displayName || sourceLabel(feedName)} to ${categoryLabel(category)}`)
       setName('')
       setUrl('')
+      setUrlTouched(false)
       // Slice 20: also clear the discovery hints so the next Add
-      // starts with empty inputs (the user can re-use them if
-      // they want — copying from the previous row is one click).
+      // starts with empty inputs.
       setSitemapUrl('')
       setLinkPattern('')
+      setHeaders(null)
+      setHeadersOk(true)
+      setHeadersOpen(false)
+      setHeadersKey((k) => k + 1)
       setTestResult(null)
       await onAdded()
-    } catch (err) {
-      onError(parseApiError(err, 'failed to add source'))
+    } catch (e) {
+      setTestResult({ kind: 'err', message: fieldSaveMessage(e, 'url', sendUrl, sourceLabel) })
     } finally {
       setSubmitting(false)
     }
   }
 
-  // Test the URL via the new ``POST /api/sources/test`` endpoint.
-  // Reuses ``validateForm`` for client-side checks; the backend
-  // does the real fetch + parse. Result is shown inline; no DB
-  // write happens regardless of outcome.
-  const test = async () => {
-    const err = validateForm()
-    if (err) {
-      setTestResult({ kind: 'err', message: err })
-      return
-    }
-    setTesting(true)
-    setTestResult(null)
-    try {
-      const result = await api.testSource({
-        name: name.trim().toLowerCase() || undefined,
-        type: sourceType,
-        category,
-        url: url.trim(),
-      })
-      if (result.ok) {
-        setTestResult({
-          kind: 'ok',
-          message: `Looks good — ${result.item_count ?? 0} items found`,
-          itemCount: result.item_count ?? 0,
-          sampleTitles: result.sample_titles,
-          resolvedUrl: result.resolved_url ?? undefined,
-        })
-      } else {
-        setTestResult({
-          kind: 'err',
-          message: friendlyTestError(result.error_kind, result.error),
-          resolvedUrl: result.resolved_url ?? undefined,
-        })
-      }
-    } catch (err) {
-      // The endpoint returned 4xx/5xx (auth, network) — the
-      // jsonFetch helper throws. Map to a friendly message.
-      const raw = (err as Error).message
-      setTestResult({
-        kind: 'err',
-        message: `Couldn't test the feed — ${raw}`,
-      })
-    } finally {
-      setTesting(false)
-    }
-  }
+  const nameHint =
+    nameError ??
+    (name.trim()
+      ? null
+      : suggested
+        ? `Leave it blank to call it “${sourceLabel(suggested)}”.`
+        : sourceType === 'youtube_channel' && url.trim()
+          ? 'Name is chosen after Test.'
+          : 'Leave it blank to name the feed after its address.')
+  const blocked = !url.trim() || !!(nameError || urlError) || headersBlocked
 
   return (
     <>
-      <AutoFeedBlock onAdded={onAdded} onError={onError} />
-      <form onSubmit={submit} className="space-y-3 text-ios-body">
-      <div>
-        <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-name">Name</label>
-        <input
-          id="fm-name"
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="my_blog"
-          className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
-        />
-        <p className="text-ios-caption text-label-secondary mt-1">
-          lowercase letters, digits, underscore
-        </p>
-      </div>
-      {/* Subtype selector. Drives the URL label + placeholder + the
-          validator branch in ``submit``. Radios sit next to the URL
-          field so the user sees the choice immediately — a dropdown
-          would work but adds a click and hides the most common
-          choice (RSS). Picking "Podcast" or "YouTube" also bumps the
-          refresh default to 6h (episodes/videos are infrequent;
-          polling hourly just wastes requests — see
-          _PODCAST_DEFAULT_REFRESH / _YOUTUBE_DEFAULT_REFRESH on the
-          backend) unless the user has already customized it away
-          from the plain-RSS default. */}
-      <fieldset className="flex items-center gap-3 flex-wrap">
-        <legend className="sr-only">Source type</legend>
-        <span className="text-ios-caption uppercase tracking-wide text-label-tertiary">Type</span>
-        <label className="flex items-center gap-1 text-ios-caption text-label-primary">
-          <input
-            type="radio"
-            name="fm-type"
-            value="rss"
-            checked={sourceType === 'rss'}
-            onChange={() => {
-              setSourceType('rss')
-              if (refresh === PODCAST_DEFAULT_REFRESH) setRefresh(3600)
-            }}
-            className="accent-accent"
-          />
-          RSS / Atom
-        </label>
-        <label className="flex items-center gap-1 text-ios-caption text-label-primary">
-          <input
-            type="radio"
-            name="fm-type"
-            value="reddit"
-            checked={sourceType === 'reddit'}
-            onChange={() => {
-              setSourceType('reddit')
-              if (refresh === PODCAST_DEFAULT_REFRESH) setRefresh(900)
-            }}
-            className="accent-accent"
-          />
-          Subreddit
-        </label>
-        <label className="flex items-center gap-1 text-ios-caption text-label-primary">
-          <input
-            type="radio"
-            name="fm-type"
-            value="podcast"
-            checked={sourceType === 'podcast'}
-            onChange={() => {
-              setSourceType('podcast')
-              if (refresh === 3600) setRefresh(PODCAST_DEFAULT_REFRESH)
-              if (category === 'news') setCategory('podcast')
-            }}
-            className="accent-accent"
-          />
-          Podcast
-        </label>
-        <label className="flex items-center gap-1 text-ios-caption text-label-primary">
-          <input
-            type="radio"
-            name="fm-type"
-            value="youtube_channel"
-            checked={sourceType === 'youtube_channel'}
-            onChange={() => {
-              setSourceType('youtube_channel')
-              if (refresh === 3600) setRefresh(YOUTUBE_DEFAULT_REFRESH)
-              if (category === 'news') setCategory('video')
-            }}
-            className="accent-accent"
-          />
-          YouTube
-        </label>
-        <label
-          className="flex items-center gap-1 text-ios-caption text-label-primary"
-          title="For sites without an RSS feed: the dashboard periodically scrapes the URL for new articles via its sitemap."
-        >
-          <input
-            type="radio"
-            name="fm-type"
-            value="generic_scrape"
-            checked={sourceType === 'generic_scrape'}
-            onChange={() => {
-              setSourceType('generic_scrape')
-              // 2h is the backend default for generic_scrape
-              // (_GENERIC_SCRAPE_DEFAULT_REFRESH). Single polls
-              // can mean multiple real page fetches per tick, so
-              // hourly is too aggressive for a scrape that wasn't
-              // opted into via a real feed.
-              if (refresh === 3600 || refresh === PODCAST_DEFAULT_REFRESH) {
-                setRefresh(7200)
-              }
-            }}
-            className="accent-accent"
-          />
-          Track page (no RSS)
-        </label>
+      <AutoFeedBlock sources={sources} onAdded={onAdded} onCreated={onCreated} onPrefill={prefill} />
+      <form ref={formRef} onSubmit={submit} noValidate className="space-y-4 text-ios-body scroll-mt-4">
+      {/* Type first: it decides what the address field takes. Radios
+          rather than a dropdown so the choices are visible at once. */}
+      <fieldset>
+        <legend className={labelClass}>Type</legend>
+        <div className="flex flex-wrap gap-x-4">
+          <label className={radioLabelClass}>
+            <input
+              type="radio"
+              name="fm-type"
+              value="rss"
+              checked={sourceType === 'rss'}
+              onChange={() => chooseType('rss')}
+              className="accent-accent w-5 h-5"
+            />
+            RSS / Atom
+          </label>
+          <label className={radioLabelClass}>
+            <input
+              type="radio"
+              name="fm-type"
+              value="reddit"
+              checked={sourceType === 'reddit'}
+              onChange={() => chooseType('reddit')}
+              className="accent-accent w-5 h-5"
+            />
+            Subreddit
+          </label>
+          <label className={radioLabelClass}>
+            <input
+              type="radio"
+              name="fm-type"
+              value="podcast"
+              checked={sourceType === 'podcast'}
+              onChange={() => chooseType('podcast')}
+              className="accent-accent w-5 h-5"
+            />
+            Podcast
+          </label>
+          <label className={radioLabelClass}>
+            <input
+              type="radio"
+              name="fm-type"
+              value="youtube_channel"
+              checked={sourceType === 'youtube_channel'}
+              onChange={() => chooseType('youtube_channel')}
+              className="accent-accent w-5 h-5"
+            />
+            YouTube
+          </label>
+          <label
+            className={radioLabelClass}
+            title="For sites without an RSS feed: Popping checks the page for new articles."
+          >
+            <input
+              type="radio"
+              name="fm-type"
+              value="generic_scrape"
+              checked={sourceType === 'generic_scrape'}
+              onChange={() => chooseType('generic_scrape')}
+              className="accent-accent w-5 h-5"
+            />
+            Track page (no RSS)
+          </label>
+        </div>
       </fieldset>
       <div>
-        <label
-          className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1"
-          htmlFor="fm-url"
-        >
+        <label className={labelClass} htmlFor="fm-url">
           {sourceType === 'reddit'
             ? 'Subreddit'
             : sourceType === 'podcast'
               ? 'Podcast RSS URL'
               : sourceType === 'youtube_channel'
-                ? 'YouTube channel URL'
+                ? 'YouTube channel link or channel ID'
                 : sourceType === 'generic_scrape'
                   ? 'Page URL (no RSS — will be scraped)'
                   : 'RSS / Atom URL'}
@@ -1632,107 +1126,164 @@ function AddCustomTab({
         <input
           id="fm-url"
           type={sourceType === 'reddit' ? 'text' : 'url'}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          enterKeyHint="next"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
+          onBlur={() => setUrlTouched(true)}
           placeholder={
             sourceType === 'reddit'
               ? 'r/python or https://www.reddit.com/r/python'
               : sourceType === 'podcast'
                 ? 'https://example.com/podcast/feed.xml'
                 : sourceType === 'youtube_channel'
-                  ? 'https://www.youtube.com/@handle'
+                  ? '@handle or https://www.youtube.com/@handle'
                   : sourceType === 'generic_scrape'
                     ? 'https://example.com'
                     : 'https://example.com/feed.xml'
           }
-          className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
+          className={fieldClass}
         />
+        {sourceType === 'youtube_channel' && (
+          <p className="text-ios-caption text-label-secondary mt-1">
+            A channel link, video link, @handle or channel ID (starts with UC)
+          </p>
+        )}
+        {urlTouched && urlError && <p className="text-ios-caption text-red-300 mt-1 break-words">{urlError}</p>}
+      </div>
+      <div>
+        <label className={labelClass} htmlFor="fm-name">Name (optional)</label>
+        <input
+          id="fm-name"
+          type="text"
+          autoCapitalize="words"
+          autoCorrect="off"
+          spellCheck={false}
+          enterKeyHint="next"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="e.g. CPABC Newsroom"
+          className={fieldClass}
+        />
+        {nameHint && (
+          <p className={`text-ios-caption mt-1 break-words ${nameError ? 'text-red-300' : 'text-label-secondary'}`}>
+            {nameHint}
+          </p>
+        )}
       </div>
       {/* Slice 20: discovery hints for ``type='generic_scrape'`` sources.
           Two optional inputs that let the user bypass the homepage-based
           sitemap discovery (sitemapUrl) or fall through to page_links
           (linkPattern) without having to PATCH the row after creating.
-          Both are conditional — only render when type=generic_scrape;
-          for other types the fields are silently ignored server-side.
-          Empty values are coerced to undefined in submit() so the
-          backend leaves the columns NULL (= default behavior). */}
+          Only shown for type=generic_scrape; other types ignore them
+          server-side. */}
       {sourceType === 'generic_scrape' && (
-        <div className="space-y-3">
+        <div className="space-y-4">
           <div>
-            <label
-              className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1"
-              htmlFor="fm-sitemap-url"
-              title="Direct sitemap URL. Bypasses the homepage-based discovery heuristic — useful when the homepage's sitemap_index is broken or absent."
-            >
-              Sitemap URL (optional)
+            <label className={labelClass} htmlFor="fm-sitemap-url">
+              Sitemap address (optional)
             </label>
             <input
               id="fm-sitemap-url"
               type="url"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              enterKeyHint="next"
               value={sitemapUrl}
               onChange={(e) => setSitemapUrl(e.target.value)}
               placeholder="https://example.com/sitemap-news.xml"
-              className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
+              className={fieldClass}
             />
           </div>
           <div>
-            <label
-              className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1"
-              htmlFor="fm-link-pattern"
-              title="Path prefix for the page_links fallback. Plugin fetches the page above and extracts every <a href> matching this prefix when sitemap discovery returns nothing."
-            >
-              Link pattern (optional)
+            <label className={labelClass} htmlFor="fm-link-pattern">
+              Only links starting with (optional)
             </label>
             <input
               id="fm-link-pattern"
               type="text"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              enterKeyHint="next"
               value={linkPattern}
               onChange={(e) => setLinkPattern(e.target.value)}
               placeholder="/library/"
-              className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary placeholder:text-label-tertiary"
+              className={fieldClass}
             />
           </div>
         </div>
       )}
-      <div className="flex gap-2">
-        <div className="flex-1">
-          <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-category">Category</label>
-          <select
-            id="fm-category"
-            value={category}
-            onChange={(e) => setCategory(e.target.value)}
-            className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
-          >
-            {CATEGORY_OPTIONS.map((c) => (
-              <option key={c} value={c}>{c}</option>
-            ))}
-          </select>
-        </div>
-        <div className="flex-1">
-          <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1" htmlFor="fm-refresh">Refresh</label>
-          <select
-            id="fm-refresh"
-            value={refresh}
-            onChange={(e) => setRefresh(Number(e.target.value))}
-            className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
-          >
-            {REFRESH_PRESETS.map((p) => (
-              <option key={p.value} value={p.value}>every {p.label}</option>
-            ))}
-          </select>
-        </div>
+      <div>
+        <label className={labelClass} htmlFor="fm-category">Category</label>
+        <CategoryPicker
+          inputId="fm-category"
+          value={category}
+          sources={sources}
+          onChange={setCategory}
+          defaultInSuggestions
+          onDraftChange={setCategoryDraft}
+          order={tabOrder}
+        />
       </div>
-      {/* Test result inline. ``data-test-result`` is the
-          hook a future test could use to assert on the UI; not
-          load-bearing for production. The block is conditionally
-          rendered — no visual change when there's no result. The
-          44px min-height keeps the layout from jumping when a
-          result appears (3 lines of sample titles + a single
-          status line still fits in 44px at body text size). */}
+      <div>
+        <label className={labelClass} htmlFor="fm-refresh">Check for new items</label>
+        <select
+          id="fm-refresh"
+          value={refresh}
+          onChange={(e) => setRefresh(Number(e.target.value))}
+          className="select-ios w-full min-h-[44px] rounded-ios bg-bg-elevated border border-hairline pl-3 pr-8 text-ios-body text-label-primary"
+        >
+          {!REFRESH_PRESETS.some((p) => p.value === refresh) && (
+            <option value={refresh}>every {refreshLabel(refresh)}</option>
+          )}
+          {REFRESH_PRESETS.map((p) => (
+            <option key={p.value} value={p.value}>every {p.label}</option>
+          ))}
+        </select>
+      </div>
+      {takesHeaders && (
+        <div className="space-y-3">
+          <button
+            type="button"
+            aria-expanded={headersOpen}
+            aria-controls="fm-headers"
+            onClick={() => setHeadersOpen((open) => !open)}
+            className="w-full min-h-[44px] flex items-center justify-between gap-2 rounded-ios border border-hairline px-3 py-2 text-left active:opacity-60"
+          >
+            <span className="min-w-0">
+              <span className="block text-ios-body text-label-primary">Advanced</span>
+              <span className="block text-ios-caption text-label-secondary">Headers for sites that block readers</span>
+            </span>
+            <span aria-hidden="true" className="shrink-0 text-label-tertiary">{headersOpen ? '▴' : '▾'}</span>
+          </button>
+          {/* Kept mounted while closed, so typed rows survive. */}
+          <div id="fm-headers" hidden={!headersOpen}>
+            <HeadersEditor
+              key={headersKey}
+              mode="local"
+              value={null}
+              onCommit={setHeaders}
+              onValidChange={setHeadersOk}
+              disabled={submitting}
+            />
+          </div>
+          {headersBlocked && !headersOpen && (
+            <p className="text-ios-caption text-red-300">Fix the headers under Advanced, or remove them.</p>
+          )}
+        </div>
+      )}
+      {/* Test result inline. ``data-test-result`` is the hook the
+          flows in scripts/iphone-audit assert on. Add failures land
+          here too, so they show inside the sheet. */}
       {testResult && (
         <div
           data-test-result={testResult.kind}
-          className={`rounded-ios p-3 text-ios-body ${
+          role="status"
+          className={`rounded-ios p-3 text-ios-body break-words ${
             testResult.kind === 'ok'
               ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-200'
               : 'bg-red-500/15 border border-red-500/40 text-red-200'
@@ -1744,8 +1295,7 @@ function AddCustomTab({
           </div>
           {testResult.resolvedUrl && (
             <div className="mt-1 text-ios-caption opacity-80 break-all">
-              Resolved to the real feed: {testResult.resolvedUrl}
-              {testResult.kind === 'ok' && ' — Add will use this URL.'}
+              Feed address: {testResult.resolvedUrl}
             </div>
           )}
           {testResult.kind === 'ok' && testResult.sampleTitles && testResult.sampleTitles.length > 0 && (
@@ -1757,30 +1307,29 @@ function AddCustomTab({
           )}
         </div>
       )}
-      {/* Two-button row: Test (left) + Add (right). Test is the
-          ``secondary`` visual — outlined instead of filled — so
-          the primary "Add" still reads as the default action.
-          Both disabled while a request is in flight; the disabled
-          state keeps the user from firing parallel requests. */}
+      {/* Test (outlined) and Add (filled, the default action). Both
+          wait while a request is in flight. */}
       <div className="flex gap-2">
         <button
           type="button"
           onClick={() => void test()}
-          disabled={testing || submitting || !!(nameError || urlError)}
+          disabled={testing || submitting || blocked}
           className="flex-1 min-h-[44px] rounded-ios border border-accent text-accent active:opacity-60 disabled:opacity-40"
         >
           {testing ? 'Testing…' : 'Test'}
         </button>
         <button
           type="submit"
-          disabled={submitting || testing || !!(nameError || urlError)}
+          disabled={submitting || testing || blocked || categoryDraft}
           className="flex-1 min-h-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white"
         >
-          {submitting ? 'adding…' : 'Add feed'}
+          {submitting ? 'Adding…' : 'Add feed'}
         </button>
       </div>
+      {categoryDraft && (
+        <p className="text-ios-caption text-label-secondary">Finish or cancel the new category.</p>
+      )}
       </form>
     </>
   )
 }
-

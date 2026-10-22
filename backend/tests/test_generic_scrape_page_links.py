@@ -1,23 +1,27 @@
 """Slice-18 wire tests: generic_scrape page_links strategy + link extraction.
 
-When ``sources.link_pattern`` is set and the sitemap strategies
-both return zero candidates, the ``GenericScrapePlugin.fetch``
-method falls through to fetching ``self.url`` and extracting
-every ``<a href>`` matching the path-prefix pattern. Designed
-for sites like ollama.com that don't publish a sitemap at all
-but DO expose a list of recent items on a stable URL shape.
+When ``sources.link_pattern`` is set, the ``GenericScrapePlugin.fetch``
+method reads ``self.url`` and keeps every ``<a href>`` matching the
+path-prefix pattern. Designed for sites like ollama.com that don't
+publish a sitemap at all but DO expose a list of recent items on a
+stable URL shape. Without a pattern the page is read as a listing
+(``article_detect.listing_links``). A section URL reads its page
+first; a site root reads its sitemap first (PR10b,
+``plan_candidates``).
 
 These tests are at the plugin + helper level. They mock the
-network (fetch_html, discover_sitemap_urls) and the URL safety
-check, so no Postgres is needed. The wire tests assert:
+network (fetch_html_checked, discover_sitemap_entries) and the URL
+safety check, so no Postgres is needed. The wire tests assert:
 
-  1. link_pattern=None -> no page_links attempt (fall back
-     silently). Backwards-compatible with pre-migration rows.
-  2. link_pattern='/library/' + sitemap returns 0 -> page_links
-     attempted, plugin returns the extracted items.
-  3. link_pattern='/library/' + sitemap returns N -> page_links
-     NOT attempted (sitemap wins). This is by design — sitemap
-     strategies are still the primary path.
+  1. link_pattern=None -> the page is read with ``listing_links``,
+     not the prefix filter; nothing found raises
+     ``NoArticleListError``, while ``probe`` still returns [].
+  2. link_pattern='/library/' on a section URL -> page_links
+     runs first, the sitemap isn't asked, and the plugin returns
+     the extracted items.
+  3. link_pattern='/library/' on a site root + sitemap returns N
+     -> page_links NOT attempted (sitemap wins), and the sitemap
+     read is scoped to the pattern.
   4. Same-origin filter: external-host links discarded.
   5. Pattern filter: links not matching the prefix discarded.
   6. Junk scheme filter: javascript:, mailto:, #anchor discarded.
@@ -89,19 +93,30 @@ def _make_plugin(row: SimpleNamespace):
 
 @pytest.mark.no_db
 @pytest.mark.asyncio
-async def test_plugin_no_page_links_when_link_pattern_none():
-    """When the row has no link_pattern, the plugin does NOT
-    attempt page_links even if sitemap discovery returns nothing.
-    page_links is opt-in.
+async def test_plugin_without_link_pattern_reads_the_page_as_a_listing():
+    """When the row has no link_pattern, the plugin reads the page
+    with ``listing_links`` (the page's repeating list of posts), not
+    the prefix filter. When neither the page nor the sitemap lists
+    anything, the feed has no list of articles: ``NoArticleListError``
+    (``[no list]``). ``probe`` (the Test preview) still returns [].
     """
-    plugin = _make_plugin(_make_row(url="https://ollama.com/search?o=newest", link_pattern=None))
+    from app.sources.base import NoArticleListError
+    from app.sources.generic_scrape import probe
 
-    with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=[])), \
-         patch("app.sources.generic_scrape._discover_page_links", new=AsyncMock()) as mock_page_links:
-        result = await plugin.fetch()
+    url = "https://ollama.com/search?o=newest"
+    plugin = _make_plugin(_make_row(url=url, link_pattern=None))
+    page = "<html><body><p>No posts here.</p></body></html>"
 
-    assert result == []
-    mock_page_links.assert_not_awaited()
+    with patch("app.sources.generic_scrape.discover_sitemap_entries", new=AsyncMock(return_value=[])), \
+         patch("app.sources.generic_scrape.fetch_html_checked", new=AsyncMock(return_value=(page, url))), \
+         patch("app.sources.generic_scrape.listing_links", return_value=[]) as mock_listing, \
+         patch("app.sources.generic_scrape._extract_links_from_html") as mock_prefix:
+        with pytest.raises(NoArticleListError):
+            await plugin.fetch()
+        assert await probe(url) == []
+
+    assert mock_listing.call_args_list[0].args == (page, url)
+    mock_prefix.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -111,28 +126,31 @@ async def test_plugin_no_page_links_when_link_pattern_none():
 
 @pytest.mark.no_db
 @pytest.mark.asyncio
-async def test_plugin_page_links_runs_when_sitemap_empty_and_pattern_set():
-    """When the row has a link_pattern and sitemap discovery
-    returns 0 candidates, the plugin falls through to
-    page_links discovery and processes the extracted URLs
-    through the standard _extract_one chain.
+async def test_plugin_page_links_runs_first_for_a_section_url():
+    """A row with a link_pattern on a section URL (not the site root)
+    reads its page first: page_links discovery runs, the sitemap is
+    never asked, and the extracted URLs go through the standard
+    _extract_one chain.
     """
+    from app.article_detect import Candidate
+
     plugin = _make_plugin(_make_row(url="https://ollama.com/search?o=newest", link_pattern="/library/"))
 
     fake_links = [
-        "https://ollama.com/library/foo",
-        "https://ollama.com/library/bar",
+        Candidate("https://ollama.com/library/foo", None, None),
+        Candidate("https://ollama.com/library/bar", None, None),
     ]
 
-    async def fake_extract(url: str, custom_headers=None):
+    async def fake_extract(url: str, custom_headers=None, **kwargs):
         return {"title": url.rsplit("/", 1)[-1], "url": url, "text": "x", "published_at": None, "summary": "x", "image_url": None}
 
-    with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=[])), \
+    with patch("app.sources.generic_scrape.discover_sitemap_entries", new=AsyncMock(return_value=[])) as mock_sitemap, \
          patch("app.sources.generic_scrape._discover_page_links", new=AsyncMock(return_value=fake_links)) as mock_page_links, \
          patch("app.sources.generic_scrape._extract_one", side_effect=fake_extract):
         result = await plugin.fetch()
 
     mock_page_links.assert_awaited_once()
+    mock_sitemap.assert_not_awaited()
     args, kwargs = mock_page_links.call_args
     assert args[0] == "https://ollama.com/search?o=newest"
     assert args[1] == "/library/"
@@ -149,24 +167,31 @@ async def test_plugin_page_links_runs_when_sitemap_empty_and_pattern_set():
 @pytest.mark.no_db
 @pytest.mark.asyncio
 async def test_plugin_sitemap_wins_over_page_links():
-    """When sitemap discovery returns candidates, the plugin
-    does NOT fall through to page_links. Sitemap is the
-    primary path; page_links is the "no sitemap at all" fallback.
+    """On a site root, when sitemap discovery returns candidates, the
+    plugin does NOT fall through to page_links. The sitemap read is
+    scoped to the link pattern (the pattern filters every candidate),
+    so only entries under /library/ come back from it.
     """
+    from app.article_detect import Candidate
+
     plugin = _make_plugin(_make_row(url="https://example.com", link_pattern="/library/"))
 
-    sitemap_candidates = ["https://example.com/post-1", "https://example.com/post-2"]
+    sitemap_candidates = [
+        Candidate("https://example.com/library/post-1", None, None),
+        Candidate("https://example.com/library/post-2", None, None),
+    ]
 
-    async def fake_extract(url: str, custom_headers=None):
+    async def fake_extract(url: str, custom_headers=None, **kwargs):
         return {"title": url.rsplit("/", 1)[-1], "url": url, "text": "x", "published_at": None, "summary": "x", "image_url": None}
 
-    with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=sitemap_candidates)), \
+    with patch("app.sources.generic_scrape.discover_sitemap_entries", new=AsyncMock(return_value=sitemap_candidates)) as mock_sitemap, \
          patch("app.sources.generic_scrape._discover_page_links", new=AsyncMock()) as mock_page_links, \
          patch("app.sources.generic_scrape._extract_one", side_effect=fake_extract):
         result = await plugin.fetch()
 
     assert len(result) == 2
     mock_page_links.assert_not_awaited()
+    assert mock_sitemap.call_args.kwargs["path_prefix"] == "/library/"
 
 
 # ---------------------------------------------------------------------------
@@ -430,16 +455,18 @@ async def test_update_source_ignores_link_pattern_when_unset():
 @pytest.mark.no_db
 @pytest.mark.asyncio
 async def test_page_links_fetch_html_safety_check():
-    """The page_links strategy uses fetch_html internally,
+    """The page_links strategy uses fetch_html_checked internally,
     which enforces the URL safety check (denied hosts, private
-    network ranges). If the page URL is rejected, the plugin
-    returns []. We test this by making fetch_html return None
-    (simulating a URL safety rejection).
+    network ranges). If the page URL is rejected and the sitemap has
+    nothing either, the feed has no list of articles. We test this by
+    making fetch_html_checked return None (simulating a URL safety
+    rejection).
     """
+    from app.sources.base import NoArticleListError
+
     plugin = _make_plugin(_make_row(url="https://internal.example.com/list", link_pattern="/post/"))
 
-    with patch("app.sources.generic_scrape.discover_sitemap_urls", new=AsyncMock(return_value=[])), \
-         patch("app.sources.generic_scrape.fetch_html", new=AsyncMock(return_value=None)):
-        result = await plugin.fetch()
-
-    assert result == []
+    with patch("app.sources.generic_scrape.discover_sitemap_entries", new=AsyncMock(return_value=[])), \
+         patch("app.sources.generic_scrape.fetch_html_checked", new=AsyncMock(return_value=None)):
+        with pytest.raises(NoArticleListError):
+            await plugin.fetch()

@@ -77,12 +77,13 @@ def test_empty_state_branches_on_source_lookup():
       - source found + last_error: show error
       - source found + error_count >= threshold: show auto-disabled
       - source found + last_fetch_at: show "last fetched Xh ago"
-      - source not found (meta column): show original generic message
+      - source not found (meta column): show "No stories yet"
     """
     src = _read_column()
-    # The original message must still exist (preserved for meta columns).
-    assert "no entries in this column yet" in src, (
-        "original generic message should be preserved for meta columns"
+    # The meta columns' message (PR7a: an empty Saved or For You says
+    # "No stories yet", with the first-feed button on a fresh install).
+    assert "No stories yet" in src, (
+        "the meta-column empty message should be present"
     )
     # Source-aware messages should be present.
     assert "last_error" in src, "empty-state should reference last_error"
@@ -181,4 +182,53 @@ def test_empty_state_distinguishes_auto_disabled_from_generic_error():
     )
     assert has_error_snippet, (
         "Empty-state should still surface transient fetch errors"
+    )
+
+# ---------------------------------------------------------------------------
+# 7. The lookup uses the column's backing feed, not its tab key (PR7a)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.no_db
+def test_empty_state_looks_up_the_columns_source_name():
+    """A one-feed filter's column key is ``meta:filter``, so the lookup
+    can't be derived from the key: App passes the backing feed's name as
+    ``sourceName`` (the one filtered feed, or a category's name) at every
+    Column call site, and the empty state looks that name up.
+    """
+    src = _read_column()
+    assert re.search(r"sourcesByName\?\.get\(sourceName\)", src), (
+        "EmptyColumnMessage should look up sourcesByName by sourceName"
+    )
+    app = _read_app()
+    sites = list(re.finditer(r"<Column\b[^>]*>", app, re.DOTALL))
+    for i, site in enumerate(sites):
+        assert "sourceName=" in site.group(0), (
+            f"Column call site #{i + 1} must pass sourceName"
+        )
+    assert re.search(r"activeSources\.size === 1", app), (
+        "a one-feed filter should name its feed as the column's sourceName"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. A quiet category says so, with one tap to a wider window (PR4d, D5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.no_db
+def test_empty_state_offers_a_wider_window():
+    """A category tab whose feeds brought nothing in its window reads
+    "Nothing in 2 days · Show 7 days", and the offer widens the tab's
+    window through the same setter as the ⋯ control."""
+    src = _read_column()
+    # The line itself (EMPTY_WINDOW_LINES), not a comment that quotes it.
+    assert re.search(r"'2d':\s*'Nothing in 2 days · Show 7 days'", src), (
+        "the quiet-category line should be present verbatim as the 2-day entry"
+    )
+    assert "data-show-wider" in src, (
+        "the offer should be a button (data-show-wider) that widens the window"
+    )
+    assert re.search(r"onShowWider\?\.?\(|onShowWider\(", src), (
+        "the offer should call onShowWider"
     )

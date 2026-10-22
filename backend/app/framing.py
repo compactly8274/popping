@@ -53,7 +53,7 @@ from sqlalchemy import bindparam, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.llm import ProviderError, router
+from app.llm import complete_with_fallback
 from app.models import Entry, StoryCluster
 from app.scoring.personal import _cosine
 
@@ -375,30 +375,17 @@ async def _classify_tones(titles: list[str]) -> Optional[list[str]]:
     and pick it back up on the next run."""
     if not titles:
         return []
-    providers = router.providers_for("scoring")
-    if not providers:
-        logger.info("framing: no LLM provider configured for tone tagging — skipping")
-        return None
-    prompt = _build_tone_prompt(titles)
-    for candidate in providers:
-        try:
-            # think=False: a short, structured-output prompt (a JSON
-            # array of tone labels) — same reasoning as
-            # app.article_summary's matching comment. This call
-            # already tolerates CoT-wrapped output via
-            # _extract_first_json_array below as a second line of
-            # defense, but disabling thinking avoids relying on that
-            # fallback in the first place.
-            content = await candidate.complete(prompt, max_tokens=_TONE_MAX_TOKENS, think=False)
-        except ProviderError as exc:
-            logger.warning("framing: tone call failed on %s: %s — trying next provider", candidate.name, exc)
-            continue
-        parsed = _parse_tone_response(content, len(titles))
-        if parsed is not None:
-            return parsed
-        logger.warning("framing: %s returned unparsable tone output, trying next provider", candidate.name)
-    logger.warning("framing: all configured LLM providers failed or returned unusable tone output")
-    return None
+    tones, _ = await complete_with_fallback(
+        "scoring",
+        _build_tone_prompt(titles),
+        log_name="framing",
+        parse=lambda content: _parse_tone_response(content, len(titles)),
+        max_tokens=_TONE_MAX_TOKENS,
+        # A short structured-output prompt; thinking would only eat the
+        # token budget (_extract_first_json_array tolerates it anyway).
+        think=False,
+    )
+    return tones
 
 
 async def _tag_untagged_clusters(session: AsyncSession) -> int:

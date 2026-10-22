@@ -12,11 +12,27 @@ monkeypatched candidate list so it's deterministic and network-free.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
+from app.article_detect import Candidate
 from app.sources import generic_scrape
 from app.sources.generic_scrape import GenericScrapePlugin, _extract_one, probe
 from factories import make_source
+
+_NOW = dt.datetime.now(dt.timezone.utc)
+
+
+def _candidates(urls):
+    """Sitemap results as ``discover_sitemap_entries`` returns them."""
+    return [Candidate(url, None, None) for url in urls]
+
+
+def _article(url):
+    """A dated item, as ``_extract_one`` returns it for an article. The
+    date keeps these tests clear of the undated cap (two a poll)."""
+    return {"title": f"Article {url}", "url": url, "published_at": _NOW}
 
 _ARTICLE_HTML = """
 <html>
@@ -56,10 +72,12 @@ async def test_extract_one_returns_none_for_unreachable_url():
 
 @pytest.mark.asyncio
 async def test_probe_returns_empty_list_when_no_sitemap_found(monkeypatch):
-    async def fake_discover_sitemap_urls(url, limit=50):
+    # The listing page itself (a loopback address) is refused by the URL
+    # safety check before any request, so neither read finds anything.
+    async def fake_discover_sitemap_entries(url, limit=50, path_prefix=None, **kwargs):
         return []
 
-    monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
+    monkeypatch.setattr(generic_scrape, "discover_sitemap_entries", fake_discover_sitemap_entries)
     assert await probe("http://127.0.0.1:1/nope") == []
 
 
@@ -67,13 +85,13 @@ async def test_probe_returns_empty_list_when_no_sitemap_found(monkeypatch):
 async def test_probe_stops_at_limit(monkeypatch):
     # Five candidates all "extract" successfully via a stubbed
     # _extract_one; probe(limit=2) should only take the first 2.
-    async def fake_discover_sitemap_urls(url, limit=50):
-        return [f"https://example.com/{i}" for i in range(5)]
+    async def fake_discover_sitemap_entries(url, limit=50, path_prefix=None, **kwargs):
+        return _candidates(f"https://example.com/{i}" for i in range(5))
 
-    async def fake_extract_one(url, custom_headers=None):
+    async def fake_extract_one(url, custom_headers=None, **kwargs):
         return {"title": f"Article at {url}", "url": url}
 
-    monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
+    monkeypatch.setattr(generic_scrape, "discover_sitemap_entries", fake_discover_sitemap_entries)
     monkeypatch.setattr(generic_scrape, "_extract_one", fake_extract_one)
 
     result = await probe("https://example.com/", limit=2)
@@ -93,16 +111,16 @@ async def test_plugin_fetch_skips_already_extracted_urls(db_session, monkeypatch
     # membership check below.
     plugin._mark_extracted("https://example.com/already-seen")
 
-    async def fake_discover_sitemap_urls(url, limit=200):
-        return ["https://example.com/already-seen", "https://example.com/new-one"]
+    async def fake_discover_sitemap_entries(url, limit=200, **kwargs):
+        return _candidates(["https://example.com/already-seen", "https://example.com/new-one"])
 
     calls: list[str] = []
 
-    async def fake_extract_one(url, custom_headers=None):
+    async def fake_extract_one(url, custom_headers=None, **kwargs):
         calls.append(url)
         return {"title": "New Article", "url": url}
 
-    monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
+    monkeypatch.setattr(generic_scrape, "discover_sitemap_entries", fake_discover_sitemap_entries)
     monkeypatch.setattr(generic_scrape, "_extract_one", fake_extract_one)
 
     items = await plugin.fetch()
@@ -125,13 +143,13 @@ async def test_plugin_fetch_respects_per_poll_cap(db_session, monkeypatch):
     source = await make_source(db_session, "big_site", type="generic_scrape")
     plugin = GenericScrapePlugin(source)
 
-    async def fake_discover_sitemap_urls(url, limit=200):
-        return [f"https://example.com/{i}" for i in range(generic_scrape._MAX_NEW_PER_POLL + 5)]
+    async def fake_discover_sitemap_entries(url, limit=200, **kwargs):
+        return _candidates(f"https://example.com/{i}" for i in range(generic_scrape._MAX_NEW_PER_POLL + 5))
 
-    async def fake_extract_one(url, custom_headers=None):
-        return {"title": f"Article {url}", "url": url}
+    async def fake_extract_one(url, custom_headers=None, **kwargs):
+        return _article(url)
 
-    monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
+    monkeypatch.setattr(generic_scrape, "discover_sitemap_entries", fake_discover_sitemap_entries)
     monkeypatch.setattr(generic_scrape, "_extract_one", fake_extract_one)
 
     items = await plugin.fetch()
@@ -158,14 +176,14 @@ async def test_plugin_fetch_runs_extractions_concurrently(db_session, monkeypatc
     source = await make_source(db_session, "slow_site", type="generic_scrape")
     plugin = GenericScrapePlugin(source)
 
-    async def fake_discover_sitemap_urls(url, limit=200):
-        return [f"https://example.com/{i}" for i in range(generic_scrape._MAX_NEW_PER_POLL)]
+    async def fake_discover_sitemap_entries(url, limit=200, **kwargs):
+        return _candidates(f"https://example.com/{i}" for i in range(generic_scrape._MAX_NEW_PER_POLL))
 
-    async def fake_extract_one(url, custom_headers=None):
+    async def fake_extract_one(url, custom_headers=None, **kwargs):
         await asyncio.sleep(0.2)
-        return {"title": f"Article {url}", "url": url}
+        return _article(url)
 
-    monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
+    monkeypatch.setattr(generic_scrape, "discover_sitemap_entries", fake_discover_sitemap_entries)
     monkeypatch.setattr(generic_scrape, "_extract_one", fake_extract_one)
 
     start = time.monotonic()
@@ -191,15 +209,15 @@ async def test_plugin_fetch_marks_extracted_even_on_extraction_error(db_session,
     plugin = GenericScrapePlugin(source)
     urls = [f"https://example.com/{i}" for i in range(3)]
 
-    async def fake_discover_sitemap_urls(url, limit=200):
-        return urls
+    async def fake_discover_sitemap_entries(url, limit=200, **kwargs):
+        return _candidates(urls)
 
-    async def fake_extract_one(url, custom_headers=None):
+    async def fake_extract_one(url, custom_headers=None, **kwargs):
         if url == urls[1]:
             raise RuntimeError("boom")
-        return {"title": f"Article {url}", "url": url}
+        return _article(url)
 
-    monkeypatch.setattr(generic_scrape, "discover_sitemap_urls", fake_discover_sitemap_urls)
+    monkeypatch.setattr(generic_scrape, "discover_sitemap_entries", fake_discover_sitemap_entries)
     monkeypatch.setattr(generic_scrape, "_extract_one", fake_extract_one)
 
     items = await plugin.fetch()

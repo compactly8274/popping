@@ -54,7 +54,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import current_user, resolve_user_id
-from app.config import settings
 from app.db import get_session
 from app.models import Entry, Interaction
 from app.schemas import InteractionBatchIn, InteractionIn, InteractionListOut, InteractionOut
@@ -226,7 +225,8 @@ async def get_recent_interactions(
 
     Query parameters
       - ``types``: comma-separated list of interaction types
-        to include. Empty = all types. Example:
+        to include. Empty = every type except ``dwell`` and
+        ``view``. ``dwell`` is never returned. Example:
         ``?types=view,never&limit=20`` returns the user's
         20 most recent reads + hides.
       - ``limit``: page size (default 50, max 200).
@@ -264,18 +264,17 @@ async def get_recent_interactions(
     if types.strip():
         type_list = [t.strip() for t in types.split(",") if t.strip()]
 
-    # The hidden dwell events: ``dwell`` fires per-card on
-    # mark-read as a "how long was this on screen" signal.
-    # The History view shouldn't show those — the user
-    # already sees the read event for the same entry. Filter
-    # dwell out by default. The frontend doesn't need to
-    # know about this; the types filter is optional.
-    if "dwell" not in type_list:
-        type_list.append("dwell")
-    # We use ``NOT IN (dwell)`` so the SQL still hits the
-    # (user_id, created_at) index; converting to a set
-    # membership check here keeps the query plan cheap.
-    exclude_types = {"dwell"}
+    # ``dwell`` fires per-card on mark-read as a "how long was
+    # this on screen" signal, and ``view`` fires once per story
+    # read (often, once seen-on-scroll lands). Neither belongs in
+    # an unfiltered History: the list would be all reads. So:
+    #   - no types given: everything except ``dwell`` and ``view``;
+    #   - explicit types: those types, minus ``dwell``, which is
+    #     never listed (``?types=dwell`` returns nothing).
+    # ``dwell`` used to be appended to ``type_list`` here, which
+    # turned the no-filter case into ``IN (dwell) AND NOT IN
+    # (dwell)`` and emptied History.
+    exclude_types = {"dwell"} if type_list else {"dwell", "view"}
 
     # Validate group_by. Whitelist: any other value falls
     # back to ``none``. We don't 400 on bad input — the
@@ -302,8 +301,8 @@ async def get_recent_interactions(
     )
     if type_list:
         page_q = page_q.where(Interaction.type.in_(type_list))
-    # Apply the dwell exclusion: NOT IN is cheaper than
-    # re-evaluating the type list.
+    # Apply the exclusion as its own ``NOT IN`` (the same
+    # filter goes on the count query below).
     if exclude_types:
         page_q = page_q.where(Interaction.type.notin_(exclude_types))
 

@@ -18,7 +18,6 @@ import asyncio
 import datetime as dt
 import json
 import logging
-from typing import Any
 
 import httpx
 
@@ -56,7 +55,7 @@ _etag_cache: dict[str, str] = {}
 
 def _gh_headers() -> dict[str, str]:
     h = {
-        "User-Agent": "Popping/0.2 (+https://github.com/compactly8274/popping)",
+        "User-Agent": settings.user_agent,
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
@@ -78,7 +77,12 @@ def _parse_iso(s: str | None) -> dt.datetime | None:
 async def _fetch_repo(
     client: httpx.AsyncClient,
     repo: str,
+    failures: dict[str, Exception] | None = None,
 ) -> list[dict]:
+    """One repo's newest releases. Returns ``[]`` for a 304 (nothing
+    new) and for a failure; a failure (non-200, network error, bad
+    body) is also recorded in ``failures`` under the repo's name, so
+    ``fetch`` can tell "every repo failed" from "nothing new"."""
     url = f"{_BASE}/repos/{repo}/releases?per_page={_TOP_PER_REPO}"
     headers = _gh_headers()
     if (etag := _etag_cache.get(repo)):
@@ -104,6 +108,15 @@ async def _fetch_repo(
                     resp.status_code,
                     excerpt[:200].decode("utf-8", "replace"),
                 )
+                if failures is not None:
+                    # An ``HTTPStatusError``, so the scheduler labels it
+                    # by status (403 rate limit: blocked; 5xx: upstream
+                    # error) if every repo fails.
+                    failures[repo] = httpx.HTTPStatusError(
+                        f"github_releases: {repo} returned {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
                 return []
             cl = resp.headers.get("content-length")
             if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
@@ -125,6 +138,8 @@ async def _fetch_repo(
             rels = json.loads(bytes(buf))
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("github_releases: %s fetch failed: %s", repo, exc)
+        if failures is not None:
+            failures[repo] = exc
         return []
     items: list[dict] = []
     for rel in rels:
@@ -160,6 +175,11 @@ class GithubReleases(SourcePlugin):
     repos: list[str] = _DEFAULT_REPOS  # class-level so tests can override
 
     async def fetch(self) -> list[dict]:
+        """Releases from every repo, newest first. One repo's 304 or
+        failure only leaves that repo out; when every repo failed, this
+        raises the first repo's error so the feed reads Failing or
+        Blocked instead of looking quiet."""
+        failures: dict[str, Exception] = {}
         async with httpx.AsyncClient(
             timeout=_TIMEOUT,
             follow_redirects=True, max_redirects=5,
@@ -172,9 +192,11 @@ class GithubReleases(SourcePlugin):
             # Concurrent across repos — keeps total wall time at one
             # round-trip. 5 in flight is fine for our default list.
             per_repo = await asyncio.gather(
-                *(_fetch_repo(client, repo) for repo in self.repos),
+                *(_fetch_repo(client, repo, failures) for repo in self.repos),
                 return_exceptions=False,
             )
+        if self.repos and all(repo in failures for repo in self.repos):
+            raise failures[self.repos[0]]
         merged: list[dict] = []
         for chunk in per_repo:
             merged.extend(chunk)

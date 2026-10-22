@@ -26,7 +26,6 @@ link tag is found.
 from __future__ import annotations
 
 import logging
-import mimetypes
 import os
 import re
 from pathlib import Path
@@ -128,7 +127,7 @@ _HTML_PROBE_BYTES = 64 * 1024
 
 # App-shaped UA — used for the favicon HTML probe and falls back to
 # /favicon.ico. Most sites accept this without 403.
-_APP_UA = "Popping/0.2 (+https://github.com/compactly8274/popping)"
+_APP_UA = settings.user_agent
 # Browser-shaped UA — used for the actual image download. Cloudflare,
 # Imgur, GitHub-raw and a handful of other CDNs 403 non-browser UAs
 # for image fetches even when the same UA fetched the page HTML fine.
@@ -136,20 +135,20 @@ _BROWSER_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-_IMAGE_ACCEPT = "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8"
+_IMAGE_ACCEPT = "image/avif,image/webp,image/png,image/*;q=0.8"
 _HTML_ACCEPT = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
 
 # Common image content-types → file extension. feedparser may hand us
 # variants ("image/jpg", "image/x-icon"); cover the ones seen in the
-# wild. Anything we don't recognise falls back to "bin" so we still
-# cache the bytes rather than dropping them.
+# wild. Anything not listed is rejected (see _ext_from_content_type).
+# SVG is deliberately absent: it can carry <script>, and /assets is
+# served same-origin with the dashboard.
 _EXT_BY_CT: dict[str, str] = {
     "image/png": "png",
     "image/jpeg": "jpg",
     "image/jpg": "jpg",
     "image/webp": "webp",
     "image/gif": "gif",
-    "image/svg+xml": "svg",
     "image/x-icon": "ico",
     "image/vnd.microsoft.icon": "ico",
     "image/bmp": "bmp",

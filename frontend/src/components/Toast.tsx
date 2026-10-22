@@ -7,15 +7,20 @@
 // an action) so the user has time to read the
 // message and decide whether to invoke the action.
 //
-// Auto-dismiss: 1.5s without an action, 5s with one.
+// Auto-dismiss: 3s without an action, 5s with one.
 // Errors render in red via the optional `kind` prop.
 //
 // The toast is a singleton — a new toast replaces
 // the previous one. Multi-stack toast UX is a worse
 // shape for a dashboard; one at a time keeps the
 // noise down.
+//
+// ``onExpire`` (PR5a) runs when the toast goes without its action: its
+// timer ran out, or another toast took its place. A Hide's held
+// ``never`` is released by it (D25); Undo cancels it instead.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useVisualViewport } from '../lib/visualViewport'
 
 type ToastAction = {
   label: string
@@ -26,6 +31,9 @@ type ToastEvent = {
   message: string
   kind?: 'info' | 'error'
   action?: ToastAction
+  onExpire?: () => void
+  // Set when the action ran: the toast went by Undo, not by expiry.
+  acted?: boolean
 }
 
 type Listener = (e: ToastEvent) => void
@@ -44,12 +52,14 @@ const listeners = new Set<Listener>()
  *  adds an Undo-style right-aligned button to
  *  the toast. When action is set, the
  *  auto-dismiss timer extends to 5 seconds.
+ *  ``onExpire`` runs when the toast closes without
+ *  its action having run.
  */
 export function toast(
   message: string,
   options:
     | ToastEvent['kind']
-    | { kind?: ToastEvent['kind']; action?: ToastAction } = 'info',
+    | { kind?: ToastEvent['kind']; action?: ToastAction; onExpire?: () => void } = 'info',
 ): void {
   // Normalize both signatures into a single
   // ToastEvent shape. The old form passes a
@@ -57,21 +67,41 @@ export function toast(
   // an options object.
   let kind: ToastEvent['kind']
   let action: ToastAction | undefined
+  let onExpire: (() => void) | undefined
   if (typeof options === 'string') {
     kind = options
   } else {
     kind = options.kind ?? 'info'
     action = options.action
+    onExpire = options.onExpire
   }
-  const event: ToastEvent = { message, kind, action }
+  const event: ToastEvent = { message, kind, action, onExpire }
   for (const l of listeners) l(event)
 }
 
 export function ToastHost() {
   const [current, setCurrent] = useState<ToastEvent | null>(null)
+  // The toast showing now, for the paths that take it down: each calls
+  // its ``onExpire`` once, here, never from an effect's cleanup (React
+  // runs those twice in development).
+  const currentRef = useRef<ToastEvent | null>(null)
+  // Lift the toast above the iOS keyboard while one is open.
+  const { kbInset } = useVisualViewport()
+
+  // Takes the toast down. ``expired``: it went without its action.
+  const dismiss = (expired: boolean) => {
+    const ev = currentRef.current
+    currentRef.current = null
+    setCurrent(null)
+    if (expired && ev && !ev.acted) ev.onExpire?.()
+  }
 
   useEffect(() => {
     const onEvent: Listener = (e) => {
+      // The toast this one replaces went without its action.
+      const prev = currentRef.current
+      if (prev && !prev.acted) prev.onExpire?.()
+      currentRef.current = e
       setCurrent(e)
     }
     listeners.add(onEvent)
@@ -82,15 +112,17 @@ export function ToastHost() {
 
   // Auto-dismiss. Cleanup ensures rapid back-to-back
   // toasts reset the timer rather than firing on the
-  // stale one. The timer is 5s when an action is
-  // present (the user needs time to read the message
-  // + decide whether to invoke the action), 1.5s
-  // otherwise (the prior behavior).
+  // stale one. 5s when there is an action to decide on
+  // or an error to read, 3s otherwise: on a phone the
+  // eye often reaches the bottom of the screen after
+  // 1.5s, which is when the old timer closed it.
   useEffect(() => {
     if (!current) return
     const id = setTimeout(
-      () => setCurrent(null),
-      current.action ? 5000 : 1500,
+      () => {
+        if (currentRef.current === current) dismiss(true)
+      },
+      current.action || current.kind === 'error' ? 5000 : 3000,
     )
     return () => clearTimeout(id)
   }, [current])
@@ -114,12 +146,14 @@ export function ToastHost() {
       // (when present) is clickable.
       role="status"
       aria-live="polite"
-      className="fixed inset-x-0 bottom-6 z-50 flex justify-center pointer-events-none"
+      // z-[60]: above the Settings sheet (z-50) regardless of DOM order.
+      className="fixed inset-x-0 z-[60] flex justify-center pointer-events-none"
+      style={{ bottom: `calc(1.5rem + env(safe-area-inset-bottom) + ${kbInset}px)` }}
     >
       <div
         className={`pointer-events-auto flex items-center gap-3 rounded-ios border px-4 py-2 text-ios-body shadow-glow-md max-w-[min(90vw,420px)] ${color}`}
       >
-        <span className="flex-1 min-w-0 truncate">{current.message}</span>
+        <span className="flex-1 min-w-0 line-clamp-3 break-words">{current.message}</span>
         {current.action && (
           <button
             type="button"
@@ -128,8 +162,10 @@ export function ToastHost() {
               // auto-dismiss timer's cleanup function
               // ensures the toast stays dismissed even
               // if the timer would have fired later.
+              // The action ran: no ``onExpire``.
+              current.acted = true
               current.action!.onClick()
-              setCurrent(null)
+              dismiss(false)
             }}
             className="shrink-0 text-accent active:opacity-60 font-semibold min-h-[44px] -my-2 -mr-2 px-3 rounded-ios"
             aria-label={current.action.label}

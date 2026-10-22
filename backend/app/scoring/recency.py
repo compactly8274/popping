@@ -8,6 +8,7 @@ different rates:
   - deals           48h   (deal posts are evergreen — they don't age out)
   - sports          3h    (results have very short relevance)
   - tech            12h   (HN, GitHub releases — fast refresh keeps them current)
+  - on_this_day     6h    (a day's anniversaries; tomorrow brings new ones)
   - everything else 12h   (sensible default)
 """
 
@@ -22,6 +23,7 @@ _HALF_LIFE_HOURS = {
     "deals": 48.0,
     "sports": 3.0,
     "tech": 12.0,
+    "on_this_day": 6.0,
 }
 _DEFAULT_HALF_LIFE_HOURS = 12.0
 

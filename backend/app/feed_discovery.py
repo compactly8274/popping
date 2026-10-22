@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.llm import ProviderError, router
+from app.llm import complete_with_fallback
 from app.models import FeedRecommendationCandidate, Source
 from app.sources.rss import fetch_rss
 from app.url_safety import check_url_safe
@@ -100,6 +100,24 @@ def _build_prompt(category: str, context: str, exclude_names: set[str], limit: i
     )
 
 
+
+def _parse_suggestions(content: str) -> list[dict] | None:
+    """The model's reply as a list of suggestion dicts, or None if it
+    isn't JSON of the expected shape."""
+    content = _strip_code_fence(content)
+    if not content:
+        return None
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(parsed, dict):
+        # Some providers wrap the array in {"feeds": [...]} despite the prompt.
+        parsed = parsed.get("feeds") or parsed.get("suggestions") or []
+    if not isinstance(parsed, list):
+        return None
+    return [item for item in parsed if isinstance(item, dict)]
+
 async def _ask_llm_for_suggestions(
     category: str, context: str, exclude_names: set[str], limit: int
 ) -> tuple[list[dict], str | None]:
@@ -116,48 +134,15 @@ async def _ask_llm_for_suggestions(
     API key" apart from "this category is temporarily saturated" —
     both look identical as a bare ``added=0`` otherwise.
     """
-    providers = router.providers_for("brief")
-    if not providers:
-        logger.info("feed_discovery: no LLM provider configured — skipping")
-        return [], "no LLM provider configured"
-    prompt = _build_prompt(category, context, exclude_names, limit)
-    last_note: str | None = None
-    for candidate in providers:
-        try:
-            content = await asyncio.wait_for(
-                candidate.complete(prompt, max_tokens=_LLM_MAX_TOKENS),
-                timeout=_LLM_CALL_TIMEOUT_S,
-            )
-        except ProviderError as exc:
-            logger.warning("feed_discovery: LLM call failed on %s: %s — trying next provider", candidate.name, exc)
-            last_note = f"{candidate.name}: {exc}"
-            continue
-        except asyncio.TimeoutError:
-            logger.warning(
-                "feed_discovery: %s took longer than %.0fs — trying next provider",
-                candidate.name, _LLM_CALL_TIMEOUT_S,
-            )
-            last_note = f"{candidate.name}: timed out after {_LLM_CALL_TIMEOUT_S:.0f}s"
-            continue
-        content = _strip_code_fence(content or "")
-        if not content:
-            last_note = f"{candidate.name}: returned an empty response"
-            continue
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, ValueError):
-            logger.warning("feed_discovery: %s returned non-JSON output, skipping", candidate.name)
-            last_note = f"{candidate.name}: returned non-JSON output"
-            continue
-        if isinstance(parsed, dict):
-            # Some providers wrap the array in {"feeds": [...]}. despite the prompt.
-            parsed = parsed.get("feeds") or parsed.get("suggestions") or []
-        if not isinstance(parsed, list):
-            last_note = f"{candidate.name}: returned an unexpected response shape"
-            continue
-        return [item for item in parsed if isinstance(item, dict)], None
-    logger.warning("feed_discovery: all configured LLM providers failed or returned unusable output")
-    return [], last_note or "all configured providers failed"
+    items, note = await complete_with_fallback(
+        "brief",
+        _build_prompt(category, context, exclude_names, limit),
+        log_name="feed_discovery",
+        timeout=_LLM_CALL_TIMEOUT_S,
+        parse=_parse_suggestions,
+        max_tokens=_LLM_MAX_TOKENS,
+    )
+    return (items, None) if items is not None else ([], note)
 
 
 async def _validate_feed_url(url: str) -> bool:

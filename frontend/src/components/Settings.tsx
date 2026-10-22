@@ -10,7 +10,8 @@
 //   LLM            — moved from Drawer. Provider + model pickers,
 //                    brief tone pills, "Generate brief now".
 //   Notifications  — moved from Drawer. Backend status + retry.
-//   Reset          — moved from Drawer. Clear local state.
+//   Reset          — moved from Drawer. Reset reading state, and the
+//                    build this page runs (PR1r).
 //
 // Tab navigation: the URL holds the open tab via
 // ``?view=settings&tab=feeds|llm|notifications|reset`` so the back
@@ -23,10 +24,12 @@
 // overlay" for free, and the overlay is dismissible by clearing the
 // param (Esc + tapping Done both do that).
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import {
   api,
   safeExternalUrl,
+  type LLMSettingsUpdate,
   type LLMTagsResponse,
   type LLMStatus,
   type NotificationStatus,
@@ -34,18 +37,18 @@ import {
   type Source,
 } from '../api'
 import { FeedManager } from './FeedManager'
+import { SETTINGS_TABS, type SettingsTab } from '../lib/settingsTabs'
+import { flushEditors, setPageHiding, type SaveState } from '../lib/sourceSaves'
+import { errorMessage } from '../lib/apiErrors'
+import { FieldError, SaveStatus } from './feeds/SaveStatus'
+import { useMediaQuery, useVisualViewport } from '../lib/visualViewport'
 import { toast } from './Toast'
+import { sourceLabel } from '../lib/labels'
 import { usePreferences, type HistoryGroupByValue } from '../lib/preferences'
+import { formatBuildTime, shortId } from '../lib/buildId'
+import { liveBuildId } from '../lib/useUpdateCheck'
 
-export type SettingsTab =
-  | 'feeds'
-  | 'llm'
-  | 'notifications'
-  | 'history'
-  | 'hidden'
-  | 'starred'
-  | 'voted'
-  | 'reset'
+export type { SettingsTab }
 
 type Props = {
   open: boolean
@@ -56,8 +59,12 @@ type Props = {
   // path can list existing names client-side).
   sources: Source[]
   onRefreshSources: () => Promise<void>
-  onError: (msg: string) => void
   onClose: () => void
+  // Open this feed's row in Feeds (the Menu's ›, a ?source= link).
+  // ``focusNonce`` changes on every request, so asking for the same
+  // feed again while Settings is open still scrolls to it.
+  focusSourceId?: number | null
+  focusNonce?: number
   // Lifted state from App. The Settings overlay owns the canonical
   // brief-tone state — Drawer's tone picker is gone, so this is
   // the only place the tone can change.
@@ -71,11 +78,13 @@ type Props = {
     onError?: (msg: string) => void,
   ) => Promise<void>
   generating: boolean
-  // Bubbles the old→new source name mapping from FeedManager's
-  // inline edit, so App can remap the active filter chip in the
-  // same render cycle.
-  onSourceRenamed?: (oldName: string, newName: string) => void
-  // Reset hooks. Wipes local namespaced keys; App owns the
+  // A feed was added or deleted in Feeds, so App shows the change at
+  // once; and the Edit action on an "Added …" toast.
+  onSourceAdded?: (row: Source) => void
+  onSourceDeleted?: (id: number) => void
+  onEditSource?: (id: number) => void
+  // Reset hooks. Wipes local namespaced keys and the reading-state
+  // preferences (saves, hides and saved views stay); App owns the
   // reload so every component's state mirrors reset in lockstep.
   onResetLocalState: () => void
   // List of currently-hidden entry ids. Shown on the Hidden tab
@@ -105,12 +114,12 @@ type Props = {
 
 const TAB_META: Record<SettingsTab, { label: string; icon: string }> = {
   feeds: { label: 'Feeds', icon: 'feeds' },
-  llm: { label: 'LLM', icon: 'llm' },
+  llm: { label: 'AI', icon: 'llm' },
   notifications: { label: 'Notifications', icon: 'bell' },
   history: { label: 'History', icon: 'history' },
   hidden: { label: 'Hidden', icon: 'eye-off' },
   starred: { label: 'Saved', icon: 'star' },
-  voted: { label: 'Voted', icon: 'arrow-down' },
+  voted: { label: 'Downvoted', icon: 'arrow-down' },
   reset: { label: 'Reset', icon: 'reset' },
 }
 
@@ -119,13 +128,16 @@ export function Settings({
   tab,
   sources,
   onRefreshSources,
-  onError,
   onClose,
+  focusSourceId,
+  focusNonce,
   briefTone,
   onBriefToneChange,
   triggerGenerate,
   generating,
-  onSourceRenamed,
+  onSourceAdded,
+  onSourceDeleted,
+  onEditSource,
   onResetLocalState,
   hiddenEntries,
   onRestoreHidden,
@@ -153,15 +165,34 @@ export function Settings({
     api
       .notificationStatus()
       .then((s) => alive && setNotif(s))
-      .catch((e) => alive && setNotifError((e as Error).message))
+      .catch((e) => alive && setNotifError(errorMessage(e)))
     api
       .llmStatus()
       .then((s) => alive && setLlm(s))
-      .catch((e) => alive && setLlmError((e as Error).message))
+      .catch((e) => alive && setLlmError(errorMessage(e)))
     return () => {
       alive = false
     }
   }, [open])
+
+  // Reset's inline confirm; it starts over each time the tab opens.
+  const [confirmReset, setConfirmReset] = useState(false)
+  useEffect(() => {
+    if (tab !== 'reset') setConfirmReset(false)
+  }, [tab])
+
+  // Errors inside Settings show as a toast over the sheet; App's banner
+  // sits behind it, where nobody would see it.
+  const reportError = useCallback((m: string) => toast(m, 'error'), [])
+
+  // Done, the backdrop and Esc: the blur commits a text field being
+  // edited, flushEditors commits any other unsaved draft, and the sheet
+  // closes at once. Saves carry on after it has gone.
+  const handleClose = useCallback(() => {
+    ;(document.activeElement as HTMLElement | null)?.blur()
+    flushEditors()
+    onClose()
+  }, [onClose])
 
   // Esc closes. Mirrors the Drawer's pattern; App's keyboard handler
   // also listens for Esc on the search input but this listener
@@ -172,14 +203,55 @@ export function Settings({
       if (e.key === 'Escape') {
         e.stopPropagation()
         e.preventDefault()
-        onClose()
+        handleClose()
       }
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [open, onClose])
+  }, [open, handleClose])
+
+  // Switching apps mid-edit: commit what is being typed and send it at
+  // once with keepalive. setPageHiding comes first so these commits go
+  // straight out, whichever of App's listeners and these runs first.
+  useEffect(() => {
+    if (!open) return
+    const hide = () => {
+      setPageHiding(true)
+      ;(document.activeElement as HTMLElement | null)?.blur()
+      flushEditors()
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') hide()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', hide)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', hide)
+    }
+  }, [open])
+
+  // The on-screen keyboard on a phone: the sheet shrinks to the visible
+  // area, so Done and the focused field stay above the keyboard. The
+  // desktop panel ignores this.
+  const viewport = useVisualViewport()
+  const phone = useMediaQuery('(max-width: 767px)')
+  const keyboard = open && phone && viewport.keyboardOpen
+  const panelRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!keyboard) return
+    const el = document.activeElement
+    if (el instanceof HTMLElement && panelRef.current?.contains(el)) el.scrollIntoView({ block: 'nearest' })
+  }, [keyboard, viewport.height, viewport.offsetTop])
 
   if (!open) return null
+
+  const panelStyle = keyboard
+    ? {
+        top: `calc(env(safe-area-inset-top) + 0.75rem + ${viewport.offsetTop}px)`,
+        bottom: `${Math.max(0, document.documentElement.clientHeight - (viewport.offsetTop + viewport.height))}px`,
+      }
+    : undefined
 
   return (
     <div
@@ -190,41 +262,49 @@ export function Settings({
       onClick={(e) => {
         // Backdrop tap closes. The inner card has stopPropagation so
         // taps inside it don't close.
-        if (e.target === e.currentTarget) onClose()
+        if (e.target === e.currentTarget) handleClose()
       }}
     >
       <div
+        ref={panelRef}
+        style={panelStyle}
         // Right-side panel on desktop, full-viewport sheet on mobile.
+        // The mobile sheet is pinned by its top edge, not a vh height:
+        // iOS Safari's vh counts the space behind its toolbar, so a
+        // 92vh sheet ran off the top of the visible screen.
         // The desktop panel is wider than the Drawer (480px) because
         // the LLM tab needs room for the provider/model pickers and
         // the Feeds tab's add-custom form has a wide textarea.
-        className="absolute inset-x-0 bottom-0 top-auto h-[92vh] rounded-t-ios-lg bg-bg-app shadow-2xl flex flex-col
+        // Side insets keep the sheet's content clear of the notch in
+        // landscape; they are 0 in portrait.
+        className="absolute inset-x-0 bottom-0 top-[calc(env(safe-area-inset-top)+0.75rem)] rounded-t-ios-lg bg-bg-app shadow-2xl flex flex-col
+                   pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]
+                   motion-safe:animate-sheet-up md:animate-none
                    md:inset-y-0 md:right-0 md:left-auto md:top-0 md:bottom-auto md:h-full md:w-[480px] md:rounded-none"
       >
-        {/* Header — same shape as Drawer but with the tab strip
-            underneath the title row instead of inside the body. The
-            "Done" button is on the left, title on the right
-            (matches the Drawer's right-anchored panel). */}
-        <div className="flex items-center justify-between px-4 pt-3 pb-3 md:pt-5 md:pb-4 border-b border-hairline shrink-0">
-          <button
-            onClick={onClose}
-            aria-label="close settings"
-            className="min-h-[32px] min-w-[32px] flex items-center justify-center rounded-ios text-accent active:bg-bg-elevated"
-          >
-            <span className="text-ios-body font-normal">Done</span>
-          </button>
-          <h2 className="text-2xl md:text-ios-large-title font-bold text-label-primary tracking-tight">
-            {tab === 'feeds' ? 'Settings' : `Settings → ${TAB_META[tab].label}`}
+        {/* Header — iOS sheet layout: title on the leading edge, Done
+            on the trailing edge. The title gives way (truncates) before
+            Done ever shrinks. The selected tab pill already says which
+            tab is open, so the title is always just "Settings". */}
+        <div className="flex items-center justify-between gap-3 px-4 pt-3 pb-3 md:pt-5 md:pb-4 border-b border-hairline shrink-0">
+          <h2 className="min-w-0 flex-1 truncate text-2xl md:text-ios-large-title font-bold text-label-primary tracking-tight">
+            Settings
           </h2>
+          <button
+            onClick={handleClose}
+            aria-label="close settings"
+            className="shrink-0 min-h-[44px] min-w-[44px] px-2 flex items-center justify-center rounded-ios text-ios-body font-semibold text-accent active:bg-bg-elevated"
+          >
+            Done
+          </button>
         </div>
-        {/* Tab strip. iOS segmented control style — same 4-cell
-            grid the Drawer's tone picker uses, but extended to
-            cover all settings tabs. Active tab uses bg-bg-elevated
-            + text-accent; inactive is bg-bg-surface + text-label-
-            primary. ``role="tablist"`` so screen readers
-            announce it as a tab group. */}
-        <div className="flex gap-1 mx-4 mt-3 rounded-ios overflow-hidden border border-hairline" role="tablist">
-          {(['feeds', 'llm', 'notifications', 'history', 'hidden', 'starred', 'voted', 'reset'] as SettingsTab[]).map((t) => {
+        {/* Tab strip: a scrolling row of labelled pills, the same
+            shape as the dashboard's category chips. Eight icon-only
+            cells didn't fit a phone with their labels, and icons
+            alone left the reader guessing. ``role="tablist"`` so
+            screen readers announce it as a tab group. */}
+        <div data-hscroll className="flex gap-1.5 overflow-x-auto px-4 mt-3 pb-1" role="tablist">
+          {SETTINGS_TABS.map((t) => {
             const active = t === tab
             return (
               <button
@@ -233,24 +313,27 @@ export function Settings({
                 aria-selected={active}
                 onClick={() => {
                   // Tab changes are URL-driven. App owns the URL
-                  // updater; we just bubble the new tab.
+                  // updater; we just bubble the new tab. The history
+                  // state is kept: App's Done uses it to step back
+                  // instead of adding an entry.
                   const u = new URL(window.location.href)
                   u.searchParams.set('tab', t)
-                  window.history.replaceState(null, '', u.toString())
+                  u.searchParams.delete('source')
+                  window.history.replaceState(window.history.state, '', u.toString())
                   // Force a re-render via a custom event so App
                   // re-reads the URL. Alternative: lift a callback
                   // to App and call it. The custom event is
                   // simpler and keeps the API minimal.
                   window.dispatchEvent(new Event('popstate'))
                 }}
-                className={`flex-1 min-h-[36px] flex items-center justify-center gap-1 text-ios-caption transition ${
+                className={`shrink-0 min-h-[44px] flex items-center gap-1.5 rounded-full px-3 text-ios-caption font-medium whitespace-nowrap transition ${
                   active
-                    ? 'bg-bg-elevated text-accent'
-                    : 'bg-bg-surface text-label-primary active:bg-bg-elevated'
+                    ? 'bg-accent text-white'
+                    : 'bg-bg-surface text-label-secondary active:bg-bg-elevated'
                 }`}
               >
                 <TabIcon name={TAB_META[t].icon} active={active} />
-                <span className="hidden sm:inline">{TAB_META[t].label}</span>
+                <span>{TAB_META[t].label}</span>
               </button>
             )
           })}
@@ -258,14 +341,22 @@ export function Settings({
         {/* Body. ``min-h-0`` lets the section actually scroll when
             the content overflows the viewport. Same pattern as the
             Drawer. */}
-        <div className="flex-1 min-h-0 overflow-y-auto bg-bg-app pb-8">
+        <div
+          className={`flex-1 min-h-0 overflow-y-auto overscroll-contain bg-bg-app ${
+            keyboard ? 'pb-8' : 'pb-[calc(2rem+env(safe-area-inset-bottom))]'
+          }`}
+        >
           {tab === 'feeds' && (
-            <div className="pt-4">
+            <div className="pt-4 px-4">
               <FeedManager
                 sources={sources}
                 onRefresh={onRefreshSources}
-                onError={onError}
-                onSourceRenamed={onSourceRenamed}
+                onError={reportError}
+                focusSourceId={focusSourceId}
+                focusNonce={focusNonce}
+                onSourceAdded={onSourceAdded}
+                onSourceDeleted={onSourceDeleted}
+                onEditSource={onEditSource}
               />
             </div>
           )}
@@ -280,7 +371,7 @@ export function Settings({
                   api
                     .llmStatus()
                     .then((s) => setLlm(s))
-                    .catch((e) => setLlmError((e as Error).message))
+                    .catch((e) => setLlmError(errorMessage(e)))
                 }}
               />
               <div>
@@ -290,9 +381,9 @@ export function Settings({
                 <div className="grid grid-cols-3 gap-0 rounded-ios overflow-hidden border border-hairline">
                   {(
                     [
-                      { value: 'terse' as const, label: 'terse' },
-                      { value: 'narrative' as const, label: 'narrative' },
-                      { value: 'alert' as const, label: 'alert' },
+                      { value: 'terse' as const, label: 'Short' },
+                      { value: 'narrative' as const, label: 'Story' },
+                      { value: 'alert' as const, label: 'Alerts' },
                     ]
                   ).map((t) => {
                     const active = t.value === briefTone
@@ -329,43 +420,41 @@ export function Settings({
             <div className="pt-4 px-4 space-y-3">
               {notifError ? (
                 <div className="rounded-ios bg-red-500/15 border border-red-500/40 p-3">
-                  <div className="text-ios-body text-red-200">Couldn't check status</div>
-                  <div className="text-ios-caption text-red-300/80">
-                    tap retry — {notifError}
-                  </div>
+                  <div className="text-ios-body text-red-200">Couldn't check notifications</div>
+                  <div className="text-ios-caption text-red-300/80 break-words">{notifError}</div>
                   <button
                     onClick={() => {
                       setNotifError(null)
                       api
                         .notificationStatus()
                         .then((s) => setNotif(s))
-                        .catch((e) => setNotifError((e as Error).message))
+                        .catch((e) => setNotifError(errorMessage(e)))
                     }}
-                    className="mt-2 text-ios-caption text-accent active:opacity-60"
+                    className="mt-2 min-h-[44px] px-3 rounded-ios border border-hairline text-ios-body text-accent active:opacity-60"
                   >
-                    Retry
+                    Try again
                   </button>
                 </div>
               ) : notif === null ? (
-                <div className="text-ios-body text-label-secondary">checking…</div>
+                <div className="text-ios-body text-label-secondary">Checking…</div>
               ) : notif.configured ? (
                 <div className="rounded-ios bg-emerald-500/10 border border-emerald-500/30 p-3">
-                  <div className="text-ios-body text-emerald-300">Configured</div>
+                  <div className="text-ios-body text-emerald-300">On</div>
                   <div className="text-ios-caption text-emerald-300/80">
                     {notif.backend} · {notif.scheme}
                   </div>
                 </div>
               ) : (
                 <div className="rounded-ios bg-amber-500/10 border border-amber-500/30 p-3">
-                  <div className="text-ios-body text-amber-300">Not configured</div>
+                  <div className="text-ios-body text-amber-300">Off</div>
                   <div className="text-ios-caption text-amber-300/80">
-                    set APPRISE_URL or PUSHOVER_* in .env, then restart the backend
+                    Push notifications are off. They are turned on in the server&apos;s settings file; see
+                    “Notifications” in the README.
                   </div>
                 </div>
               )}
               <p className="text-ios-caption text-label-secondary">
-                Notifications are sent for high-priority brief sections (alerts).
-                Set the URL in <code className="text-ios-caption">.env</code> on the host.
+                When they&apos;re on, Popping sends one for the alert sections of each new brief.
               </p>
             </div>
           )}
@@ -393,36 +482,73 @@ export function Settings({
             />
           )}
 
-          {tab === 'history' && <HistoryTabContent onError={onError} />}
+          {tab === 'history' && <HistoryTabContent onError={reportError} />}
 
           {tab === 'reset' && (
             <div className="pt-4 px-4 space-y-3">
               <div className="rounded-ios bg-bg-surface border border-hairline p-3">
                 <div className="text-ios-body text-label-primary">
-                  Clear local state
+                  Reset reading state
                 </div>
                 <p className="text-ios-caption text-label-secondary mt-1">
-                  Wipes read marks, column preferences, last-viewed timestamps, and
-                  the last-selected mobile column. Server data (entries, sources,
-                  briefs) is untouched — a refresh re-fetches everything.
+                  Clears read marks, each tab&apos;s sort and filter, last-visit times and folded
+                  sections on all your devices, and this device&apos;s own settings. Saved and hidden
+                  stories, votes, saved views, feeds and briefs stay.
                 </p>
-                <button
-                  onClick={() => {
-                    if (window.confirm('Clear local state? This wipes read marks, column preferences, and last-viewed timestamps on this device. This can\'t be undone.')) {
-                      onResetLocalState()
-                    }
-                  }}
-                  className="mt-3 w-full min-h-[44px] rounded-ios bg-red-500/15 border border-red-500/40 text-red-300 active:opacity-60"
-                >
-                  Clear local state
-                </button>
+                {confirmReset ? (
+                  <div className="mt-3 rounded-ios border border-red-500/40 p-3 space-y-2">
+                    <p className="text-ios-body text-label-primary">
+                      Reset reading state on all your devices? This can&apos;t be undone.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setConfirmReset(false)
+                          onResetLocalState()
+                        }}
+                        className="min-h-[44px] px-3 rounded-ios bg-red-500 text-white text-ios-body active:opacity-80"
+                      >
+                        Reset
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmReset(false)}
+                        className="min-h-[44px] px-3 rounded-ios border border-hairline text-label-primary text-ios-body active:opacity-60"
+                      >
+                        Keep
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmReset(true)}
+                    className="mt-3 w-full min-h-[44px] rounded-ios bg-red-500/15 border border-red-500/40 text-red-300 active:opacity-60"
+                  >
+                    Reset reading state
+                  </button>
+                )}
               </div>
+              <BuildLine />
             </div>
           )}
         </div>
       </div>
     </div>
   )
+}
+
+// Which build this page runs, e.g. "Build 3f9a1c2e · 19 Oct, 14:02", so
+// a device can be checked against a deploy (PR1r). The id is the
+// running page's, not the server's: a resumed page keeps its old build.
+function BuildLine() {
+  const line = useMemo(() => {
+    const id = shortId(liveBuildId()) || 'dev'
+    const built = formatBuildTime(__BUILD_TIME__)
+    return built ? `Build ${id} · ${built}` : `Build ${id}`
+  }, [])
+  return <p className="px-1 text-ios-caption text-label-secondary">{line}</p>
 }
 
 // Tab icons. Inline SVGs to avoid a dep on an icon library. Each
@@ -530,11 +656,28 @@ const emptyApiKeySet: Record<ApiKeyProvider, boolean> = {
   ollama_cloud: false,
 }
 
-// LLM section. Moved from Drawer.tsx, used inside the Settings
-// overlay. The LLM config (provider + model) is the most complex
-// piece of the Settings so it lives in its own function. The
-// brief-tone picker and Generate button are now siblings, not
-// nested.
+// The AI tab's provider, models and keys. Every control saves on its
+// own, like the feed editor: a provider or model saves when picked, a
+// typed model name or key when the field is left. Each PUT carries
+// only its own fields (routes/settings.py: a missing field is left
+// alone), and they go out one at a time in the order made.
+type AiField = 'provider' | 'model_brief' | 'model_scoring' | ApiKeyProvider
+const OTHER = '__other__'
+const isKeyProvider = (p: string): p is ApiKeyProvider => API_KEY_PROVIDERS.some((k) => k.id === p)
+const keyLabel = (p: ApiKeyProvider) => API_KEY_PROVIDERS.find((k) => k.id === p)!.label
+const keySetFrom = (s: SettingsOut): Record<ApiKeyProvider, boolean> => ({
+  anthropic: s.anthropic_api_key_set,
+  openai: s.openai_api_key_set,
+  groq: s.groq_api_key_set,
+  ollama_cloud: s.ollama_cloud_api_key_set,
+})
+const aiLabelClass = 'block text-ios-caption uppercase tracking-wide text-label-tertiary'
+const aiFieldClass =
+  'w-full min-w-0 min-h-[44px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-body text-label-primary placeholder:text-label-tertiary'
+const aiSelectClass =
+  'select-ios w-full min-h-[44px] rounded-ios bg-bg-elevated border border-hairline pl-3 pr-8 text-ios-body text-label-primary'
+const IDLE_STATE: SaveState = { status: 'idle' }
+
 function LLMSection({
   llm,
   llmError,
@@ -546,341 +689,437 @@ function LLMSection({
   onChange: (next: LLMStatus) => void
   onRetry: () => void
 }) {
-  const [pickerOpen, setPickerOpen] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // What the server has saved ('' = the server's settings file).
+  const [provider, setProvider] = useState('')
+  const [modelBrief, setModelBrief] = useState('')
+  const [modelScoring, setModelScoring] = useState('')
   const [tags, setTags] = useState<LLMTagsResponse | null>(null)
   const [scoringTags, setScoringTags] = useState<LLMTagsResponse | null>(null)
-  const [provider, setProvider] = useState<string>('')
-  const [modelBrief, setModelBrief] = useState<string>('')
-  const [modelScoring, setModelScoring] = useState<string>('')
-  const [freeTextBrief, setFreeTextBrief] = useState<string>('')
-  const [useFreeText, setUseFreeText] = useState<boolean>(false)
   const [tagsError, setTagsError] = useState<string | null>(null)
-  const [tagsLoading, setTagsLoading] = useState<boolean>(false)
-  const [saving, setSaving] = useState<boolean>(false)
-  const [saveError, setSaveError] = useState<string | null>(null)
-  // API-key inputs are write-only: blank by default (never prefilled
-  // with the real value, which the GET endpoint never sends anyway),
-  // typed text = "set to this" on the next Save, left blank = "don't
-  // touch". ``apiKeySet`` mirrors the *_api_key_set booleans so each
-  // row can show "configured" vs "not set" without knowing the value.
-  const [apiKeys, setApiKeys] = useState<Record<ApiKeyProvider, string>>(emptyApiKeys)
-  const [apiKeySet, setApiKeySet] = useState<Record<ApiKeyProvider, boolean>>(emptyApiKeySet)
-  const [clearingKey, setClearingKey] = useState<ApiKeyProvider | null>(null)
+  const [tagsLoading, setTagsLoading] = useState(false)
+  // A typed model name: "Other…" in a list, or the only way to name a
+  // model for providers without a list. null = not typing one.
+  const [briefDraft, setBriefDraft] = useState<string | null>(null)
+  const [scoringDraft, setScoringDraft] = useState<string | null>(null)
+  // Keys are write-only: the server only says whether one is set.
+  const [keySet, setKeySet] = useState<Record<ApiKeyProvider, boolean>>(emptyApiKeySet)
+  const [keyDrafts, setKeyDrafts] = useState<Record<ApiKeyProvider, string>>(emptyApiKeys)
+  const [keySaved, setKeySaved] = useState<Partial<Record<ApiKeyProvider, boolean>>>({})
+  const [confirmRemove, setConfirmRemove] = useState<ApiKeyProvider | null>(null)
+  // Set when the chosen provider still has no usable key.
+  const [noKeyFor, setNoKeyFor] = useState<ApiKeyProvider | null>(null)
+  const [states, setStates] = useState<Partial<Record<AiField, SaveState>>>({})
+  const stateOf = (f: AiField) => states[f] ?? IDLE_STATE
+  const setFieldState = (f: AiField, s: SaveState) => setStates((prev) => ({ ...prev, [f]: s }))
 
-  const openPicker = async () => {
-    setPickerOpen(true)
-    setSaveError(null)
+  // Bumped on every tags fetch so a slow response for a provider the
+  // user has already switched away from can't overwrite the newer list.
+  const tagsRequest = useRef(0)
+  const fetchTags = async (pinned: string) => {
+    const request = ++tagsRequest.current
+    const prov = pinned === 'ollama' ? 'ollama' : pinned === 'ollama_cloud' || pinned === '' ? 'ollama_cloud' : null
+    let tb: LLMTagsResponse | null = null
+    let ts: LLMTagsResponse | null = null
     setTagsError(null)
-    setTagsLoading(true)
-    try {
-      const s = await api.settings()
-      const prov = providerForTagsFetch(s)
-      let tb: LLMTagsResponse | null = null
-      let ts: LLMTagsResponse | null = null
-      if (prov) {
-        // Tags fetch failure (e.g. no Ollama Cloud key configured) is
-        // common and shouldn't block the form from reflecting current
-        // settings below — in particular, it must not leave a
-        // previously-typed API key sitting in the input because
-        // applySettingsToForm never ran.
-        try {
-          ;[tb, ts] = await Promise.all([
-            api.llmTags(prov, false, 'brief'),
-            api.llmTags(prov, false, 'scoring'),
-          ])
-        } catch (err) {
-          setTagsError((err as Error).message)
-        }
+    if (prov) {
+      setTagsLoading(true)
+      try {
+        ;[tb, ts] = await Promise.all([api.llmTags(prov, false, 'brief'), api.llmTags(prov, false, 'scoring')])
+      } catch (err) {
+        if (request === tagsRequest.current) setTagsError(`Couldn't load the model list. ${errorMessage(err)}`)
       }
+    }
+    if (request === tagsRequest.current) {
       setTags(tb)
       setScoringTags(ts)
-      applySettingsToForm(s, tb, ts)
-    } catch (err) {
-      // api.settings() itself failed — nothing to populate the form with.
-      setSaveError((err as Error).message)
-    } finally {
       setTagsLoading(false)
     }
   }
 
-  const providerForTagsFetch = (s: SettingsOut | null): string | null => {
-    const pinned = s?.llm_provider || ''
-    if (pinned === 'ollama_cloud' || pinned === '') return 'ollama_cloud'
-    if (pinned === 'ollama') return 'ollama'
-    return null
-  }
+  // The controls are always shown: load what is saved when the tab opens.
+  useEffect(() => {
+    let alive = true
+    api
+      .settings()
+      .then(async (s) => {
+        if (!alive) return
+        setProvider(s.llm_provider || '')
+        setModelBrief(s.llm_model_brief || '')
+        setModelScoring(s.llm_model_scoring || '')
+        setKeySet(keySetFrom(s))
+        setLoaded(true)
+        await fetchTags(s.llm_provider || '')
+      })
+      .catch((err) => alive && setLoadError(errorMessage(err)))
+    return () => {
+      alive = false
+    }
+    // Once per opening of the tab.
+  }, [])
 
-  const applySettingsToForm = (
-    s: SettingsOut,
-    t: LLMTagsResponse | null,
-    ts: LLMTagsResponse | null,
+  // One PUT at a time, in the order the changes were made.
+  const queue = useRef<Promise<void>>(Promise.resolve())
+  const savedTimers = useRef(new Map<AiField, ReturnType<typeof setTimeout>>())
+  useEffect(() => () => savedTimers.current.forEach((t) => clearTimeout(t)), [])
+  const save = (
+    field: AiField,
+    body: LLMSettingsUpdate,
+    { after, undo }: { after?: (status: LLMStatus | null) => void; undo?: () => void } = {},
   ) => {
-    setProvider(s.llm_provider || '')
-    setModelBrief(s.llm_model_brief || '')
-    setModelScoring(s.llm_model_scoring || '')
-    const tagNames = t?.models?.map((m) => m.name) ?? []
-    const isFreeText =
-      Boolean(s.llm_model_brief) && tagNames.length > 0 && !tagNames.includes(s.llm_model_brief || '')
-    setUseFreeText(isFreeText)
-    setFreeTextBrief(isFreeText ? s.llm_model_brief || '' : '')
-    setApiKeySet({
-      anthropic: s.anthropic_api_key_set,
-      openai: s.openai_api_key_set,
-      groq: s.groq_api_key_set,
-      ollama_cloud: s.ollama_cloud_api_key_set,
+    setFieldState(field, { status: 'saving' })
+    queue.current = queue.current.then(async () => {
+      try {
+        const s = await api.updateLLMSettings(body)
+        setKeySet(keySetFrom(s))
+        const status = await api.llmStatus().catch(() => null)
+        if (status) onChange(status)
+        after?.(status)
+        setFieldState(field, { status: 'saved' })
+        clearTimeout(savedTimers.current.get(field))
+        savedTimers.current.set(
+          field,
+          setTimeout(() => setStates((prev) => (prev[field]?.status === 'saved' ? { ...prev, [field]: IDLE_STATE } : prev)), 1500),
+        )
+      } catch (err) {
+        undo?.()
+        // Never echo a key: the message is about the save, not the value.
+        setFieldState(field, { status: 'error', message: errorMessage(err) })
+      }
     })
-    setApiKeys(emptyApiKeys)
-    void ts
   }
 
-  const save = async () => {
-    setSaving(true)
-    setSaveError(null)
-    try {
-      await api.updateLLMSettings({
-        provider: provider,
-        model_brief: useFreeText ? freeTextBrief : modelBrief,
-        model_scoring: modelScoring,
-        // Blank input = "don't touch" (omit); only typed values are
-        // sent. Clearing an already-set key is a separate action
-        // (the "clear" button below) so it takes effect immediately
-        // rather than being lost if the user forgets to hit Save.
-        anthropic_api_key: apiKeys.anthropic || undefined,
-        openai_api_key: apiKeys.openai || undefined,
-        groq_api_key: apiKeys.groq || undefined,
-        ollama_cloud_api_key: apiKeys.ollama_cloud || undefined,
-      })
-      const status = await api.llmStatus()
-      onChange(status)
-      setPickerOpen(false)
-    } catch (err) {
-      setSaveError((err as Error).message)
-    } finally {
-      setSaving(false)
-    }
+  // A provider change clears both models (names are provider-specific)
+  // in the same PUT, for every provider, and reloads the model lists.
+  const changeProvider = (next: string) => {
+    const before = { provider, modelBrief, modelScoring }
+    setProvider(next)
+    setModelBrief('')
+    setModelScoring('')
+    setBriefDraft(null)
+    setScoringDraft(null)
+    setNoKeyFor(null)
+    void fetchTags(next)
+    save(
+      'provider',
+      { provider: next, model_brief: '', model_scoring: '' },
+      {
+        after: (status) => {
+          if (isKeyProvider(next) && status && !status.configured) setNoKeyFor(next)
+        },
+        undo: () => {
+          setProvider(before.provider)
+          setModelBrief(before.modelBrief)
+          setModelScoring(before.modelScoring)
+          void fetchTags(before.provider)
+        },
+      },
+    )
   }
 
-  const clearApiKey = async (id: ApiKeyProvider) => {
-    setClearingKey(id)
-    setSaveError(null)
-    try {
-      const field = `${id}_api_key` as const
-      const s = await api.updateLLMSettings({ [field]: '' })
-      setApiKeySet({
-        anthropic: s.anthropic_api_key_set,
-        openai: s.openai_api_key_set,
-        groq: s.groq_api_key_set,
-        ollama_cloud: s.ollama_cloud_api_key_set,
-      })
-      setApiKeys((prev) => ({ ...prev, [id]: '' }))
-    } catch (err) {
-      setSaveError((err as Error).message)
-    } finally {
-      setClearingKey(null)
-    }
+  const saveModel = (kind: 'brief' | 'scoring', value: string) => {
+    const field = kind === 'brief' ? 'model_brief' : 'model_scoring'
+    const saved = kind === 'brief' ? modelBrief : modelScoring
+    const set = kind === 'brief' ? setModelBrief : setModelScoring
+    if (value === saved) return
+    set(value)
+    save(field, { [field]: value }, { undo: () => set(saved) })
   }
 
-  const tagOptions = useMemo(() => tags?.models ?? [], [tags])
-  const tagNames = useMemo(() => tagOptions.map((m) => m.name), [tagOptions])
-  const hasRecommendations = useMemo(
-    () => tagOptions.some((m) => m.recommended),
-    [tagOptions],
+  // A typed key saves when the field is left; an empty or untouched
+  // field sends nothing ("" would delete the key).
+  const commitKey = (id: ApiKeyProvider) => {
+    const value = keyDrafts[id].trim()
+    if (!value) return
+    setKeyDrafts((prev) => ({ ...prev, [id]: '' }))
+    setKeySaved((prev) => ({ ...prev, [id]: false }))
+    save(id, { [`${id}_api_key`]: value } as LLMSettingsUpdate, {
+      after: (status) => {
+        setKeySaved((prev) => ({ ...prev, [id]: true }))
+        if (noKeyFor === id && status?.configured) setNoKeyFor(null)
+      },
+      undo: () => setKeyDrafts((prev) => (prev[id] ? prev : { ...prev, [id]: value })),
+    })
+  }
+  const removeKey = (id: ApiKeyProvider) => {
+    setConfirmRemove(null)
+    setKeySaved((prev) => ({ ...prev, [id]: false }))
+    save(id, { [`${id}_api_key`]: '' } as LLMSettingsUpdate)
+  }
+
+  const keyInput = (id: ApiKeyProvider, labelledBy?: string) => (
+    <input
+      id={`ai-key-${id}`}
+      type="password"
+      // Not the sign-in password: "new-password" and the password
+      // managers' ignore flags keep iOS and browser autofill from
+      // offering the saved login here, which would then be saved and
+      // sent to the AI provider as a key.
+      autoComplete="new-password"
+      data-1p-ignore=""
+      data-lpignore="true"
+      data-bwignore=""
+      data-form-type="other"
+      autoCapitalize="none"
+      autoCorrect="off"
+      spellCheck={false}
+      enterKeyHint="done"
+      aria-label={labelledBy ? undefined : `${keyLabel(id)} key`}
+      value={keyDrafts[id]}
+      onChange={(e) => setKeyDrafts((prev) => ({ ...prev, [id]: e.target.value }))}
+      onBlur={() => commitKey(id)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault()
+          e.currentTarget.blur()
+        }
+      }}
+      placeholder={keySet[id] ? 'Saved. Paste to replace.' : 'Not set'}
+      className={aiFieldClass}
+    />
   )
-  const scoringOptions = useMemo(() => scoringTags?.models ?? [], [scoringTags])
-  const hasScoringRecommendations = useMemo(
-    () => scoringOptions.some((m) => m.recommended),
-    [scoringOptions],
-  )
+  const fieldError = (f: AiField) => {
+    const s = stateOf(f)
+    return s.status === 'error' && s.message ? <FieldError message={s.message} /> : null
+  }
+
+  // One model picker: a list when the provider has one (with a saved
+  // name missing from it kept first, and Other…), else a text field.
+  const modelPicker = (kind: 'brief' | 'scoring') => {
+    const field = kind === 'brief' ? 'model_brief' : 'model_scoring'
+    const saved = kind === 'brief' ? modelBrief : modelScoring
+    const draft = kind === 'brief' ? briefDraft : scoringDraft
+    const setDraft = kind === 'brief' ? setBriefDraft : setScoringDraft
+    const options = (kind === 'brief' ? tags : scoringTags)?.models ?? []
+    const id = `ai-${field}`
+    const label = kind === 'brief' ? 'Brief model' : 'Story-ranking model'
+    const hasList = options.length > 0
+    const typing = !hasList || draft !== null
+    const recommended = options.some((m) => m.recommended)
+    return (
+      <div>
+        <div className="flex items-center justify-between gap-2 mb-1">
+          <label htmlFor={id} className={aiLabelClass}>
+            {label}
+          </label>
+          <SaveStatus state={stateOf(field)} />
+        </div>
+        {typing ? (
+          <input
+            id={id}
+            type="text"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint="done"
+            value={draft ?? saved}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={(e) => {
+              const v = e.currentTarget.value.trim()
+              // From a list, an empty name means "not typing one".
+              if (hasList && !v) return setDraft(null)
+              if (draft !== null) saveModel(kind, v)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                e.currentTarget.blur()
+              }
+            }}
+            placeholder={hasList ? 'Model name' : "Empty uses this provider's default"}
+            className={aiFieldClass}
+          />
+        ) : (
+          <select
+            id={id}
+            value={saved}
+            onChange={(e) => {
+              if (e.target.value === OTHER) {
+                flushSync(() => setDraft(''))
+                document.getElementById(id)?.focus()
+                return
+              }
+              saveModel(kind, e.target.value)
+            }}
+            className={aiSelectClass}
+          >
+            {saved && !options.some((m) => m.name === saved) && <option value={saved}>{saved}</option>}
+            <option value="">Provider default</option>
+            {options.map((m) => (
+              <option key={m.name} value={m.name}>
+                {m.recommended ? '★ ' : ''}
+                {m.name}
+                {m.recommended_note ? ` (${m.recommended_note})` : ''}
+              </option>
+            ))}
+            <option value={OTHER}>Other…</option>
+          </select>
+        )}
+        {hasList && typing && (
+          <button
+            type="button"
+            onClick={() => setDraft(null)}
+            className="mt-1 min-h-[44px] px-1 text-ios-caption text-accent active:opacity-60"
+          >
+            Pick from the list
+          </button>
+        )}
+        {recommended && !typing && (
+          <p className="mt-1 text-ios-caption text-label-tertiary">★ marks models recommended for this task</p>
+        )}
+        {fieldError(field)}
+      </div>
+    )
+  }
+
+  const needsKeyHere = isKeyProvider(provider) && !keySet[provider] ? provider : null
 
   return (
-    <div className="rounded-ios bg-bg-surface border border-hairline p-3">
+    <div className="rounded-ios bg-bg-surface border border-hairline p-3 space-y-4">
       <div className="flex items-center gap-2">
         {llmError ? (
           <button
             onClick={onRetry}
-            className="flex-1 min-w-0 text-left text-red-400 active:bg-bg-elevated rounded-ios px-2 py-1"
+            className="flex-1 min-w-0 min-h-[44px] text-left text-red-400 active:bg-bg-elevated rounded-ios px-2"
           >
-            <div className="text-ios-body truncate">Couldn't check</div>
-            <div className="text-ios-caption text-label-secondary truncate">
-              tap to retry
-            </div>
+            <div className="text-ios-body truncate">Couldn't check the AI model</div>
+            <div className="text-ios-caption text-label-secondary truncate">Tap to try again</div>
           </button>
         ) : llm === null ? (
           <div className="flex-1 min-w-0">
-            <div className="text-ios-body text-label-primary truncate">LLM</div>
-            <div className="text-ios-caption text-label-secondary truncate">checking…</div>
+            <div className="text-ios-body text-label-primary truncate">AI model</div>
+            <div className="text-ios-caption text-label-secondary truncate">Checking…</div>
           </div>
         ) : llm.configured ? (
           <div className="flex-1 min-w-0">
-            <div className="text-ios-body text-label-primary truncate">
-              {llm.backend}
-            </div>
-            <div className="text-ios-caption text-label-secondary truncate">
-              {llm.model}
-            </div>
+            <div className="text-ios-body text-label-primary truncate">{llm.backend}</div>
+            <div className="text-ios-caption text-label-secondary truncate">{llm.model}</div>
           </div>
         ) : (
           <div className="flex-1 min-w-0">
-            <div className="text-ios-body text-amber-400 truncate">Not configured</div>
-            <div className="text-ios-caption text-label-secondary truncate">
-              set provider in env or pick one below
-            </div>
+            <div className="text-ios-body text-amber-400 truncate">Not set up</div>
+            <div className="text-ios-caption text-label-secondary">Pick a provider below and add its key.</div>
           </div>
         )}
-        <button
-          onClick={pickerOpen ? () => setPickerOpen(false) : openPicker}
-          className="shrink-0 text-ios-body text-accent active:opacity-60 px-2"
-        >
-          {pickerOpen ? 'Cancel' : 'Edit'}
-        </button>
       </div>
-      {pickerOpen && (
-        <div className="mt-3 space-y-3">
+
+      {loadError ? (
+        <p className="text-ios-caption text-red-400 break-words">Couldn't load the AI settings. {loadError}</p>
+      ) : !loaded ? (
+        <p className="text-ios-caption text-label-secondary">Loading…</p>
+      ) : (
+        <>
           <div>
-            <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
-              Provider
-            </label>
+            <div className="flex items-center justify-between gap-2 mb-1">
+              <label htmlFor="ai-provider" className={aiLabelClass}>
+                Provider
+              </label>
+              <SaveStatus state={stateOf('provider')} />
+            </div>
             <select
+              id="ai-provider"
               value={provider}
-              onChange={(e) => setProvider(e.target.value)}
-              className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
+              onChange={(e) => changeProvider(e.target.value)}
+              className={aiSelectClass}
             >
-              <option value="">— env default —</option>
+              <option value="">Default</option>
               <option value="ollama_cloud">Ollama Cloud</option>
               <option value="ollama">Ollama (local)</option>
               <option value="anthropic">Anthropic</option>
               <option value="openai">OpenAI</option>
               <option value="groq">Groq</option>
             </select>
+            {fieldError('provider')}
           </div>
-          <div>
-            <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
-              Brief model
-            </label>
-            {useFreeText ? (
-              <input
-                type="text"
-                value={freeTextBrief}
-                onChange={(e) => setFreeTextBrief(e.target.value)}
-                placeholder="model name"
-                className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
-              />
-            ) : (
-              <select
-                value={modelBrief}
-                onChange={(e) => setModelBrief(e.target.value)}
-                className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
-              >
-                <option value="">— env default —</option>
-                {tagOptions.map((m) => (
-                  <option key={m.name} value={m.name}>
-                    {m.recommended ? '★ ' : ''}
-                    {m.name}
-                    {m.recommended_note ? ` (${m.recommended_note})` : ''}
-                  </option>
-                ))}
-              </select>
-            )}
-            {tagNames.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setUseFreeText((v) => !v)}
-                className="mt-1 text-ios-caption text-accent active:opacity-60"
-              >
-                {useFreeText ? 'pick from list' : 'type a name instead'}
-              </button>
-            )}
-            {hasRecommendations && (
-              <div className="mt-1 text-ios-caption text-label-tertiary">
-                ★ marks models recommended for this task
+
+          {needsKeyHere && (
+            <div>
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <label htmlFor={`ai-key-${needsKeyHere}`} className={aiLabelClass}>
+                  {keyLabel(needsKeyHere)} key
+                </label>
+                <SaveStatus state={stateOf(needsKeyHere)} />
               </div>
-            )}
-          </div>
-          <div>
-            <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
-              Scoring model
-            </label>
-            <select
-              value={modelScoring}
-              onChange={(e) => setModelScoring(e.target.value)}
-              className="w-full min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
-            >
-              <option value="">— env default —</option>
-              {scoringOptions.map((m) => (
-                <option key={m.name} value={m.name}>
-                  {m.recommended ? '★ ' : ''}
-                  {m.name}
-                  {m.recommended_note ? ` (${m.recommended_note})` : ''}
-                </option>
-              ))}
-            </select>
-            {hasScoringRecommendations && (
-              <div className="mt-1 text-ios-caption text-label-tertiary">
-                ★ marks models recommended for this task
-              </div>
-            )}
-          </div>
-          <div>
-            <label className="block text-ios-caption uppercase tracking-wide text-label-tertiary mb-1">
-              API keys
-            </label>
-            <div className="text-ios-caption text-label-tertiary mb-2">
-              Optional — set a key here instead of editing .env. A key
-              you type is saved when you tap save below; clearing
-              takes effect immediately and reverts to the .env value.
+              {keyInput(needsKeyHere, 'label')}
+              <p className="mt-1 text-ios-caption text-label-secondary">
+                If your {keyLabel(needsKeyHere)} key isn&apos;t in the server&apos;s settings file, paste it here.
+              </p>
+              {noKeyFor === needsKeyHere && (
+                <p className="mt-1 text-ios-caption text-amber-400">
+                  Popping has no {keyLabel(needsKeyHere)} key yet. Paste one above.
+                </p>
+              )}
+              {fieldError(needsKeyHere)}
             </div>
-            <div className="space-y-2">
-              {API_KEY_PROVIDERS.map(({ id, label }) => (
-                <div key={id} className="flex items-center gap-2">
-                  <div className="w-24 shrink-0 text-ios-caption text-label-secondary truncate">
-                    {label}
+          )}
+
+          {modelPicker('brief')}
+          {modelPicker('scoring')}
+          {tagsLoading && <p className="text-ios-caption text-label-secondary">Loading models…</p>}
+          {tagsError && <p className="text-ios-caption text-red-400 break-words">{tagsError}</p>}
+
+          <div>
+            <h3 className={`${aiLabelClass} mb-1`}>API keys</h3>
+            <p className="text-ios-caption text-label-secondary mb-2">
+              Paste a key and it saves when you leave the field. Leave it empty to keep the current one.
+            </p>
+            <div className="space-y-3">
+              {API_KEY_PROVIDERS.filter(({ id }) => id !== needsKeyHere).map(({ id, label }) => (
+                <div key={id}>
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <label htmlFor={`ai-key-${id}`} className="text-ios-caption text-label-secondary">
+                      {label}
+                    </label>
+                    <SaveStatus state={stateOf(id)} />
                   </div>
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={apiKeys[id]}
-                    onChange={(e) => setApiKeys((prev) => ({ ...prev, [id]: e.target.value }))}
-                    placeholder={apiKeySet[id] ? 'configured — type to replace' : 'not set'}
-                    className="flex-1 min-w-0 min-h-[36px] rounded-ios bg-bg-elevated border border-hairline px-2 text-label-primary"
-                  />
-                  {apiKeySet[id] && (
-                    <button
-                      type="button"
-                      onClick={() => clearApiKey(id)}
-                      disabled={clearingKey === id}
-                      className="shrink-0 text-ios-caption text-red-400 active:opacity-60 disabled:opacity-40"
-                    >
-                      {clearingKey === id ? 'clearing…' : 'clear'}
-                    </button>
+                  <div className="flex items-center gap-2">
+                    {keyInput(id, 'label')}
+                    {keySet[id] && confirmRemove !== id && (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmRemove(id)}
+                        className="shrink-0 min-h-[44px] px-3 rounded-ios border border-hairline text-ios-body text-red-300 active:opacity-60"
+                        aria-label={`remove the ${label} key`}
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                  {keySaved[id] && <p className="mt-1 text-ios-caption text-emerald-300">Key saved</p>}
+                  {confirmRemove === id && (
+                    <div className="mt-2 rounded-ios border border-hairline p-3 space-y-2">
+                      <p className="text-ios-body text-label-primary">
+                        Remove the {label} key? Popping falls back to the server&apos;s settings file.
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => removeKey(id)}
+                          className="min-h-[44px] px-3 rounded-ios bg-red-500 text-white text-ios-body active:opacity-80"
+                        >
+                          Remove
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmRemove(null)}
+                          className="min-h-[44px] px-3 rounded-ios border border-hairline text-label-primary text-ios-body active:opacity-60"
+                        >
+                          Keep
+                        </button>
+                      </div>
+                    </div>
                   )}
+                  {fieldError(id)}
                 </div>
               ))}
             </div>
           </div>
-          {tagsLoading && (
-            <div className="text-ios-caption text-label-secondary">loading models…</div>
-          )}
-          {tagsError && (
-            <div className="text-ios-caption text-red-400">{tagsError}</div>
-          )}
-          {saveError && (
-            <div className="text-ios-caption text-red-400">{saveError}</div>
-          )}
-          <button
-            onClick={save}
-            disabled={saving}
-            className="w-full min-h-[44px] rounded-ios bg-accent active:opacity-80 disabled:opacity-40 text-white"
-          >
-            {saving ? 'saving…' : 'save'}
-          </button>
-        </div>
+        </>
       )}
     </div>
   )
 }
-
-
-
 
 
 // History tab content. Fetches the user's recent engagement
@@ -966,10 +1205,10 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
       })
       .catch((err: Error) => {
         if (!alive) return
-        setError(err.message)
+        setError(errorMessage(err))
         setLoading(false)
         setLoadingMore(false)
-        onError(err.message)
+        onError(`Couldn't load your history. ${errorMessage(err)}`)
       })
     return () => {
       alive = false
@@ -1030,14 +1269,14 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
   if (loading) {
     return (
       <div className="pt-4 px-4 text-ios-body text-label-secondary">
-        loading history\u2026
+        Loading history…
       </div>
     )
   }
   if (error) {
     return (
-      <div className="pt-4 px-4 text-ios-body text-red-400">
-        failed to load history: {error}
+      <div className="pt-4 px-4 text-ios-body text-red-400 break-words">
+        Couldn&apos;t load your history. {error}
       </div>
     )
   }
@@ -1048,28 +1287,22 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
         <div className="rounded-ios bg-bg-surface border border-hairline p-3">
           <div className="text-ios-body text-label-primary">No history yet</div>
           <div className="text-ios-caption text-label-secondary mt-0.5">
-            Mark a card as read (\u2713) or hide it (\u25ef with strike) and it will
-            show up here. The History view is grouped by polarity \u2014
-            reads are positive, hides are negative \u2014 so you can
-            review what you engaged with.
+            Stories you hide or save show up here.
           </div>
         </div>
       </div>
     )
   }
 
-  // Group items by type into Read / Hidden / Saved buckets.
-  // The "View" type fires on every card mark-read so the
-  // Read group is the dense one. The "never" type fires on
-  // eye-button hide so the Hidden group is smaller. The
-  // "bookmark" type fires on star so the Saved group is
-  // the small one.
+  // Group items by type into Hidden / Saved buckets. The
+  // "never" type fires on hide, "bookmark" on save. Views
+  // (reads) are no longer listed: the server leaves them out
+  // unless asked for them, so a Read group would always be
+  // empty.
   type Group = { label: string; color: string; items: Item[] }
-  const read: Item[] = items.filter((i) => i.type === 'view')
   const hidden: Item[] = items.filter((i) => i.type === 'never')
   const saved: Item[] = items.filter((i) => i.type === 'bookmark')
   const groups: Group[] = [
-    { label: 'Read', color: 'text-green-500', items: read },
     { label: 'Hidden', color: 'text-red-400', items: hidden },
     { label: 'Saved', color: 'text-amber-400', items: saved },
   ].filter((g) => g.items.length > 0)
@@ -1103,15 +1336,15 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
                 >
                   <div className="flex items-start gap-2">
                     <span className={`shrink-0 mt-0.5 text-ios-caption ${g.color}`} aria-hidden="true">
-                      {g.label === 'Read' ? '\u2713' : g.label === 'Hidden' ? '\u25ef with strike' : '\u2606'}
+                      {g.label === 'Hidden' ? <TabIcon name="eye-off" active={false} /> : '☆'}
                     </span>
                     <div className="min-w-0 flex-1">
-                      <div className="text-ios-body text-label-primary line-clamp-2">
+                      <div className="text-ios-body text-label-primary line-clamp-2 break-words">
                         {i.entry_title}
                       </div>
                       <div className="text-ios-caption text-label-secondary mt-0.5 flex items-center gap-2">
-                        <span>{i.source_name}</span>
-                        <span aria-hidden="true">\u00b7</span>
+                        <span className="min-w-0 truncate">{sourceLabel(i.source_name)}</span>
+                        <span aria-hidden="true">·</span>
                         <span title={i.created_at}>{timeAgo(i.created_at)}</span>
                       </div>
                     </div>
@@ -1144,18 +1377,16 @@ function HistoryTabContent({ onError }: { onError: (msg: string) => void }) {
           aria-live="polite"
         >
           {loadingMore
-            ? 'loading more\u2026'
-            : `${total - items.length} more \u2014 scroll to load`}
+            ? 'Loading more…'
+            : `${total - items.length} more. Scroll to load them.`}
         </div>
       )}
     </div>
   )
 }
 
-// Controls strip: a small two-pill toggle for the group-by
-// mode. iOS-style: pill-shaped, the active option is filled
-// with the accent color. ``min-h-[28px]`` keeps the touch
-// target large enough.
+// Controls strip: a two-segment control for the group-by mode,
+// iOS-style, each segment a full 44px target.
 function Controls({
   groupBy,
   onGroupByChange,
@@ -1164,23 +1395,25 @@ function Controls({
   onGroupByChange: (g: 'none' | 'entry') => void
 }) {
   return (
-    <div className="flex gap-1" role="group" aria-label="group history by">
-      <button
-        onClick={() => onGroupByChange('entry')}
-        aria-pressed={groupBy === 'entry'}
-        className={`flex-1 rounded-full px-3 py-1.5 min-h-[28px] text-ios-caption
-                    ${groupBy === 'entry' ? 'bg-accent text-white' : 'bg-bg-surface text-label-primary border border-hairline'}`}
-      >
-        By entry
-      </button>
-      <button
-        onClick={() => onGroupByChange('none')}
-        aria-pressed={groupBy === 'none'}
-        className={`flex-1 rounded-full px-3 py-1.5 min-h-[28px] text-ios-caption
-                    ${groupBy === 'none' ? 'bg-accent text-white' : 'bg-bg-surface text-label-primary border border-hairline'}`}
-      >
-        All events
-      </button>
+    <div className="grid grid-cols-2 rounded-ios overflow-hidden border border-hairline" role="group" aria-label="group history by">
+      {(
+        [
+          { value: 'entry' as const, label: 'By entry' },
+          { value: 'none' as const, label: 'All events' },
+        ]
+      ).map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          onClick={() => onGroupByChange(o.value)}
+          aria-pressed={groupBy === o.value}
+          className={`min-h-[44px] px-3 text-ios-body transition ${
+            groupBy === o.value ? 'bg-bg-elevated text-accent' : 'bg-bg-surface text-label-primary active:bg-bg-elevated'
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
     </div>
   )
 }
@@ -1344,7 +1577,7 @@ function EntryIdListContent({
           {loaded.length > 0 && (
             <button
               onClick={onBulkAction}
-              className="text-ios-body text-accent active:opacity-60 shrink-0"
+              className="shrink-0 min-h-[44px] px-3 -mr-2 rounded-ios text-ios-body text-accent active:opacity-60"
               aria-label={bulkLabel}
             >
               {bulkLabel}
@@ -1354,7 +1587,7 @@ function EntryIdListContent({
       </div>
       {loadError && (
         <div className="rounded-ios bg-red-500/10 border border-red-500/30 p-3 text-ios-caption text-red-400">
-          Couldn’t load the list: {loadError}
+          Couldn’t load the list. {loadError}
         </div>
       )}
       {loading && loaded.length === 0 && (
@@ -1374,13 +1607,13 @@ function EntryIdListContent({
                   href={safeExternalUrl(e.url)}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="block text-ios-body text-label-primary active:opacity-60 truncate"
+                  className="block text-ios-body text-label-primary active:opacity-60 line-clamp-2 break-words"
                   title={e.title}
                 >
                   {e.title}
                 </a>
                 <div className="text-ios-caption text-label-tertiary mt-0.5 truncate">
-                  {e.source_name}
+                  {sourceLabel(e.source_name)}
                   {e.published_at && (
                     <> · {timeAgo(e.published_at)}</>
                   )}
@@ -1388,7 +1621,7 @@ function EntryIdListContent({
               </div>
               <button
                 onClick={() => onRowAction(e.id)}
-                className="text-ios-caption text-accent active:opacity-60 shrink-0 self-center"
+                className="shrink-0 self-center min-h-[44px] px-3 -mr-2 rounded-ios text-ios-body text-accent active:opacity-60"
                 aria-label={`${actionLabel}: ${e.title}`}
               >
                 {actionLabel}
@@ -1448,7 +1681,7 @@ function HiddenTabContent({
       })
       .catch((e: Error) => {
         if (!alive) return
-        setLoadError(e.message)
+        setLoadError(errorMessage(e))
       })
       .finally(() => {
         if (!alive) return
@@ -1464,7 +1697,7 @@ function HiddenTabContent({
   return (
     <EntryIdListContent
       actionLabel="Restore"
-      emptyHint="Right-click a card → Hide this entry (or press h) to dismiss it. Hidden entries stay in the database but don’t show on the dashboard."
+      emptyHint="Tap the eye on a card to hide it. Hidden stories stay in Popping but leave the dashboard."
       populatedHint="Tap Restore to show an entry on the dashboard again."
       bulkLabel="Restore all"
       onBulkAction={onRestoreAll}
@@ -1521,7 +1754,7 @@ function StarredTabContent({
       })
       .catch((e: Error) => {
         if (!alive) return
-        setLoadError(e.message)
+        setLoadError(errorMessage(e))
       })
       .finally(() => {
         if (!alive) return
@@ -1536,7 +1769,7 @@ function StarredTabContent({
   return (
     <EntryIdListContent
       actionLabel="Remove"
-      emptyHint="Right-click a card → Save for later (or press b) to bookmark an entry. Saved items surface in the Saved column at the top of the dashboard."
+      emptyHint="Tap the star on a card to save it for later. Saved stories show in the Saved column at the top of the dashboard."
       populatedHint="The Saved column at the top of the dashboard shows your bookmarks, most recent first. Remove drops one star; Clear all drops every star."
       bulkLabel="Clear all"
       onBulkAction={onClearAll}
@@ -1606,7 +1839,7 @@ function DownvotedTabContent({
       })
       .catch((e: Error) => {
         if (!alive) return
-        setLoadError(e.message)
+        setLoadError(errorMessage(e))
       })
       .finally(() => {
         if (!alive) return
@@ -1621,7 +1854,7 @@ function DownvotedTabContent({
   return (
     <EntryIdListContent
       actionLabel="Hide"
-      emptyHint="Downvote a card (▼ in its footer, or right-click → Downvote) to tune the algorithm away from more like it. Entries you've downvoted but haven't hidden yet show up here."
+      emptyHint="Tap ▼ on a card to see fewer stories like it. Stories you've downvoted but not hidden show up here."
       populatedHint="Voting doesn't remove anything from view on its own — Hide (or Hide all downvoted) is the deliberate next step once you're sure you don't want to see more like these."
       bulkLabel="Hide all downvoted"
       onBulkAction={onHideAll}

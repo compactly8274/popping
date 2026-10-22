@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shopify store sitemap index (/sitemap.xml). Only the blogs sitemap
+     lists articles. -->
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap>
+    <loc>https://shop.example.com/sitemap_products_1.xml?from=7352107024567&amp;to=8812345678901</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://shop.example.com/sitemap_pages_1.xml</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://shop.example.com/sitemap_collections_1.xml</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://shop.example.com/sitemap_blogs_1.xml</loc>
+  </sitemap>
+</sitemapindex>

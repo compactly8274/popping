@@ -2,30 +2,46 @@
 
 Personal AI-ranked intelligence dashboard. Aggregates deals, vulnerabilities, news, sports, podcasts, YouTube, and more into a single scored feed.
 
-**Phase 1 scope**: scaffold + 1 RSS source (BBC News) + minimal UI. The schema and source-plugin interface are designed to absorb the rest of the categories (deals, vulns, sports, etc.) in later phases without reshaping the database.
+Ships with RSS, Hacker News, Reddit, CVE (NVD + CISA KEV), GitHub releases, podcasts, YouTube, RedFlagDeals, Wikipedia "on this day" and generic-scrape sources, plus an LLM-written daily Brief.
 
 ## Quickstart
 
 **Prebuilt images (production, no build step):**
 
 ```bash
-cp .env.example .env             # defaults work out of the box
-docker compose up -d             # pulls ghcr.io/compactly8274/popping-{backend,frontend}:latest
-open http://<server-ip>:14789    # frontend (the only published port)
+cp .env.example .env             # then set POSTGRES_PASSWORD (openssl rand -hex 24)
+docker compose up -d             # pulls ghcr.io/adamjmachill/popping-{backend,frontend}:latest
+open http://localhost:14789      # frontend (the only published port)
 ```
 
 The frontend publishes on `14789` by default — a 5-digit port in the
 14xxx range chosen to stay out of the common 3000/5173/8000/8080/8443
 range and below typical ephemeral-port territory (32768+). Override with
-`POPPING_FRONTEND_PORT=<port>` in `.env` (the container still listens on
-5173; only the host-side mapping changes). The backend is reachable from
+`POPPING_FRONTEND_PORT=<port>` in `.env` (nginx inside the container
+listens on 8080; only the host-side mapping changes). The backend is reachable from
 the frontend over the internal docker network (`http://backend:8000`);
-postgres and redis are entirely internal.
+postgres is entirely internal.
 
-**Headless / LAN deployments** — the frontend binds to `0.0.0.0:14789` by
-default, so any device on the network can reach it. Put a reverse proxy
-in front (Caddy / Traefik / Nginx) for TLS + (optionally) additional
-auth in front of OIDC. Enable OIDC (see below) before exposing on a LAN.
+**The app has no login unless OIDC is enabled.** Anyone who can reach it
+can change settings, delete sources and spend your LLM credit. The
+frontend therefore binds to `127.0.0.1:14789` by default. On a VPS, keep
+it that way: Docker's port rules bypass `ufw`, so `0.0.0.0` would be
+public.
+
+**Public deployment (Cloudflare Tunnel + Access)** — no open ports, TLS
+handled by Cloudflare:
+
+1. In Cloudflare Zero Trust, create a tunnel and copy its token. Give it a
+   public hostname (e.g. `popping.example.com`) pointing at
+   `http://frontend:8080`.
+2. Add a Cloudflare Access application for that hostname that only allows
+   your email.
+3. In `.env` set `COMPOSE_PROFILES=tunnel`, `TUNNEL_TOKEN=<token>` and
+   `PUBLIC_URL=https://popping.example.com`, then `docker compose up -d`.
+
+**LAN deployments** — set `POPPING_FRONTEND_HOST=0.0.0.0`, put a reverse
+proxy (Caddy / Traefik / Nginx) in front for TLS, and enable OIDC (see
+below).
 
 The first boot runs `alembic upgrade head` against a fresh postgres volume, so the schema is created automatically. The scheduler then fires one immediate fetch per plugin and re-fetches every `refresh_interval_seconds`.
 
@@ -40,6 +56,16 @@ docker compose up -d       # recreate containers with the new image
 
 `pull_policy` defaults to `always`, so a plain `docker compose up -d` already pulls when the digest moved; the explicit `pull` step is only needed if you've set `POPPING_PULL_POLICY=missing` or `=never` in your `.env` (intentional opt-out for change-windowed deployments — see `.env.example` for the trade-off).
 
+**Server helpers (`ops/`):** two small scripts for a VPS install at `/opt/popping`.
+
+- `ops/popping-update.sh`: `git pull`, `docker compose pull`, `up -d`, then `docker image prune -f` so old images don't fill the disk, and waits for the backend to report healthy.
+- `ops/popping-backup.sh`: nightly `pg_dump` plus a copy of `.env` into `/root/backups`, kept 14 days. Install and restore steps are in the script header.
+
+```bash
+cp ops/popping-update.sh /usr/local/bin/popping-update && chmod 700 /usr/local/bin/popping-update
+popping-update
+```
+
 **Local dev with hot-reload (build from source):**
 
 ```bash
@@ -48,17 +74,17 @@ cp docker-compose.override.yml.example docker-compose.override.yml
 docker compose up -d --build     # builds from ./backend and ./frontend, bind-mounts source
 ```
 
-The override is auto-loaded by `docker compose up` and only adds `build:` + bind mounts; postgres and redis stay pulled.
+The override is auto-loaded by `docker compose up` and only adds `build:` + bind mounts; postgres stays pulled.
 
 **Pin to a specific build:**
 
 ```bash
 # In .env:
-POPPING_IMAGE_TAG=sha-50af121    # exact commit (immutable)
-# or
-POPPING_IMAGE_TAG=pr-3           # test a PR
+POPPING_IMAGE_TAG=sha-<full 40-char commit sha>    # exact commit (immutable)
 POPPING_PULL_POLICY=never        # don't auto-update a pinned tag
 ```
+
+Only pushes to `main` publish images. PR builds are validation-only and never reach GHCR, so there is no `pr-<num>` tag to pin; to try a PR, check out its branch and use the local-build override above.
 
 ## Architecture
 
@@ -73,29 +99,31 @@ POPPING_PULL_POLICY=never        # don't auto-update a pinned tag
                    │  (sources)  │   │
                    └──────┬──────┘   │
                           │          │
-              ┌───────────┼──────────┤
-              ▼           ▼          ▼
-        ┌─────────┐  ┌────────┐  ┌─────────┐
-        │Postgres │  │ Redis  │  │ Source  │
-        │pgvector │  │        │  │ plugins │
-        └─────────┘  └────────┘  └─────────┘
+              ┌───────────┴──────────┤
+              ▼                      ▼
+        ┌─────────┐            ┌─────────┐
+        │Postgres │            │ Source  │
+        │pgvector │            │ plugins │
+        └─────────┘            └─────────┘
 ```
 
 - **Backend** (`backend/`): FastAPI + SQLAlchemy 2 async + APScheduler + pgvector.
-- **Frontend** (`frontend/`): Vite + React + Tailwind.
+- **Frontend** (`frontend/`): Vite + React + Tailwind, served in production by nginx (`frontend/nginx.conf.template`), which also proxies `/api`, `/assets` and `/auth` to the backend.
 - **Source plugins** (`backend/app/sources/`): drop a file, restart the backend, it's registered automatically via `@register_source`.
-- **Storage**: Postgres 16 with pgvector (embeddings phase 2+), Redis for caching (phase 1 unused).
+- **Storage**: Postgres 16 with pgvector (embedding storage). The backend runs as a single process; see `ARCHITECTURE.md`.
 
 ## API
 
 | Endpoint                          | Purpose                                | Auth      |
 | --------------------------------- | -------------------------------------- | --------- |
 | `GET  /api/health`                | Liveness + counts                      | public    |
-| `GET  /api/sources`               | Registered sources + last-fetch state  | public    |
-| `GET  /api/sources/{id}`          | One source                             | public    |
-| `GET  /api/entries`               | List entries (`?category=&source=&limit=`) | public |
-| `GET  /api/foryou`                | Personal top-N feed (with convergence boost) | login |
+| `GET  /api/sources`               | Registered sources + last-fetch state and feed health (see [Feed health](#feed-health)) | public |
+| `GET  /api/sources/{id}`          | One source, with the same health fields | public    |
+| `GET  /api/entries`               | List entries (`?category=&source=&limit=`; window: `max_age_hours=`, `per_source_cap=`, `active_only=`). Leaves out your hidden stories, except in search (`q=`) | public |
+| `GET  /api/entries/by-ids`        | Cards for up to 200 ids (`?ids=1,2,3`), same fields as the list plus `source_name` | public |
+| `GET  /api/foryou`                | Personal top-N feed (with convergence boost; `max_age_hours=`). Leaves out paused feeds and your hidden stories | login |
 | `POST /api/ingest/{source_name}`  | Force a fetch now (instead of waiting) | login     |
+| `POST /api/sources/check-now`     | Check up to 20 feeds in the next minute (pull to refresh), keeping each feed's cooldown and failure backoff | login |
 | `GET  /auth/login`                | Kick off the OIDC flow (302 to IdP)    | n/a       |
 | `GET  /auth/callback`             | OIDC redirect URI                      | n/a       |
 | `POST /auth/local`                | Local-user login (form on login page)  | n/a       |
@@ -327,7 +355,13 @@ container:
 
 - `llm.provider` — picked via the chip; no env default.
 - `llm.model_brief` / `llm.model_scoring` — model names for brief + scoring. Default `OLLAMA_CLOUD_MODEL_BRIEF` / `OLLAMA_CLOUD_MODEL_SCORING`.
-- `brief.window_hours` — lookback window for the brief generator. Filters on `fetched_at` (when the row landed in the DB), not `published_at`, so historical content (Wikipedia "on this day") ingested today doesn't pollute today's digest. Default 24, clamped to `[1, 168]`.
+- `brief.window_hours` — lookback window for the brief generator. Filters on `fetched_at` (when the row landed in the DB), not `published_at`. Wikipedia "on this day" is left out by feed. Stories published more than `ingest.backfill_hours` before they were fetched (a new feed's backfill) are left out too. Default 24, clamped to `[1, 168]`.
+- `ingest.*` — what a poll stores (`app/ingest_rules.py`). No env default; set them as `app_settings` rows. A value that isn't a number or is out of range uses the default.
+  - `ingest.first_fetch_keep` (10, `[1, 200]`) and `ingest.backfill_hours` (48, `[1, 720]`): a feed's first fetch stores its newest 10 stories plus everything from the last 48 hours. That covers a new feed, one that first works days after it was added, one whose address changed, and one back after `ingest.resume_gap_hours` (72, `[48, 8760]`) without a successful poll.
+  - `ingest.max_age_days` (30, `[1, 3650]`): later polls skip stories older than this, or dated before the first fetch's 48-hour window.
+  - `ingest.max_undated_per_poll` (2, `[0, 100]`): later polls store at most this many undated stories, and only ones listed above the newest stored story.
+  - `ingest.max_per_poll` (50, `[1, 1000]`): new stories stored per poll, newest first. The rest are stored by the next polls.
+- `refresh.cooldown_seconds` (600, `[60, 86400]`): after a feed is checked (a check-now queue or any successful fetch), `POST /api/sources/check-now` doesn't queue it again for this long. `force` uses 60. No env default; a value that isn't a number or is out of range uses the default.
 
 **Env vs DB.** On first boot, `seed_from_env` copies the relevant env
 values into the table — but only if the table is empty for that key.
@@ -343,7 +377,7 @@ set), all bot-tolerant. Categories:
 | Source                  | Category | Refresh | Notes |
 | ----------------------- | -------- | ------- | ----- |
 | BBC News                | `news`   | 1 h     | RSS; phase 3 fixed the User-Agent and switched to https |
-| Wikipedia On This Day   | `news`   | 12 h    | REST; today's historical events + curated anniversaries |
+| Wikipedia On This Day   | `on_this_day` | 12 h | REST; the day's 5 selected anniversaries, in their own tab and kept out of For You and the Brief |
 | Hacker News top         | `tech`   | 5 min   | Firebase API; top 30 stories, score + comment count in meta |
 | GitHub releases         | `tech`   | 30 min  | 5 repos (python/cpython, nodejs/node, kubernetes/*, rust-lang/rust); ETag-cached |
 | NVD recent CVEs         | `vulns`  | 6 h     | NIST CVE 2.0 API; 7-day rolling window of published CVEs |
@@ -366,9 +400,159 @@ header, which is enough to get past those filters without any
 unconventional headers.
 
 Sources intentionally deferred to a later phase: RedFlagDeals (rate-limit
-sensitive), ESPN (sport-specific endpoints), YouTube RSS (channel
-resolution), Reddit / Mastodon (privacy-policy noise), Podcast Index
-and Keepa (API keys + tier-specific endpoints).
+sensitive), ESPN (sport-specific endpoints), Reddit / Mastodon
+(privacy-policy noise), Podcast Index and Keepa (API keys +
+tier-specific endpoints).
+
+### Feed health
+
+Every source the API returns (the list, `GET /api/sources/{id}`, and
+the rows that POST, PATCH and `/auto` send back) says whether the feed
+is pulling:
+
+| Field | Meaning |
+| --- | --- |
+| `last_attempt_at` | When the last check finished, whatever it found. Null until the feed's first check after migration 0031 |
+| `last_fetch_at` | When the last successful check finished |
+| `last_error` | What went wrong, as `[<kind>] <detail>` (below); null after a success |
+| `error_count` | Failures in a row. Each doubles the check interval (at most 6 h), and the sixth stops the feed (`active` false) |
+| `last_item_count`, `last_new_count` | The last successful check: items the feed listed (before the ingest rules cut them) and new stories stored |
+| `stories_24h`, `stories_7d` | Stories that arrived in the last 24 hours and 7 days |
+| `newest_story_at` | The newest arrival in the last 7 days (null when nothing arrived this week) |
+| `has_stories` | Whether the feed has ever stored a story |
+
+`last_error` kinds:
+
+| Kind | Comes from |
+| --- | --- |
+| `[blocked]` | HTTP 401, 402, 403 |
+| `[not found]` | HTTP 404 |
+| `[upstream error]` | HTTP 5xx |
+| `[http error]` | Any other HTTP error, 429 included |
+| `[network]` | Connect errors and timeouts |
+| `[not a feed]` | The address answered with something that isn't a feed (a web page, JSON, an empty body) |
+| `[no list]` | A website feed found no list of articles |
+| `[reddit off]` | A subreddit feed while Reddit is off on the server (no proxy, direct mode disabled) |
+| `[error]` | Anything else |
+
+`[no list]` and `[reddit off]` are setup states, not failures: they
+never count toward `error_count`, never slow the feed's checks and
+never stop it. A paused feed isn't checked; `POST /api/ingest/{name}`
+answers `"status": "paused"` for one.
+
+### Website feeds
+
+A site with no feed is added as a website feed (`type` `generic_scrape`,
+`backend/app/sources/generic_scrape.py`). Each check:
+
+- **Finds the list of articles.** It reads the listing page the feed
+  points at and the site's sitemap; the first that lists articles wins.
+  A section address (`/news`) reads its page first; a site root, a feed
+  with a `sitemap_url`, or an address that looks like a sitemap reads the
+  sitemap first (an HTML `/sitemap/` page is still read as a page after
+  it). A check whose usual read fails or finds nothing reads the other
+  one; a page that check reads is read once more when the usual read
+  lists it, so one bad check can't lose a story. So is a page read while
+  one of the site's sitemaps failed (a news sitemap down beside a post
+  sitemap that loads), once a check's sitemaps all load. A `sitemap_url`
+  is read as the sitemap whatever its address looks like (`/?sitemap=index`);
+  one that names nothing and doesn't look like a sitemap (the site's own
+  address) leads to the site's sitemaps through robots.txt. With a
+  `link_pattern`, the page's links under that path are the list;
+  without one, the page's repeating list of posts is. The sitemap is
+  read for the pattern's path, else the address's section, never the
+  whole site instead.
+- **Keeps only articles.** Of a site's sitemaps only news, post and
+  unknown ones are read (a page sitemap only when there is no post
+  sitemap; never tag, author, product or attachment sitemaps; a video,
+  image or media sitemap lists pages and is read). A sitemap's name of
+  several words counts by its last one, so a `media_release`,
+  `media-release` or `product_update` post type's sitemap is read. URLs
+  that are not article-shaped (tag, author, cart and archive pages,
+  About, Contact, files) are dropped; a sitemap's entry is a page
+  whatever its ending (`.jhtml`, `.nsf`) unless that ending is a file
+  type's, and a folder's index page (`/news/<slug>/index.html`) is judged
+  as the folder. Each new page is scored as an article
+  before it is kept (`backend/app/article_detect.py`). A date the
+  site's own list gives a page (a listing card's `<time>`, a news
+  sitemap's publication date) counts as the page's date, and so does a
+  date printed next to a page's only title (a `<time>` beside the
+  `<h1>`, or a line right after it that starts with a date, as Webflow
+  and WordPress block themes print them). A feed with a
+  `link_pattern` takes the pattern as the article signal, and so does a
+  `sitemap_url` for the pages it lists. Only a page directly under a
+  static section (`/about/history`, `/pages/our-story`) is dropped as
+  static, so news filed deeper (`/about/news/<slug>`,
+  `/about-us/news-and-media/<slug>`) is read, and the section a feed
+  reads (its address's section or its `link_pattern`) is never dropped
+  for its own name. On a
+  listing page the section's name is lifted only when nothing else there
+  is a list, so a category page's links to its subcategories never
+  outvote its posts.
+- **Fetches only new pages,** at most 10 a check, skipping stories
+  already stored. At most `ingest.max_undated_per_poll` (2) of them may
+  be undated, and an undated page that is old backlog is skipped: on a
+  listing page, or in a sitemap that gives the page no `<lastmod>`, one
+  listed below a stored story (in the sitemap's own order; on a listing
+  page, stored stories pinned at its top above newer ones, such as a
+  sticky post, don't count when a stored story or a page the feed has
+  read comes further down); in a sitemap, one last modified before the
+  check's backlog line. A page a check left for later while it was new
+  (refused, failed, or read while the usual read gave nothing or had a
+  sitemap fail) is still new when it is read. A page
+  that times out or answers 5xx is asked for again on the next checks
+  (3 in all).
+
+A website's failures read as the kinds above: a site that refuses its
+sitemaps, its listing page or every article page asked for is
+`[blocked]` (a 429 is `[http error]`); the feed's own listing page or
+`sitemap_url` missing is `[not found]`; a host that doesn't answer or
+doesn't resolve is `[network]`; and `[no list]` only when nothing lists
+articles at all. A feed's own sitemap that loads empty (a news sitemap
+between stories) is a check with nothing new, unless its listing page
+fails. A missing robots.txt or guessed sitemap path is
+routine, a refused robots.txt counts only when every sitemap is refused
+too, and a sitemap index that loads counts neither way (an index whose
+post sitemaps are all refused is `[blocked]`). A page that refuses
+everyone (members only) while another page of the site loads (a stored
+story, a page read before that answered with a page, or a page not
+tried yet) is skipped, so it never fails the feed; a page that is gone
+or answers 5xx doesn't count as loading, and a page that was gone,
+wasn't a page or refused us before is never the one asked.
+
+### Adding a YouTube channel
+
+Settings → Feeds → Add, then either paste the link, `@handle` or
+channel ID into Auto feed and tap Auto-add, or pick YouTube under Type
+in the form below. Name is optional: Popping names the feed after the
+handle (`mkbhd_yt`) or, for a video link, after the channel once Test
+has looked it up. Popping turns what you paste into the channel's free
+YouTube feed:
+
+| You paste | What happens |
+| --- | --- |
+| The channel ID (starts with `UC`), a `/channel/UC…` link, the feed link (`feeds/videos.xml?channel_id=…`), or a channel's uploads playlist (`list=UU…`) | Used directly. No lookup. |
+| A public playlist link (`list=PL…`) | Follows that playlist. No lookup. |
+| An `@handle`, a `/c/name` or `/user/name` link, a video link (`watch?v=`, `youtu.be`, `/shorts/`, `/live/`), or an old `youtube.com/name` link | Popping opens that one YouTube page and reads the channel ID from it. |
+| Watch later, Liked videos, mixes, the home page, search results | Refused with a message: they have no feed. |
+
+YouTube sometimes answers a server with a consent page or a "confirm
+you're not a bot" check instead of the channel page. Popping then says
+so and asks for the channel ID. In the YouTube app: open the channel,
+tap "more about this channel", then Share channel, then Copy channel
+ID, and paste that.
+
+Each lookup writes one log line, without the link's query string:
+
+```bash
+cd /opt/popping && docker compose logs backend | grep "youtube: lookup"
+```
+
+`result=` names the page marker that worked (`canonical`, `rss_link`,
+`channel_id`, …) or why it failed: `blocked:consent` or `blocked:bot`
+(YouTube refused the server), `not_found`, `http_<code>`, `network`,
+`blocked:ssrf` or `blocked:host` (the link led somewhere Popping won't
+go).
 
 ## Adding a new source plugin
 
@@ -390,6 +574,12 @@ and Keepa (API keys + tier-specific endpoints).
            # Return [{title, url, published_at, ...extras}, ...]
            ...
    ```
+
+   Return `[]` only when there is nothing new. When the fetch fails,
+   let the error raise (an `httpx` error, or `NotAFeedError` from
+   `app.sources.base`): the scheduler records its kind on the feed
+   (see [Feed health](#feed-health)), where an empty list would look
+   like a quiet feed.
 
 2. Add the import to the bottom of `backend/app/sources/__init__.py`:
 
@@ -495,7 +685,6 @@ just without the vector signal.
 │       ├── main.py            # FastAPI app + lifespan
 │       ├── config.py          # pydantic-settings
 │       ├── db.py              # async SQLAlchemy engine
-│       ├── redis.py           # async Redis client
 │       ├── deps.py
 │       ├── auth/              # OIDC + local auth (mounted when OIDC_ENABLED=true)
 │       │   ├── settings.py    #   OIDCConfig loader
@@ -564,10 +753,12 @@ just without the vector signal.
 
 ## Environment variables
 
-All optional except the database credentials (defaults work). See `.env.example` for the full list. The frontend's `VITE_BACKEND_URL` (in `docker-compose.yml`) points Vite's dev-server proxy at the backend container.
+All optional except the database credentials (defaults work). See `.env.example` for the full list. In production nginx proxies to `BACKEND_URL` (set in `docker-compose.yml`); in dev, `VITE_BACKEND_URL` points Vite's dev-server proxy at the backend.
 
 ## Development notes
 
 - **Hot reload**: both backend (`uvicorn --reload`) and frontend (Vite HMR) reload on file changes via the bind mounts in `docker-compose.yml`.
 - **Schema changes**: edit `app/models.py`, then `docker compose exec backend alembic revision --autogenerate -m "..."`. Commit the new file in `alembic/versions/`.
 - **Reset**: `docker compose down -v` wipes the postgres volume. Next `up` re-runs migrations from scratch.
+- **Dependencies**: Python packages are pinned in `backend/requirements.lock` (runtime) and `backend/requirements-dev.lock` (adds test tools). After editing `pyproject.toml`, run `backend/scripts/lock.sh` (needs [uv](https://docs.astral.sh/uv/)). torch is installed separately as the CPU build; its version is `TORCH_VERSION` in `backend/Dockerfile`.
+- **Upgrading from an older image**: the backend now runs as uid 10001. If an existing `assets` volume was created by an older root-run image, fix its ownership once: `docker compose run --rm --user root backend chown -R 10001:10001 /app/assets`.

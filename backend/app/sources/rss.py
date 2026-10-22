@@ -29,13 +29,14 @@ from urllib.parse import urljoin
 import feedparser
 import httpx
 
+from app.config import settings
 from app.sources import register_source
-from app.sources.base import SourcePlugin
+from app.sources.base import NotAFeedError, SourcePlugin
 from app.url_safety import check_url_safe, ssrf_event_hook
 
 logger = logging.getLogger("popping.sources.rss")
 
-_USER_AGENT = "Popping/0.2 (+https://github.com/compactly8274/popping)"
+_USER_AGENT = settings.user_agent
 _ACCEPT = (
     "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8"
 )
@@ -363,11 +364,14 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
     is genuinely degraded and we'd rather skip the tick than hold
     up the scheduler for a feed that's not going to land.
 
-    Empty-result detection: if HTTP 200 but the body doesn't look
-    like a feed (wrong content-type or ``feed.bozo`` with zero
-    entries), raise so the scheduler's per-source error path writes
-    a tooltip with the actual response excerpt — better than silently
-    showing zero entries with no explanation.
+    Empty-result detection: if HTTP 200 but the body isn't a feed at
+    all (zero entries and no RSS/Atom/RDF format recognised, which is
+    what a web page gives), raise ``NotAFeedError`` (``[not a feed]``).
+    If it is a feed whose entries are broken (wrong content-type or
+    ``feed.bozo``), raise ``ValueError``. Either way the scheduler's
+    per-source error path writes a tooltip with the actual response
+    excerpt — better than silently showing zero entries with no
+    explanation. A well-formed feed with no entries is still ``[]``.
     """
     # Merge caller's overrides on top of defaults. httpx doesn't
     # raise on collisions — the later key wins — so the order here
@@ -450,10 +454,27 @@ async def fetch_rss(url: str, headers: dict[str, str] | None = None) -> list[dic
                 if transcript:
                     item["transcript_url"], item["transcript_type"] = transcript
                 items.append(item)
-            # HTTP 200 but the body doesn't look like an RSS/Atom
-            # feed: Cloudflare challenges, paywall interstitials,
-            # JavaScript-rendered shells, etc. all return HTML that
-            # feedparser silently accepts with ``bozo=True`` and zero
+            # HTTP 200 but the body isn't an RSS/Atom feed at all:
+            # Cloudflare challenges, paywall interstitials, a site's
+            # home page, JavaScript-rendered shells, a JSON API.
+            # feedparser accepts them with zero entries and no
+            # ``version`` (the feed format it recognised), and an
+            # ordinary text/html page doesn't even set ``bozo``, so
+            # the malformed check below would let it through as an
+            # empty feed. Say what it is, so the feed reads "not a
+            # feed" (fix: its address) rather than quietly bringing
+            # nothing. A well-formed feed with no entries has a
+            # ``version`` and stays a success. ``version`` comes from
+            # the one parse above; no second parse is needed.
+            if not items and not feed.get("version"):
+                snippet = resp.text[:200].replace("\n", " ").strip()
+                raise NotAFeedError(
+                    f"rss: {url} could not be parsed as a feed: no RSS or Atom "
+                    f"document (content-type={resp.headers.get('content-type')!r}, "
+                    f"excerpt={snippet!r})"
+                )
+            # A feed whose entries are broken: ``bozo=True`` (or a
+            # content type that isn't feed-like) with zero usable
             # entries. Surface it as an error so the scheduler can
             # record a useful tooltip instead of silently emptying
             # the dashboard.

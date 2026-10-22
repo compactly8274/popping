@@ -68,7 +68,10 @@ class OllamaProvider(Provider):
             raise ProviderError(
                 f"ollama returned {resp.status_code}: {resp.text[:200]}"
             )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProviderError(f"ollama returned invalid JSON: {exc}") from exc
         text = data.get("response", "")
         thinking = data.get("thinking", "")
         # Only substitute the thinking field for models we know put

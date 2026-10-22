@@ -4,6 +4,35 @@ from __future__ import annotations
 
 import html
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+
+# A stored-URL lookup ``scheduler._ingest`` hands to a plugin with
+# ``SourcePlugin.takes_ingest_hints``: given candidate URLs, returns the
+# ones already stored as entries. The scheduler runs the query, so the
+# plugin stays DB-free and can skip those pages before fetching them.
+KnownUrls = Callable[[list[str]], Awaitable[set[str]]]
+
+
+# Errors a plugin's ``fetch`` raises for the scheduler to record as
+# their own kind (``scheduler._classify_error``), so a feed's
+# ``last_error`` says what is wrong and which fix applies, instead of a
+# bare ``[error]`` or a silently empty success.
+
+
+class NotAFeedError(ValueError):
+    """The address answered, but with something that isn't a feed (an
+    HTML page, JSON, an empty body). Recorded as ``[not a feed]``.
+
+    A ``ValueError`` whose message says "parse", so the Test route
+    (``routes/sources._test_source_impl``) still reports it as
+    ``parse_error``."""
+
+
+class NoArticleListError(Exception):
+    """A website feed found no list of articles to read: no sitemap,
+    no matching links on the page. Recorded as ``[no list]``, a setup
+    state: it never counts toward ``error_count`` and never stops the
+    feed, because the fix is to point the feed at a section."""
 
 
 class SourcePlugin(ABC):
@@ -32,6 +61,27 @@ class SourcePlugin(ABC):
     # every call site. None for class-driven built-ins, which use
     # ``ingest:<name>`` instead.
     source_id: int | None = None
+    # Set by row-driven plugins to the address they were built to
+    # fetch: the backing row's ``(url, sitemap_url, link_pattern)`` at
+    # construction (``row_fetch_target``). A job keeps its plugin
+    # instance until ``update_source`` replaces it, so after an address
+    # change an older instance can still be fetching the old address;
+    # ``scheduler._ingest`` compares this with the row it commits
+    # against and discards a batch that came from an address the row
+    # no longer has. None for class-driven built-ins, whose address
+    # can't be edited; ``_ingest`` snapshots their row instead.
+    fetch_target: tuple[str | None, str | None, str | None] | None = None
+    # True for a plugin whose ``fetch`` takes the keyword arguments
+    # ``known_urls`` (a ``KnownUrls`` lookup), ``max_undated``
+    # (``ingest.max_undated_per_poll``) and ``backlog_before`` (the
+    # date before which a page is old backlog on this poll, None on a
+    # first fetch), which ``scheduler._ingest`` then passes. Only
+    # ``GenericScrapePlugin`` does: it fetches a page per candidate, so
+    # skipping stored ones before the fetch matters, and its items never
+    # include stored URLs, so the ingest rules' undated cap has to be
+    # applied inside it. Every other plugin's ``fetch`` takes no
+    # arguments.
+    takes_ingest_hints: bool = False
 
     @abstractmethod
     async def fetch(self) -> list[dict]:
@@ -50,6 +100,20 @@ class SourcePlugin(ABC):
         tracking params from URLs, decode HTML entities in titles).
         """
         return validate_required(self.name, raw)
+
+
+def row_fetch_target(source_row) -> tuple[str | None, str | None, str | None]:
+    """The address a ``Source`` row points a plugin at: its URL, sitemap
+    URL and link pattern, the three fields whose change re-points a
+    feed (see ``scheduler.update_source``). Every row-driven plugin
+    records the full tuple, whatever its type, so it compares equal to
+    the same tuple read from the row. ``getattr`` with a default keeps
+    stand-in rows without the newer columns working."""
+    return (
+        source_row.url,
+        getattr(source_row, "sitemap_url", None),
+        getattr(source_row, "link_pattern", None),
+    )
 
 
 def validate_required(name: str, raw: dict) -> dict:

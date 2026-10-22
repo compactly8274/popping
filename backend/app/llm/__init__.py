@@ -1,8 +1,7 @@
 """LLM provider abstraction.
 
-Phase 2 ships the plumbing only — no call site uses it yet. Phase 4's
-Brief generator imports ``Router.provider_for(task)`` and calls
-``.complete(prompt)``.
+Callers either pick providers via ``router.providers_for(task)`` or use
+``complete_with_fallback`` to try each in turn.
 
 Selection order for ``provider_for(task)``:
 
@@ -27,19 +26,19 @@ cache (warm) or env values (cold); no DB I/O on this path.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import Callable, TypeVar
 
 from app import runtime_settings
 from app.config import settings
+from app.llm.anthropic import AnthropicProvider
 from app.llm.base import Provider, ProviderError
 from app.llm.groq import GroqProvider
 from app.llm.ollama import OllamaProvider
 from app.llm.ollama_cloud import OllamaCloudProvider
 from app.llm.openai import OpenAIProvider
 
-# Anthropic is imported lazily inside ``_construct`` so the ``anthropic``
-# package isn't required at install time. Other providers live at module
-# scope because they're tiny (httpx only) and don't add much weight.
 logger = logging.getLogger("popping.llm")
 
 
@@ -140,8 +139,6 @@ class Router:
             api_key = Router._api_key_for("anthropic")
             if not api_key:
                 return None
-            from app.llm.anthropic import AnthropicProvider
-
             return AnthropicProvider(model, api_key)
         if backend == "openai":
             api_key = Router._api_key_for("openai")
@@ -231,5 +228,65 @@ class Router:
 
 router = Router()
 
+T = TypeVar("T")
 
-__all__ = ["Provider", "ProviderError", "Router", "router"]
+
+def _strip_or_none(content: str) -> str | None:
+    return content.strip() or None
+
+
+async def complete_with_fallback(
+    task: str,
+    prompt: str,
+    *,
+    log_name: str,
+    timeout: float | None = None,
+    parse: Callable[[str], T | None] = _strip_or_none,
+    **complete_kwargs,
+) -> tuple[T | None, str | None]:
+    """Try each provider for ``task`` in order until one returns output
+    that ``parse`` accepts (anything but None).
+
+    Returns ``(result, None)`` on success, or ``(None, note)`` where
+    ``note`` says why the last provider failed (or that none is
+    configured). ``timeout`` bounds each provider attempt separately.
+    """
+    providers = router.providers_for(task)
+    if not providers:
+        logger.info("%s: no LLM provider configured — skipping", log_name)
+        return None, "no LLM provider configured"
+    note: str | None = None
+    for candidate in providers:
+        try:
+            call = candidate.complete(prompt, **complete_kwargs)
+            content = await (asyncio.wait_for(call, timeout) if timeout else call)
+        except ProviderError as exc:
+            logger.warning(
+                "%s: LLM call failed on %s: %s — trying next provider",
+                log_name, candidate.name, exc,
+            )
+            note = f"{candidate.name}: {exc}"
+            continue
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s: %s took longer than %.0fs — trying next provider",
+                log_name, candidate.name, timeout,
+            )
+            note = f"{candidate.name}: timed out after {timeout:.0f}s"
+            continue
+        result = parse(content or "")
+        if result is not None:
+            return result, None
+        logger.warning("%s: %s returned unusable output — trying next provider", log_name, candidate.name)
+        note = f"{candidate.name}: returned unusable output"
+    logger.warning("%s: all configured LLM providers failed", log_name)
+    return None, note or "all configured providers failed"
+
+
+__all__ = [
+    "Provider",
+    "ProviderError",
+    "Router",
+    "complete_with_fallback",
+    "router",
+]

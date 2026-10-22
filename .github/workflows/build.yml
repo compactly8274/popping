@@ -6,10 +6,12 @@ name: build
 #
 # Tags produced:
 #   ghcr.io/<owner>/popping-backend:main        <- every push to main
-#   ghcr.io/<owner>/popping-backend:sha-<sha>   <- every push (any branch)
+#   ghcr.io/<owner>/popping-backend:sha-<full sha> <- every push to main
 #   ghcr.io/<owner>/popping-frontend:main
-#   ghcr.io/<owner>/popping-frontend:sha-<sha>
-#   ghcr.io/<owner>/popping-{backend,frontend}:<pr>-<num>  <- PR builds
+#   ghcr.io/<owner>/popping-frontend:sha-<full sha>
+#   ghcr.io/<owner>/popping-{backend,frontend}:latest  <- every push to main
+#   PR builds are never pushed: login and push run only on push events
+#   (both image jobs), so a PR's pr-<num> tag exists only inside its run.
 
 on:
   push:
@@ -21,8 +23,11 @@ permissions:
   contents: read
   packages: write   # only needed on push-to-main; safe to declare unconditionally
 
+# The event is part of the group: a PR's run that GitHub creates only
+# after the PR was merged runs with the base branch's ref, and with the
+# ref alone it cancelled the push-to-main run that publishes the images.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -52,7 +57,13 @@ jobs:
 
       - name: Install backend + test deps
         working-directory: backend
-        run: pip install -e ".[test]"
+        # Same pins as the image: CPU torch (version from the Dockerfile),
+        # then the lockfile, then the app itself.
+        run: |
+          TORCH_VERSION=$(sed -n 's/^ARG TORCH_VERSION=//p' Dockerfile)
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+          pip install -r requirements-dev.lock
+          pip install --no-deps -e .
 
       - name: Create pgvector extension
         run: |
@@ -92,8 +103,102 @@ jobs:
             echo "::error::${line}"
           done
 
+  frontend-checks:
+    name: frontend lint + build
+    # Lint, build, unit tests and the smoke run take about 12 minutes,
+    # but on a slow Ubuntu mirror the browser install alone has taken 17;
+    # still fail well before GitHub's 6h default.
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    # Read-only token, and not left in the checkout: this job downloads
+    # Playwright and browsers, and must not be able to push an image.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      # tsc + vite build
+      - run: npm run build
+      # The rules the feed editor and Add form share (src/lib), run
+      # straight from the TypeScript source with Node's type stripping.
+      - name: Unit tests
+        run: node --experimental-strip-types --test 'scripts/unit/*.test.ts'
+      # Playwright is installed for this run only: --no-save plus the
+      # diff check prove package.json, the lockfile and the Docker
+      # build stay untouched.
+      - name: Install Playwright (not saved)
+        run: |
+          npm install --no-save --no-audit --no-fund --ignore-scripts playwright@1.56.1
+          git diff --exit-code package.json package-lock.json
+          npx playwright install --with-deps chromium
+      - name: Start preview
+        run: |
+          nohup ./node_modules/.bin/vite preview --host 127.0.0.1 --port 4173 --strictPort > /tmp/preview.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:4173/ && exit 0; sleep 0.5; done
+          cat /tmp/preview.log; exit 1
+      # Renders the main screens at iPhone sizes against a mocked API and
+      # fails on text or boxes running past their container
+      # (frontend/scripts/iphone-audit/README.md).
+      - name: iPhone layout smoke test
+        run: node scripts/iphone-audit/smoke.cjs http://127.0.0.1:4173 --csp --strict
+
+  # The Safari-engine run only reports, so it is its own job: the frontend
+  # image never waits on it. WebKit's system packages (GStreamer, ffmpeg)
+  # are the bulk of the apt download, and on a slow Ubuntu mirror they
+  # ran the frontend job past its timeout so no image was published.
+  frontend-safari-report:
+    name: frontend Safari report
+    timeout-minutes: 30
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Install Playwright WebKit (not saved)
+        run: |
+          npm install --no-save --no-audit --no-fund --ignore-scripts playwright@1.56.1
+          git diff --exit-code package.json package-lock.json
+          npx playwright install --with-deps webkit
+      - name: Start preview
+        run: |
+          nohup ./node_modules/.bin/vite preview --host 127.0.0.1 --port 4173 --strictPort > /tmp/preview.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:4173/ && exit 0; sleep 0.5; done
+          cat /tmp/preview.log; exit 1
+      # States only: the behaviour flows drive Chromium (CDP touch) and
+      # would roughly double the job's time here for a report nobody gates on.
+      - name: iPhone layout smoke test (Safari engine, report only)
+        run: node scripts/iphone-audit/smoke.cjs http://127.0.0.1:4173 --browser webkit --states-only
+
   build-backend:
     name: backend image
+    # A normal build takes a few minutes; fail fast instead of GitHub's 6h default.
+    timeout-minutes: 30
+    # Never publish an image whose tests failed: compose pulls :latest.
+    needs: backend-tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,6 +245,10 @@ jobs:
 
   build-frontend:
     name: frontend image
+    # A normal build takes a few minutes; fail fast instead of GitHub's 6h default.
+    timeout-minutes: 30
+    # Never publish an image whose tests failed: compose pulls :latest.
+    needs: [backend-tests, frontend-checks]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -26,10 +26,11 @@ live as ``Source`` rows the same way user-added RSS rows do.
 
 Failure modes follow the rest of the source plugins:
   - Feature off (no proxy URL AND ``reddit_direct_disabled`` True):
-    the underlying ``reddit_client.fetch_subreddit`` returns ``[]``
-    and the scheduler's normal "nothing new" path takes over. The
-    one-shot WARNING log on the first such row tells the operator
-    the feature is off.
+    the scheduler checks first and records the ``[reddit off]`` setup
+    state without calling ``fetch`` (``scheduler._ingest_once``), so
+    the feed says why it brings nothing. Called anyway, ``fetch``
+    returns ``[]``, and the one-shot WARNING log on the first such
+    row tells the operator the feature is off.
   - Malformed subreddit slug (``r/foo/bar``, empty, weird chars):
     ``normalize_subreddit`` returns None and ``fetch`` short-circuits
     to ``[]`` so a bad row logs DEBUG and is skipped. Mirrors the
@@ -54,7 +55,7 @@ from collections import OrderedDict
 
 from app.models import Source
 from app import reddit_client
-from app.sources.base import SourcePlugin
+from app.sources.base import SourcePlugin, row_fetch_target
 from app.sources.reddit import normalize_subreddit
 
 logger = logging.getLogger("popping.sources.dynamic_reddit")
@@ -116,6 +117,8 @@ class DynamicRedditPlugin(SourcePlugin):
         # Lets the scheduler compute this job's id (``ingest:dynamic:<id>``)
         # for backoff rescheduling without reaching into ``_source_row``.
         self.source_id = source_row.id
+        # The address this instance fetches (see ``SourcePlugin.fetch_target``).
+        self.fetch_target = row_fetch_target(source_row)
 
     async def fetch(self) -> list[dict]:
         # If this source is in its one-cycle cooldown from a previous

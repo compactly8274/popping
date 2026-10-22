@@ -42,11 +42,14 @@ class Source(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    # What the user calls the feed ("CPABC Newsroom"). ``name`` stays the
+    # internal slug; NULL = show a label derived from it.
+    display_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     type: Mapped[str] = mapped_column(String(20), nullable=False)  # rss / api / scrape
     category: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     url: Mapped[str] = mapped_column(Text, nullable=False)
     # Optional direct sitemap URL. When set, the generic_scrape
-    # plugin parses it with ``trafilatura.sitemaps.sitemap_search``
+    # plugin parses it with ``app.feed_autodiscovery.discover_sitemap_urls``
     # directly instead of asking trafilatura to discover the
     # sitemap from the page URL. Solves the case where the
     # homepage's sitemap_index is broken (e.g. 1100+ cross-domain
@@ -71,6 +74,16 @@ class Source(Base):
     last_fetch_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Feed health (migration 0031). ``last_attempt_at`` is when the last
+    # check finished, whatever came of it: a success (then it equals
+    # ``last_fetch_at``), a failure or a setup state (``last_error``).
+    # ``last_item_count`` is how many items the last successful check
+    # listed, before the ingest rules cut them; ``last_new_count`` is
+    # how many of those it stored. All NULL until the row's first check
+    # after the migration (no backfill).
+    last_attempt_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_item_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_new_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     # Multiplier on the source's contribution to composite score (phase 2).
     # Default 1.0; the UI for tuning this lands in phase 3.

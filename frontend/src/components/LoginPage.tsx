@@ -7,6 +7,7 @@
 
 import { useEffect, useState } from 'react'
 import { api, type CurrentUser } from '../api'
+import { errorMessage } from '../lib/apiErrors'
 
 interface Props {
   returnTo: string
@@ -34,7 +35,13 @@ export function LoginPage({ returnTo, onSignedIn }: Props) {
       const user = await api.loginLocal(username, password)
       onSignedIn(user)
     } catch (e2) {
-      setErr((e2 as Error).message)
+      // The server answers 401 for any wrong username or password,
+      // without saying which.
+      setErr(
+        (e2 as { status?: number }).status === 401
+          ? "That username and password don't match."
+          : errorMessage(e2),
+      )
     } finally {
       setBusy(false)
     }
@@ -74,6 +81,12 @@ export function LoginPage({ returnTo, onSignedIn }: Props) {
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   autoComplete="username"
+                  // iOS capitalises the first letter by default, so a
+                  // lowercase username would fail to sign in.
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  enterKeyHint="next"
                   className="mt-1 w-full min-h-[44px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-body text-label-primary placeholder:text-label-tertiary focus:outline-none focus:border-accent"
                 />
               </label>
@@ -86,6 +99,7 @@ export function LoginPage({ returnTo, onSignedIn }: Props) {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   autoComplete="current-password"
+                  enterKeyHint="go"
                   className="mt-1 w-full min-h-[44px] rounded-ios bg-bg-elevated border border-hairline px-3 text-ios-body text-label-primary placeholder:text-label-tertiary focus:outline-none focus:border-accent"
                 />
               </label>

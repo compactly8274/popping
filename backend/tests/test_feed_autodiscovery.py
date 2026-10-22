@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from app import article_extract as article_extract_mod
 from app import feed_autodiscovery as feed_autodiscovery_mod
 from app.feed_autodiscovery import discover_feed_url, discover_sitemap_urls
 from app.routes import sources as sources_route
@@ -52,65 +53,6 @@ async def test_discover_feed_url_unreachable_host_returns_none():
     assert await discover_feed_url("http://127.0.0.1:1/nope") is None
 
 
-# --- app.feed_autodiscovery: trafilatura's per-request download timeout ----
-#
-# Follow-up regression: even after the find_feed_urls -> determine_feed
-# fix above, Auto Feed still failed on real multi-sitemap sites.
-# trafilatura's OWN per-request download timeout defaults to 30s —
-# the exact same value as our outer _TRAFILATURA_BUDGET. sitemap_search
-# doesn't make just one request; it crawls robots.txt, several guessed
-# paths, and any nested sitemap-index references, fetching each in
-# turn. So a single slow/hanging host among those candidates could
-# consume the ENTIRE outer 30s budget by itself, starving every other
-# candidate in the same crawl of a chance to run — observed directly
-# via a real site's sitemap discovery going silent for ~28s before our
-# wait_for cut it off. _tighten_trafilatura_download_timeout() mutates
-# the shared ConfigParser trafilatura's fetch_url binds as its default
-# so every internal request this module triggers is capped tightly
-# instead of up to 30s.
-
-
-def test_tighten_trafilatura_download_timeout_mutates_the_shared_default():
-    import inspect
-
-    from trafilatura.downloads import fetch_url
-
-    def _current_timeout() -> int:
-        return inspect.signature(fetch_url).parameters["config"].default.getint(
-            "DEFAULT", "DOWNLOAD_TIMEOUT",
-        )
-
-    original = _current_timeout()
-    try:
-        feed_autodiscovery_mod._tighten_trafilatura_download_timeout()
-        assert _current_timeout() == feed_autodiscovery_mod._TRAFILATURA_DOWNLOAD_TIMEOUT_S
-    finally:
-        # Restore — this module-level ConfigParser is shared process-
-        # wide, so a leaked mutation would affect unrelated trafilatura
-        # callers (e.g. app.article_extract) for the rest of the test run.
-        inspect.signature(fetch_url).parameters["config"].default.set(
-            "DEFAULT", "DOWNLOAD_TIMEOUT", str(original),
-        )
-
-
-def test_sitemap_search_internal_fetch_uses_the_same_shared_config():
-    """Pins the mechanism the fix relies on: SitemapObject.fetch calls
-    fetch_url with the shared config object, so it resolves to the same
-    bound default our tighten function mutates. If a trafilatura
-    upgrade ever changes this call to pass its own config, the timeout
-    fix silently stops applying to sitemap crawls — this test would
-    catch that."""
-    import inspect
-
-    from trafilatura.sitemaps import SitemapObject
-
-    src = inspect.getsource(SitemapObject.fetch)
-    # trafilatura >= 2.x passes ``config=self.config`` explicitly, but
-    # the config still originates from the same shared default object
-    # we mutate in ``_tighten_trafilatura_download_timeout``.
-    assert "fetch_url(self.current_url" in src
-
-
 # --- app.feed_autodiscovery: real trafilatura discovery, no monkeypatch ----
 #
 # Everything above (and the rest of this file) either rejects a URL
@@ -131,6 +73,26 @@ def test_sitemap_search_internal_fetch_uses_the_same_shared_config():
 # actually observable.
 
 
+_SITEMAP_ROUTES = {
+    "/robots.txt": "User-agent: *\nSitemap: http://HOST/sitemap_index.xml\n",
+    "/sitemap_index.xml": (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        "<sitemap><loc>http://HOST/news.xml</loc></sitemap>"
+        "<sitemap><loc>http://evil.example/other.xml</loc></sitemap>"
+        "</sitemapindex>"
+    ),
+    "/news.xml": (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        "<url><loc>http://HOST/article-1</loc></url>"
+        "<url><loc>http://HOST/article-2</loc></url>"
+        "<url><loc>http://elsewhere.example/x</loc></url>"
+        "</urlset>"
+    ),
+}
+
+
 class _MockNewsSiteHandler(BaseHTTPRequestHandler):
     """Serves a homepage with a <link rel=alternate> feed tag, and the
     feed itself, on two paths. Deliberately minimal — just enough
@@ -140,6 +102,15 @@ class _MockNewsSiteHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        host = self.headers.get("Host")
+        if self.path in _SITEMAP_ROUTES:
+            body = _SITEMAP_ROUTES[self.path].replace("HOST", host).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/feed.xml":
             body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -210,6 +181,10 @@ def mock_news_site(monkeypatch):
     async def _noop_ssrf_event_hook(request):
         return None
     monkeypatch.setattr(rss_mod, "ssrf_event_hook", _noop_ssrf_event_hook)
+    # The homepage and sitemap fetches go through article_extract's
+    # guarded fetch_html, which has its own two bindings.
+    monkeypatch.setattr(article_extract_mod, "check_url_safe", safe)
+    monkeypatch.setattr(article_extract_mod, "ssrf_event_hook", _noop_ssrf_event_hook)
     # courlan's get_hostinfo (which trafilatura.feeds.determine_feed's
     # caller relies on) treats a bare "127.0.0.1:PORT" as having no
     # extractable domain (it wants a real TLD) and bails before ever
@@ -248,20 +223,34 @@ async def test_trafilatura_find_feed_urls_does_not_return_the_feed_url(mock_news
 
 
 @pytest.mark.asyncio
-@pytest.mark.skip(
-    reason=(
-        "trafilatura's internal downloads layer now has its own SSRF guard "
-        "that blocks 127.0.0.1 in CI, so the mock-news-site fixture can no "
-        "longer drive the real network path. The non-network tests above "
-        "still cover the URL-safety + determine_feed contract."
-    ),
-)
 async def test_discover_feed_url_finds_feed_linked_from_homepage(mock_news_site):
     """The actual regression: pasting a homepage URL (not the feed URL
     directly) must resolve to the real feed, via the <link
     rel=alternate> tag — this is the entire point of Auto Feed."""
     result = await discover_feed_url(mock_news_site)
     assert result == f"{mock_news_site}feed.xml"
+
+
+@pytest.mark.asyncio
+async def test_discover_sitemap_urls_follows_robots_and_index(mock_news_site):
+    """robots.txt -> sitemap index -> urlset, keeping only same-site URLs
+    (the off-site nested sitemap is never fetched)."""
+    urls = await discover_sitemap_urls(mock_news_site)
+    assert urls == [f"{mock_news_site}article-1", f"{mock_news_site}article-2"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_never_fetches_through_trafilatura(mock_news_site, monkeypatch):
+    """trafilatura's downloader bypasses the SSRF guard; discovery must
+    not call it."""
+    import trafilatura.downloads as downloads
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("trafilatura fetch_url must not be used")
+
+    monkeypatch.setattr(downloads, "fetch_url", _boom)
+    assert await discover_feed_url(mock_news_site) == f"{mock_news_site}feed.xml"
+    assert await discover_sitemap_urls(mock_news_site)
 
 
 # --- app.routes.sources._slugify_hostname ----------------------------------

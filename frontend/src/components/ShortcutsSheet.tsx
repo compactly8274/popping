@@ -29,7 +29,8 @@ const GLOBAL_BINDINGS: Binding[] = [
   { key: '?', label: 'show this shortcuts sheet' },
   { key: '/', label: 'focus search' },
   { key: 'r', label: 'refresh dashboard' },
-  { key: 'Esc', label: 'close drawer / clear search' },
+  { key: ',', label: 'open settings' },
+  { key: 'Esc', label: 'close the menu or settings / clear search' },
 ]
 
 const NAVIGATION_BINDINGS: Binding[] = [
@@ -39,8 +40,11 @@ const NAVIGATION_BINDINGS: Binding[] = [
 ]
 
 const CARD_BINDINGS: Binding[] = [
-  { key: 'm', label: 'mark selected card read' },
   { key: 's', label: 'toggle inline summary on selected card' },
+  { key: 'b', label: 'save or unsave the selected card' },
+  { key: 'h', label: 'hide the selected card (Undo in the toast)' },
+  { key: 'a', label: 'upvote the selected card (again to take it back)' },
+  { key: 'z', label: 'downvote the selected card (again to take it back)' },
 ]
 
 export function ShortcutsSheet({ open, onClose }: Props) {
@@ -76,7 +80,7 @@ export function ShortcutsSheet({ open, onClose }: Props) {
         // treatment for visual consistency. ``onClick`` is a no-op
         // so a click inside the card doesn't bubble to the backdrop
         // and close the sheet.
-        className="w-full max-w-md max-h-[80vh] overflow-y-auto bg-bg-elevated rounded-ios-lg p-4 space-y-4"
+        className="w-full max-w-md max-h-[80dvh] overflow-y-auto overscroll-contain bg-bg-elevated rounded-ios-lg p-4 space-y-4"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
@@ -90,7 +94,7 @@ export function ShortcutsSheet({ open, onClose }: Props) {
             type="button"
             onClick={onClose}
             aria-label="close shortcuts"
-            className="text-label-secondary active:text-label-primary min-h-[32px] min-w-[32px] flex items-center justify-center"
+            className="w-11 h-11 -mr-3 text-label-secondary active:text-label-primary flex items-center justify-center"
           >
             ✕
           </button>

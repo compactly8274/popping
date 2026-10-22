@@ -19,20 +19,17 @@ type Props = {
   error?: string | null
   searching?: boolean
   // Per-card engagement, wired the same way as the "For You" row
-  // in App — search results are cross-column, so there's no single
-  // owning column to mark read against. Callers should scope reads
-  // under a shared pseudo-column key (App uses ``'Search'``).
+  // in App.
   categoriesBySourceId?: Map<number, string>
   // Same shape, favicon path — Card's thumbnail fallback for
   // entries with no photo of their own.
   faviconBySourceId?: Map<number, string | null>
-  // Entries the user has already read anywhere on the dashboard
-  // (App's ``globalReadIds``). Drives the dimmed/unread ring.
-  readIds?: Set<number>
-  onMarkRead?: (entryId: number) => void
+  // A story was opened: App marks it seen, under its category's
+  // ``seen:`` key, as from a tab (PR3b). Results are never dimmed: they
+  // are what you searched for.
+  onOpenEntry?: (entry: Entry) => void
+  // Hide (App's ``hideStory``): the card's ⋯ row and a swipe left.
   onHide?: (entryId: number) => void
-  onHideToggle?: (entryId: number) => void
-  hiddenSet?: Set<number>
   onStar?: (entryId: number) => void
   starredSet?: Set<number>
   onVote?: (entryId: number, direction: 'up' | 'down' | null) => void
@@ -49,11 +46,8 @@ export function SearchResults({
   searching,
   categoriesBySourceId,
   faviconBySourceId,
-  readIds,
-  onMarkRead,
+  onOpenEntry,
   onHide,
-  onHideToggle,
-  hiddenSet,
   onStar,
   starredSet,
   onVote,
@@ -63,11 +57,11 @@ export function SearchResults({
 }: Props) {
   return (
     <section className="flex flex-col h-full overflow-hidden">
-      <header className="flex items-center justify-between px-1 pb-2 border-b border-hairline">
-        <h2 className="text-ios-caption uppercase tracking-wide text-label-tertiary">
+      <header className="flex items-center justify-between gap-2 px-1 pb-2 border-b border-hairline">
+        <h2 className="shrink-0 whitespace-nowrap text-ios-caption uppercase tracking-wide text-label-tertiary">
           Search results
         </h2>
-        <span className="text-ios-caption text-label-secondary">
+        <span className="min-w-0 truncate text-ios-caption text-label-secondary">
           {error
             ? 'failed'
             : searching
@@ -75,10 +69,10 @@ export function SearchResults({
               : `${entries.length} for "${query}"`}
         </span>
       </header>
-      <div className="flex-1 overflow-x-clip overflow-y-auto space-y-2 pr-1">
+      <div className="flex-1 overflow-x-clip overflow-y-auto overscroll-contain space-y-2 pr-1">
         {error ? (
           <p className="text-ios-body text-red-400 px-1" role="alert">
-            search failed — {error}
+            Search failed. {error}
           </p>
         ) : entries.length === 0 ? (
           <p className="text-ios-body text-label-secondary italic px-1">
@@ -92,13 +86,10 @@ export function SearchResults({
               sourceName={sourcesById.get(e.source_id)}
               sourceFaviconPath={faviconBySourceId?.get(e.source_id)}
               category={categoriesBySourceId?.get(e.source_id)}
-              unread={readIds ? !readIds.has(e.id) : undefined}
               expanded={expandedSummaries?.has(e.id) ?? false}
               onToggleSummary={onToggleSummary ? () => onToggleSummary(e.id) : undefined}
-              onMarkRead={onMarkRead ? () => onMarkRead(e.id) : undefined}
+              onActivate={onOpenEntry ? () => onOpenEntry(e) : undefined}
               onHide={onHide ? () => onHide(e.id) : undefined}
-              onHideToggle={onHideToggle ? () => onHideToggle(e.id) : undefined}
-              hidden={hiddenSet?.has(e.id) ?? false}
               onStar={onStar ? () => onStar(e.id) : undefined}
               starred={starredSet?.has(e.id) ?? false}
               onVote={onVote ? (dir) => onVote(e.id, dir) : undefined}

@@ -12,10 +12,9 @@ fallback when no provider is configured or the article fetch fails.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
-from app.llm import ProviderError, router
+from app.llm import complete_with_fallback
 
 logger = logging.getLogger("popping.article_summary")
 
@@ -59,46 +58,17 @@ async def summarize_article(title: str, article_text: str) -> str | None:
     Returns None if no provider is configured or every configured
     provider fails — same contract as
     ``app.podcast_transcript.summarize_transcript``."""
-    providers = router.providers_for("brief")
-    if not providers:
-        logger.info("article_summary: no LLM provider configured — skipping")
-        return None
-    prompt = _build_prompt(title, article_text)
-    for candidate in providers:
-        try:
-            content = await asyncio.wait_for(
-                # think=False: a short, tightly-token-capped direct-
-                # answer prompt. A thinking model given the default
-                # (True) can burn the whole _SUMMARY_MAX_TOKENS budget
-                # on its CoT preamble and never reach the actual
-                # summary — see Provider.complete's docstring.
-                candidate.complete(
-                    prompt,
-                    max_tokens=_SUMMARY_MAX_TOKENS,
-                    think=False,
-                    # Halt on the first paragraph break after a quote
-                    # or period — a cheap guard against models that
-                    # keep going into analysis after 3-4 sentences.
-                    # Ollama-native ``stop``; other providers accept
-                    # and apply it as a stop-string too.
-                    stop=["\n\n"],
-                ),
-                timeout=_LLM_CALL_TIMEOUT_S,
-            )
-        except ProviderError as exc:
-            logger.warning(
-                "article_summary: LLM call failed on %s: %s — trying next provider",
-                candidate.name, exc,
-            )
-            continue
-        except asyncio.TimeoutError:
-            logger.warning(
-                "article_summary: %s took longer than %.0fs — trying next provider",
-                candidate.name, _LLM_CALL_TIMEOUT_S,
-            )
-            continue
-        content = (content or "").strip()
-        if content:
-            return content
-    logger.warning("article_summary: all configured LLM providers failed")
-    return None
+    summary, _ = await complete_with_fallback(
+        "brief",
+        _build_prompt(title, article_text),
+        log_name="article_summary",
+        timeout=_LLM_CALL_TIMEOUT_S,
+        max_tokens=_SUMMARY_MAX_TOKENS,
+        # think=False: a short, tightly capped direct-answer prompt; a
+        # thinking model can spend the whole budget on its reasoning.
+        think=False,
+        # Stop at the first paragraph break, a cheap guard against models
+        # that keep going into analysis after 3-4 sentences.
+        stop=["\n\n"],
+    )
+    return summary

@@ -24,7 +24,7 @@ import logging
 import re
 from typing import Optional
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -32,6 +32,7 @@ from app.llm import ProviderError, router
 from app.models import Brief, Entry, Source
 from app.notify import Notifier
 from app import brief_filter
+from app import ingest_rules
 from app import runtime_settings
 
 logger = logging.getLogger("popping.brief")
@@ -89,6 +90,25 @@ _BRIEF_STOP_SEQUENCES: list[str] = [
 # ``my_history_feed`` would still flow into the brief — the slug
 # match is a deliberate, narrow opt-out, not a category filter.
 _HISTORICAL_SOURCE_SLUGS: frozenset[str] = frozenset({"wikipedia_on_this_day"})
+
+
+def _not_backfill(backfill_hours: int):
+    """Keep a story out of the brief when it was published more than
+    ``backfill_hours`` before it reached us: a new feed's first fetch
+    brings its newest few stories, which can be weeks old but carry
+    today's ``fetched_at``.
+
+    Measured against each story's own ``fetched_at``, not the brief's
+    ``since``: date-only stories (website scrapes, CISA KEV) are stamped
+    midnight UTC, and an RSS story published just before ``since`` and
+    fetched after it is still news, so a ``published_at >= since``
+    guard would drop both, and almost everything at a 1 h window.
+    Undated stories stay.
+    """
+    return or_(
+        Entry.published_at.is_(None),
+        Entry.published_at >= Entry.fetched_at - dt.timedelta(hours=backfill_hours),
+    )
 
 
 class BriefGenerator:
@@ -340,6 +360,15 @@ class BriefGenerator:
         return n
 
     @staticmethod
+    async def _resolve_backfill_hours() -> int:
+        """``ingest.backfill_hours``, the same knob (and the same parse
+        and range check) the ingest rules use for a first fetch's
+        "last couple of days"."""
+        key = "ingest.backfill_hours"
+        raw = await runtime_settings.get_many([key])
+        return ingest_rules.parse_tunables(raw).backfill_hours
+
+    @staticmethod
     async def _select_entries(session: AsyncSession, *, limit: int) -> list[tuple[Entry, Source]]:
         """Top-N entries ingested in the lookback window, by composite_score
         with a convergence multiplier applied.
@@ -362,6 +391,8 @@ class BriefGenerator:
         are ingested today — using ``fetched_at`` keeps the brief focused
         on actual recent content. The dashboard's browse view still
         sorts by ``published_at`` so historical entries stay visible.
+        A new feed's backfill (stories published long before they were
+        fetched) is left out too; see ``_not_backfill``.
 
         Historical-content sources (currently just
         ``wikipedia_on_this_day``) are excluded by slug. Their entries
@@ -380,10 +411,12 @@ class BriefGenerator:
         over_fetch = min(max(limit * 4, 200), 500)
         window_hours = await BriefGenerator._resolve_window_hours()
         since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
+        backfill_hours = await BriefGenerator._resolve_backfill_hours()
         stmt = (
             select(Entry, Source)
             .join(Source, Entry.source_id == Source.id)
             .where(Entry.fetched_at >= since)
+            .where(_not_backfill(backfill_hours))
             .where(Source.name.notin_(_HISTORICAL_SOURCE_SLUGS))
             .order_by(desc(Entry.composite_score))
             .limit(over_fetch)
@@ -445,10 +478,12 @@ class BriefGenerator:
 
         window_hours = await BriefGenerator._resolve_window_hours()
         since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
+        backfill_hours = await BriefGenerator._resolve_backfill_hours()
         stmt = (
             select(Entry, Source)
             .join(Source, Entry.source_id == Source.id)
             .where(Entry.fetched_at >= since)
+            .where(_not_backfill(backfill_hours))
             .where(Source.name.notin_(_HISTORICAL_SOURCE_SLUGS))
             .order_by(desc(Entry.composite_score))
             .limit(limit * 5)  # over-fetch; filter post-hoc by slug

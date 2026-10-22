@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Google News sitemap (/news-sitemap.xml): the last two days of
+     articles, with the news: namespace. -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">
+  <url>
+    <loc>https://www.example.com/news/2026/10/19/bridge-reopens-after-repairs</loc>
+    <news:news>
+      <news:publication>
+        <news:name>Example Daily</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:publication_date>2026-10-19T16:20:00-07:00</news:publication_date>
+      <news:title>Bridge reopens after repairs</news:title>
+    </news:news>
+  </url>
+  <url>
+    <loc>https://www.example.com/news/2026/10/19/school-board-votes-on-budget</loc>
+    <news:news>
+      <news:publication>
+        <news:name>Example Daily</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:publication_date>2026-10-19T09:05:00-07:00</news:publication_date>
+      <news:title>School board votes on budget</news:title>
+    </news:news>
+  </url>
+</urlset>

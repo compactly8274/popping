@@ -30,7 +30,8 @@ async def ingest_endpoint(source_name: str) -> IngestResult:
     # 404 only if the name is neither a registered plugin class nor
     # a dynamic ``Source`` row. ``trigger_now`` already handles
     # both cases (registry hit goes to the in-memory class; DB hit
-    # goes through ``_plugin_for(row)`` and then ``_ingest``);
+    # runs the row's job plugin, or ``_plugin_for(row)`` when it has
+    # no job, through ``_ingest``);
     # we just need to pre-check the dynamic case so the 404
     # message stays meaningful. Without the DB lookup, a dynamic
     # source would 404 even though ``trigger_now`` would handle it

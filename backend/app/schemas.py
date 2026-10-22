@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import datetime as dt
 import enum
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictBool, StringConstraints, conlist
 
 
 class SourceOut(BaseModel):
     id: int
     name: str
+    display_name: Optional[str] = None
     type: str
     category: str
     url: str
@@ -60,6 +61,28 @@ class SourceOut(BaseModel):
     # voted on) rather than None so the frontend can render it
     # directly without a null check.
     net_vote_score: int = 0
+
+    # Feed health (migration 0031), read off the row. NULL until the
+    # feed's first check after the migration; the frontend then falls
+    # back to ``last_fetch_at``. ``last_attempt_at`` is when the last
+    # check finished, whatever came of it (``last_error`` says what went
+    # wrong). The counts are the last successful check's: items listed
+    # before the ingest rules cut them, and new stories stored.
+    last_attempt_at: Optional[dt.datetime] = None
+    last_item_count: Optional[int] = None
+    last_new_count: Optional[int] = None
+
+    # Story counts. Not ORM attributes: ``routes.sources._health_counts``
+    # computes them for every endpoint that returns a source and
+    # assigns them after ``model_validate``. ``stories_24h`` /
+    # ``stories_7d`` count stories that arrived (``fetched_at``) in the
+    # last 24 hours / 7 days; ``newest_story_at`` is the newest arrival
+    # in those 7 days (null when nothing arrived this week);
+    # ``has_stories`` is whether the feed has ever stored one.
+    stories_24h: int = 0
+    stories_7d: int = 0
+    newest_story_at: Optional[dt.datetime] = None
+    has_stories: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -112,6 +135,8 @@ class SourceCreate(BaseModel):
     # ``AttributeError`` and the request 500s before reaching any
     # client-visible error message.
     custom_headers: Optional[dict] = None
+    # Free-text label shown in the app; blank clears it.
+    display_name: Optional[str] = None
 
 
 class SourceAutoRequest(BaseModel):
@@ -136,7 +161,10 @@ class SourceAutoResult(BaseModel):
     URL itself, or a feed it linked to) or ``"generic_scrape"`` when
     no feed exists but the site's sitemap produced at least one
     extractable article, so periodic scraping was set up instead of a
-    feed subscription. ``source`` is the created row on success.
+    feed subscription. ``kind`` is ``"youtube_channel"`` when the URL
+    was a YouTube link, bare channel id or @handle; then ``source`` may
+    be an existing row that already follows the same feed, and nothing
+    new was created. ``source`` is the created row on success.
     """
     found: bool
     kind: Optional[str] = None
@@ -168,7 +196,7 @@ class SourceUpdate(BaseModel):
     # homepage-discovery behavior; set to a working direct
     # sitemap URL when the homepage's sitemap_index is broken
     # but a specific section's sitemap is healthy. The plugin
-    # uses this URL with ``trafilatura.sitemaps.sitemap_search``
+    # uses this URL with ``app.feed_autodiscovery.discover_sitemap_urls``
     # directly instead of going through the broken discovery
     # heuristic.
     sitemap_url: Optional[str] = None
@@ -183,10 +211,12 @@ class SourceUpdate(BaseModel):
     # route layer enforces this so the same-origin safety
     # check isn't bypassed.
     link_pattern: Optional[str] = None
-    # Set to ``{}`` (or empty dict) to clear an existing override.
-    # ``None`` leaves the column untouched (the PATCH endpoint
-    # treats missing fields as no-ops).
+    # An explicit ``null`` (or ``{}``) clears an existing override;
+    # omitting the field leaves the column untouched. The PATCH
+    # endpoint tells the two apart with ``model_fields_set``.
     custom_headers: Optional[dict] = None
+    # Free-text label shown in the app; blank clears it.
+    display_name: Optional[str] = None
 
 
 class SourceTestRequest(BaseModel):
@@ -237,14 +267,17 @@ class SourceTestResult(BaseModel):
       - ``invalid_url``      URL failed the http/https / subreddit
                              validator
       - ``unsupported_type`` ``type`` is not in the accepted set
+      - ``invalid_headers``  ``custom_headers`` failed validation
+                             (bad name, denied name, duplicate,
+                             value too long or not printable ASCII)
       - ``network_error``    connection refused, DNS, TLS, etc.
       - ``unknown``          catch-all
 
     ``resolved_url`` is set when the submitted URL was an Apple
-    Podcasts show page (``podcasts.apple.com/.../id<N>``) that got
-    resolved to its actual RSS feed via ``app.apple_podcasts`` —
-    null for every other URL, including one that was already a
-    direct feed URL. The frontend shows this so the user sees what
+    Podcasts show page (``podcasts.apple.com/.../id<N>``) or a YouTube
+    link that got resolved to its actual feed (``app.apple_podcasts``,
+    ``app.youtube``) — null for every other URL, including one that
+    was already a direct feed URL. The frontend shows this so the user sees what
     actually got fetched/would be added, rather than the resolution
     happening invisibly.
     """
@@ -255,6 +288,55 @@ class SourceTestResult(BaseModel):
     error_kind: Optional[str] = None
     error: Optional[str] = None
     resolved_url: Optional[str] = None
+
+
+# Source ids are INTEGER primary keys. ``strict`` so ``"5"``, ``5.0``
+# and ``true`` are refused rather than coerced; the bound keeps an
+# out-of-range id from reaching the database as a 500.
+CheckNowSourceId = Annotated[int, Field(strict=True, ge=1, le=2**31 - 1)]
+
+# Most feeds one check-now call takes. The scheduler caps
+# ``queue_check`` with the same constant (``_CHECK_NOW_MAX_FEEDS``).
+CHECK_NOW_MAX_IDS = 20
+
+
+class CheckNowRequest(BaseModel):
+    """Body of ``POST /api/sources/check-now`` (pull to refresh).
+
+    ``source_ids`` are the feeds to check soon, 1 to 20 of them (a
+    longer list is a 422). ``force`` is for an explicit Check now on
+    one feed: it skips the failure-backoff gate and shortens the
+    cooldown (see ``scheduler.queue_check``). Unknown fields are
+    refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_ids: conlist(CheckNowSourceId, min_length=1, max_length=CHECK_NOW_MAX_IDS)
+    force: StrictBool = False
+
+
+class CheckNowResult(BaseModel):
+    """Body of ``POST /api/sources/check-now``.
+
+    Every requested id lands in exactly one of ``queued_ids``,
+    ``cooling_down``, ``paused`` and ``backing_off``; ``queued`` is
+    ``len(queued_ids)``. ``queued_at`` is the server's clock when the
+    checks were queued: a queued feed is done once its
+    ``last_attempt_at`` is at or after it, whatever the check found
+    (``last_error`` says what went wrong; a success also moves
+    ``last_fetch_at``). ``expected_done_s`` is about when the last
+    queued check should be done, in seconds from ``queued_at`` (0 when
+    nothing was queued).
+    """
+
+    queued: int
+    cooling_down: list[int]
+    paused: list[int]
+    backing_off: list[int]
+    queued_ids: list[int]
+    queued_at: dt.datetime
+    expected_done_s: int
 
 
 class FeedRecommendation(BaseModel):
@@ -371,50 +453,8 @@ class EntryRedditCommentSummaryOut(BaseModel):
     rate_limited: bool = False
 
 
-class EntryOut(BaseModel):
-    id: int
-    source_id: int
-    title: str
-    url: str
-    published_at: Optional[dt.datetime]
-    # When the row landed in our DB. Distinct from ``published_at``
-    # (when the source article was published) — Wikipedia OTD entries
-    # carry a very old ``published_at`` but a fresh ``fetched_at``.
-    # The frontend uses this to compute "new since last visit" /
-    # read/unread state. Optional for forward-compat with rows written
-    # before the column existed; in practice every row has a value.
-    fetched_at: Optional[dt.datetime] = None
-    composite_score: float
-    personal_score: float
-    raw_score: float
-    # ``= None`` is required for the v2 model_validate path: in v1
-    # ``Optional[dict]`` without a default was implicitly ``None``,
-    # but v2 requires the explicit default. The /api/entries list
-    # endpoint SELECTs ``meta`` (it's a JSONB blob) so the field is
-    # usually populated; the default is the safety net for any
-    # future code path that constructs an EntryOut from a partial
-    # row.
-    meta: Optional[dict] = None
-    # Remote URL of the entry's thumbnail (parsed from the feed).
-    image_url: Optional[str] = None
-    # Local path under /assets, e.g. "thumbnails/1234.jpg".
-    image_path: Optional[str] = None
-    # Joined source name. Populated by endpoints
-    # that JOIN sources for display (e.g. the
-    # by-ids endpoint used by the Settings
-    # overlay's Hidden and Starred tabs). The
-    # list endpoint deliberately omits it —
-    # the dashboard already has a source name
-    # map (sourcesById) so the JOIN would be
-    # redundant bytes on the wire for the
-    # common 200-row list poll.
-    source_name: Optional[str] = None
-
-    model_config = ConfigDict(from_attributes=True)
-
-
 class EntryListOut(BaseModel):
-    """Slim subset of ``EntryOut`` for the list endpoints.
+    """The card shape every list endpoint returns.
 
     The list payload is the dominant bytes-on-wire shape — the
     dashboard polls ``/api/entries`` every 60s and renders up to
@@ -425,9 +465,6 @@ class EntryListOut(BaseModel):
     ``meta`` is fetched on demand by ``POST /api/entries/{id}/summary``
     when the user expands a card. ``embedding`` is server-internal
     and never returned by any list endpoint.
-
-    The full ``EntryOut`` is still used for endpoints that need the
-    meta — the per-card summary endpoint, etc.
 
     ``reddit_thread_url`` + ``reddit_comment_count`` are pulled out of
     ``Entry.meta`` at projection time (``routes/entries.py``) so the
@@ -450,6 +487,12 @@ class EntryListOut(BaseModel):
     # trip to /api/entries/{id}/summary on cards that have been
     # expanded before.
     cached_summary: Optional[str] = None
+    # The blurb under the headline (D34): the cached summary when
+    # there is one, else the feed's own description cleaned and cut
+    # to about 300 characters; null when there is nothing to show.
+    # Computed at projection time (``routes.entries.card_preview``),
+    # never stored. Old bundles ignore it.
+    preview: Optional[str] = None
     image_url: Optional[str] = None
     image_path: Optional[str] = None
     # Reddit cross-reference footer. Both null = no cross-ref found
@@ -483,12 +526,35 @@ class EntryListOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class EntryOut(EntryListOut):
+    """A card plus its feed's name, for ``GET /api/entries/by-ids``
+    (Saved, and Settings' Hidden, Starred and Voted lists). Same
+    projection as ``/api/entries`` (``routes.entries._CARD_COLUMNS``),
+    so a story loaded by id renders the same card as one loaded by a
+    tab. The frontend's ``EntryOut`` is ``Entry`` plus
+    ``source_name``, matching this.
+
+    The list endpoint leaves ``source_name`` out: the dashboard
+    already has the feed map, so the JOIN's name would be redundant
+    bytes on every poll.
+    """
+    source_name: str
+
+
 class IngestResult(BaseModel):
     source: str
     fetched: int
     inserted: int
     duplicates: int
+    # New items the ingest rules left out (``app.ingest_rules``): a
+    # first fetch's older backlog, old or undated items, or the
+    # per-poll cap's overflow, which a later poll picks up.
+    skipped: int = 0
     error: Optional[str] = None
+    # "paused" when the feed is paused and nothing was fetched; None
+    # otherwise. Declared so ``IngestResult(**summary)`` keeps it
+    # (unknown keys are dropped).
+    status: Optional[str] = None
 
 
 class BriefOut(BaseModel):
@@ -588,7 +654,6 @@ class HealthOut(BaseModel):
     sources: int
     entries: int
     db: str
-    redis: str
     last_fetch: Optional[dt.datetime] = None
 
 
@@ -722,10 +787,9 @@ class UserPreferenceOut(BaseModel):
     and as the body of ``GET /api/preferences/{key}``.
 
     ``updated_at`` is the server's record of when the row was last
-    written. The frontend doesn't currently use it (PUT is unconditional
-    upsert; the client owns the "did this change" logic) but it's
-    surfaced for future diff-based sync and for debugging "when did
-    my read state last change?".
+    written (the writing transaction's start time). It's the watermark
+    for ``GET /api/preferences?since=``, and useful for debugging "when
+    did my read state last change?".
     """
 
     key: str
@@ -759,6 +823,53 @@ class UserPreferenceIn(BaseModel):
     """
 
     value: Optional[object] = None
+
+
+# Entry ids are BIGINT-safe positive ints. ``strict`` so ``"5"``,
+# ``5.0`` and ``true`` are refused instead of coerced: the stored
+# lists hold JSON numbers, and the client always sends numbers.
+PreferenceEntryId = Annotated[int, Field(strict=True, ge=1, le=2**63 - 1)]
+
+
+def _check_vote_id(value: str) -> str:
+    if int(value) > 2**63 - 1:
+        raise ValueError("entry id out of range")
+    return value
+
+
+# A vote key is the entry id as a canonical digit string (no sign, no
+# leading zero), so "7" and "07" can't name the same story twice.
+PreferenceVoteId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[1-9][0-9]{0,18}$"),
+    AfterValidator(_check_vote_id),
+]
+
+# Outer bounds on one PATCH body. They equal the largest per-key caps
+# in ``routes/preferences.py`` (``_SET_KEY_CAPS``); the route then
+# checks the key's own cap.
+MAX_PATCH_IDS = 1000
+MAX_PATCH_VOTES = 2000
+
+
+class UserPreferencePatchIn(BaseModel):
+    """Body of ``PATCH /api/preferences/{key}``: a change to a set key,
+    not a whole new value, so two devices (or two calls in one tick)
+    can't overwrite each other's edits.
+
+    ``add`` / ``remove`` apply to the id-list keys; ``set`` applies to
+    ``voted_entries`` only (``null`` clears a vote). Which ops a key
+    takes is checked by the route, which answers 422 for a wrong
+    pairing. Unknown fields are refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    add: list[PreferenceEntryId] = Field(default_factory=list, max_length=MAX_PATCH_IDS)
+    remove: list[PreferenceEntryId] = Field(default_factory=list, max_length=MAX_PATCH_IDS)
+    set_: dict[PreferenceVoteId, Optional[Literal["up", "down"]]] = Field(
+        default_factory=dict, alias="set", max_length=MAX_PATCH_VOTES
+    )
 
 
 class FramingArticleOut(BaseModel):

@@ -221,3 +221,48 @@ def make_vector():
         return [seed] * dim
 
     return _make
+
+
+@pytest.fixture
+def offline_ingest(monkeypatch):
+    """Run ``scheduler._ingest`` with no embedder, no job rescheduling
+    and no network asset passes; yields the URLs that reached the embed
+    step. See ``ingest_harness.install_offline_ingest``."""
+    from ingest_harness import install_offline_ingest
+
+    return install_offline_ingest(monkeypatch)
+
+
+@pytest.fixture
+def fake_dns(monkeypatch):
+    """Answer DNS for the hosts the YouTube and source-route tests use,
+    so the real ``check_url_safe`` and ``ssrf_event_hook`` run without
+    network. The patch is process-wide (``url_safety`` uses the shared
+    ``socket`` module, and asyncpg resolves ``POSTGRES_HOST`` through
+    it), so every other host goes to the real resolver. Yields the host
+    map; a test can add entries (for example a private address)."""
+    import socket as _socket
+
+    import app.url_safety as url_safety
+
+    real = url_safety.socket.getaddrinfo
+    hosts = {
+        "youtube.com": "142.250.0.1",
+        "www.youtube.com": "142.250.0.1",
+        "m.youtube.com": "142.250.0.1",
+        "music.youtube.com": "142.250.0.1",
+        "consent.youtube.com": "142.250.0.2",
+        "example.com": "93.184.215.14",
+        "example.org": "93.184.215.14",
+        "evil.internal": "10.0.0.5",
+    }
+
+    def _fake(host, port, *args, **kwargs):
+        name = host.decode() if isinstance(host, bytes) else host
+        ip = hosts.get(name)
+        if ip is None:
+            return real(host, port, *args, **kwargs)
+        return [(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", _fake)
+    yield hosts

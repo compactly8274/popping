@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- An ollama-style model page (/library/<model>), the plugin's own
+     link-pattern design case. It declares no article type and no date:
+     on its own it is not an article, but under the owner's link
+     pattern it is exactly what the owner asked for. -->
+<title>riverlm3</title>
+<meta name="description" content="A compact open model for chat and code, in 2B and 8B sizes.">
+<meta property="og:title" content="riverlm3">
+<meta property="og:description" content="A compact open model for chat and code, in 2B and 8B sizes.">
+<meta property="og:image" content="https://models.example.com/public/og.png">
+<link rel="icon" href="/public/icon.png">
+</head>
+<body>
+<header class="flex"><a href="/">Models</a><nav><a href="/library">Library</a> <a href="/blog">Blog</a></nav></header>
+<main class="mx-auto">
+  <section>
+    <h1 class="flex items-center">riverlm3</h1>
+    <p class="text-neutral-800">A compact open model for chat and code, in 2B and 8B sizes.</p>
+    <div class="flex"><span>tools</span> <span>2b</span> <span>8b</span> <span>41.2K Pulls</span> <span>Updated 3 days ago</span></div>
+  </section>
+  <section id="readme">
+    <h2>Readme</h2>
+    <p>riverlm3 is a family of small language models trained for chat, tool use and code completion. The 2B model runs comfortably on a laptop CPU, and the 8B model fits on a single consumer graphics card with room to spare for a long context.</p>
+    <p>Both sizes were trained on a mix of permissively licensed code, public-domain books and filtered web text, then tuned on conversations written for the project. They follow instructions well, call tools through a simple JSON format, and keep to a requested output format more reliably than earlier releases.</p>
+    <p>To get started, pull the model and run it from the command line, or call it from the local API with the model name. A context window of 32 thousand tokens is supported, and quantized builds are available for machines with less memory.</p>
+    <p>The models are released under an open license that allows commercial use. Please read the model card for known limitations, including weaker performance on languages other than English and on long chains of arithmetic.</p>
+  </section>
+</main>
+<footer><a href="/privacy">Privacy</a></footer>
+</body>
+</html>

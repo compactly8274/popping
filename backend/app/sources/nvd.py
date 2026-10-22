@@ -21,10 +21,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-from typing import Any
 
 import httpx
 
+from app.config import settings
 from app.sources import register_source
 from app.sources.base import SourcePlugin
 from app.url_safety import ssrf_event_hook
@@ -41,7 +41,7 @@ _TIMEOUT = 30.0  # NVD can be slow
 # one gates the JSON parse.
 _MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 _DEFAULT_HEADERS = {
-    "User-Agent": "Popping/0.2 (+https://github.com/compactly8274/popping)",
+    "User-Agent": settings.user_agent,
 }
 
 
@@ -125,13 +125,16 @@ class NvdRecent(SourcePlugin):
                                 f"{_MAX_RESPONSE_BYTES} cap"
                             )
         except (httpx.HTTPError, ValueError) as exc:
+            # Re-raised, not swallowed: the scheduler records the
+            # error kind (blocked, network, ...) on the feed, where an
+            # empty list would look like a quiet week.
             logger.warning("nvd: fetch failed: %s", exc)
-            return []
+            raise
         try:
             data = json.loads(bytes(buf))
         except ValueError:
             logger.warning("nvd: non-JSON response (likely 404 / captcha)")
-            return []
+            raise
         items: list[dict] = []
         for cve in (data.get("vulnerabilities") or []):
             cve_inner = cve.get("cve") or {}

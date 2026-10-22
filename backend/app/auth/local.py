@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
-from typing import Optional
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status

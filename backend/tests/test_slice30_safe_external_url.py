@@ -143,16 +143,16 @@ def test_safe_external_url_passes_through_other_urls():
 
 @pytest.mark.no_db
 def test_card_uses_safe_external_url_for_entry_url():
-    """The context-menu Open in new tab action must wrap
-    entry.url in safeExternalUrl. This is the path the user
-    takes when they long-press a card and pick Open in new tab."""
+    """The ⋯ sheet's Open in browser row (also the right-click menu's)
+    must wrap entry.url in safeExternalUrl. This is the path the user
+    takes when they tap ⋯ on a card and pick Open in browser."""
     src = CARD.read_text()
     m = re.search(
-        r"label:\s*['\"]Open in new tab['\"][\s\S]*?window\.open\((safeExternalUrl\([^)]+\))",
+        r"label:\s*['\"]Open in browser['\"][\s\S]*?window\.open\((safeExternalUrl\([^)]+\))",
         src,
     )
     assert m, (
-        "Couldn't find the context-menu Open in new tab handler using "
+        "Couldn't find the sheet's Open in browser handler using "
         "safeExternalUrl. Expected window.open(safeExternalUrl(entry.url)."
     )
 

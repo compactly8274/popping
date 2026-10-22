@@ -1,13 +1,19 @@
 """Wikipedia On This Day.
 
-Fetches the events/holidays/selected-anniversaries for the current
-UTC date from Wikipedia's REST API. The data only changes daily so
-we refresh every 12 h.
+Fetches the selected anniversaries for the current UTC date from
+Wikipedia's REST API: at most ``_MAX_ITEMS`` a day, in their own
+``on_this_day`` category (tab). The data only changes daily so we
+refresh every 12 h.
 
 Each ``Event`` has ``text`` (the event description, ~1-2 sentences)
 and ``pages`` (Wikipedia articles it links to). The first linked
 page becomes the entry URL; the ``text`` is the title. ``year`` is
 stored in meta so the UI can render "1865: …" if it wants.
+
+The entry URL carries the date (``#otd-YYYY-MM-DD``). Entries are
+unique on ``url`` and the same anniversaries come back every year, so
+without the date a day's items would mostly collide with last year's
+and be dropped as duplicates.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ import logging
 
 import httpx
 
+from app.config import settings
 from app.sources import register_source
 from app.sources.base import SourcePlugin
 from app.url_safety import ssrf_event_hook
@@ -26,7 +33,9 @@ logger = logging.getLogger("popping.sources.wikipedia_on_this_day")
 
 _BASE = "https://en.wikipedia.org/api/rest_v1/feed/onthisday/all"
 _TIMEOUT = 15.0
-_MAX_EVENTS = 50  # plenty; the feed has ~60 events per day
+# The first few of the day's curated ``selected`` list. (``events``
+# lists ~60 a day and flooded the tab.)
+_MAX_ITEMS = 5
 # 5 MB. The feed is ~100 KB. The cap defends against a
 # compromised upstream returning a multi-gigabyte body before
 # we OOM. Unrelated to the per-thumbnail 2 MB cap in
@@ -34,7 +43,7 @@ _MAX_EVENTS = 50  # plenty; the feed has ~60 events per day
 # one gates the JSON parse.
 _MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 _DEFAULT_HEADERS = {
-    "User-Agent": "Popping/0.2 (+https://github.com/compactly8274/popping)",
+    "User-Agent": settings.user_agent,
     "Accept": "application/json",
 }
 
@@ -62,11 +71,21 @@ def _fallback_url(mm: str, dd: str, slug: str) -> str:
     return f"https://en.wikipedia.org/wiki/Wikipedia:Selected_anniversaries#{slug}"
 
 
+def _dated_url(page_url: str, day: dt.date) -> str:
+    """``page_url`` made unique to ``day``: ``#otd-YYYY-MM-DD``, or
+    ``-otd-YYYY-MM-DD`` added to a fragment the URL already has (the
+    fallback URLs above), so the link still opens the page."""
+    tag = f"otd-{day:%Y-%m-%d}"
+    if "#" in page_url:
+        return f"{page_url}-{tag}"
+    return f"{page_url}#{tag}"
+
+
 @register_source
 class WikipediaOnThisDay(SourcePlugin):
     name = "wikipedia_on_this_day"
     type = "api"
-    category = "news"
+    category = "on_this_day"
     url = f"{_BASE}/01/01"  # canonical "primary" date; actual date is per-fetch
     refresh_interval_seconds = 43200  # 12 h
 
@@ -102,64 +121,79 @@ class WikipediaOnThisDay(SourcePlugin):
                                 f"{_MAX_RESPONSE_BYTES} cap"
                             )
         except (httpx.HTTPError, ValueError) as exc:
+            # Re-raised, not swallowed: the scheduler records the
+            # error kind (blocked, network, ...) on the feed, where an
+            # empty list would look like a day with nothing to post.
             logger.warning("wikipedia_on_this_day: fetch failed: %s", exc)
-            return []
+            raise
         try:
             data = json.loads(bytes(buf))
         except ValueError:
             logger.warning("wikipedia_on_this_day: non-JSON response")
-            return []
+            raise
         items: list[dict] = []
-        # The feed splits content by type; we use ``events`` for
-        # historical events and ``selected`` for the curated anniversaries.
-        # ``holidays`` and ``births``/``deaths`` are skipped — they're
-        # noise for a personal feed.
-        for kind in ("events", "selected"):
-            for ev in (data.get(kind) or [])[:_MAX_EVENTS]:
-                text = (ev.get("text") or "").strip()
-                if not text:
-                    continue
-                year = ev.get("year")
-                # First linked page is the canonical link for this event.
-                pages = ev.get("pages") or []
-                first_page = pages[0] if pages else None
-                page_url = None
-                if first_page:
-                    # REST API returns ``content_urls.desktop.page`` for
-                    # the canonical article; fall back to titles.
-                    content_urls = first_page.get("content_urls") or {}
-                    desktop = content_urls.get("desktop") or {}
-                    page_url = desktop.get("page")
-                    if not page_url:
-                        title = first_page.get("titles") or {}
-                        normalized = title.get("normalized") or title.get("display")
-                        if normalized:
-                            page_url = (
-                                f"https://en.wikipedia.org/wiki/{normalized.replace(' ', '_')}"
-                            )
+        # The feed splits content by type. Only ``selected`` (the
+        # curated anniversaries) is used: ``events`` is ~60 a day, and
+        # ``holidays`` and ``births``/``deaths`` are noise for a
+        # personal feed.
+        kind = "selected"
+        urls: set[str] = set()
+        for ev in data.get(kind) or []:
+            if len(items) >= _MAX_ITEMS:
+                break
+            if not isinstance(ev, dict):
+                continue
+            text = (ev.get("text") or "").strip()
+            if not text:
+                continue
+            year = ev.get("year")
+            # First linked page is the canonical link for this event.
+            pages = ev.get("pages") or []
+            first_page = pages[0] if pages else None
+            page_url = None
+            if first_page:
+                # REST API returns ``content_urls.desktop.page`` for
+                # the canonical article; fall back to titles.
+                content_urls = first_page.get("content_urls") or {}
+                desktop = content_urls.get("desktop") or {}
+                page_url = desktop.get("page")
                 if not page_url:
-                    # Use a stable slug derived from the event text
-                    # so the fallback URL is unique per event. The
-                    # title is already a good differentiator ("1865:
-                    # Lincoln…") and is human-meaningful as a
-                    # fragment.
-                    slug = "".join(
-                        c.lower() if c.isalnum() else "-"
-                        for c in text[:64]
-                    ).strip("-") or "event"
-                    page_url = _fallback_url(f"{now.month:02d}", f"{now.day:02d}", slug)
-                title = f"{year}: {text}" if year else text
-                items.append(
-                    {
-                        "title": title,
-                        "url": page_url,
-                        "published_at": now,  # the "freshness" is when the day rolled over
-                        "summary": text,
-                        "meta": {
-                            "year": year,
-                            "kind": kind,  # events | selected
-                            "wiki_title": (first_page or {}).get("title"),
-                        },
-                    }
-                )
+                    title = first_page.get("titles") or {}
+                    normalized = title.get("normalized") or title.get("display")
+                    if normalized:
+                        page_url = (
+                            f"https://en.wikipedia.org/wiki/{normalized.replace(' ', '_')}"
+                        )
+            if not page_url:
+                # Use a stable slug derived from the event text
+                # so the fallback URL is unique per event. The
+                # title is already a good differentiator ("1865:
+                # Lincoln…") and is human-meaningful as a
+                # fragment.
+                slug = "".join(
+                    c.lower() if c.isalnum() else "-"
+                    for c in text[:64]
+                ).strip("-") or "event"
+                page_url = _fallback_url(f"{now.month:02d}", f"{now.day:02d}", slug)
+            url = _dated_url(page_url, now.date())
+            # Two anniversaries can link the same article; the second
+            # would only be a duplicate at insert, so it doesn't use up
+            # one of the day's slots.
+            if url in urls:
+                continue
+            urls.add(url)
+            title = f"{year}: {text}" if year else text
+            items.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "published_at": now,  # the "freshness" is when the day rolled over
+                    "summary": text,
+                    "meta": {
+                        "year": year,
+                        "kind": kind,
+                        "wiki_title": (first_page or {}).get("title"),
+                    },
+                }
+            )
         return items

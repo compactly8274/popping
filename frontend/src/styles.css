@@ -15,7 +15,15 @@
 
 @layer base {
   html, body, #root { height: 100%; }
+  /* Keep the last card clear of the iPhone home indicator when the
+     app runs full screen from the home screen (viewport-fit=cover). */
+  #root { padding-bottom: env(safe-area-inset-bottom); }
   html { color-scheme: dark; }
+  /* Fields default to the 17px body size. iOS Safari zooms the page
+     in when a field under 16px gets focus and doesn't zoom back out;
+     every field is built at 17px, and a utility class can still set
+     another size (the guard's C6 rule checks none goes under 16px). */
+  input, select, textarea { font-size: 17px; line-height: 22px; }
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background-color: #000000; color: #ffffff; }
   /* The app is a vertical feed — the document must never pan
      horizontally. A stray overflowing element (long unbroken URL in
@@ -26,9 +34,16 @@
      a scroll container (clip, not hidden), while vertical scrolling
      keeps working everywhere. */
   html, body { overflow-x: clip; }
+  /* No page-level rubber-band: the shell is height:100% with its own
+     scrollers (each marked overscroll-contain), so a drag past the end
+     of a list must not move the whole app, header included. */
+  html, body { overscroll-behavior-y: none; }
   /* Long unbroken tokens (URLs pasted in summaries/titles) wrap
      instead of stretching the layout. */
-  body { overflow-wrap: break-word; }
+  /* ``anywhere`` also lowers a flex or grid item's min-content size,
+     so a long unbroken token can't widen its row; ``break-word`` is
+     the fallback for Safari before 15.4. */
+  body { overflow-wrap: break-word; overflow-wrap: anywhere; }
   /* Prevent the iOS / Safari "page is loading" white flash that
      happens between the first paint and the JS module load. The
      inline <style> in index.html already paints black pre-JS; this
@@ -177,5 +192,17 @@
 @media (prefers-reduced-motion: reduce) {
   .wallpaper-blob {
     animation: none !important;
+  }
+}
+
+@layer components {
+  /* iOS draws a native select with no chevron once it has a custom
+     background, so it looks like a text box. One shared style with a
+     drawn chevron. Padding comes from the markup (``pl-3 pr-8``),
+     because utilities beat component classes. */
+  .select-ios {
+    appearance: none;
+    -webkit-appearance: none;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='rgba(235,235,245,0.6)' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 0.75rem center / 12px;
   }
 }

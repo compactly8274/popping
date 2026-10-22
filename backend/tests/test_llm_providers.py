@@ -28,6 +28,7 @@ import pytest
 
 from app.llm.ollama import OllamaProvider
 from app.llm.ollama_cloud import OllamaCloudProvider
+from app.llm import router as llm_router
 
 
 class _CapturingTransport(httpx.AsyncBaseTransport):
@@ -142,7 +143,7 @@ async def test_article_summary_requests_think_false(monkeypatch):
     from app import article_summary
 
     fake = _RecordingProvider()
-    monkeypatch.setattr(article_summary.router, "providers_for", lambda task: [fake])
+    monkeypatch.setattr(llm_router, "providers_for", lambda task: [fake])
 
     result = await article_summary.summarize_article("Headline", "Article body text.")
 
@@ -155,7 +156,7 @@ async def test_podcast_transcript_requests_think_false(monkeypatch):
     from app import podcast_transcript
 
     fake = _RecordingProvider()
-    monkeypatch.setattr(podcast_transcript.router, "providers_for", lambda task: [fake])
+    monkeypatch.setattr(llm_router, "providers_for", lambda task: [fake])
 
     result = await podcast_transcript.summarize_transcript("Episode", "Transcript text.")
 
@@ -168,7 +169,7 @@ async def test_reddit_comment_summary_requests_think_false(monkeypatch):
     from app import reddit_comment_summary
 
     fake = _RecordingProvider()
-    monkeypatch.setattr(reddit_comment_summary.router, "providers_for", lambda task: [fake])
+    monkeypatch.setattr(llm_router, "providers_for", lambda task: [fake])
 
     result = await reddit_comment_summary.summarize_comments(
         "Thread title", [{"author": "alice", "text": "great point"}],

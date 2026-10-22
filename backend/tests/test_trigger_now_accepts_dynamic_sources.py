@@ -15,8 +15,9 @@ behavioral contract:
   1. Registry hit (name in list_sources()) -> _ingest called
      with the class. Fast path, no DB session opened.
   2. DB row hit (name not in registry, but Source row with
-     that name exists) -> _ingest called with the dynamic
-     plugin instance returned by ``_plugin_for(row)``.
+     that name exists) -> _ingest called with the plugin instance
+     the row's scheduler job holds, or, when it has no job (paused,
+     or no scheduler), the one ``_plugin_for(row)`` returns.
   3. Neither registry nor DB -> returns ``{"error": "unknown source", ...}``.
   4. DB row exists but _plugin_for returns None (unsupported
      ``type``) -> returns ``{"error": "unsupported source type: '...', ...}``.
@@ -120,6 +121,71 @@ async def test_trigger_now_db_hit_uses_plugin_for_row():
     mock_pf.assert_called_once_with(fake_row)
     mock_ingest.assert_awaited_once_with(fake_plugin_instance)
     fake_session.scalar.assert_awaited_once()
+
+
+def _row_session(row):
+    fake_session = MagicMock()
+    fake_session.scalar = AsyncMock(return_value=row)
+    fake_session_ctx = MagicMock()
+    fake_session_ctx.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session_ctx.__aexit__ = AsyncMock(return_value=None)
+    return fake_session_ctx
+
+
+@pytest.mark.no_db
+@pytest.mark.asyncio
+async def test_trigger_now_runs_the_plugin_its_job_holds():
+    """A dynamic row with a scheduler job runs that job's own plugin
+    instance, not a fresh one: the manual fetch then has the tick's
+    in-flight address (``fetch_target``) and per-instance state, such as
+    a website feed's ``_extracted_urls``, which a fresh instance would
+    lose and re-extract every page."""
+    from app.sources.dynamic_rss import DynamicRssPlugin
+
+    fake_row = SimpleNamespace(
+        id=42,
+        name="my_custom_feed",
+        type="rss",
+        url="https://example.com/feed.xml",
+        category="news",
+        refresh_interval_seconds=3600,
+    )
+    job_plugin = DynamicRssPlugin(fake_row)
+    fake_scheduler = MagicMock()
+    fake_scheduler.get_job.return_value = SimpleNamespace(args=[job_plugin])
+
+    with patch.object(scheduler, "list_sources", return_value={}), \
+         patch.object(scheduler, "_scheduler", fake_scheduler), \
+         patch.object(scheduler, "_ingest", new=AsyncMock(return_value={"source": "my_custom_feed", "fetched": 0, "inserted": 0, "duplicates": 0, "error": None})) as mock_ingest, \
+         patch.object(scheduler, "_plugin_for") as mock_pf, \
+         patch("app.db.SessionLocal", return_value=_row_session(fake_row)):
+        await scheduler.trigger_now("my_custom_feed")
+
+    fake_scheduler.get_job.assert_called_once_with(scheduler._dynamic_job_id(42))
+    mock_ingest.assert_awaited_once_with(job_plugin)
+    mock_pf.assert_not_called()
+
+
+@pytest.mark.no_db
+@pytest.mark.asyncio
+async def test_trigger_now_builds_a_plugin_when_the_row_has_no_job():
+    """A paused row has no job (``update_source`` removes it), so the
+    manual fetch builds one with ``_plugin_for``."""
+    fake_plugin_instance = MagicMock(name="DynamicRssPluginInstance")
+    fake_row = SimpleNamespace(id=7, name="paused_feed", type="rss")
+    fake_scheduler = MagicMock()
+    fake_scheduler.get_job.return_value = None
+
+    with patch.object(scheduler, "list_sources", return_value={}), \
+         patch.object(scheduler, "_scheduler", fake_scheduler), \
+         patch.object(scheduler, "_ingest", new=AsyncMock(return_value={"source": "paused_feed", "status": "paused", "fetched": 0, "inserted": 0, "duplicates": 0, "error": None})) as mock_ingest, \
+         patch.object(scheduler, "_plugin_for", return_value=fake_plugin_instance) as mock_pf, \
+         patch("app.db.SessionLocal", return_value=_row_session(fake_row)):
+        result = await scheduler.trigger_now("paused_feed")
+
+    mock_pf.assert_called_once_with(fake_row)
+    mock_ingest.assert_awaited_once_with(fake_plugin_instance)
+    assert result["status"] == "paused"
 
 
 # ---------------------------------------------------------------------------

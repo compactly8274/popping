@@ -13,13 +13,12 @@ don't publish a transcript tag.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 
 import httpx
 
-from app.llm import ProviderError, router
+from app.llm import complete_with_fallback
 from app.url_safety import check_url_safe, ssrf_event_hook
 
 logger = logging.getLogger("popping.podcast_transcript")
@@ -201,35 +200,13 @@ async def summarize_transcript(episode_title: str, transcript_text: str) -> str 
     """Summarize ``transcript_text`` via the configured LLM provider
     (same fallback chain the Brief generator uses). Returns None if
     no provider is configured or every configured provider fails."""
-    providers = router.providers_for("brief")
-    if not providers:
-        logger.info("podcast_transcript: no LLM provider configured — skipping summary")
-        return None
-    prompt = _build_prompt(episode_title, transcript_text)
-    for candidate in providers:
-        try:
-            content = await asyncio.wait_for(
-                # think=False — see app.article_summary's matching
-                # comment / Provider.complete's docstring: a thinking
-                # model can burn the whole token budget on CoT and
-                # never reach the actual summary.
-                candidate.complete(prompt, max_tokens=_SUMMARY_MAX_TOKENS, think=False),
-                timeout=_LLM_CALL_TIMEOUT_S,
-            )
-        except ProviderError as exc:
-            logger.warning(
-                "podcast_transcript: LLM call failed on %s: %s — trying next provider",
-                candidate.name, exc,
-            )
-            continue
-        except asyncio.TimeoutError:
-            logger.warning(
-                "podcast_transcript: %s took longer than %.0fs — trying next provider",
-                candidate.name, _LLM_CALL_TIMEOUT_S,
-            )
-            continue
-        content = (content or "").strip()
-        if content:
-            return content
-    logger.warning("podcast_transcript: all configured LLM providers failed")
-    return None
+    summary, _ = await complete_with_fallback(
+        "brief",
+        _build_prompt(episode_title, transcript_text),
+        log_name="podcast_transcript",
+        timeout=_LLM_CALL_TIMEOUT_S,
+        max_tokens=_SUMMARY_MAX_TOKENS,
+        # think=False: see app.article_summary.
+        think=False,
+    )
+    return summary
